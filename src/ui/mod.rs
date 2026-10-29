@@ -26,6 +26,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("exec", "Open a shell in the selected container"),
     ("close-exec", "Close the embedded shell (not the container)"),
     ("performance", "Expand/collapse global performance (p)"),
+    (
+        "sort-contexts",
+        "Sort contexts by connection, name, CPU or memory (o)",
+    ),
     ("back", "Return to the previous workspace"),
     ("all", "Return to all runtimes"),
     ("monochrome", "Toggle terminal colors"),
@@ -71,6 +75,7 @@ fn condition_style(app: &App, condition: Condition) -> Style {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.action_review_visible = false;
     let area = frame.area();
     if area.width < 32 || area.height < 10 {
         frame.render_widget(
@@ -141,6 +146,136 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.picker.is_some() {
         draw_picker(frame, app, area);
     }
+    if app.action_confirmation.is_some() || app.action_progress.is_some() {
+        draw_action(frame, app, area);
+    }
+}
+
+fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
+    use crate::actions::{Action, Status};
+    let dialog = centered(area, 100, area.height.saturating_sub(2).min(28));
+    frame.render_widget(Clear, dialog);
+    if area.width < 60 || area.height < 18 {
+        frame.render_widget(Paragraph::new("Resize to at least 60 × 18 to review lifecycle targets.\nEsc cancels confirmation; running actions continue.").wrap(Wrap { trim: false }).block(Block::bordered().title(" Lifecycle ")), dialog);
+        return;
+    }
+    let (request, scroll, finished) = if let Some(confirmation) = &app.action_confirmation {
+        (&confirmation.request, confirmation.scroll, None)
+    } else if let Some(progress) = &app.action_progress {
+        (&progress.request, progress.scroll, Some(progress.finished))
+    } else {
+        return;
+    };
+    let title = match finished {
+        None => format!(" Confirm {} ", request.action.label()),
+        Some(false) => format!(" {} · Running ", request.action.label()),
+        Some(true) => format!(" {} · Results ", request.action.label()),
+    };
+    let block = Block::bordered()
+        .title(title)
+        .title_bottom(" ↑/↓ PgUp/PgDn Review targets ");
+    let inner = padded(block.inner(dialog));
+    frame.render_widget(block, dialog);
+    let parts = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(3),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!("Runtime: {}", safe_text(&request.connection.name))),
+            Line::from(format!(
+                "{}: {} · {} target(s), {} skipped",
+                request.action.label(),
+                safe_text(&request.name),
+                request.containers.len(),
+                request.skipped
+            )),
+        ]),
+        parts[0],
+    );
+    let mut lines = vec![
+        Line::from(format!(
+            "Endpoint: {}",
+            safe_text(&request.connection.endpoint)
+        )),
+        Line::from(format!("Runtime ID: {}", safe_text(&request.identity))),
+        Line::styled(
+            "Existing containers only; no Compose dependency orchestration.",
+            muted(),
+        ),
+    ];
+    if request.action == Action::Delete {
+        lines.push(Line::styled(
+            "Container writable data is lost. Networks, ALL volumes and images stay.",
+            accent(app, Color::Yellow),
+        ));
+    } else if matches!(request.action, Action::Stop | Action::Restart) {
+        lines.push(Line::styled(
+            "10s stop grace period, then runtime may kill the process.",
+            accent(app, Color::Yellow),
+        ));
+    }
+    for (index, container) in request.containers.iter().enumerate() {
+        lines.push(Line::from(format!(
+            "{} · {}",
+            index + 1,
+            safe_text(&container.name)
+        )));
+        lines.push(Line::styled(
+            format!("  ID: {}", safe_text(&container.id)),
+            muted(),
+        ));
+        if let Some(progress) = &app.action_progress {
+            let (text, style) = match &progress.results[index] {
+                Some(Status::Succeeded) => ("Succeeded".into(), accent(app, Color::Green)),
+                Some(status @ Status::Failed(_)) => (status.text(), accent(app, Color::Red)),
+                Some(status) => (status.text(), accent(app, Color::Yellow)),
+                None => ("Pending / checking safety".into(), muted()),
+            };
+            lines.push(Line::styled(safe_text(&text), style));
+        }
+        lines.push(Line::from(""));
+    }
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let max_scroll = paragraph
+        .line_count(parts[1].width)
+        .saturating_sub(parts[1].height as usize);
+    let scroll = scroll.min(max_scroll).min(u16::MAX as usize);
+    frame.render_widget(paragraph.scroll((scroll as u16, 0)), parts[1]);
+    let deleting = request.action == Action::Delete;
+    let confirmation_name = safe_text(&request.name);
+    let prompt = if let Some(confirmation) = &mut app.action_confirmation {
+        confirmation.scroll = scroll;
+        app.action_review_visible = true;
+        let hint = if deleting {
+            format!(
+                "Type {} then Enter to DELETE\n> {} · Esc Cancel",
+                confirmation_name,
+                safe_text(&confirmation.typed)
+            )
+        } else {
+            "y Confirm · Enter/Esc Cancel (default)".into()
+        };
+        format!(
+            "{hint}\n{}",
+            confirmation
+                .error
+                .as_deref()
+                .map(safe_text)
+                .unwrap_or_default()
+        )
+    } else {
+        let progress = app.action_progress.as_mut().unwrap();
+        progress.scroll = scroll;
+        if progress.finished {
+            "Enter/Esc Close · Inventory refresh requested\nNo automatic retry or rollback; inspect unknown outcomes.".into()
+        } else {
+            "Checking / applying confirmed targets. Please wait.\nQuitting cannot undo a request already sent to the runtime.".into()
+        }
+    };
+    frame.render_widget(Paragraph::new(prompt).wrap(Wrap { trim: false }), parts[2]);
 }
 
 fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -173,7 +308,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         .performance_scroll
         .min(app.engines.len().saturating_sub(1));
     let mut y = inner.y;
-    for index in app.performance_scroll..app.engines.len() {
+    for &index in app.context_order.iter().skip(app.performance_scroll) {
         if y + 3 >= inner.bottom() {
             break;
         }
@@ -457,11 +592,11 @@ fn draw_usage(frame: &mut Frame, app: &App, index: usize, area: Rect) {
     let engine = &app.engines[index];
     let line = |offset| Rect::new(area.x, area.y + offset, area.width, 1);
     let condition = if engine.error.is_some() {
-        Condition::new(Tone::Error, "unavailable")
+        Condition::new(Tone::Warning, "unavailable")
     } else if engine.alias.is_some() {
         Condition::new(Tone::Neutral, "alias")
     } else if let Some(snapshot) = &engine.snapshot {
-        crate::model::aggregate_condition(&snapshot.containers)
+        crate::model::runtime_condition(&snapshot.containers)
     } else {
         Condition::new(Tone::Warning, "connecting")
     };
@@ -598,7 +733,7 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
     if let Some(error) = &engine.error {
         lines.push(Line::styled(
             "Connection unavailable",
-            accent(app, Color::Red),
+            accent(app, Color::Yellow),
         ));
         lines.push(Line::from(safe_text(error)));
         if engine.snapshot.is_some() {
@@ -833,9 +968,37 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
             accent(app, Color::Yellow),
         ));
     }
+    if row.scope == Scope::Engine
+        && let Some(images) = &snapshot.images
+    {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            format!("Images ({})", images.len()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        for image in images {
+            let tags = if image.tags.is_empty() {
+                "<untagged>".into()
+            } else {
+                image.tags.join(", ")
+            };
+            lines.push(Line::from(format!(
+                "  {} · {}",
+                safe_text(&tags),
+                image
+                    .size
+                    .map(metrics::bytes)
+                    .unwrap_or_else(|| "size unavailable".into())
+            )));
+            lines.push(Line::styled(
+                format!("    {}", safe_text(&image.id)),
+                muted(),
+            ));
+        }
+    }
     lines.push(Line::from(""));
     lines.push(Line::styled(
-        "Inspection + exec · no lifecycle actions",
+        "S Start · s Stop · r Restart · d Delete (Explorer; confirmation required)",
         muted(),
     ));
     lines
@@ -860,9 +1023,9 @@ fn network_lines(app: &App) -> Vec<Line<'static>> {
         )));
         return lines;
     }
-    if let Some(error) = &engine.error {
+    if engine.error.is_some() {
         lines.push(Line::styled(
-            format!("Unavailable / stale: {}", safe_text(error)),
+            "Connection unavailable / stale · see Overview for details",
             accent(app, Color::Yellow),
         ));
     }
@@ -1159,7 +1322,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         } else if app.detail_focus && app.tab == Tab::Logs {
             "? Keys  w Wrap  / Search  n/N Match  j/k Scroll  f Follow  h/l Pan (unwrap)  Tab Explorer"
         } else {
-            "? Keys  p Performance  Space Toggle  Enter Open  e Exec  Tab Pane  1/2/3/4 Views  : Commands"
+            "? Keys  S/s/r/d Actions  p Performance  Space Toggle  Enter Open  e Exec  Tab Pane  1/2/3/4 Views  : Commands"
         };
         vec![
             Line::styled(hints, muted()),
@@ -1194,6 +1357,11 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         "q                 Back through panes/workspaces; quit from home\n",
         "Tab / Shift-Tab   Cycle Explorer / Performance (open) / Details\n",
         "p                 Expand/collapse bottom-left Performance\n",
+        "o                 Sort contexts (pins first; usage is a snapshot)\n",
+        "S / s / r / d     Start / Stop / Restart / Delete in Explorer\n",
+        "                  Container or Compose rows only; confirmation required\n",
+        "                  y confirms; Enter/Esc cancels; Delete: type name + Enter\n",
+        "                  Delete stopped containers only; keep networks/volumes/images\n",
         "1 / 2 / 3 / 4     Overview / Logs / Networks / Exec\n",
         "gg / G            First / last; G resumes log following\n",
         "Ctrl-u / Ctrl-d   Half-page up / down\n",
@@ -1290,6 +1458,7 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
         .take(inner.height as usize)
         .map(|(index, choice)| {
             let label = match choice {
+                Choice::ContextSort(mode) => mode.label().into(),
                 Choice::Project(project) => format!(
                     "{} / {}{}",
                     app.engines[project.engine].connection.name,
@@ -1526,7 +1695,11 @@ mod tests {
         assert!(text.contains("▸ Performance"));
         assert!(!text.contains("Colima / development"));
         app.performance_open = true;
-        app.performance_scroll = 1;
+        app.performance_scroll = app
+            .context_order
+            .iter()
+            .position(|&index| index == 1)
+            .unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let text: String = terminal
             .backend()
@@ -1625,6 +1798,126 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_context_is_a_warning_with_neutral_names_and_overview_diagnostics() {
+        let mut app = App::new(
+            vec![crate::config::Connection {
+                name: "Colima".into(),
+                kind: BackendKind::Docker,
+                endpoint: "unix:///colima.sock".into(),
+            }],
+            100,
+            false,
+            true,
+        );
+        let diagnostic = "unique socket diagnostic: connection refused";
+        app.update_engine(0, Err(diagnostic.into()));
+        assert_eq!(app.condition_for(&app.rows[0]).unwrap().tone, Tone::Warning);
+        app.performance_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Colima [unavailable]"));
+        assert!(text.contains("Connection unavailable"));
+        assert!(text.contains(diagnostic));
+        assert!(buffer.content.iter().any(|cell| cell.fg == Color::Yellow));
+        assert!(buffer.content.iter().all(|cell| cell.fg != Color::Red));
+        for y in 0..40 {
+            let line: String = (0..160).map(|x| buffer[(x, y)].symbol()).collect();
+            if let Some(x) = line.find("Colima") {
+                // Names are ASCII; fixture rows contain only single-column symbols.
+                let x = line[..x].chars().count() as u16;
+                for offset in 0..6 {
+                    assert_eq!(buffer[(x + offset, y)].fg, Color::Reset);
+                }
+            }
+        }
+        app.tab = Tab::Networks;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("see Overview for details"));
+        assert!(!text.contains(diagnostic));
+        app.monochrome = true;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| cell.fg == Color::Reset)
+        );
+    }
+
+    #[test]
+    fn stale_inventory_warns_and_recovery_restores_unhealthy_red_indicator() {
+        let mut app = App::new(
+            vec![crate::config::Connection {
+                name: "Colima".into(),
+                kind: BackendKind::Docker,
+                endpoint: "unix:///colima.sock".into(),
+            }],
+            100,
+            false,
+            true,
+        );
+        let snapshot = crate::model::Snapshot {
+            containers: vec![crate::model::Container {
+                id: "api".into(),
+                name: "api".into(),
+                state: "running".into(),
+                health: Some("unhealthy".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        app.update_engine(0, Ok(snapshot.clone()));
+        assert_eq!(
+            app.condition_for(&app.rows[0]).unwrap(),
+            Condition::new(Tone::Warning, "workload issues")
+        );
+        app.update_engine(0, Err("socket unavailable".into()));
+        assert_eq!(app.condition_for(&app.rows[0]).unwrap().tone, Tone::Warning);
+        let lines = overview_lines(&app);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("Showing stale, last-known data"))
+        );
+        app.update_engine(0, Ok(snapshot));
+        assert_eq!(
+            app.condition_for(&app.rows[0]).unwrap(),
+            Condition::new(Tone::Warning, "workload issues")
+        );
+        app.performance_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("[workload issues]"));
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|cell| cell.fg == Color::Yellow && cell.symbol() == "◐")
+        );
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.fg == Color::Red && cell.symbol() == "●")
+        );
+    }
+
+    #[test]
     fn logs_have_a_scrollbar_and_display_line_position_in_both_wrap_modes() {
         let mut app = App::new(crate::demo::connections(), 100, true, true);
         crate::demo::populate(&mut app);
@@ -1665,5 +1958,64 @@ mod tests {
             .collect();
         assert!(text.contains("Rows 1–"));
         assert!(text.contains("Paused"));
+    }
+
+    #[test]
+    fn lifecycle_confirmation_lists_targets_and_small_terminals_cannot_confirm() {
+        let mut app = App::new(crate::demo::connections(), 100, false, true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        app.request_action(crate::actions::Action::Stop);
+        assert!(app.action_confirmation.is_some());
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.action_review_visible);
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for expected in [
+            "Confirm Stop",
+            "Runtime: OrbStack",
+            "3 target(s)",
+            "shop-api-1",
+            "ID: api-1",
+            "y Confirm",
+            "Enter/Esc Cancel",
+        ] {
+            assert!(text.contains(expected), "{expected}");
+        }
+        let mut tiny = Terminal::new(TestBackend::new(50, 15)).unwrap();
+        tiny.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!app.action_review_visible);
+        app.confirm_action();
+        assert!(app.action_request.is_none());
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.confirm_action();
+        assert!(app.action_request.is_some());
+        app.action_progress.as_mut().unwrap().finished = true;
+        app.action_progress.as_mut().unwrap().results[0] =
+            Some(crate::actions::Status::Unknown("lost response".into()));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Outcome unknown"));
+        assert!(text.contains("inspect state before retrying"));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| cell.bg == Color::Reset)
+        );
     }
 }

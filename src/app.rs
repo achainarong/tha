@@ -5,7 +5,7 @@ use crate::{
     model::{Condition, Container, Snapshot, Tone},
     workspace::Project,
 };
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -114,6 +114,7 @@ struct NavigationState {
 }
 
 pub enum Choice {
+    ContextSort(crate::context_sort::ContextSort),
     Project(Project),
     Exec {
         engine: usize,
@@ -129,6 +130,11 @@ pub struct Picker {
 
 pub struct App {
     pub engines: Vec<Engine>,
+    pub context_order: Vec<usize>,
+    pub context_pins: Vec<String>,
+    pub context_sort: crate::context_sort::ContextSort,
+    /// Machine identity is provider + machine name, never its temporary socket path.
+    podman_machines: BTreeMap<String, usize>,
     pub expanded: HashSet<String>,
     pub rows: Vec<Row>,
     pub selected: usize,
@@ -162,8 +168,13 @@ pub struct App {
     pub exec_input: bool,
     pub exec_dimensions: (u16, u16),
     pub platforms: crate::platform::Cache,
+    pub action_confirmation: Option<crate::actions::Confirmation>,
+    pub action_request: Option<crate::actions::Request>,
+    pub action_progress: Option<crate::actions::Progress>,
+    pub action_review_visible: bool,
     startup_cwd: Option<PathBuf>,
     startup_pending: HashSet<usize>,
+    startup_discovery_pending: bool,
 }
 
 impl App {
@@ -173,7 +184,12 @@ impl App {
         monochrome: bool,
         demo: bool,
     ) -> Self {
+        let context_order = (0..connections.len()).collect();
         let mut app = Self {
+            context_order,
+            context_pins: Vec::new(),
+            context_sort: Default::default(),
+            podman_machines: BTreeMap::new(),
             engines: connections
                 .into_iter()
                 .map(|connection| Engine {
@@ -218,8 +234,13 @@ impl App {
             exec_input: false,
             exec_dimensions: (24, 80),
             platforms: Default::default(),
+            action_confirmation: None,
+            action_request: None,
+            action_progress: None,
+            action_review_visible: false,
             startup_cwd: None,
             startup_pending: HashSet::new(),
+            startup_discovery_pending: false,
         };
         for i in 0..app.engines.len() {
             app.expanded.insert(format!("{i}/{:?}", Scope::Engine));
@@ -250,22 +271,38 @@ impl App {
                 .snapshot
                 .as_ref()
                 .and_then(|s| s.engine_id.as_deref());
-            self.engines[i].alias = identity.and_then(|id| {
+            self.engines[i].alias = self.engines[i].snapshot.as_ref().and_then(|_| {
                 (0..i)
                     .find(|&other| {
                         self.engines[other].error.is_none()
-                            && self.engines[other]
-                                .snapshot
-                                .as_ref()
-                                .and_then(|s| s.engine_id.as_deref())
-                                == Some(id)
+                            && self.engines[other].snapshot.is_some()
+                            && (identity.is_some_and(|id| {
+                                self.engines[other]
+                                    .snapshot
+                                    .as_ref()
+                                    .and_then(|s| s.engine_id.as_deref())
+                                    == Some(id)
+                            }) || ((self.engines[i]
+                                .connection
+                                .endpoint
+                                .starts_with("unix://")
+                                || self.engines[i].connection.endpoint.starts_with('/'))
+                                && crate::discovery::endpoint_key(&self.engines[i].connection)
+                                    == crate::discovery::endpoint_key(
+                                        &self.engines[other].connection,
+                                    )))
                     })
                     .map(|other| self.engines[other].connection.name.clone())
             });
         }
         self.refresh_tree();
         self.startup_pending.remove(&index);
-        if self.startup_pending.is_empty()
+        self.complete_startup();
+    }
+
+    fn complete_startup(&mut self) {
+        if !self.startup_discovery_pending
+            && self.startup_pending.is_empty()
             && let Some(cwd) = self.startup_cwd.take()
         {
             let projects = crate::workspace::directory_matches(&self.engines, &cwd);
@@ -288,8 +325,206 @@ impl App {
         }
     }
 
+    /// Reconcile discovery without moving any existing backend index or navigation key.
+    /// Returns worker availability for native Podman machines only.
+    pub fn reconcile_podman(
+        &mut self,
+        discovery: &crate::discovery::podman::Discovery,
+    ) -> Vec<(usize, bool)> {
+        for machine in &discovery.machines {
+            if !self.podman_machines.contains_key(&machine.name) {
+                let index = self.engines.len();
+                self.engines.push(Engine {
+                    connection: Connection {
+                        name: format!("Podman / {}", machine.name),
+                        kind: crate::config::BackendKind::Docker,
+                        endpoint: String::new(),
+                    },
+                    snapshot: None,
+                    error: None,
+                    alias: None,
+                    metrics: Default::default(),
+                    metrics_revision: 0,
+                });
+                let pin_rank = |engine: usize| {
+                    self.context_pins
+                        .iter()
+                        .position(|name| name == &self.engines[engine].connection.name)
+                        .unwrap_or(usize::MAX)
+                };
+                let position = self
+                    .context_order
+                    .iter()
+                    .position(|&engine| pin_rank(index) < pin_rank(engine))
+                    .unwrap_or(self.context_order.len());
+                if !self.context_order.is_empty() && position <= self.performance_scroll {
+                    self.performance_scroll += 1;
+                }
+                self.context_order.insert(position, index);
+                self.expanded.insert(format!("{index}/{:?}", Scope::Engine));
+                self.podman_machines.insert(machine.name.clone(), index);
+                if self.startup_cwd.is_some() {
+                    self.startup_pending.insert(index);
+                }
+            }
+        }
+        let mut availability = Vec::new();
+        // Clone the small identity map so update_engine can also recompute aliases.
+        for (name, index) in self.podman_machines.clone() {
+            let endpoint = discovery
+                .machines
+                .iter()
+                .find(|machine| machine.name == name)
+                .map(|machine| &machine.endpoint);
+            let error = if let Some(warning) = &discovery.warning {
+                Some(warning.clone())
+            } else {
+                match endpoint {
+                    Some(Ok(endpoint)) => {
+                        if self.engines[index].connection.endpoint != *endpoint {
+                            let engine = &mut self.engines[index];
+                            engine.connection.endpoint = endpoint.clone();
+                            engine.metrics = Default::default();
+                            engine.metrics_revision = engine.metrics_revision.wrapping_add(1);
+                            engine.error =
+                                Some("Podman socket changed; refreshing inventory".into());
+                        }
+                        availability.push((index, true));
+                        None
+                    }
+                    Some(Err(error)) => Some(error.clone()),
+                    None => Some(
+                        "Podman machine is no longer listed; refresh after starting it separately"
+                            .into(),
+                    ),
+                }
+            };
+            if let Some(error) = error {
+                self.update_engine(index, Err(error));
+                availability.push((index, false));
+            }
+        }
+        self.refresh_tree();
+        self.startup_discovery_pending = false;
+        self.complete_startup();
+        availability
+    }
+
+    pub fn wait_for_machine_discovery(&mut self) {
+        self.startup_discovery_pending = self.startup_cwd.is_some();
+    }
+
     pub fn current(&self) -> Option<&Row> {
         self.rows.get(self.selected)
+    }
+
+    pub fn request_action(&mut self, action: crate::actions::Action) {
+        if self.action_progress.is_some()
+            || self.action_request.is_some()
+            || self.action_confirmation.is_some()
+        {
+            return;
+        }
+        let request = (|| {
+            if self.demo {
+                anyhow::bail!("Demo mode: lifecycle mutations are disabled");
+            }
+            let row = self
+                .current()
+                .ok_or_else(|| anyhow::anyhow!("Select a container or Compose workload"))?;
+            let engine = &self.engines[row.engine];
+            if engine.error.is_some() || engine.alias.is_some() {
+                anyhow::bail!(
+                    "Connection unavailable or aliased; select its connected primary context"
+                );
+            }
+            crate::actions::Request::build(
+                row.engine,
+                &engine.connection,
+                engine
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.engine_id.as_deref()),
+                &row.scope,
+                self.selected_containers(),
+                action,
+            )
+        })();
+        match request {
+            Ok(request) => {
+                self.action_review_visible = false;
+                self.action_confirmation = Some(crate::actions::Confirmation {
+                    request,
+                    typed: String::new(),
+                    scroll: 0,
+                    error: None,
+                });
+            }
+            Err(error) => self.notice = format!("{error:#}"),
+        }
+    }
+
+    pub fn confirm_action(&mut self) {
+        if !self.action_review_visible {
+            if let Some(confirmation) = &mut self.action_confirmation {
+                confirmation.error =
+                    Some("Review targets in a terminal at least 60 × 18 before confirming".into());
+            }
+            return;
+        }
+        let Some(mut confirmation) = self.action_confirmation.take() else {
+            return;
+        };
+        if confirmation.request.action == crate::actions::Action::Delete
+            && confirmation.typed != confirmation.request.name
+        {
+            confirmation.error = Some("Name does not match; nothing was sent".into());
+            self.action_confirmation = Some(confirmation);
+            return;
+        }
+        let request = confirmation.request;
+        let validation = (|| {
+            let engine = self
+                .engines
+                .get(request.engine)
+                .ok_or_else(|| anyhow::anyhow!("Runtime no longer exists"))?;
+            if self.demo
+                || engine.error.is_some()
+                || engine.alias.is_some()
+                || engine.connection != request.connection
+            {
+                anyhow::bail!("Connection changed or is unavailable; select and confirm again");
+            }
+            let snapshot = engine
+                .snapshot
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Refresh inventory before retrying"))?;
+            if snapshot.engine_id.as_deref() != Some(request.identity.as_str()) {
+                anyhow::bail!("Runtime identity changed; select and confirm again");
+            }
+            for container in &request.containers {
+                let current = snapshot
+                    .containers
+                    .iter()
+                    .find(|current| current.id == container.id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Container disappeared; select and confirm again")
+                    })?;
+                request.validate_container(container, current)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })();
+        if let Err(error) = validation {
+            self.notice = format!("{error:#}");
+            return;
+        }
+        self.action_progress = Some(crate::actions::Progress {
+            results: vec![None; request.containers.len()],
+            request: request.clone(),
+            finished: false,
+            scroll: 0,
+        });
+        self.action_request = Some(request);
     }
 
     pub fn apply_metrics(&mut self, event: crate::metrics::Event) {
@@ -367,7 +602,7 @@ impl App {
             return Some(Condition::new(Tone::Neutral, "alias"));
         }
         if engine.error.is_some() {
-            return Some(Condition::new(Tone::Error, "unavailable"));
+            return Some(Condition::new(Tone::Warning, "unavailable"));
         }
         let Some(snapshot) = &engine.snapshot else {
             return Some(Condition::new(Tone::Warning, "connecting"));
@@ -382,6 +617,9 @@ impl App {
         }
         if row.scope == Scope::Engine && members.is_empty() {
             return Some(Condition::new(Tone::Good, "connected"));
+        }
+        if row.scope == Scope::Engine {
+            return Some(crate::model::runtime_condition(members));
         }
         Some(crate::model::aggregate_condition(members))
     }
@@ -494,8 +732,16 @@ impl App {
 
     pub fn refresh_tree(&mut self) {
         let previous = self.current().map(|r| r.key.clone());
+        if matches!(
+            self.context_sort,
+            crate::context_sort::ContextSort::ConnectedFirst
+                | crate::context_sort::ContextSort::Name
+        ) {
+            self.reorder_contexts();
+        }
         let mut rows = Vec::new();
-        for (i, engine) in self.engines.iter().enumerate() {
+        for &i in &self.context_order {
+            let engine = &self.engines[i];
             let tree = engine_tree(i, engine);
             let focused;
             let tree = if let Some(project) = &self.project {
@@ -757,6 +1003,12 @@ impl App {
             return;
         }
         match picker.choices.remove(picker.selected) {
+            Choice::ContextSort(mode) => {
+                self.context_sort = mode;
+                self.reorder_contexts();
+                self.refresh_tree();
+                self.notice = format!("Context order: {} · o to sort again", mode.label());
+            }
             Choice::Project(project) => self.open_project(project),
             Choice::Exec { engine, container } => {
                 if self.engines[engine].error.is_some() || self.engines[engine].alias.is_some() {
@@ -770,6 +1022,54 @@ impl App {
                     command: self.exec_command.clone(),
                 });
             }
+        }
+    }
+
+    pub fn pick_context_sort(&mut self) {
+        use crate::context_sort::ContextSort;
+        self.picker = Some(Picker {
+            title: "Sort contexts · pins stay first".into(),
+            choices: ContextSort::ALL
+                .into_iter()
+                .map(Choice::ContextSort)
+                .collect(),
+            selected: ContextSort::ALL
+                .iter()
+                .position(|mode| *mode == self.context_sort)
+                .unwrap_or(0),
+        });
+    }
+
+    fn reorder_contexts(&mut self) {
+        let focused_engine = self.context_order.get(self.performance_scroll).copied();
+        let contexts: Vec<_> = self
+            .engines
+            .iter()
+            .enumerate()
+            .map(|(index, engine)| {
+                let summary = self.engine_metrics(index);
+                crate::context_sort::Context {
+                    engine: index,
+                    name: &engine.connection.name,
+                    endpoint_key: engine.connection.key(),
+                    connected: engine.snapshot.is_some() && engine.error.is_none(),
+                    cpu: summary
+                        .cpu_percent
+                        .filter(|_| summary.cpu_samples == summary.running),
+                    memory: summary
+                        .memory_bytes
+                        .filter(|_| summary.memory_samples == summary.running),
+                }
+            })
+            .collect();
+        self.context_order =
+            crate::context_sort::order(&contexts, &self.context_pins, self.context_sort);
+        if let Some(index) = focused_engine {
+            self.performance_scroll = self
+                .context_order
+                .iter()
+                .position(|&engine| engine == index)
+                .unwrap_or(0);
         }
     }
 }
@@ -1265,6 +1565,221 @@ mod tests {
         assert_eq!(app.metrics_for(&row).memory_label(), "0 B");
         app.update_engine(0, Err("offline".into()));
         assert_eq!(app.metrics_for(&row).cpu_label(), "--");
+    }
+
+    #[test]
+    fn native_podman_reconciliation_keeps_machine_indices_across_restarts_and_failures() {
+        use crate::discovery::podman::{Discovery, Machine};
+        let mut app = app();
+        let before = app.engines[0].connection.clone();
+        let report = |socket: &str| Discovery {
+            machines: vec![
+                Machine {
+                    name: "first".into(),
+                    endpoint: Ok(socket.into()),
+                },
+                Machine {
+                    name: "second".into(),
+                    endpoint: Err("stopped".into()),
+                },
+            ],
+            warning: None,
+        };
+        let availability = app.reconcile_podman(&report("unix:///one.sock"));
+        let index = app.podman_machines["first"];
+        let stopped = app.podman_machines["second"];
+        assert!(availability.contains(&(index, true)));
+        assert!(availability.contains(&(stopped, false)));
+        app.update_engine(
+            index,
+            Ok(Snapshot {
+                engine_id: Some("podman-id".into()),
+                ..Default::default()
+            }),
+        );
+        app.selected = app.rows.iter().position(|row| row.engine == index).unwrap();
+        let selected = app.current().unwrap().key.clone();
+        app.reconcile_podman(&report("unix:///two.sock"));
+        assert_eq!(app.podman_machines["first"], index);
+        assert_eq!(app.current().unwrap().key, selected);
+        assert_eq!(app.engines[index].connection.endpoint, "unix:///two.sock");
+        assert!(app.engines[index].error.is_some());
+        assert_eq!(app.engines[0].connection, before);
+        let failed_scan = Discovery {
+            machines: vec![],
+            warning: Some("invalid JSON".into()),
+        };
+        assert!(
+            app.reconcile_podman(&failed_scan)
+                .iter()
+                .all(|(_, available)| !available)
+        );
+        assert_eq!(app.engines[index].connection.endpoint, "unix:///two.sock");
+        app.reconcile_podman(&Discovery::default());
+        assert!(
+            app.engines[index]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("no longer listed")
+        );
+        assert_eq!(app.reconcile_podman(&report("unix:///three.sock")).len(), 2);
+        assert_eq!(app.podman_machines["first"], index);
+    }
+
+    #[test]
+    fn native_podman_and_docker_context_aliases_do_not_duplicate_metrics() {
+        use crate::discovery::podman::{Discovery, Machine};
+        let mut app = app();
+        let identity = app.engines[0].snapshot.as_ref().unwrap().engine_id.clone();
+        app.reconcile_podman(&Discovery {
+            machines: vec![Machine {
+                name: "fixture".into(),
+                endpoint: Ok("unix:///podman.sock".into()),
+            }],
+            warning: None,
+        });
+        let index = app.podman_machines["fixture"];
+        app.update_engine(
+            index,
+            Ok(Snapshot {
+                engine_id: identity,
+                ..Default::default()
+            }),
+        );
+        // Seed the same nonempty identity explicitly, independent of the app fixture.
+        app.update_engine(
+            0,
+            Ok(Snapshot {
+                engine_id: Some("same-podman".into()),
+                ..Default::default()
+            }),
+        );
+        app.update_engine(
+            index,
+            Ok(Snapshot {
+                engine_id: Some("same-podman".into()),
+                ..Default::default()
+            }),
+        );
+        assert!(app.engines[index].alias.is_some());
+        assert_eq!(app.engine_metrics(index).cpu_percent, None);
+    }
+
+    #[test]
+    fn startup_matching_waits_for_native_discovery_and_uses_machine_project_labels() {
+        use crate::discovery::podman::{Discovery, Machine};
+        let mut app = app();
+        let cwd = std::env::current_dir().unwrap();
+        app.configure_startup(cwd.clone());
+        app.wait_for_machine_discovery();
+        app.update_engine(0, Ok(Snapshot::default()));
+        assert!(app.startup_cwd.is_some());
+        app.reconcile_podman(&Discovery {
+            machines: vec![Machine {
+                name: "fixture".into(),
+                endpoint: Ok("unix:///podman.sock".into()),
+            }],
+            warning: None,
+        });
+        let index = app.podman_machines["fixture"];
+        assert!(app.project.is_none());
+        app.update_engine(
+            index,
+            Ok(Snapshot {
+                containers: vec![Container {
+                    id: "native-api".into(),
+                    project: Some("native-project".into()),
+                    service: Some("api".into()),
+                    compose_working_dir: Some(cwd),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        );
+        assert_eq!(app.project.as_ref().unwrap().engine, index);
+        assert_eq!(app.project.as_ref().unwrap().name, "native-project");
+    }
+
+    #[test]
+    fn matching_podman_socket_is_aliased_even_when_the_api_omits_engine_identity() {
+        use crate::discovery::podman::{Discovery, Machine};
+        let mut app = app();
+        app.reconcile_podman(&Discovery {
+            machines: vec![Machine {
+                name: "fixture".into(),
+                endpoint: Ok("/test".into()),
+            }],
+            warning: None,
+        });
+        let index = app.podman_machines["fixture"];
+        app.update_engine(index, Ok(Snapshot::default()));
+        assert!(app.engines[index].alias.is_some());
+    }
+
+    #[test]
+    fn late_native_machine_respects_pins_without_resorting_usage_or_moving_focus() {
+        use crate::discovery::podman::{Discovery, Machine};
+        let mut app = app();
+        app.context_sort = crate::context_sort::ContextSort::Cpu;
+        app.context_pins = vec!["Podman / preferred".into()];
+        let selected = app.current().unwrap().key.clone();
+        app.reconcile_podman(&Discovery {
+            machines: vec![Machine {
+                name: "preferred".into(),
+                endpoint: Ok("unix:///podman.sock".into()),
+            }],
+            warning: None,
+        });
+        assert_eq!(app.context_order[0], app.podman_machines["preferred"]);
+        assert_eq!(app.context_order[app.performance_scroll], 0);
+        assert_eq!(app.current().unwrap().key, selected);
+    }
+
+    #[test]
+    fn sorting_preserves_backend_indices_selection_expansion_and_log_targets() {
+        use crate::context_sort::ContextSort;
+        let mut app = App::new(crate::demo::connections(), 100, false, true);
+        crate::demo::populate(&mut app);
+        let identities: Vec<_> = app
+            .engines
+            .iter()
+            .map(|engine| engine.connection.clone())
+            .collect();
+        let selection = app.current().unwrap().key.clone();
+        let expanded = app.expanded.clone();
+        app.log_scope = Some("fixed-log-target".into());
+        app.performance_scroll = app
+            .context_order
+            .iter()
+            .position(|&engine| engine == 0)
+            .unwrap();
+        app.pick_context_sort();
+        app.picker.as_mut().unwrap().selected = 2;
+        app.choose();
+        assert_eq!(app.context_sort, ContextSort::Cpu);
+        assert_eq!(app.current().unwrap().key, selection);
+        assert_eq!(app.expanded, expanded);
+        assert_eq!(app.log_scope.as_deref(), Some("fixed-log-target"));
+        assert_eq!(app.context_order[app.performance_scroll], 0);
+        assert_eq!(
+            app.engines
+                .iter()
+                .map(|engine| engine.connection.clone())
+                .collect::<Vec<_>>(),
+            identities
+        );
+        let order = app.context_order.clone();
+        app.update_engine(0, Err("disconnected".into()));
+        app.refresh_tree();
+        assert_eq!(
+            app.context_order, order,
+            "usage sort must not jump on refresh"
+        );
+        app.pick_context_sort();
+        app.picker.as_mut().unwrap().selected = 0;
+        app.choose();
+        assert_ne!(app.context_order, order);
     }
 
     #[test]

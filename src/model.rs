@@ -169,6 +169,17 @@ pub fn aggregate_condition<'a>(containers: impl IntoIterator<Item = &'a Containe
     }
 }
 
+/// A runtime can be reachable while some of its workloads have failed.
+/// Keep those failures red at workload scope, not at the context level.
+pub fn runtime_condition<'a>(containers: impl IntoIterator<Item = &'a Container>) -> Condition {
+    let condition = aggregate_condition(containers);
+    if condition.tone == Tone::Error {
+        Condition::new(Tone::Warning, "workload issues")
+    } else {
+        condition
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Resource {
     pub name: String,
@@ -187,8 +198,16 @@ pub struct Snapshot {
     pub containers: Vec<Container>,
     pub networks: Vec<Resource>,
     pub volumes: Vec<Resource>,
+    pub images: Option<Vec<Image>>,
     pub namespaces: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Image {
+    pub id: String,
+    pub tags: Vec<String>,
+    pub size: Option<u64>,
 }
 
 pub fn project(labels: &Labels) -> Option<String> {
@@ -259,6 +278,12 @@ mod tests {
         assert_eq!(project(&Labels::new()), None);
         let labels = Labels::from([("nerdctl/compose/project".into(), "shop".into())]);
         assert_eq!(project(&labels).as_deref(), Some("shop"));
+        let labels = Labels::from([
+            ("io.podman.compose.project".into(), "hello-podman".into()),
+            ("io.podman.compose.service".into(), "hello".into()),
+        ]);
+        assert_eq!(project(&labels).as_deref(), Some("hello-podman"));
+        assert_eq!(service(&labels).as_deref(), Some("hello"));
     }
 
     #[test]
@@ -340,5 +365,11 @@ mod tests {
             Tone::Error
         );
         assert_eq!(aggregate_condition([&stopped]).tone, Tone::Neutral);
+        assert_eq!(
+            runtime_condition([&good, &failed]),
+            Condition::new(Tone::Warning, "workload issues")
+        );
+        assert_eq!(failed.condition().tone, Tone::Error);
+        assert_eq!(runtime_condition([&good]).tone, Tone::Good);
     }
 }

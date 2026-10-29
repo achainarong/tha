@@ -6,7 +6,70 @@ A runtime-first container terminal UI, written in Rust. **Tha** is the product;
 Explore **engine → Compose project → service → container**, with networks and
 volumes next to their workloads. Native containerd adds a namespace level.
 
-## Start
+## Quick install
+
+Prebuilt releases support **Linux AMD64, Linux ARM64, and macOS ARM64**. No Rust
+installation or sudo is needed. The following downloads the latest stable
+release, verifies its SHA-256 checksum, and installs `tha` into `~/.local/bin`.
+Requires `curl`, `tar`, and either `sha256sum` (Linux) or `shasum` (macOS).
+
+**Release downloads become available after the first version tag is published.**
+Until then, use the source-build instructions below.
+
+```sh
+(
+  set -eu
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64|Linux-amd64) asset=tha-linux-amd64.tar.gz ;;
+    Linux-aarch64|Linux-arm64) asset=tha-linux-arm64.tar.gz ;;
+    Darwin-arm64) asset=tha-macos-arm64.tar.gz ;;
+    *) echo 'Supported: Linux AMD64/ARM64 and macOS ARM64 (native shell).' >&2; exit 1 ;;
+  esac
+  base=https://github.com/achainarong/tha/releases/latest/download
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/tha-install.XXXXXX")
+  trap 'rm -f "$tmp/$asset" "$tmp/SHA256SUMS" "$tmp/CHECKSUM" "$tmp/tha"; rmdir "$tmp"' 0
+  trap 'exit 1' HUP INT TERM
+  curl --proto '=https' --tlsv1.2 -fsSL "$base/$asset" -o "$tmp/$asset"
+  curl --proto '=https' --tlsv1.2 -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"
+  awk -v asset="$asset" '$2 == asset { print }' "$tmp/SHA256SUMS" > "$tmp/CHECKSUM"
+  if [ "$(wc -l < "$tmp/CHECKSUM" | tr -d '[:space:]')" != 1 ]; then
+    echo "Missing or duplicate checksum for $asset; nothing installed." >&2
+    exit 1
+  fi
+  (
+    cd "$tmp"
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum -c CHECKSUM
+    else
+      shasum -a 256 -c CHECKSUM
+    fi
+  )
+  tar -xzf "$tmp/$asset" -C "$tmp" tha
+  mkdir -p "$HOME/.local/bin"
+  install -m 755 "$tmp/tha" "$HOME/.local/bin/tha"
+  "$HOME/.local/bin/tha" --version
+)
+```
+
+Then run `~/.local/bin/tha`, or add `~/.local/bin` to your `PATH`:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+tha
+```
+
+Linux archives are statically linked with musl, avoiding a dependency on the
+build runner's glibc version. ARM means **64-bit ARM**, not ARMv7. The macOS binary
+is ad-hoc signed, not Apple-notarized; Intel Macs are not included. Checksums
+detect corrupted/mismatched downloads, not an independently authenticated
+publisher. Only install releases from the repository you trust.
+
+To pin or roll back, choose a version from
+[GitHub Releases](https://github.com/achainarong/tha/releases), download its matching
+archive and `SHA256SUMS`, verify the archive, and replace the installed binary.
+No runtime state or user configuration is migrated by installation.
+
+## Build from source
 
 Requires macOS or Linux, Rust 1.88+ (current stable recommended), and an
 interactive terminal. No Docker CLI is required for Docker API browsing;
@@ -20,6 +83,7 @@ tha
 ```
 
 Ensure Cargo's bin directory is on `PATH`. Installation does not require sudo.
+If both install locations are on `PATH`, `command -v tha` shows which takes precedence.
 Tha never starts an engine, VM, or container automatically.
 
 ## First MVP
@@ -35,7 +99,7 @@ Tha never starts an engine, VM, or container automatically.
 - Bounded log history, highlighted search, wrapping toggle, scrollbar, and retained-row position.
 - Vim navigation, command palette, scrollable shortcut cheatsheet, and narrow-terminal layout.
 - Terminal-native foreground/background and ANSI palette; no hardcoded RGB theme.
-- Embedded PTY container exec; **no start, stop, restart, delete, or Compose mutation actions yet**.
+- Embedded PTY container exec and confirmation-backed Docker/Podman lifecycle actions.
 
 ### Runtime coverage
 
@@ -45,7 +109,7 @@ Tha never starts an engine, VM, or container automatically.
 | Docker Desktop | Docker API over Unix socket | Contexts and macOS socket discovery |
 | OrbStack | Docker API over Unix socket | Context and macOS socket discovery |
 | Docker-backed Colima | Docker API over Unix socket | Contexts and profile sockets |
-| Podman | Docker-compatible API socket | API service must already be available; compatibility needs live validation |
+| Podman | Docker-compatible API socket | Native machine discovery plus rootless/rootful local sockets; machine/API service must already be running |
 | Native containerd / nerdctl | `nerdctl` subprocess adapter | Requires `nerdctl` on PATH and an accessible containerd socket |
 
 Containerd namespaces are shown separately. Its network/volume inventory is
@@ -64,6 +128,35 @@ Docker/OrbStack/Podman/containerd sockets. Rootless discovery also checks
 `XDG_RUNTIME_DIR`. `DOCKER_CONFIG` changes the Docker configuration location.
 All discovered contexts are considered, not just the active one; Tha never
 changes your active context.
+
+### Podman machines
+
+With `podman` on PATH, Tha asynchronously reads `podman machine list --format json`
+and inspects running machines for `ConnectionInfo.PodmanSocket.Path`. Each machine
+appears as **Podman / machine-name** without a Docker context, Podman Desktop, or
+privileged helper. Multiple machines are supported. Missing Podman and empty
+machine lists are optional-provider states, not application failures.
+
+Discovery refreshes with inventory and `:refresh`. Stopped/disappeared machines
+remain visible as unavailable with last-known data; Tha does not connect to a
+stopped machine. Restarting or changing a forwarded socket replaces that machine's
+inventory/stats workers without changing its navigation identity. Old worker
+responses are rejected, logs resubscribe to the new socket, and an existing Exec
+session is never redirected. Docker-context aliases sharing an engine ID or a
+canonical Unix socket do not duplicate workload trees or metrics.
+
+Machine commands have a 3-second deadline, a 1 MiB output limit, and at most four
+concurrent inspections. Invalid JSON, inspect failures, and API failures remain
+local warnings; other runtimes keep refreshing. Inventory uses the negotiated
+Docker-compatible API. Container images are listed with tags, IDs, and reported
+sizes at the bottom of runtime Overview (Tab into details and scroll). Image
+listing failures do not hide containers. Compose grouping recognizes both
+`com.docker.compose.*` and `io.podman.compose.*` labels.
+
+Tha never starts machines, changes rootless/rootful settings, installs helpers,
+or changes the default Docker/Podman connection. Live compatibility is version-
+specific; the fixture checks below cover the installed macOS Podman machine,
+not every Podman version or remote transport.
 
 Explicit connections are useful for endpoints discovery cannot find:
 
@@ -118,6 +211,8 @@ your navigation. Demo mode never auto-opens a project.
 | `Ctrl-u` / `Ctrl-d` | Half-page up / down |
 | `Tab` / `Shift-Tab` | Cycle Explorer / Performance (when open) / Details |
 | `p` / `:performance` | Expand/collapse bottom-left global Performance |
+| `o` / `:sort-contexts` | Choose connected-first, name, CPU, or memory context order |
+| `S` / `s` / `r` / `d` in Explorer | Start / Stop / Restart / Delete selected container or Compose workload |
 | `1` / `2` / `3` / `4` | Overview / Logs / Networks / Exec on the right |
 | `/` | Search tree or highlight log matches when the log pane is focused |
 | `n` / `N` | Next / previous match; logs navigate individual occurrences |
@@ -266,6 +361,68 @@ or another argv array in the config for images without `sh`. If the runtime CLI
 is missing or exits unsuccessfully, Tha shows the error in its existing view.
 Exec may modify container contents; it is intentionally **not read-only**.
 
+## Container and Compose lifecycle actions
+
+With **Explorer focused**, select a container, Compose service, or Compose project:
+
+- **`S`** starts existing `created`/`exited` containers.
+- **`s`** stops running containers.
+- **`r`** restarts running containers; stopped members are skipped.
+- **`d`** deletes stopped containers (`created`, `exited`, or `dead`) only. Stop all
+  members first; a group with running/paused/restarting/unknown members is refused.
+
+These work through the Docker-compatible API for **Docker and Podman**. Runtime
+contexts, generic grouping/resource rows, unavailable/aliased connections,
+Kubernetes-managed workloads, demo mode, and native containerd cannot be mutated.
+While Exec owns input, all these keys go to the shell. `Ctrl-d` remains half-page
+navigation in Tha and EOF inside Exec; it is never a delete shortcut.
+
+Every action opens a scrollable confirmation listing the exact runtime, endpoint,
+container names/IDs, target count, and skipped count. **`y` confirms Start/Stop/
+Restart; Enter or Esc cancels by default.** Delete requires typing the selected
+container/service/project name exactly, then Enter. Esc cancels deletion. A
+terminal of at least 60 × 18 is required to review and confirm actions.
+
+**Delete loses the container's writable data. Networks, images, and all volumes
+(including anonymous volumes) are retained.** Force deletion is disabled. There
+is no bulk image/network/volume removal and no pruning.
+
+Compose actions affect **only the confirmed, existing containers**. They do not
+run `compose up/down`, recreate removed containers, build/pull images, or perform
+dependency-ordered orchestration. Start does not recreate a deleted container.
+Stop/Restart allow a 10-second graceful-stop period before the runtime may kill
+the process. Stopping/deleting a container can also terminate its Exec session.
+
+Runtime identity, container IDs/names, Compose labels, management metadata, and
+eligible states are rechecked before writes. Targets remain frozen when inventory
+refreshes; newly discovered replicas are not silently added. Operations run
+sequentially off the UI thread, with per-container outcomes and a refresh when
+finished. Bulk operations are **not atomic** and have no automatic rollback.
+Normal API rejections are reported per member; ambiguous failures/timeouts are
+shown as **outcome unknown**, stop remaining mutations, and are never retried
+automatically. Inspect current state before explicitly confirming another action.
+Quitting cannot undo a request already received by the runtime.
+
+## Context ordering
+
+Contexts default to connected first, then alphabetical (case-insensitive) within
+each group. Unavailable contexts remain visible. Press `o` or `:sort-contexts`
+to choose connected-first, name, descending CPU, or descending memory ordering.
+CPU/memory order captures complete, fresh measurements when you confirm the
+choice; it stays fixed until you sort again. Missing/partial/stale values sort
+after measured values. These are summed container metrics, not host usage.
+Only top-level contexts and the global Performance dock are reordered; workloads,
+expanded branches, selection, and logs/Exec targets retain their identities.
+
+Pin preferred contexts first using exact displayed names, in priority order:
+
+```toml
+context_order = ["Colima / default", "OrbStack"]
+```
+
+Pins take precedence in every sort mode, even when unavailable. Undiscovered
+names are ignored; duplicate or empty pin names are rejected.
+
 ## Container state and image architecture
 
 Status circles use the terminal palette, with text labels so color is not the
@@ -278,8 +435,11 @@ only signal:
 - **Neutral:** normal completion (exit 0), stopped/exited without a known failure,
   or unknown status. Completed batch jobs are not automatically treated as errors.
 
-Projects/services/runtimes inherit the most important member state: errors take
-priority over warnings. Disconnected engines are explicitly unavailable.
+Projects/services inherit the most important member state: errors take priority
+over warnings. **Runtime/context rows summarize failed children as yellow
+`[workload issues]`**, rather than making a reachable engine look failed. Failed
+containers and their Compose groups stay red. Disconnected engines show yellow
+unavailable warnings, with full connection diagnostics in Overview only.
 
 A single-container Overview (including a one-container service) shows **Platform**,
 such as `linux/arm64/v8 (ARM64)` or `linux/amd64 (AMD64 / x86_64)`. This comes from
@@ -301,6 +461,44 @@ vertical padding where space permits, reduced automatically in small panes.
 
 ## Development
 
+### Tagged releases
+
+`.github/workflows/release.yml` runs on pushed `v*` tags. The tag must exactly
+match the package version in `Cargo.toml`, for example `v0.1.0` for `0.1.0`.
+Prerelease versions such as `0.2.0-rc.1` become GitHub prereleases and are not
+selected by the quick-install `latest` URL.
+
+The workflow reuses the full macOS/Linux CI checks, including all four terminal
+smoke tests, then tests/builds each release target on a matching native runner:
+
+| Asset | Rust target | Runner |
+| --- | --- | --- |
+| `tha-linux-amd64.tar.gz` | `x86_64-unknown-linux-musl` | `ubuntu-24.04` |
+| `tha-linux-arm64.tar.gz` | `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` |
+| `tha-macos-arm64.tar.gz` | `aarch64-apple-darwin` | `macos-15` |
+
+Only after all checks/builds pass are the three archives and `SHA256SUMS`
+uploaded to a draft release and then published. Each archive contains `tha`,
+`LICENSE`, and this README. Publishing uses the workflow's `GITHUB_TOKEN` with
+`contents: write` only in the publish job; no personal access token is needed.
+No release is published on ordinary branch pushes or pull requests.
+
+After committing/pushing the intended release source and matching version,
+a maintainer can trigger publication explicitly:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+No tags or releases are created by local build/test commands. Existing releases
+are never overwritten automatically, and moving a tag during the build prevents
+publication of assets from the old commit. If publishing fails after creating a draft,
+inspect that draft and its assets before deleting it or completing publication
+manually; a rerun intentionally refuses to overwrite it.
+
+### Local checks
+
 ```sh
 make help
 make build
@@ -320,12 +518,25 @@ Optional pseudo-terminal smoke test (Python tooling is not a runtime dependency)
 make build
 uv run --with pyte python scripts/smoke.py
 uv run --with pyte python scripts/exec_smoke.py
+uv run --with pyte python scripts/podman_smoke.py
+uv run --with pyte python scripts/actions_smoke.py
 ```
 
 The exec smoke test uses a fake runtime CLI and mock engine; it never executes
 commands inside real containers. It checks embedded exec, key routing,
 Ctrl-] navigation, resize/paste, retained exit output, OSC containment, image
 platform, exact endpoint routing, and removal of ambient context overrides.
+
+The Podman smoke test uses a fake Podman executable and mock API sockets. It
+checks machine discovery, images, metrics, stopped machines, socket replacement,
+invalid-JSON recovery, and terminal restoration without starting a real VM.
+
+The lifecycle smoke test uses a separate mock API for every mutation. It checks
+`S/s/r/d`, cancel-by-default confirmation, exact-name deletion, automatic refresh,
+per-container results, and volume-preserving delete flags. `tests/actions.rs`
+also covers stale identities/states/labels, partial failures, lost responses,
+and no automatic retries against mock Docker 1.53 / Podman-compatible 1.44 APIs.
+No lifecycle test reads live-engine endpoint environment variables.
 
 Optional read-only live Docker inventory check:
 
@@ -341,10 +552,25 @@ THA_TEST_DOCKER_SOCKET=unix:///path/to/docker.sock \
   cargo test --test runtime_contracts live_docker_metrics -- --ignored
 ```
 
+With the existing `hello-podman` fixtures running, verify native discovery,
+Compose/standalone containers, images, networks, volumes, platform, metrics,
+and logs (read-only):
+
+```sh
+cargo test --locked --test runtime_contracts live_podman -- --ignored
+```
+
+Machine stops/restarts and multiple-machine cases are tested with mocks rather
+than stopping real machines. Live coverage: macOS Podman 6.1.4 / API 1.44, plus
+read-only Colima, Docker Desktop, and OrbStack regression checks. Other Podman
+versions and Linux Podman machines still need live verification. No native
+containerd image inventory was added by this change.
+
 ### Structure
 
 - `backend/`: Docker API and native containerd adapters.
 - `discovery.rs`: endpoint discovery without changing engine state.
+- `discovery/podman.rs`: bounded, asynchronous native Podman machine discovery.
 - `model.rs`: shared workload model and terminal-output sanitization.
 - `metrics.rs`: CPU deltas, freshness, aggregation, bounded history, and sampling workers.
 - `app.rs`: tree, grouping, selection, and focus state.
@@ -371,6 +597,5 @@ Logs can themselves contain
 secrets—Tha cannot infer or redact every application-specific secret.
 
 This is an early MVP, not a claim of tested parity across every runtime. Next:
-live Podman/containerd compatibility testing, native containerd transport,
-structured log exploration, configurable bindings, and explicitly confirmed
-lifecycle actions.
+broader Podman/containerd compatibility testing, native containerd transport,
+structured log exploration, configurable bindings, and image-layer exploration.

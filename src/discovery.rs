@@ -1,4 +1,5 @@
 use crate::config::{BackendKind, Connection};
+pub mod podman;
 use serde_json::Value;
 use std::{
     collections::HashSet,
@@ -132,17 +133,19 @@ pub fn deduplicate(connections: Vec<Connection>) -> Vec<Connection> {
     let mut seen = HashSet::new();
     connections
         .into_iter()
-        .filter(|connection| {
-            let path = connection
-                .endpoint
-                .strip_prefix("unix://")
-                .unwrap_or(&connection.endpoint);
-            let endpoint = std::fs::canonicalize(path)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| path.into());
-            seen.insert(format!("{:?}:{endpoint}", connection.kind))
-        })
+        .filter(|connection| seen.insert(endpoint_key(connection)))
         .collect()
+}
+
+pub fn endpoint_key(connection: &Connection) -> String {
+    let path = connection
+        .endpoint
+        .strip_prefix("unix://")
+        .unwrap_or(&connection.endpoint);
+    let endpoint = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.into());
+    format!("{:?}:{endpoint}", connection.kind)
 }
 
 #[cfg(test)]

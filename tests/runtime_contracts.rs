@@ -55,6 +55,26 @@ impl MockEngine {
                     }
                 }
                 let request = String::from_utf8_lossy(&bytes);
+                if request.contains("/images/json") {
+                    let (status, body) = if network_failure {
+                        (
+                            "501 Not Implemented",
+                            serde_json::json!({"message":"image listing unavailable"}),
+                        )
+                    } else {
+                        (
+                            "200 OK",
+                            serde_json::json!([{"Id":format!("sha256:{}", "a".repeat(64)),"ParentId":"","RepoTags":["shop:latest"],"RepoDigests":[],"Created":1,"Size":1024,"SharedSize":-1,"VirtualSize":1024,"Labels":{},"Containers":1}]),
+                        )
+                    };
+                    let body = body.to_string();
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    continue;
+                }
                 if request.contains("/images/") || request.contains("/containers/api123/json") {
                     let id = format!("sha256:{}", "a".repeat(64));
                     let body = if request.contains("/images/") {
@@ -167,6 +187,8 @@ async fn docker_inventory_preserves_ownership_and_attachments() {
     assert_eq!(snapshot.networks[0].containers, ["shop-api-1"]);
     assert_eq!(snapshot.volumes[0].containers, ["shop-api-1"]);
     assert!(!snapshot.networks[0].external);
+    assert_eq!(snapshot.images.as_ref().unwrap()[0].tags, ["shop:latest"]);
+    assert_eq!(snapshot.images.as_ref().unwrap()[0].size, Some(1024));
 }
 
 #[tokio::test]
@@ -174,6 +196,13 @@ async fn partial_resource_failure_does_not_hide_containers() {
     let engine = MockEngine::start(true);
     let snapshot = backend::snapshot(&engine.connection()).await.unwrap();
     assert_eq!(snapshot.containers.len(), 1);
+    assert!(snapshot.images.is_none());
+    assert!(
+        snapshot
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Images unavailable"))
+    );
     assert!(
         snapshot
             .warnings
@@ -397,4 +426,64 @@ async fn live_docker_platform() {
         .unwrap();
     assert!(!platform.architecture.is_empty());
     assert_ne!(platform.os, "unknown-os");
+}
+
+#[tokio::test]
+#[ignore = "Read-only Podman fixture check; requires a running machine with hello-podman fixtures"]
+async fn live_podman_inventory_platform_metrics_and_logs() {
+    let discovery = tha::discovery::podman::discover().await;
+    assert!(discovery.warning.is_none(), "{:?}", discovery.warning);
+    let machine = discovery
+        .machines
+        .into_iter()
+        .find(|machine| machine.name == "podman-machine-default")
+        .expect("Start the existing Podman fixture machine separately");
+    let connection = Connection {
+        name: format!("Podman / {}", machine.name),
+        kind: BackendKind::Docker,
+        endpoint: machine.endpoint.unwrap(),
+    };
+    let snapshot = backend::snapshot(&connection).await.unwrap();
+    assert!(snapshot.warnings.is_empty(), "{:?}", snapshot.warnings);
+    let compose = snapshot
+        .containers
+        .iter()
+        .find(|container| container.name == "hello-podman_hello_1")
+        .expect("Existing Compose fixture is required");
+    assert_eq!(compose.project.as_deref(), Some("hello-podman"));
+    assert_eq!(compose.service.as_deref(), Some("hello"));
+    assert!(snapshot.containers.iter().any(|container| container.name
+        == "hello-podman-standalone"
+        && container.project.is_none()));
+    for name in ["hello-podman_hello", "hello-podman-standalone-net"] {
+        assert!(snapshot.networks.iter().any(|network| network.name == name));
+    }
+    for name in ["hello-podman_hello-data", "hello-podman-standalone-data"] {
+        assert!(snapshot.volumes.iter().any(|volume| volume.name == name));
+    }
+    assert!(
+        snapshot
+            .images
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|image| image.tags.iter().any(|tag| tag.ends_with("nginx:alpine")))
+    );
+    let platform = tha::platform::lookup(&connection, compose).await.unwrap();
+    assert!(!platform.architecture.is_empty());
+    let batch = backend::metrics(&connection, &snapshot.containers, &Default::default()).await;
+    assert!(batch.values().all(|reading| {
+        reading
+            .as_ref()
+            .is_ok_and(|reading| reading.usage.memory_bytes.is_some())
+    }));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let task = tha::logs::subscribe(connection, vec![compose.clone()], 42, tx);
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    assert_eq!(event.generation, 42);
+    assert!(!event.error, "{}", event.text);
 }

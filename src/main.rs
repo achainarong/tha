@@ -16,7 +16,7 @@ use tha::{
 };
 use tokio::{
     sync::{mpsc, watch},
-    task::{JoinHandle, JoinSet},
+    task::JoinHandle,
 };
 
 #[tokio::main]
@@ -37,13 +37,28 @@ async fn start() -> Result<()> {
         connections(&cli, &config)?
     };
     if cli.list_connections {
-        for connection in &connections {
+        let discovery = if cli.demo {
+            Default::default()
+        } else {
+            discovery::podman::discover().await
+        };
+        let native = discovery.machines.into_iter().filter_map(|machine| {
+            machine.endpoint.ok().map(|endpoint| Connection {
+                name: format!("Podman / {}", machine.name),
+                kind: BackendKind::Docker,
+                endpoint,
+            })
+        });
+        for connection in discovery::deduplicate(connections.into_iter().chain(native).collect()) {
             println!(
                 "{}\t{:?}\t{}",
                 tha::model::safe_text(&connection.name),
                 connection.kind,
                 tha::model::safe_text(&connection.endpoint)
             );
+        }
+        if let Some(warning) = discovery.warning {
+            eprintln!("tha: {}", tha::model::safe_text(&warning));
         }
         return Ok(());
     }
@@ -64,8 +79,14 @@ async fn start() -> Result<()> {
     app.log_view.wrap = config.log_wrap;
     app.exec_command = config.exec_command;
     app.metrics_refresh_seconds = config.metrics_refresh_seconds;
+    app.context_pins = config.context_order;
+    app.refresh_tree();
+    if !cli.demo {
+        app.selected = 0;
+    }
     if !cli.demo && !cli.overview {
         app.configure_startup(std::env::current_dir().context("Cannot read current directory")?);
+        app.wait_for_machine_discovery();
     }
     run(app, config.refresh_seconds).await
 }
@@ -120,6 +141,81 @@ impl Drop for AbortTask {
     }
 }
 
+struct SnapshotEvent {
+    engine: usize,
+    generation: u64,
+    result: Result<Snapshot, String>,
+}
+
+#[derive(Default)]
+struct EngineWorkers {
+    connection: Option<Connection>,
+    generation: u64,
+    tasks: Vec<AbortTask>,
+}
+
+impl EngineWorkers {
+    fn accepts(&self, generation: u64) -> bool {
+        self.connection.is_some() && self.generation == generation
+    }
+}
+
+struct WorkerChannels {
+    snapshots: mpsc::Sender<SnapshotEvent>,
+    metrics: mpsc::Sender<metrics::Event>,
+    refresh: watch::Receiver<u64>,
+}
+
+fn sync_workers(
+    app: &mut App,
+    availability: &[(usize, bool)],
+    workers: &mut Vec<EngineWorkers>,
+    targets: &mut Vec<watch::Sender<Option<metrics::Target>>>,
+    channels: &WorkerChannels,
+    refresh_seconds: u64,
+) {
+    while workers.len() < app.engines.len() {
+        workers.push(EngineWorkers::default());
+        targets.push(watch::channel(None).0);
+    }
+    for &(index, available) in availability {
+        let engine = &mut app.engines[index];
+        let slot = &mut workers[index];
+        let connection = available.then_some(&engine.connection);
+        if slot.connection.as_ref() == connection {
+            continue;
+        }
+        slot.tasks.clear(); // Drop aborts both old-endpoint workers.
+        slot.generation = slot.generation.wrapping_add(1);
+        slot.connection = connection.cloned();
+        engine.metrics_revision = engine.metrics_revision.wrapping_add(1);
+        targets[index].send_replace(None);
+        if !available {
+            continue;
+        }
+        let connection = engine.connection.clone();
+        slot.tasks.push(AbortTask(tokio::spawn(metrics::worker(
+            index,
+            connection.clone(),
+            targets[index].subscribe(),
+            channels.metrics.clone(),
+            app.metrics_refresh_seconds,
+        ))));
+        let sender = channels.snapshots.clone();
+        let mut refresh = channels.refresh.clone();
+        let generation = slot.generation;
+        slot.tasks.push(AbortTask(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(refresh_seconds));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! { _ = interval.tick() => {}, changed = refresh.changed() => { if changed.is_err() { break; } } }
+                let result = backend::snapshot(&connection).await.map_err(|error| format!("{error:#}"));
+                if sender.send(SnapshotEvent { engine: index, generation, result }).await.is_err() { break; }
+            }
+        })));
+    }
+}
+
 async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     // Ratatui installs a panic hook that restores raw mode and the alternate screen.
     let mut terminal = ratatui::try_init().context("Cannot initialize terminal")?;
@@ -127,38 +223,48 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
     let mut events = EventStream::new();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<(usize, Result<Snapshot, String>)>(32);
+    let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<SnapshotEvent>(32);
     let (refresh_tx, refresh_rx) = watch::channel(0u64);
     let (log_tx, mut log_rx) = mpsc::channel::<LogEvent>(512);
     let (metrics_tx, mut metrics_rx) = mpsc::channel::<metrics::Event>(32);
     let (platform_tx, mut platform_rx) = mpsc::channel::<tha::platform::Event>(16);
     let mut platform_task: Option<(tha::platform::Key, AbortTask)> = None;
+    let (action_tx, mut action_rx) = mpsc::channel(64);
+    let mut action_task: Option<AbortTask> = None;
     let mut metric_targets = Vec::new();
-    let mut workers = JoinSet::new();
+    let mut workers = Vec::new();
+    let channels = WorkerChannels {
+        snapshots: snapshot_tx,
+        metrics: metrics_tx,
+        refresh: refresh_rx.clone(),
+    };
+    let (discovery_tx, mut discovery_rx) = mpsc::channel(1);
+    let mut discovery_task = None;
     if !app.demo {
-        for (index, engine) in app.engines.iter().enumerate() {
-            let (target_tx, target_rx) = watch::channel(None);
-            metric_targets.push(target_tx);
-            workers.spawn(metrics::worker(
-                index,
-                engine.connection.clone(),
-                target_rx,
-                metrics_tx.clone(),
-                app.metrics_refresh_seconds,
-            ));
-            let connection = engine.connection.clone();
-            let tx = snapshot_tx.clone();
-            let mut refresh = refresh_rx.clone();
-            workers.spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(refresh_seconds));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tokio::select! { _ = interval.tick() => {}, changed = refresh.changed() => { if changed.is_err() { break; } } }
-                    let snapshot = backend::snapshot(&connection).await.map_err(|error| format!("{error:#}"));
-                    if tx.send((index, snapshot)).await.is_err() { break; }
+        let available: Vec<_> = (0..app.engines.len()).map(|index| (index, true)).collect();
+        sync_workers(
+            &mut app,
+            &available,
+            &mut workers,
+            &mut metric_targets,
+            &channels,
+            refresh_seconds,
+        );
+        let mut refresh = refresh_rx;
+        discovery_task = Some(AbortTask(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(refresh_seconds));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! { _ = interval.tick() => {}, changed = refresh.changed() => { if changed.is_err() { break; } } }
+                if discovery_tx
+                    .send(discovery::podman::discover().await)
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
-            });
-        }
+            }
+        })));
     }
     let mut log_task: Option<AbortTask> = None;
     let log_capacity = app.logs.capacity();
@@ -175,7 +281,13 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                     if handle_key(&mut app, key, height, &refresh_tx) { break; }
                 },
                 Some(Ok(Event::Paste(text))) => {
-                    if app.exec_input && app.tab == Tab::Exec {
+                    if let Some(confirmation) = &mut app.action_confirmation {
+                        if confirmation.request.action == tha::actions::Action::Delete {
+                            if text.chars().any(char::is_control) || confirmation.typed.len() + text.len() > 1024 {
+                                confirmation.error = Some("Paste contains control characters or exceeds 1024 bytes; nothing pasted".into());
+                            } else { confirmation.typed.push_str(&text); }
+                        }
+                    } else if app.exec_input && app.tab == Tab::Exec {
                         if let Some(session) = &mut app.exec_session && let Err(error) = session.paste(&text) { app.notice = format!("{error:#}"); }
                     } else if app.input_mode != InputMode::Normal {
                         let text = tha::model::safe_text(&text);
@@ -183,14 +295,37 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                     }
                 },
                 Some(Err(error)) => return Err(error.into()),
+                Some(Ok(Event::Resize(_, _))) => app.action_review_visible = false,
                 None => break,
                 _ => {}
             },
-            Some((index, snapshot)) = snapshot_rx.recv() => {
-                app.update_engine(index, snapshot);
+            Some(event) = snapshot_rx.recv() => {
+                if !workers.get(event.engine).is_some_and(|slot| slot.accepts(event.generation)) { continue; }
+                app.update_engine(event.engine, event.result);
+                publish_metric_targets(&mut app, &metric_targets);
+            },
+            Some(discovery) = discovery_rx.recv() => {
+                if let Some(warning) = &discovery.warning { app.notice = warning.clone(); }
+                let availability = app.reconcile_podman(&discovery);
+                sync_workers(&mut app, &availability, &mut workers, &mut metric_targets, &channels, refresh_seconds);
                 publish_metric_targets(&mut app, &metric_targets);
             },
             Some(event) = metrics_rx.recv() => app.apply_metrics(event),
+            Some(event) = action_rx.recv() => {
+                if let Some(progress) = &mut app.action_progress {
+                    match event {
+                        tha::actions::Event::Result { index, status } => {
+                            if let Some(result) = progress.results.get_mut(index) { *result = Some(status); }
+                        }
+                        tha::actions::Event::Finished => {
+                            progress.finished = true;
+                            app.notice = format!("{} finished; inspect per-container results. No automatic retry or rollback.", progress.request.action.label());
+                            action_task = None;
+                            refresh_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
+                        }
+                    }
+                }
+            },
             Some(event) = platform_rx.recv() => app.platforms.insert(event.key, match event.result { Ok(platform) => tha::platform::State::Ready(platform), Err(error) => tha::platform::State::Unavailable(error) }),
             _ = redraw.tick() => {
                 update_platform(&mut app, &mut platform_task, &platform_tx);
@@ -210,9 +345,17 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
         if let Some(request) = app.exec_request.take() {
             app.start_exec(request);
         }
+        if let Some(request) = app.action_request.take() {
+            action_task = Some(AbortTask(tokio::spawn(tha::actions::run(
+                request,
+                action_tx.clone(),
+            ))));
+        }
     }
     drop(log_task);
-    workers.abort_all();
+    drop(action_task);
+    drop(discovery_task);
+    drop(workers);
     Ok(())
 }
 
@@ -297,8 +440,9 @@ fn update_logs(
     let containers = app.selected_containers();
     let engine = &app.engines[row.engine];
     let scope = format!(
-        "{}:{:?}:{:?}",
+        "{}:{:?}:{:?}:{:?}",
         row.key,
+        engine.connection.endpoint,
         engine.error,
         containers.iter().map(|c| c.key()).collect::<Vec<_>>()
     );
@@ -388,6 +532,89 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return true;
     }
+    if app.action_confirmation.is_some() {
+        use tha::actions::Action;
+        let deleting = app.action_confirmation.as_ref().unwrap().request.action == Action::Delete;
+        match key.code {
+            KeyCode::Esc => app.action_confirmation = None,
+            KeyCode::Enter if deleting => app.confirm_action(),
+            KeyCode::Enter => app.action_confirmation = None, // Cancel is the default.
+            KeyCode::Char('y')
+                if !deleting
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                app.confirm_action()
+            }
+            KeyCode::Up | KeyCode::PageUp => {
+                let confirmation = app.action_confirmation.as_mut().unwrap();
+                confirmation.scroll =
+                    confirmation
+                        .scroll
+                        .saturating_sub(if key.code == KeyCode::PageUp {
+                            height.max(1)
+                        } else {
+                            1
+                        });
+            }
+            KeyCode::Down | KeyCode::PageDown => {
+                let confirmation = app.action_confirmation.as_mut().unwrap();
+                confirmation.scroll = confirmation
+                    .scroll
+                    .saturating_add(if key.code == KeyCode::PageDown {
+                        height.max(1)
+                    } else {
+                        1
+                    })
+                    .min(u16::MAX as usize);
+            }
+            KeyCode::Backspace if deleting => {
+                app.action_confirmation.as_mut().unwrap().typed.pop();
+            }
+            KeyCode::Char(ch)
+                if deleting
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let confirmation = app.action_confirmation.as_mut().unwrap();
+                if !ch.is_control() && confirmation.typed.len() + ch.len_utf8() <= 1024 {
+                    confirmation.typed.push(ch);
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
+    if let Some(progress) = &mut app.action_progress {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') if progress.finished => {
+                app.action_progress = None
+            }
+            KeyCode::Up | KeyCode::PageUp => {
+                progress.scroll = progress
+                    .scroll
+                    .saturating_sub(if key.code == KeyCode::PageUp {
+                        height.max(1)
+                    } else {
+                        1
+                    })
+            }
+            KeyCode::Down | KeyCode::PageDown => {
+                progress.scroll = progress
+                    .scroll
+                    .saturating_add(if key.code == KeyCode::PageDown {
+                        height.max(1)
+                    } else {
+                        1
+                    })
+                    .min(u16::MAX as usize)
+            }
+            _ => {}
+        }
+        return false;
+    }
     if app.help {
         match key.code {
             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::F(1) => {
@@ -469,9 +696,23 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         return false;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let lifecycle_key = !app.detail_focus
+        && !app.performance_focus
+        && !key.modifiers.intersects(
+            KeyModifiers::CONTROL
+                | KeyModifiers::ALT
+                | KeyModifiers::SUPER
+                | KeyModifiers::HYPER
+                | KeyModifiers::META,
+        )
+        && key.kind == KeyEventKind::Press;
     let pending_g = app.pending_g;
     app.pending_g = false;
     match key.code {
+        KeyCode::Char('S') if lifecycle_key => app.request_action(tha::actions::Action::Start),
+        KeyCode::Char('s') if lifecycle_key => app.request_action(tha::actions::Action::Stop),
+        KeyCode::Char('r') if lifecycle_key => app.request_action(tha::actions::Action::Restart),
+        KeyCode::Char('d') if lifecycle_key => app.request_action(tha::actions::Action::Delete),
         KeyCode::Char('q') => {
             if app.performance_focus {
                 app.performance_focus = false;
@@ -504,6 +745,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         }
         KeyCode::Char('e') => app.request_exec(),
         KeyCode::Char('p') => app.toggle_performance(),
+        KeyCode::Char('o') => app.pick_context_sort(),
         KeyCode::Char(':') => {
             app.input_mode = InputMode::Command;
             app.input.clear();
@@ -533,9 +775,10 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         }
         KeyCode::Enter => {
             if app.performance_focus {
-                let engine_index = app
-                    .performance_scroll
-                    .min(app.engines.len().saturating_sub(1));
+                let engine_index = app.context_order.get(app.performance_scroll).copied();
+                let Some(engine_index) = engine_index else {
+                    return false;
+                };
                 while app.back() {}
                 app.performance_focus = false;
                 app.tree_query.clear();
@@ -699,6 +942,7 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
         "exec" => app.request_exec(),
         "close-exec" => app.close_exec(),
         "performance" => app.toggle_performance(),
+        "sort-contexts" => app.pick_context_sort(),
         "back" => {
             app.back();
         }
@@ -948,6 +1192,46 @@ mod tests {
     }
 
     #[test]
+    fn context_sort_shortcut_and_command_open_picker_and_enter_uses_display_order() {
+        let mut app = app();
+        let (tx, _) = watch::channel(0);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert!(app.picker.is_some());
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        execute(&mut app, "sort-contexts", &tx);
+        app.picker.as_mut().unwrap().selected = 1;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert_eq!(app.context_sort, tha::context_sort::ContextSort::Name);
+        app.performance_open = true;
+        app.performance_focus = true;
+        app.performance_scroll = 0;
+        let expected = app.context_order[0];
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert_eq!(app.current().unwrap().engine, expected);
+        assert!(app.detail_focus);
+    }
+
+    #[test]
     fn exec_input_owns_control_keys_and_ctrl_bracket_returns_to_navigation() {
         let mut app = app();
         let (tx, _) = watch::channel(0);
@@ -1021,5 +1305,286 @@ mod tests {
             &tx,
         );
         assert!(app.exec_request.is_some());
+    }
+
+    #[tokio::test]
+    async fn workers_are_replaced_on_socket_change_and_reject_old_or_stopped_events() {
+        let mut app = app();
+        app.engines[0].connection.endpoint = "unix:///nonexistent/tha-before.sock".into();
+        let (snapshots, mut rx) = mpsc::channel(16);
+        let (metrics, _) = mpsc::channel(16);
+        let (_refresh, refresh) = watch::channel(0);
+        let channels = WorkerChannels {
+            snapshots,
+            metrics,
+            refresh,
+        };
+        let mut workers = Vec::new();
+        let mut targets = Vec::new();
+        sync_workers(
+            &mut app,
+            &[(0, true)],
+            &mut workers,
+            &mut targets,
+            &channels,
+            5,
+        );
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(workers[0].accepts(first.generation));
+        sync_workers(
+            &mut app,
+            &[(0, true)],
+            &mut workers,
+            &mut targets,
+            &channels,
+            5,
+        );
+        assert_eq!(workers[0].generation, first.generation);
+        app.engines[0].connection.endpoint = "unix:///nonexistent/tha-after.sock".into();
+        sync_workers(
+            &mut app,
+            &[(0, true)],
+            &mut workers,
+            &mut targets,
+            &channels,
+            5,
+        );
+        assert!(!workers[0].accepts(first.generation));
+        let next = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(workers[0].accepts(next.generation));
+        assert!(next.result.is_err());
+        sync_workers(
+            &mut app,
+            &[(0, false)],
+            &mut workers,
+            &mut targets,
+            &channels,
+            5,
+        );
+        assert!(!workers[0].accepts(next.generation));
+        assert!(workers[0].tasks.is_empty());
+        assert!(targets[0].borrow().is_none());
+    }
+
+    #[tokio::test]
+    async fn log_subscription_generation_changes_when_the_socket_changes() {
+        let mut app = app();
+        app.tab = Tab::Logs;
+        let (tx, _) = mpsc::channel(8);
+        let mut task = None;
+        update_logs(&mut app, &mut task, &tx, 100);
+        let before = app.log_generation;
+        let engine = app.current().unwrap().engine;
+        app.engines[engine].connection.endpoint = "unix:///new-podman.sock".into();
+        update_logs(&mut app, &mut task, &tx, 100);
+        assert!(app.log_generation > before);
+    }
+
+    fn lifecycle_app(state: &str) -> App {
+        let mut app = App::new(
+            vec![Connection {
+                name: "mock lifecycle".into(),
+                kind: BackendKind::Docker,
+                endpoint: "unix:///mock-only".into(),
+            }],
+            100,
+            false,
+            false,
+        );
+        app.update_engine(
+            0,
+            Ok(Snapshot {
+                engine_id: Some("mock-engine".into()),
+                containers: vec![tha::model::Container {
+                    id: "fixture".into(),
+                    name: "fixture-api".into(),
+                    project: Some("fixture-project".into()),
+                    service: Some("api".into()),
+                    state: state.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        );
+        app.selected = 1;
+        app
+    }
+
+    #[test]
+    fn lifecycle_shortcuts_require_confirmation_and_enter_defaults_to_cancel() {
+        let (tx, _) = watch::channel(0);
+        for (key, state, action) in [
+            ('S', "exited", tha::actions::Action::Start),
+            ('s', "running", tha::actions::Action::Stop),
+            ('r', "running", tha::actions::Action::Restart),
+            ('d', "exited", tha::actions::Action::Delete),
+        ] {
+            let mut app = lifecycle_app(state);
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                20,
+                &tx,
+            );
+            assert_eq!(
+                app.action_confirmation.as_ref().unwrap().request.action,
+                action
+            );
+            assert!(app.action_request.is_none());
+            if key != 'd' {
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    20,
+                    &tx,
+                );
+                assert!(app.action_confirmation.is_none());
+                assert!(app.action_request.is_none());
+            }
+        }
+        let mut app = lifecycle_app("running");
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        app.action_review_visible = true;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert!(app.action_request.is_some());
+        assert!(app.action_progress.is_some());
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert!(app.action_confirmation.is_none());
+    }
+
+    #[test]
+    fn deletion_requires_exact_name_and_stale_connections_cannot_be_confirmed() {
+        let (tx, _) = watch::channel(0);
+        let mut app = lifecycle_app("exited");
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        app.action_review_visible = true;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert!(app.action_request.is_none());
+        assert!(app.action_confirmation.as_ref().unwrap().error.is_some());
+        app.action_confirmation.as_mut().unwrap().typed = "fixture-project".into();
+        app.engines[0].connection.endpoint = "unix:///changed-socket".into();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert!(app.action_request.is_none());
+        assert!(app.notice.contains("Connection changed"));
+        let mut app = lifecycle_app("exited");
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        app.action_review_visible = true;
+        for character in "fixture-project".chars() {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                20,
+                &tx,
+            );
+        }
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert_eq!(
+            app.action_request.as_ref().unwrap().action,
+            tha::actions::Action::Delete
+        );
+    }
+
+    #[test]
+    fn lifecycle_keys_do_not_fire_in_details_shell_search_or_with_control_modifiers() {
+        let (tx, _) = watch::channel(0);
+        for mode in [
+            "details",
+            "shell",
+            "search",
+            "performance",
+            "control",
+            "repeat",
+            "demo",
+            "context",
+            "offline",
+            "alias",
+        ] {
+            let mut app = lifecycle_app("running");
+            let mut key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+            match mode {
+                "details" => app.detail_focus = true,
+                "shell" => {
+                    app.detail_focus = true;
+                    app.tab = Tab::Exec;
+                    app.exec_input = true;
+                }
+                "search" => app.input_mode = InputMode::Search,
+                "performance" => app.performance_focus = true,
+                "control" => key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                "repeat" => key.kind = KeyEventKind::Repeat,
+                "demo" => app.demo = true,
+                "context" => app.selected = 0,
+                "offline" => app.engines[0].error = Some("offline".into()),
+                _ => app.engines[0].alias = Some("primary".into()),
+            }
+            handle_key(&mut app, key, 20, &tx);
+            assert!(app.action_confirmation.is_none(), "{mode}");
+            assert!(app.action_request.is_none());
+        }
+    }
+
+    #[test]
+    fn lifecycle_confirmation_does_not_expand_to_new_replicas_or_follow_selection() {
+        let mut app = lifecycle_app("running");
+        app.request_action(tha::actions::Action::Stop);
+        let mut snapshot = app.engines[0].snapshot.clone().unwrap();
+        let mut replica = snapshot.containers[0].clone();
+        replica.id = "new-replica".into();
+        replica.name = "fixture-api-2".into();
+        snapshot.containers.push(replica);
+        app.update_engine(0, Ok(snapshot));
+        app.selected = 0;
+        app.action_review_visible = true;
+        app.confirm_action();
+        let request = app.action_request.as_ref().unwrap();
+        assert_eq!(request.engine, 0);
+        assert_eq!(request.containers.len(), 1);
+        assert_eq!(request.containers[0].id, "fixture");
     }
 }

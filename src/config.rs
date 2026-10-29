@@ -32,6 +32,8 @@ pub struct Config {
     pub log_wrap: bool,
     pub exec_command: Vec<String>,
     pub connections: Vec<Connection>,
+    /// Exact displayed connection names, in preferred order. Unknown names are ignored.
+    pub context_order: Vec<String>,
 }
 
 impl Default for Config {
@@ -44,6 +46,7 @@ impl Default for Config {
             log_wrap: true,
             exec_command: vec!["sh".into()],
             connections: Vec::new(),
+            context_order: Vec::new(),
         }
     }
 }
@@ -79,6 +82,15 @@ impl Config {
         for connection in &config.connections {
             if connection.name.trim().is_empty() || connection.endpoint.trim().is_empty() {
                 bail!("Connection names and endpoints must not be empty");
+            }
+        }
+        let mut pins = std::collections::HashSet::new();
+        for name in &config.context_order {
+            if name.trim().is_empty() {
+                bail!("context_order names must not be empty");
+            }
+            if !pins.insert(name) {
+                bail!("Duplicate context_order name: {name}");
             }
         }
         Ok(config)
@@ -128,5 +140,36 @@ mod tests {
                 .endpoint,
             "unix:///socket"
         );
+    }
+
+    #[test]
+    fn configured_context_pins_are_optional_and_validate_names() {
+        assert!(
+            toml::from_str::<Config>("")
+                .unwrap()
+                .context_order
+                .is_empty()
+        );
+        let path = std::env::temp_dir().join(format!(
+            "tha-context-order-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for input in [
+            "context_order = ['']",
+            "context_order = ['Colima', 'Colima']",
+        ] {
+            std::fs::write(&path, input).unwrap();
+            assert!(Config::load(Some(&path)).is_err());
+        }
+        std::fs::write(&path, "context_order = ['Colima', 'OrbStack']").unwrap();
+        assert_eq!(
+            Config::load(Some(&path)).unwrap().context_order,
+            ["Colima", "OrbStack"]
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

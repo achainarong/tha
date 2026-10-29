@@ -1,6 +1,7 @@
 # Copy to $XDG_CONFIG_HOME/tha/config.toml or ~/.config/tha/config.toml.
 refresh_seconds = 5
 metrics_refresh_seconds = 1 # CPU/memory target cadence; independent of inventory refresh.
+context_order = [] # Exact names pinned first, e.g. ["Colima / default", "OrbStack"].
 log_capacity = 5000
 monochrome = false
 log_wrap = true # Initial state; press w in the log pane to toggle at any time.

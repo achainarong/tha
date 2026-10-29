@@ -47,6 +47,10 @@ class Engine(socketserver.BaseRequestHandler):
                      "State": "running", "Status": "Up", "Labels": {
                          "com.docker.compose.project": "fixture-project",
                          "com.docker.compose.service": "api"}}]
+        elif "/images/json" in path:
+            data = [{"Id": IMAGE_ID, "ParentId": "", "RepoTags": ["fixture:latest"],
+                     "RepoDigests": [], "Created": 1, "Size": 1024, "SharedSize": -1,
+                     "Labels": {}, "Containers": 1}]
         elif "/images/" in path:
             data = {"Id": IMAGE_ID, "Os": "linux", "Architecture": "amd64"}
         elif "/networks" in path:
@@ -128,7 +132,7 @@ while True:
         fake.chmod(0o700)
         config = directory / "config.toml"
         config.write_text(
-            "log_wrap = false\n[[connections]]\nname = 'Mock'\nkind = 'docker'\n"
+            "log_wrap = false\ncontext_order = ['Mock']\n[[connections]]\nname = 'Mock'\nkind = 'docker'\n"
             f"endpoint = '{endpoint}'\n"
         )
         master, slave = pty.openpty()

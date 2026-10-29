@@ -153,7 +153,14 @@ pub fn populate(app: &mut App) {
         app.expanded.insert(format!("0/{scope:?}"));
     }
     app.refresh_tree();
-    app.selected = 1;
+    app.selected = app
+        .rows
+        .iter()
+        .position(|row| {
+            row.engine == 0
+                && matches!(&row.scope, Scope::Project { project, .. } if project == "shop")
+        })
+        .unwrap_or(0);
     for (engine_index, engine) in app.engines.iter().enumerate() {
         if let Some(snapshot) = &engine.snapshot {
             for container in &snapshot.containers {

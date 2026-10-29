@@ -1,0 +1,177 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require the tag to match Cargo.toml
+        id: version
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != f"v{version}":
+              raise SystemExit(f"Tag {tag!r} must match Cargo.toml: v{version}")
+          prerelease = "-" in version.split("+", 1)[0]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"prerelease={str(prerelease).lower()}\n")
+          PY
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  checks:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            machine: x86_64
+            target: x86_64-unknown-linux-musl
+            asset: tha-linux-amd64.tar.gz
+          - os: ubuntu-24.04-arm
+            machine: aarch64
+            target: aarch64-unknown-linux-musl
+            asset: tha-linux-arm64.tar.gz
+          - os: macos-15
+            machine: arm64
+            target: aarch64-apple-darwin
+            asset: tha-macos-arm64.tar.gz
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+      ASSET: ${{ matrix.asset }}
+      EXPECTED_MACHINE: ${{ matrix.machine }}
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify native runner architecture
+        run: test "$(uname -m)" = "$EXPECTED_MACHINE"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Install native musl toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+      - name: Set macOS deployment target
+        if: runner.os == 'macOS'
+        run: echo 'MACOSX_DEPLOYMENT_TARGET=11.0' >> "$GITHUB_ENV"
+      - name: Test release target
+        run: cargo test --locked --all-targets --target "$TARGET"
+      - name: Build release target
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Ad-hoc sign macOS executable
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --sign - "target/$TARGET/release/tha"
+          codesign --verify --strict "target/$TARGET/release/tha"
+      - name: Check binary version and startup
+        run: |
+          binary="target/$TARGET/release/tha"
+          test "$("$binary" --version)" = "tha ${GITHUB_REF_NAME#v}"
+          "$binary" --demo --list-connections
+          file "$binary"
+          if [ "$RUNNER_OS" = Linux ]; then
+            file "$binary" | grep -Eq 'statically linked|static-pie linked'
+          fi
+      - name: Package executable and license
+        run: |
+          stage=$(mktemp -d)
+          install -m 755 "target/$TARGET/release/tha" "$stage/tha"
+          cp LICENSE README.md "$stage/"
+          mkdir -p dist
+          COPYFILE_DISABLE=1 tar -czf "dist/$ASSET" -C "$stage" tha LICENSE README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tha-release-${{ matrix.target }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tha-release-*
+          merge-multiple: true
+          path: dist
+      - name: Validate complete asset set and write SHA256SUMS
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          directory = Path("dist")
+          expected = {
+              "tha-linux-amd64.tar.gz",
+              "tha-linux-arm64.tar.gz",
+              "tha-macos-arm64.tar.gz",
+          }
+          actual = {path.name for path in directory.iterdir()}
+          if actual != expected:
+              raise SystemExit(f"Unexpected release assets: {actual}; expected {expected}")
+          with (directory / "SHA256SUMS").open("w") as manifest:
+              for name in sorted(expected):
+                  with (directory / name).open("rb") as archive:
+                      digest = hashlib.file_digest(archive, "sha256").hexdigest()
+                  manifest.write(f"{digest}  {name}\n")
+          PY
+          (cd dist && sha256sum --check SHA256SUMS)
+      - name: Publish completed draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+          EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          # Refuse assets built from an old commit if a tag was moved during the build.
+          test "$(gh api "repos/$GH_REPO/commits/$TAG" --jq '.sha')" = "$EXPECTED_COMMIT"
+          # Never overwrite assets or delete an existing release on a rerun.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; inspect it before retrying." >&2
+            exit 1
+          fi
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --verify-tag --draft --prerelease="$PRERELEASE" \
+            --title "Tha $TAG" --generate-notes
+          gh release edit "$TAG" --draft=false

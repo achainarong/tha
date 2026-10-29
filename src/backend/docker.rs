@@ -7,7 +7,8 @@ use anyhow::{Context, Result, bail};
 use bollard::{
     API_DEFAULT_VERSION, Docker,
     query_parameters::{
-        ListContainersOptionsBuilder, ListNetworksOptions, ListVolumesOptions, StatsOptionsBuilder,
+        ListContainersOptionsBuilder, ListImagesOptionsBuilder, ListNetworksOptions,
+        ListVolumesOptions, StatsOptionsBuilder,
     },
 };
 use futures_util::StreamExt;
@@ -52,6 +53,122 @@ pub async fn platform(
     };
     let image = docker.inspect_image(&id).await?;
     crate::platform::ImagePlatform::new(image.os, image.architecture, image.variant)
+}
+
+pub async fn preflight_action(
+    docker: &Docker,
+    request: &crate::actions::Request,
+    expected: &Container,
+) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        if docker.info().await?.id.as_deref() != Some(request.identity.as_str()) {
+            bail!("Runtime identity changed; cancel and reconnect before changing containers");
+        }
+        let inspected = docker
+            .inspect_container(
+                &expected.id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await?;
+        let state = inspected
+            .state
+            .context("Container state was not reported")?;
+        let labels: Labels = inspected
+            .config
+            .context("Container ownership metadata was not reported")?
+            .labels
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let status = if state.paused == Some(true) {
+            "paused".into()
+        } else if state.restarting == Some(true) {
+            "restarting".into()
+        } else {
+            state
+                .status
+                .map(|state| state.to_string())
+                .unwrap_or_default()
+        };
+        let current = Container {
+            id: inspected.id.unwrap_or_default(),
+            name: inspected
+                .name
+                .unwrap_or_default()
+                .trim_start_matches('/')
+                .into(),
+            state: status,
+            project: model::project(&labels),
+            service: model::service(&labels),
+            managed: labels.keys().any(|key| key.starts_with("io.kubernetes.")),
+            ..Default::default()
+        };
+        request.validate_container(expected, &current)
+    })
+    .await
+    .context("Lifecycle safety check timed out; nothing was sent")?
+}
+
+pub async fn apply_action(
+    docker: &Docker,
+    request: &crate::actions::Request,
+    container: &Container,
+) -> crate::actions::Status {
+    use crate::actions::{Action, Status};
+    use bollard::query_parameters::{
+        RemoveContainerOptionsBuilder, RestartContainerOptionsBuilder, StopContainerOptionsBuilder,
+    };
+    // Recheck immediately before each write; a bulk operation is not atomic.
+    if let Err(error) = preflight_action(docker, request, container).await {
+        return Status::Failed(format!("{error:#}"));
+    }
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        match request.action {
+            Action::Start => docker.start_container(&container.id, None).await,
+            Action::Stop => {
+                docker
+                    .stop_container(
+                        &container.id,
+                        Some(StopContainerOptionsBuilder::default().t(10).build()),
+                    )
+                    .await
+            }
+            Action::Restart => {
+                docker
+                    .restart_container(
+                        &container.id,
+                        Some(RestartContainerOptionsBuilder::default().t(10).build()),
+                    )
+                    .await
+            }
+            Action::Delete => {
+                docker
+                    .remove_container(
+                        &container.id,
+                        Some(
+                            RemoveContainerOptionsBuilder::default()
+                                .force(false)
+                                .v(false)
+                                .link(false)
+                                .build(),
+                        ),
+                    )
+                    .await
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Status::Succeeded,
+        Ok(Err(bollard::errors::Error::DockerResponseServerError {
+            status_code,
+            message,
+        })) if (400..500).contains(&status_code) => {
+            Status::Failed(format!("HTTP {status_code}: {message}"))
+        }
+        Ok(Err(error)) => Status::Unknown(format!("{error}")),
+        Err(_) => Status::Unknown("Request timed out; the runtime may still complete it".into()),
+    }
 }
 
 pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
@@ -160,6 +277,32 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
         });
     }
     // Resource failures are partial failures, not a reason to hide containers.
+    let images = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        docker.list_images(Some(ListImagesOptionsBuilder::default().all(true).build())),
+    )
+    .await
+    .context("Image inventory timed out after 2s")
+    .and_then(|result| result.map_err(Into::into));
+    match images {
+        Ok(images) => {
+            let mut images: Vec<_> = images
+                .into_iter()
+                .map(|image| model::Image {
+                    id: image.id,
+                    tags: image
+                        .repo_tags
+                        .into_iter()
+                        .filter(|tag| tag != "<none>:<none>")
+                        .collect(),
+                    size: u64::try_from(image.size).ok(),
+                })
+                .collect();
+            images.sort_by(|a, b| a.tags.cmp(&b.tags).then_with(|| a.id.cmp(&b.id)));
+            result.images = Some(images);
+        }
+        Err(error) => result.warnings.push(format!("Images unavailable: {error}")),
+    }
     match docker.list_networks(None::<ListNetworksOptions>).await {
         Ok(networks) => {
             for network in networks {
