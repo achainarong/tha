@@ -117,13 +117,21 @@ pub struct InventoryView {
     pub details: bool,
     pub details_scroll: usize,
     pub pending_g: bool,
+    pub marked: HashSet<String>,
+}
+
+pub struct InventoryRemovalTarget {
+    pub request: crate::backend::RemovalRequest,
+    pub label: String,
 }
 
 pub struct InventoryRemoval {
-    pub request: crate::backend::RemovalRequest,
-    pub typed: String,
+    pub targets: Vec<InventoryRemovalTarget>,
+    pub context: (usize, OverviewMode),
+    pub scroll: usize,
     pub visible: bool,
     pub pending: bool,
+    pub dismissed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,7 +248,10 @@ pub struct App {
     pub inventory_engine: usize,
     pub inventory_views: HashMap<(usize, OverviewMode), InventoryView>,
     pub inventory_removal: Option<InventoryRemoval>,
-    pub inventory_removal_request: Option<crate::backend::RemovalRequest>,
+    pub inventory_removal_request: Option<Vec<crate::backend::RemovalRequest>>,
+    pub inventory_removal_report: Option<crate::backend::RemovalReport>,
+    pub inventory_removal_results_visible: bool,
+    pub inventory_removal_results_scroll: usize,
     pub discover_connections: bool,
     pub history_view: crate::history::View,
     pub history_database: Option<PathBuf>,
@@ -371,6 +382,9 @@ impl App {
             inventory_views: HashMap::new(),
             inventory_removal: None,
             inventory_removal_request: None,
+            inventory_removal_report: None,
+            inventory_removal_results_visible: false,
+            inventory_removal_results_scroll: 0,
             detail_scroll: 0,
             log_view: LogView::new(true),
             log_filter_text: "{}".into(),

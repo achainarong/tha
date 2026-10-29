@@ -283,6 +283,10 @@ fn reconcile(view: &mut InventoryView, rows: &[Entry]) {
 
 /// Navigation is called only after editors, dialogs and embedded shells consume keys.
 pub fn begin_removal(app: &mut App) {
+    if app.inventory_removal.is_some() {
+        app.notice = "Resource cleanup is already awaiting confirmation or running".into();
+        return;
+    }
     if app.demo {
         app.notice = "Demo mode: resource deletion is disabled".into();
         return;
@@ -310,33 +314,56 @@ pub fn begin_removal(app: &mut App) {
         .as_ref()
         .and_then(|key| rows.iter().position(|row| &row.key == key))
         .unwrap_or(view.index);
-    let Some(row) = rows.get(index) else {
-        app.notice = "Select a resource first".into();
-        return;
+    let chosen: Vec<_> = if view.marked.is_empty() {
+        rows.get(index)
+            .into_iter()
+            .filter(|row| row.status == "unreferenced")
+            .collect()
+    } else {
+        rows.iter()
+            .filter(|row| view.marked.contains(&row.key) && row.status == "unreferenced")
+            .collect()
     };
-    if row.status != "unreferenced" {
-        app.notice = "Deletion requires no running or stopped references and known usage".into();
+    if chosen.is_empty() {
+        app.notice="Select unreferenced resources first; running/stopped references and unknown usage are protected".into();
         return;
     }
     let Some(identity) = snapshot.engine_id.clone().filter(|id| !id.is_empty()) else {
         app.notice = "Runtime identity unavailable; deletion refused".into();
         return;
     };
-    let request = crate::backend::RemovalRequest {
-        connection: engine.connection.clone(),
-        identity,
-        key: row.key.clone(),
-        volume: key.1 == OverviewMode::Volumes,
-    };
-    if let Err(error) = request.validate(snapshot) {
-        app.notice = format!("{error:#}");
-        return;
+    let mut targets = Vec::new();
+    for row in chosen {
+        let request = crate::backend::RemovalRequest {
+            connection: engine.connection.clone(),
+            identity: identity.clone(),
+            key: row.key.clone(),
+            volume: key.1 == OverviewMode::Volumes,
+        };
+        if let Err(error) = request.validate(snapshot) {
+            app.notice = format!("{error:#}");
+            return;
+        }
+        targets.push(crate::app::InventoryRemovalTarget {
+            request,
+            label: format!(
+                "{}{}",
+                row.name,
+                if row.tags.is_empty() || key.1 == OverviewMode::Volumes {
+                    String::new()
+                } else {
+                    format!(":{}", row.tags)
+                }
+            ),
+        });
     }
     app.inventory_removal = Some(crate::app::InventoryRemoval {
-        request,
-        typed: String::new(),
+        targets,
+        context: key,
+        scroll: 0,
         visible: false,
         pending: false,
+        dismissed: false,
     });
 }
 
@@ -345,7 +372,19 @@ pub fn draw_removal(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     removal.visible = false;
-    let dialog = centered(area, 100, 19);
+    if removal.dismissed {
+        return;
+    }
+    let Some(first) = removal.targets.first() else {
+        return;
+    };
+    let height = removal
+        .targets
+        .len()
+        .saturating_mul(2)
+        .saturating_add(13)
+        .clamp(19, 26) as u16;
+    let dialog = centered(area, 100, height);
     frame.render_widget(Clear, dialog);
     let block = Block::bordered().title(" Confirm resource deletion ");
     let inner = block.inner(dialog);
@@ -358,35 +397,14 @@ pub fn draw_removal(frame: &mut Frame, app: &mut App, area: Rect) {
         );
         return;
     }
-    let text = format!(
-        "Runtime: {}\n{}: {}\n\n{}\nRunning AND stopped container references are checked again before removal.\nNo force deletion or automatic pruning.\n\nType this exact {} and press Enter:\n{}\n\n> {}▏\n\n{}",
-        safe_text(&removal.request.connection.name),
-        if removal.request.volume {
-            "Volume"
-        } else {
-            "Image ID"
-        },
-        safe_text(&removal.request.key),
-        if removal.request.volume {
-            "WARNING: deleting this volume permanently destroys its stored data."
-        } else {
-            "This removes the selected local image. Shared parent images are not pruned."
-        },
-        if removal.request.volume {
-            "volume name"
-        } else {
-            "image ID"
-        },
-        safe_text(&removal.request.key),
-        safe_text(&removal.typed),
-        if removal.pending {
-            "Removal in progress; do not assume cancellation or rollback."
-        } else {
-            "Enter Confirm · Esc Cancel"
-        }
-    );
-    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
-    if paragraph.line_count(inner.width) > inner.height as usize {
+    let parts = Layout::vertical([
+        Constraint::Length(6),
+        Constraint::Min(1),
+        Constraint::Length(3),
+    ])
+    .split(inner);
+    let header=Paragraph::new(format!("Runtime: {}\nRemove {} {}?\n{}\nRunning AND stopped references rechecked before EACH deletion.\nNo force deletion or parent-image pruning.",safe_text(&first.request.connection.name),removal.targets.len(),if first.request.volume {"managed volumes"} else {"images"},if first.request.volume {"WARNING: this permanently destroys all data in the listed volumes."} else {"Image sizes include shared layers; they are NOT reclaimable-space estimates."})).wrap(Wrap {trim:false});
+    if header.line_count(parts[0].width) > parts[0].height as usize {
         frame.render_widget(
             Paragraph::new(
                 "Resize wider/taller to review the complete deletion confirmation. Esc cancels.",
@@ -396,8 +414,93 @@ pub fn draw_removal(frame: &mut Frame, app: &mut App, area: Rect) {
         );
         return;
     }
+    frame.render_widget(header, parts[0]);
+    let names: Vec<_> = removal
+        .targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| {
+            Line::from(format!(
+                "{}. {}{}",
+                index + 1,
+                safe_text(&target.label),
+                if target.label == target.request.key {
+                    String::new()
+                } else {
+                    format!(" · {}", safe_text(&target.request.key))
+                }
+            ))
+        })
+        .collect();
+    let list = Paragraph::new(names).wrap(Wrap { trim: false });
+    removal.scroll = removal
+        .scroll
+        .min(
+            list.line_count(parts[1].width)
+                .saturating_sub(parts[1].height as usize),
+        )
+        .min(u16::MAX as usize);
+    frame.render_widget(list.scroll((removal.scroll as u16, 0)), parts[1]);
+    frame.render_widget(Paragraph::new(if removal.pending {"Cleanup running · Esc Hide (does not undo or cancel sent requests)\n↑/↓ or PgUp/PgDn Review names"} else {"y / Enter Confirm · n / Esc Cancel\n↑/↓ or PgUp/PgDn Review names"}).style(muted()).wrap(Wrap {trim:false}),parts[2]);
     removal.visible = true;
-    frame.render_widget(paragraph, inner);
+}
+
+pub fn draw_removal_results(frame: &mut Frame, app: &mut App, area: Rect) {
+    if !app.inventory_removal_results_visible {
+        return;
+    }
+    let Some(report) = &app.inventory_removal_report else {
+        return;
+    };
+    let dialog = centered(area, 110, 28);
+    frame.render_widget(Clear, dialog);
+    let block = Block::bordered().title(" Resource cleanup results ");
+    let inner = block.inner(dialog);
+    frame.render_widget(block, dialog);
+    if inner.width == 0 || inner.height < 3 {
+        return;
+    }
+    let parts = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(Paragraph::new(report.summary()).style(muted()), parts[0]);
+    let rows: Vec<_> = report
+        .entries
+        .iter()
+        .map(|(key, status)| {
+            Line::from(format!(
+                "{} · {}",
+                safe_text(key),
+                match status {
+                    crate::backend::RemovalStatus::Removed => "Removed".into(),
+                    crate::backend::RemovalStatus::Skipped(reason) =>
+                        format!("Skipped: {}", safe_text(reason)),
+                    crate::backend::RemovalStatus::Failed(reason) =>
+                        format!("Failed: {}", safe_text(reason)),
+                }
+            ))
+        })
+        .collect();
+    let paragraph = Paragraph::new(rows).wrap(Wrap { trim: false });
+    app.inventory_removal_results_scroll = app
+        .inventory_removal_results_scroll
+        .min(
+            paragraph
+                .line_count(parts[1].width)
+                .saturating_sub(parts[1].height as usize),
+        )
+        .min(u16::MAX as usize);
+    frame.render_widget(
+        paragraph.scroll((app.inventory_removal_results_scroll as u16, 0)),
+        parts[1],
+    );
+    frame.render_widget(
+        Paragraph::new("j/k PgUp/PgDn Scroll · Enter/Esc Close").style(muted()),
+        parts[2],
+    );
 }
 
 pub fn navigate(app: &mut App, code: KeyCode, height: usize) {
@@ -447,6 +550,30 @@ pub fn navigate(app: &mut App, code: KeyCode, height: usize) {
         };
     } else {
         match code {
+            KeyCode::Char(' ') if !view.details => {
+                if let Some(row) = rows.get(view.index) {
+                    if row.status == "unreferenced"
+                        && !(key.1 == OverviewMode::Volumes && view.filter == 5)
+                    {
+                        if !view.marked.remove(&row.key) {
+                            view.marked.insert(row.key.clone());
+                        }
+                    } else {
+                        app.notice = "Only unreferenced resources can be marked for cleanup".into();
+                    }
+                }
+            }
+            KeyCode::Char('u') if !view.details => {
+                view.marked = rows
+                    .iter()
+                    .filter(|row| {
+                        row.status == "unreferenced"
+                            && !(key.1 == OverviewMode::Volumes && view.filter == 5)
+                    })
+                    .map(|row| row.key.clone())
+                    .collect()
+            }
+            KeyCode::Char('c') if !view.details => view.marked.clear(),
             KeyCode::Up | KeyCode::Char('k') => view.index = view.index.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => view.index = view.index.saturating_add(1),
             KeyCode::PageUp => view.index = view.index.saturating_sub(amount),
@@ -460,6 +587,7 @@ pub fn navigate(app: &mut App, code: KeyCode, height: usize) {
             }
             KeyCode::Esc => view.details = false,
             KeyCode::Char('f') => {
+                view.marked.clear();
                 view.filter = (view.filter + 1) % filters(key.1).len();
                 view.index = 0;
                 view.selected = None;
@@ -545,6 +673,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         view.query.clone()
     };
+    view.marked.retain(|key| {
+        !unavailable
+            && all
+                .iter()
+                .any(|row| &row.key == key && row.status == "unreferenced")
+    });
     let rows = visible(all, &view, key.1, &query);
     reconcile(&mut view, &rows);
     let parts = Layout::vertical([
@@ -572,8 +706,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(format!(
-            "{} / {total} shown · {used} used · {unused} unreferenced{}",
+            "{} / {total} shown · {used} used · {unused} unreferenced · {} marked{}",
             rows.len(),
+            view.marked.len(),
             if query.is_empty() {
                 String::new()
             } else {
@@ -584,7 +719,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(format!(
-            "Row {} / {} · / Search  f Filter  s Sort  Enter Details  d/Del Remove unused",
+            "Row {} / {} · Space Mark  u Mark unused  c Clear  d Delete · / Search  f Filter  s Sort  Enter Details",
             if rows.is_empty() { 0 } else { view.index + 1 },
             rows.len()
         ))
@@ -682,7 +817,17 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     17
                 }) as usize;
-                let mut cells = vec![Cell::from(ellipsize_line(Line::from(name), name_width))];
+                let mark = if view.marked.contains(&row.key) {
+                    "[x] "
+                } else if row.status == "unreferenced" {
+                    "[ ] "
+                } else {
+                    "    "
+                };
+                let mut cells = vec![Cell::from(ellipsize_line(
+                    Line::from(format!("{mark}{name}")),
+                    name_width,
+                ))];
                 if wide {
                     cells.push(Cell::from(ellipsize_line(Line::from(row.tags.clone()), 14)));
                 }
@@ -783,6 +928,148 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+    #[test]
+    fn marking_is_unused_only_query_scoped_and_confirmation_targets_are_frozen() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        app.overview_mode = OverviewMode::Volumes;
+        let key = (0, OverviewMode::Volumes);
+        app.engines[0]
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .volumes
+            .push(crate::model::Resource {
+                name: "extra_cache".into(),
+                ..Default::default()
+            });
+        navigate(&mut app, KeyCode::Home, 25);
+        navigate(&mut app, KeyCode::Char(' '), 25);
+        assert!(
+            app.inventory_views[&key].marked.is_empty(),
+            "A referenced row cannot be marked"
+        );
+        navigate(&mut app, KeyCode::Char('u'), 25);
+        assert_eq!(app.inventory_views[&key].marked.len(), 2);
+        navigate(&mut app, KeyCode::Char('c'), 25);
+        app.inventory_views.get_mut(&key).unwrap().query = "old_cache".into();
+        navigate(&mut app, KeyCode::Char('u'), 25);
+        assert_eq!(app.inventory_views[&key].marked.len(), 1);
+        begin_removal(&mut app);
+        assert_eq!(app.inventory_removal.as_ref().unwrap().targets.len(), 1);
+        assert_eq!(
+            app.inventory_removal.as_ref().unwrap().targets[0]
+                .request
+                .key,
+            "old_cache"
+        );
+        app.engines[0]
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .volumes
+            .push(crate::model::Resource {
+                name: "old_cache_new".into(),
+                ..Default::default()
+            });
+        assert_eq!(
+            app.inventory_removal.as_ref().unwrap().targets.len(),
+            1,
+            "Newly appearing resources must never join an existing confirmation"
+        );
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        terminal
+            .draw(|frame| draw_removal(frame, &mut app, frame.area()))
+            .unwrap();
+        assert!(app.inventory_removal.as_ref().unwrap().visible);
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("y / Enter Confirm"));
+        assert!(text.contains("n / Esc Cancel"));
+        assert!(!text.contains("old_cache_new"));
+        let mut tiny = Terminal::new(TestBackend::new(50, 12)).unwrap();
+        tiny.draw(|frame| draw_removal(frame, &mut app, frame.area()))
+            .unwrap();
+        assert!(!app.inventory_removal.as_ref().unwrap().visible);
+        app.inventory_removal = None;
+        navigate(&mut app, KeyCode::Char('f'), 25);
+        assert!(
+            app.inventory_views[&key].marked.is_empty(),
+            "Filter changes must clear marks"
+        );
+        app.overview_mode = OverviewMode::Images;
+        navigate(&mut app, KeyCode::Char('u'), 25);
+        assert!(
+            app.inventory_views[&(0, OverviewMode::Images)]
+                .marked
+                .is_empty(),
+            "Unknown image usage cannot be bulk marked"
+        );
+    }
+    #[test]
+    fn large_confirmation_and_partial_result_lists_remain_scrollable() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.demo = false;
+        app.overview_mode = OverviewMode::Volumes;
+        app.engines[0].snapshot.as_mut().unwrap().volumes = (0..120)
+            .map(|i| crate::model::Resource {
+                name: format!("cache-{i:03}"),
+                ..Default::default()
+            })
+            .collect();
+        navigate(&mut app, KeyCode::Char('u'), 25);
+        begin_removal(&mut app);
+        assert_eq!(app.inventory_removal.as_ref().unwrap().targets.len(), 120);
+        app.inventory_removal.as_mut().unwrap().scroll = u16::MAX as usize;
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        terminal
+            .draw(|frame| draw_removal(frame, &mut app, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("cache-119"));
+        assert!(text.contains("Remove 120 managed volumes?"));
+        app.inventory_removal_report = Some(crate::backend::RemovalReport {
+            entries: vec![
+                ("cache-one".into(), crate::backend::RemovalStatus::Removed),
+                (
+                    "cache-two".into(),
+                    crate::backend::RemovalStatus::Skipped("newly referenced".into()),
+                ),
+                (
+                    "cache-three".into(),
+                    crate::backend::RemovalStatus::Failed(
+                        "connection lost; refresh before retrying".into(),
+                    ),
+                ),
+            ],
+        });
+        app.inventory_removal_results_visible = true;
+        terminal
+            .draw(|frame| draw_removal_results(frame, &mut app, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("1 removed, 1 skipped, 1 failed"));
+        assert!(text.contains("newly referenced"));
+    }
     #[test]
     fn ids_override_retagged_names_and_missing_identity_is_unknown() {
         let image = Image {

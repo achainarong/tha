@@ -47,7 +47,7 @@ class Contracts(unittest.TestCase):
     def setUpClass(cls):
         import yaml
         cls.workflow = yaml.load((ROOT / ".github/workflows/release.yml").read_text(), Loader=yaml.BaseLoader)
-        cls.installer = (ROOT / "README.md").read_text().split("```sh\n", 1)[1].split("```", 1)[0]
+        cls.installer = (ROOT / "scripts/install.sh").read_text()
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="tha-release-contract-")
@@ -69,8 +69,8 @@ class Contracts(unittest.TestCase):
     def step(self, job, name):
         return next(step["run"] for step in self.workflow["jobs"][job]["steps"] if step.get("name") == name)
 
-    def run_shell(self, script, **environment):
-        return subprocess.run(["/bin/sh", "-eu", "-c", script], cwd=self.directory,
+    def run_shell(self, script, *args, **environment):
+        return subprocess.run(["/bin/sh", "-eu", "-c", script, "sh", *args], cwd=self.directory,
                               env={**self.env, **environment}, capture_output=True, text=True, timeout=20)
 
     def test_installer_matrix_and_preserves_previous_install_on_all_verification_failures(self):
@@ -80,6 +80,7 @@ class Contracts(unittest.TestCase):
             fixture_archive(fixtures / asset)
         valid = "".join(f"{hashlib.sha256((fixtures / asset).read_bytes()).hexdigest()}  {asset}\n" for asset in ASSETS)
         self.program("uname", "import os,sys\nprint(os.environ['OS'] if sys.argv[1]=='-s' else os.environ['MACHINE'])")
+        self.program("sysctl", "import os\nprint(os.environ.get('ARM64_HARDWARE', '0'))")
         self.program("curl", """import os,sys,shutil
 from pathlib import Path
 args=sys.argv[1:]
@@ -93,6 +94,7 @@ shutil.copyfile(Path(os.environ['FIXTURES']) / url.rsplit('/',1)[1], args[args.i
         destination.parent.mkdir(parents=True)
         cases = [("Linux", "x86_64", "ok"), ("Linux", "aarch64", "ok"), ("Darwin", "arm64", "ok"),
                  ("Linux", "amd64", "ok"), ("Linux", "arm64", "ok"), ("Darwin", "x86_64", "unsupported"),
+                 ("Darwin", "x86_64", "rosetta"),
                  ("Linux", "armv7l", "unsupported"), ("Linux", "x86_64", "missing"),
                  ("Linux", "x86_64", "duplicate"), ("Linux", "x86_64", "mismatch"),
                  ("Linux", "x86_64", "download"), ("Linux", "x86_64", "broken-tar")]
@@ -109,10 +111,12 @@ shutil.copyfile(Path(os.environ['FIXTURES']) / url.rsplit('/',1)[1], args[args.i
                     manifest = f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {ASSETS[0]}\n"
                 (fixtures / "SHA256SUMS").write_text(manifest)
                 destination.write_text("previous-install")
+                arm = system == "Darwin" and (machine == "arm64" or mode == "rosetta")
                 result = self.run_shell(self.installer, OS=system, MACHINE=machine, FIXTURES=str(fixtures),
-                                        FAIL_DOWNLOAD="1" if mode == "download" else "0")
+                                        FAIL_DOWNLOAD="1" if mode == "download" else "0",
+                                        ARM64_HARDWARE="1" if arm else "0")
                 archive.write_bytes(original)
-                if mode == "ok":
+                if mode in ("ok", "rosetta"):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(destination.read_bytes(), b"#!/bin/sh\necho 'tha fixture'\n")
                 else:
@@ -142,7 +146,7 @@ shutil.copyfile(Path(os.environ['FIXTURES']) / args[4].rsplit('/',1)[1], args[ar
                  ("standalone", "0", ["old:service status", "new:--version"]),
                  ("standalone", "1", ["old:service status", "old:service stop", "new:--version", "new:service start"]),
                  ("service", "1", ["old:service status", "old:service stop"] + new_service),
-                 ("bogus", None, None)]
+                 ("bogus", None, None), ("arg:service", None, new_service)]
         for mode, previous, expected in cases:
             with self.subTest(mode=mode, previous=previous):
                 shutil.rmtree(home, ignore_errors=True)
@@ -150,12 +154,13 @@ shutil.copyfile(Path(os.environ['FIXTURES']) / args[4].rsplit('/',1)[1], args[ar
                 if previous is not None:
                     destination.write_text(old)
                     destination.chmod(0o755)
-                result = self.run_shell(self.installer, FIXTURES=str(fixtures), THA_MODE=mode,
-                                        OLD_RUNNING=previous or "0")
+                args, environment = ([mode[4:]], {}) if mode.startswith("arg:") else ([], {"THA_MODE": mode})
+                result = self.run_shell(self.installer, *args, FIXTURES=str(fixtures), OLD_RUNNING=previous or "0",
+                                        **environment)
                 calls = (home / "calls").read_text().splitlines() if (home / "calls").exists() else []
                 if expected is None:
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("THA_MODE must be standalone or service", result.stderr)
+                    self.assertIn("mode must be standalone or service", result.stderr)
                     self.assertEqual(calls, [])
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)

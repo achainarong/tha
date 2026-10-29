@@ -55,15 +55,17 @@ class Engine(socketserver.BaseRequestHandler):
                     data = {"Id": key, "Name": "/fixture-" + key, "State": {"Status": states[key], "Running": states[key] == "running"},
                             "Config": {"Labels": {"com.docker.compose.project": "fixture-project", "com.docker.compose.service": "api"}}}
             elif method == "DELETE" and "/images/" in url.path:
-                assert url.path.endswith("sha256:"+"c"*64)
+                key=url.path.split("/images/")[1]
+                assert key in self.server.unused_images
                 assert parse_qs(url.query)=={"force":["false"],"noprune":["true"]}
-                self.server.unused_image=False
+                self.server.unused_images.remove(key)
                 self.server.resource_writes.append(path)
                 data=[]
             elif method == "DELETE" and "/volumes/" in url.path:
-                assert url.path.endswith("/cache_unused")
+                key=url.path.split("/volumes/")[1]
+                assert key in self.server.unused_volumes
                 assert parse_qs(url.query)=={"force":["false"]}
-                self.server.unused_volume=False
+                self.server.unused_volumes.remove(key)
                 self.server.resource_writes.append(path)
                 code,data=204,None
             elif method in ["POST", "DELETE"]:
@@ -82,12 +84,12 @@ class Engine(socketserver.BaseRequestHandler):
                 self.server.writes.append((method, target, url.query))
                 code, data = 204, None
             elif url.path.endswith("/volumes"):
-                data = {"Volumes": [{"Name":"cache_unused","Driver":"local","Mountpoint":"/data","Labels":{"com.docker.compose.project":"fixture-project"},"Scope":"local","Options":{}}] if self.server.unused_volume else [], "Warnings": []}
+                data = {"Volumes": [{"Name":name,"Driver":"local","Mountpoint":"/data","Labels":{"com.docker.compose.project":"fixture-project"},"Scope":"local","Options":{}} for name in sorted(self.server.unused_volumes)], "Warnings": []}
             elif "/stats" in url.path:
                 data = {"cpu_stats": {"cpu_usage": {"total_usage": 100}, "system_cpu_usage": 1000, "online_cpus": 2},
                         "memory_stats": {"usage": 1024, "limit": 4096}}
             elif url.path.endswith("/images/json"):
-                data=[{"Id":"sha256:"+"c"*64,"ParentId":"","RepoTags":[],"RepoDigests":[],"Created":1,"Size":1024,"SharedSize":-1,"Labels":{},"Containers":0}] if self.server.unused_image else []
+                data=[{"Id":key,"ParentId":"","RepoTags":[],"RepoDigests":[],"Created":1,"Size":1024,"SharedSize":-1,"Labels":{},"Containers":0} for key in sorted(self.server.unused_images)]
             elif url.path.endswith("/networks"):
                 data = [{"Name":"fixture-project_default","Id":"retained-network","Driver":"bridge","Scope":"local","Labels":{"com.docker.compose.project":"fixture-project"}}]
             else:
@@ -136,8 +138,8 @@ else:
         server.states = {"a": "running", "b": "running"}
         server.writes = []
         server.resource_writes=[]
-        server.unused_image=True
-        server.unused_volume=True
+        server.unused_images={"sha256:"+"c"*64,"sha256:"+"d"*64}
+        server.unused_volumes={"cache_unused","cache_extra"}
         server.offline = offline
         threading.Thread(target=server.serve_forever, daemon=True).start()
         config = directory / "config.toml"
@@ -300,25 +302,39 @@ else:
             keys(b"\x1b[1;2C")  # Shift+Right -> Images
             expect("Images overview")
             expect("unreferenced")
+            keys(b"u")
+            expect("2 marked")
             keys(b"\x1b[3~")  # Delete
             expect("Confirm resource deletion")
-            keys(b"\r")
-            assert not server.resource_writes,"Empty confirmation must not delete"
-            keys(("sha256:"+"c"*64).encode()+b"\r")
-            expect("No resources reported")
-            assert len(server.resource_writes)==1
-            keys(b"\x1b[1;2C")  # Shift+Right -> Volumes
-            expect("cache_unused")
-            keys(b"\x1b[3~")
-            expect("permanently destroys")
-            keys(b"cache_unused\r")
+            expect("Remove 2 images?")
+            keys(b"n")
+            assert not server.resource_writes,"n must cancel without deleting"
+            keys(b"d")
+            expect("Confirm resource deletion")
+            keys(b"y")
             expect("No resources reported")
             assert len(server.resource_writes)==2
+            keys(b":removal-results\r")
+            expect("Resource cleanup results")
+            expect("2 removed, 0 skipped, 0 failed")
+            keys(b"\x1b")
+            keys(b"\x1b[1;2C")  # Shift+Right -> Volumes
+            expect("cache_unused")
+            keys(b"u\x1b[3~")
+            expect("Remove 2 managed volumes?")
+            expect("permanently destroys")
+            keys(b"\x1b")
+            assert len(server.resource_writes)==2,"Esc must cancel without deleting"
+            keys(b"d")
+            expect("Confirm resource deletion")
+            keys(b"\r")
+            expect("No resources reported")
+            assert len(server.resource_writes)==4
             keys(b"\x03")
             process.wait(timeout=5)
             assert process.returncode == 0
             assert termios.tcgetattr(slave) == original
-            print("PASS: container safeguards, runtime lifecycle, Shift-arrow overviews, exact-confirmation unused image/volume deletion and refresh, no force/pruning, background results, terminal restoration; mock mutations only")
+            print("PASS: container safeguards, runtime lifecycle, Shift-arrow overviews, select-all unused image/volume batches, y/Enter confirm, n/Esc cancel, results/refresh, no force/pruning, terminal restoration; mock mutations only")
         finally:
             if process.poll() is None:
                 process.kill()

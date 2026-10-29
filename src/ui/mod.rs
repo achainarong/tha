@@ -27,6 +27,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     ("overview", "Show workload overview"),
     (
+        "removal-results",
+        "Review the last image/volume cleanup results",
+    ),
+    (
         "metrics",
         "Analyze the selected container's CPU, RAM, disk and network metrics (5)",
     ),
@@ -261,6 +265,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_action(frame, app, area);
     }
     inventory::draw_removal(frame, app, area);
+    inventory::draw_removal_results(frame, app, area);
+    if app.inventory_removal_results_visible
+        || app
+            .inventory_removal
+            .as_ref()
+            .is_some_and(|removal| !removal.dismissed)
+    {
+        app.action_review_visible = false;
+        app.log_export_review_visible = false;
+    }
 }
 
 fn draw_log_editor(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -2301,7 +2315,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         ]
     } else {
         let hints = if app.overview_mode != OverviewMode::Containers {
-            "Shift+←/→ Overview · j/k Select · / Search · f Filter · s Sort · Enter Details · Esc Back · r Refresh"
+            "Space Mark · u Unused · c Clear · d Delete · / Search · f Filter · s Sort · Enter Details · Esc Back"
         } else if app.exec_input && app.tab == Tab::Exec {
             "Ctrl-] Navigate · SHELL INPUT · Keys go to the selected container session"
         } else if app.performance_focus {

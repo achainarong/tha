@@ -8,77 +8,37 @@ volumes next to their workloads. Native containerd adds a namespace level.
 
 ## Quick install
 
-Prebuilt releases support **Linux AMD64, Linux ARM64, and macOS ARM64**. No Rust
-installation or sudo is needed. The following downloads the latest stable
-release, verifies its SHA-256 checksum, and installs `tha` into `~/.local/bin`.
-Requires `curl`, `tar`, and either `sha256sum` (Linux) or `shasum` (macOS).
+On Linux (amd64, arm64) or macOS (Apple Silicon), paste one of these into a terminal.
+No Rust installation or sudo is needed.
 
-Choose an install mode with `THA_MODE` (the default is `standalone`):
-
-| Mode | What it installs |
-| --- | --- |
-| `standalone` | Only the `tha` binary. Metrics are sampled while the UI is open; no background process. |
-| `service` | The binary plus the per-user [background collector](#cpu-and-memory) (launchd/systemd, no sudo), started immediately so History keeps 24 hours of metrics. |
-
-For service mode, run `export THA_MODE=service` first, then paste the installer.
-Re-running the installer upgrades in place; a running service is stopped before the
-binary is replaced and started again afterwards, in either mode.
-
-**Release downloads become available after the first version tag is published.**
-Until then, use the source-build instructions below.
+**Standalone** (default) installs only the `tha` binary. Metrics are sampled while
+the UI is open; nothing runs in the background:
 
 ```sh
-(
-  set -eu
-  mode="${THA_MODE:-standalone}"
-  case "$mode" in
-    standalone|service) ;;
-    *) echo "THA_MODE must be standalone or service, not '$mode'." >&2; exit 1 ;;
-  esac
-  case "$(uname -s)-$(uname -m)" in
-    Linux-x86_64|Linux-amd64) asset=tha-linux-amd64.tar.gz ;;
-    Linux-aarch64|Linux-arm64) asset=tha-linux-arm64.tar.gz ;;
-    Darwin-arm64) asset=tha-macos-arm64.tar.gz ;;
-    *) echo 'Supported: Linux AMD64/ARM64 and macOS ARM64 (native shell).' >&2; exit 1 ;;
-  esac
-  base=https://github.com/achainarong/tha/releases/latest/download
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/tha-install.XXXXXX")
-  trap 'rm -f "$tmp/$asset" "$tmp/SHA256SUMS" "$tmp/CHECKSUM" "$tmp/tha"; rmdir "$tmp"' 0
-  trap 'exit 1' HUP INT TERM
-  curl --proto '=https' --tlsv1.2 -fsSL "$base/$asset" -o "$tmp/$asset"
-  curl --proto '=https' --tlsv1.2 -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"
-  awk -v asset="$asset" '$2 == asset { print }' "$tmp/SHA256SUMS" > "$tmp/CHECKSUM"
-  if [ "$(wc -l < "$tmp/CHECKSUM" | tr -d '[:space:]')" != 1 ]; then
-    echo "Missing or duplicate checksum for $asset; nothing installed." >&2
-    exit 1
-  fi
-  (
-    cd "$tmp"
-    if command -v sha256sum >/dev/null 2>&1; then
-      sha256sum -c CHECKSUM
-    else
-      shasum -a 256 -c CHECKSUM
-    fi
-  )
-  tar -xzf "$tmp/$asset" -C "$tmp" tha
-  bin="$HOME/.local/bin/tha"
-  running=0
-  # Never replace the executable under a running collector.
-  if [ -x "$bin" ] && "$bin" service status 2>/dev/null | grep -q ': running$'; then
-    "$bin" service stop
-    running=1
-  fi
-  mkdir -p "$HOME/.local/bin"
-  install -m 755 "$tmp/tha" "$bin"
-  "$bin" --version
-  if [ "$mode" = service ]; then
-    "$bin" service install
-    "$bin" service start
-  elif [ "$running" = 1 ]; then
-    "$bin" service start
-  fi
-)
+curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sh
 ```
+
+**Service** also installs and starts the per-user
+[background collector](#cpu-and-memory) (launchd/systemd, no sudo), so History
+keeps 24 hours of metrics even when the UI is closed:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sh -s -- service
+```
+
+The [script](scripts/install.sh) downloads the release archive and `SHA256SUMS`,
+verifies the checksum, and installs `tha` into `~/.local/bin`. It needs `curl` or
+`wget`, `tar`, and `sha256sum` (Linux) or `shasum` (macOS). Optional settings:
+
+| Variable | Effect |
+| --- | --- |
+| `THA_MODE=service` | Same as passing `service` |
+| `THA_VERSION=v0.6.0` | Install that release instead of the latest (pin or roll back) |
+| `THA_BIN_DIR=...` | Install somewhere other than `~/.local/bin` |
+
+Re-running the script updates in place. A running collector is stopped before the
+binary is replaced and started again afterwards, in either mode. Configuration and
+history are never touched.
 
 Then run `~/.local/bin/tha`, or add `~/.local/bin` to your `PATH`:
 
@@ -89,7 +49,7 @@ tha
 
 To switch an existing install from `service` to `standalone`, run
 `tha service uninstall` (history and configuration are kept). To switch from
-`standalone` to `service`, re-run the installer with `THA_MODE=service`, or run
+`standalone` to `service`, re-run the installer with `service`, or run
 `tha service install && tha service start`.
 
 Linux archives are statically linked with musl, avoiding a dependency on the
@@ -98,9 +58,7 @@ is ad-hoc signed, not Apple-notarized; Intel Macs are not included. Checksums
 detect corrupted/mismatched downloads, not an independently authenticated
 publisher. Only install releases from the repository you trust.
 
-To pin or roll back, choose a version from
-[GitHub Releases](https://github.com/achainarong/tha/releases), download its matching
-archive and `SHA256SUMS`, verify the archive, and replace the installed binary.
+Releases are listed on [GitHub Releases](https://github.com/achainarong/tha/releases).
 No runtime state or user configuration is migrated by installation.
 
 ## Build from source
@@ -350,13 +308,23 @@ rather than scanning filesystems. Shared image layers mean image sizes cannot be
 added up to estimate reclaimable space. Unreferenced resources are not necessarily
 safe to delete.
 
-**Delete** (or **d**) offers explicit removal of one **unreferenced image or managed volume**.
-Type the full image ID or exact volume name in the confirmation. Deleting a volume
-permanently destroys its stored data. Tha rechecks runtime identity and all running
-and stopped container references before sending a non-forced removal. Referenced
-resources, unknown image usage, bind mounts and demo mode are protected. There is
-no bulk prune, forced removal, or parent-image pruning. Failed/time-out responses
-are not retried automatically; refresh and verify the outcome before trying again.
+**Space** marks/unmarks unreferenced rows; **u** marks all unreferenced resources
+matching the current search/filter, and **c** clears marks. **Delete** (or **d**)
+removes marked resources, or the current row when nothing is marked. Search/filter
+changes clear marks; runtime and overview switching keep their selections separate.
+One scrollable confirmation lists the frozen count and names: **y / Enter confirms**,
+**n / Esc cancels**. No full-ID typing is required for images or volumes.
+
+Deleting volumes permanently destroys their stored data. Tha rechecks runtime
+identity and all running/stopped references before **each** non-forced deletion,
+with at most four requests in flight. Newly referenced resources are skipped;
+partial successes, skips and failures are reported via **`:removal-results`**.
+Esc can hide progress after confirmation without cancelling sent requests.
+Referenced resources, unknown image usage, bind mounts and demo mode are protected.
+There is no force or parent-image pruning; this uses individual removal requests,
+not the runtime's broad prune endpoint. Failed/time-out responses are never retried
+automatically; refresh and verify the outcome before trying again. Container
+deletion retains its existing exact-name confirmation.
 
 Compose projects disappear from the Containers explorer after their final
 container is removed and a successful inventory refresh arrives. Retained labelled
@@ -404,7 +372,7 @@ tha --standalone               # No daemon/history DB; session-only sampling
 ```
 
 Alternatively, install in service mode with the [quick installer](#quick-install)
-(`THA_MODE=service`) or `make install MODE=service`; both install and start the
+(`sh -s -- service`) or `make install MODE=service`; both install and start the
 user service. The default `standalone` mode installs only the CLI. No sudo or system-wide
 service is used. Services run as your user and need the same runtime/socket
 permissions and CLI availability as interactive Tha. Use
@@ -887,7 +855,7 @@ match the package version in `Cargo.toml`, for example `v0.1.0` for `0.1.0`.
 Prerelease versions such as `0.2.0-rc.1` become GitHub prereleases and are not
 selected by the quick-install `latest` URL.
 
-The offline `scripts/release_smoke.py` suite executes the actual README installer
+The offline `scripts/release_smoke.py` suite executes the actual `scripts/install.sh`
 and workflow shell steps against isolated fake download/GitHub commands. It checks
 the supported installer matrix, failed-download/checksum preservation, cleanup,
 tag/version and prerelease rules, exact assets, moved tags, existing releases,

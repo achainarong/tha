@@ -67,6 +67,91 @@ pub async fn remove_unused(request: RemovalRequest) -> Result<()> {
     );
     let fresh = snapshot(&request.connection).await?;
     request.validate(&fresh)?;
+    remove_validated(&request).await
+}
+
+#[derive(Debug)]
+pub enum RemovalStatus {
+    Removed,
+    Skipped(String),
+    Failed(String),
+}
+
+#[derive(Debug, Default)]
+pub struct RemovalReport {
+    pub entries: Vec<(String, RemovalStatus)>,
+}
+
+impl RemovalReport {
+    pub fn counts(&self) -> (usize, usize, usize) {
+        self.entries.iter().fold(
+            (0, 0, 0),
+            |(removed, skipped, failed), (_, status)| match status {
+                RemovalStatus::Removed => (removed + 1, skipped, failed),
+                RemovalStatus::Skipped(_) => (removed, skipped + 1, failed),
+                RemovalStatus::Failed(_) => (removed, skipped, failed + 1),
+            },
+        )
+    }
+    pub fn summary(&self) -> String {
+        let (removed, skipped, failed) = self.counts();
+        format!(
+            "Resource cleanup: {removed} removed, {skipped} skipped, {failed} failed · :removal-results"
+        )
+    }
+}
+
+/// Frozen targets, bounded concurrency, fresh checks per resource; never retry a failed write.
+pub async fn remove_unused_batch(requests: Vec<RemovalRequest>) -> RemovalReport {
+    use futures_util::{StreamExt, stream};
+    let mut seen = std::collections::HashSet::new();
+    let requests: Vec<_> = requests
+        .into_iter()
+        .filter(|request| {
+            seen.insert((
+                request.connection.endpoint.clone(),
+                request.identity.clone(),
+                request.key.clone(),
+                request.volume,
+            ))
+        })
+        .collect();
+    let mut results = stream::iter(requests.into_iter().enumerate().map(
+        |(index, request)| async move {
+            let check = async {
+                anyhow::ensure!(
+                    request.connection.kind == BackendKind::Docker,
+                    "Resource removal is unsupported for this backend"
+                );
+                let fresh = snapshot(&request.connection).await?;
+                request.validate(&fresh)
+            }
+            .await;
+            let status = match check {
+                Err(error) => RemovalStatus::Skipped(format!("{error:#}")),
+                Ok(()) => match remove_validated(&request).await {
+                    Ok(()) => RemovalStatus::Removed,
+                    Err(error) => RemovalStatus::Failed(format!(
+                        "{error:#}; outcome may be unknown; refresh before retrying"
+                    )),
+                },
+            };
+            (index, request.key, status)
+        },
+    ))
+    .buffer_unordered(4)
+    .collect::<Vec<_>>()
+    .await;
+    results.sort_by_key(|(index, _, _)| *index);
+    RemovalReport {
+        entries: results
+            .into_iter()
+            .map(|(_, key, status)| (key, status))
+            .collect(),
+    }
+}
+
+async fn remove_validated(request: &RemovalRequest) -> Result<()> {
     let docker = docker::connect(&request.connection)?
         .negotiate_version()
         .await?;

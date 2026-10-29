@@ -72,9 +72,19 @@ impl MockEngine {
                     .unwrap()
                     .push(request.lines().next().unwrap_or_default().to_owned());
                 if request.starts_with("DELETE ") {
-                    let body = "[]";
+                    let failing = request.contains("fail_cache");
+                    let body = if failing {
+                        r#"{"message":"fixture removal failure"}"#
+                    } else {
+                        "[]"
+                    };
+                    let status = if failing {
+                        "500 Internal Server Error"
+                    } else {
+                        "200 OK"
+                    };
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = stream.write_all(response.as_bytes()).await;
@@ -228,7 +238,7 @@ impl MockEngine {
                 } else if request.contains("/volumes") {
                     (
                         "200 OK",
-                        r#"{"Volumes":[{"Name":"shop_data","Driver":"local","Mountpoint":"/data","Labels":{"com.docker.compose.project":"shop"},"Scope":"local","Options":{}},{"Name":"unused_cache","Driver":"local","Mountpoint":"/unused","Labels":{},"Scope":"local","Options":{}}],"Warnings":[]}"#,
+                        r#"{"Volumes":[{"Name":"shop_data","Driver":"local","Mountpoint":"/data","Labels":{"com.docker.compose.project":"shop"},"Scope":"local","Options":{}},{"Name":"unused_cache","Driver":"local","Mountpoint":"/unused","Labels":{},"Scope":"local","Options":{}},{"Name":"fail_cache","Driver":"local","Mountpoint":"/failed","Labels":{},"Scope":"local","Options":{}}],"Warnings":[]}"#,
                     )
                 } else {
                     ("404 Not Found", r#"{"message":"unknown test endpoint"}"#)
@@ -254,6 +264,66 @@ impl MockEngine {
             endpoint: format!("unix://{}", self.path.display()),
         }
     }
+}
+
+#[tokio::test]
+async fn resource_cleanup_batch_reports_partial_results_and_does_not_retry_or_delete_references() {
+    let engine = MockEngine::start_with_manifest(false, true);
+    let base = backend::RemovalRequest {
+        connection: engine.connection(),
+        identity: "engine-one".into(),
+        key: format!("sha256:{}", "c".repeat(64)),
+        volume: false,
+    };
+    let report = backend::remove_unused_batch(vec![
+        base.clone(),
+        backend::RemovalRequest {
+            key: "shop_data".into(),
+            volume: true,
+            ..base.clone()
+        },
+        backend::RemovalRequest {
+            key: "missing_resource".into(),
+            volume: true,
+            ..base.clone()
+        },
+        backend::RemovalRequest {
+            key: "fail_cache".into(),
+            volume: true,
+            ..base.clone()
+        },
+        base, // duplicate target must not be sent twice
+    ])
+    .await;
+    assert_eq!(report.entries.len(), 4);
+    assert_eq!(report.counts(), (1, 2, 1));
+    assert!(matches!(
+        report.entries[0].1,
+        backend::RemovalStatus::Removed
+    ));
+    assert!(matches!(
+        report.entries[1].1,
+        backend::RemovalStatus::Skipped(_)
+    ));
+    assert!(matches!(
+        report.entries[3].1,
+        backend::RemovalStatus::Failed(_)
+    ));
+    let requests = engine.requests.lock().unwrap();
+    let deletes: Vec<_> = requests
+        .iter()
+        .filter(|request| request.starts_with("DELETE "))
+        .collect();
+    assert_eq!(
+        deletes.len(),
+        2,
+        "Skipped references must not be deleted and failed writes must not be retried"
+    );
+    assert!(
+        !deletes
+            .iter()
+            .any(|request| request.contains("shop_data") || request.contains("force=true"))
+    );
 }
 
 #[tokio::test]

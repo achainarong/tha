@@ -313,7 +313,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let (layers_tx, mut layers_rx) = mpsc::channel::<tha::layers::Event>(4);
     let mut layers_task: Option<AbortTask> = None;
     let (export_tx, mut export_rx) = mpsc::channel::<String>(4);
-    let (removal_tx, mut removal_rx) = mpsc::channel::<String>(1);
+    let (removal_tx, mut removal_rx) = mpsc::channel::<tha::backend::RemovalReport>(1);
     let mut removal_task: Option<AbortTask> = None;
     let mut export_task: Option<AbortTask> = None;
     let (action_tx, mut action_rx) = mpsc::channel::<tha::actions::Update>(64);
@@ -422,7 +422,19 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 }
             },
             Some(result) = export_rx.recv() => { app.log_export_busy = false; app.notice = result; export_task = None; redraw_now = true; },
-            Some(result)=removal_rx.recv()=> {app.inventory_removal=None;app.notice=result;removal_task=None;refresh_tx.send_modify(|value|*value=value.wrapping_add(1));redraw_now=true;},
+            Some(report)=removal_rx.recv()=> {
+                if let Some(removal)=app.inventory_removal.take() && let Some(view)=app.inventory_views.get_mut(&removal.context) {
+                    for target in removal.targets {view.marked.remove(&target.request.key);}
+                }
+                let (_,skipped,failed)=report.counts();
+                app.notice=report.summary();
+                app.inventory_removal_results_visible=skipped+failed>0;
+                app.inventory_removal_results_scroll=0;
+                app.inventory_removal_report=Some(report);
+                removal_task=None;
+                refresh_tx.send_modify(|value|*value=value.wrapping_add(1));
+                redraw_now=true;
+            },
             Some(update) = action_rx.recv() => {
                 let operation = update.operation;
                 let finished = matches!(&update.event, tha::actions::Event::Finished);
@@ -573,13 +585,8 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
             if let Some(request) = app.inventory_removal_request.take() {
                 let sender = removal_tx.clone();
                 removal_task = Some(AbortTask(tokio::spawn(async move {
-                    let message = match tha::backend::remove_unused(request).await {
-                        Ok(()) => "Resource deletion completed; refreshing inventory".into(),
-                        Err(error) => format!(
-                            "Resource removal failed or outcome unknown: {error:#}. Refresh before retrying."
-                        ),
-                    };
-                    let _ = sender.send(message).await;
+                    let report = tha::backend::remove_unused_batch(request).await;
+                    let _ = sender.send(report).await;
                 })));
             }
             update_layers(&mut app, &mut layers_task, &layers_tx);
@@ -882,50 +889,123 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return true;
     }
-    if let Some(removal) = app.inventory_removal.as_mut() {
+    if let Some(removal) = app.inventory_removal.as_mut()
+        && !removal.dismissed
+    {
         if !removal.pending {
             match key.code {
-                KeyCode::Esc => app.inventory_removal = None,
-                KeyCode::Enter
+                KeyCode::Esc | KeyCode::Char('n') => app.inventory_removal = None,
+                KeyCode::Enter | KeyCode::Char('y')
                     if removal.visible
-                        && removal.typed == removal.request.key
+                        && !removal.targets.is_empty()
                         && key.kind == KeyEventKind::Press
                         && !key
                             .modifiers
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
-                    let current = app.engines.iter().any(|engine| {
-                        engine.error.is_none()
-                            && engine.alias.is_none()
-                            && engine.connection.endpoint == removal.request.connection.endpoint
-                            && engine
-                                .snapshot
-                                .as_ref()
-                                .and_then(|snapshot| snapshot.engine_id.as_deref())
-                                == Some(removal.request.identity.as_str())
+                    let current = removal.targets.iter().all(|target| {
+                        app.engines.iter().any(|engine| {
+                            engine.error.is_none()
+                                && engine.alias.is_none()
+                                && engine.connection.endpoint == target.request.connection.endpoint
+                                && engine
+                                    .snapshot
+                                    .as_ref()
+                                    .and_then(|snapshot| snapshot.engine_id.as_deref())
+                                    == Some(target.request.identity.as_str())
+                        })
                     });
                     if current {
                         removal.pending = true;
-                        app.inventory_removal_request = Some(removal.request.clone());
+                        app.notice = format!(
+                            "Deleting {} resources · Esc hides progress; no automatic retries",
+                            removal.targets.len()
+                        );
+                        app.inventory_removal_request = Some(
+                            removal
+                                .targets
+                                .iter()
+                                .map(|target| target.request.clone())
+                                .collect(),
+                        );
                     } else {
                         app.inventory_removal = None;
                         app.notice = "Runtime changed; deletion cancelled".into();
                     }
                 }
-                KeyCode::Backspace => {
-                    removal.typed.pop();
+                KeyCode::Up | KeyCode::PageUp => {
+                    removal.scroll = removal
+                        .scroll
+                        .saturating_sub(if key.code == KeyCode::PageUp {
+                            height.max(1)
+                        } else {
+                            1
+                        })
                 }
-                KeyCode::Char(ch)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                        && !ch.is_control()
-                        && removal.typed.len() + ch.len_utf8() <= 4096 =>
-                {
-                    removal.typed.push(ch)
+                KeyCode::Down | KeyCode::PageDown => {
+                    removal.scroll = removal
+                        .scroll
+                        .saturating_add(if key.code == KeyCode::PageDown {
+                            height.max(1)
+                        } else {
+                            1
+                        })
+                        .min(u16::MAX as usize)
                 }
                 _ => {}
             }
+        } else {
+            match key.code {
+                KeyCode::Esc => removal.dismissed = true,
+                KeyCode::Up | KeyCode::PageUp => {
+                    removal.scroll = removal
+                        .scroll
+                        .saturating_sub(if key.code == KeyCode::PageUp {
+                            height.max(1)
+                        } else {
+                            1
+                        })
+                }
+                KeyCode::Down | KeyCode::PageDown => {
+                    removal.scroll = removal
+                        .scroll
+                        .saturating_add(if key.code == KeyCode::PageDown {
+                            height.max(1)
+                        } else {
+                            1
+                        })
+                        .min(u16::MAX as usize)
+                }
+                _ => {}
+            }
+        }
+        return false;
+    }
+    if app.inventory_removal_results_visible {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                app.inventory_removal_results_visible = false
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::PageUp => {
+                app.inventory_removal_results_scroll = app
+                    .inventory_removal_results_scroll
+                    .saturating_sub(if key.code == KeyCode::PageUp {
+                        height.max(1)
+                    } else {
+                        1
+                    })
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::PageDown => {
+                app.inventory_removal_results_scroll = app
+                    .inventory_removal_results_scroll
+                    .saturating_add(if key.code == KeyCode::PageDown {
+                        height.max(1)
+                    } else {
+                        1
+                    })
+                    .min(u16::MAX as usize)
+            }
+            _ => {}
         }
         return false;
     }
@@ -1075,6 +1155,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             }
             KeyCode::Enter => {
                 view.query = std::mem::take(&mut app.input);
+                view.marked.clear();
                 view.index = 0;
                 view.selected = None;
                 view.offset = 0;
@@ -1246,7 +1327,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             | KeyCode::Home
             | KeyCode::End
             | KeyCode::Enter
-            | KeyCode::Char('j' | 'k' | 'g' | 'G' | 'f' | 's')
+            | KeyCode::Char('j' | 'k' | 'g' | 'G' | 'f' | 's' | ' ' | 'u' | 'c')
                 if !ctrl =>
             {
                 ui::inventory::navigate(app, key.code, height)
@@ -1622,6 +1703,14 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
     }
     app.notice.clear();
     match command {
+        "removal-results" => {
+            if app.inventory_removal_report.is_some() {
+                app.inventory_removal_results_visible = true;
+                app.inventory_removal_results_scroll = 0;
+            } else {
+                app.notice = "No image/volume cleanup results yet".into();
+            }
+        }
         "quit" | "q" => return true,
         "overview" => {
             app.tab = Tab::Overview;
@@ -2899,8 +2988,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unused_resource_removal_requires_exact_visible_confirmation_and_protects_used_volumes()
-    {
+    async fn unused_resource_removal_requires_visible_yes_no_confirmation_and_protects_used_volumes()
+     {
         use tha::app::OverviewMode;
         let mut app = app();
         let (refresh, _) = watch::channel(0);
@@ -2915,12 +3004,11 @@ mod tests {
         ui::inventory::navigate(&mut app, KeyCode::End, 25);
         handle_key(&mut app, KeyEvent::from(KeyCode::Delete), 25, &refresh);
         assert_eq!(
-            app.inventory_removal.as_ref().unwrap().request.key,
+            app.inventory_removal.as_ref().unwrap().targets[0]
+                .request
+                .key,
             "old_cache"
         );
-        for ch in "old_cache".chars() {
-            handle_key(&mut app, KeyEvent::from(KeyCode::Char(ch)), 25, &refresh);
-        }
         handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 25, &refresh);
         assert!(
             app.inventory_removal_request.is_none(),
@@ -2938,17 +3026,25 @@ mod tests {
             OverviewMode::Volumes,
             "Dialogs retain keyboard ownership"
         );
-        handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 25, &refresh);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('n')), 25, &refresh);
         assert!(app.inventory_removal.is_none());
         handle_key(&mut app, KeyEvent::from(KeyCode::Delete), 25, &refresh);
-        app.inventory_removal.as_mut().unwrap().typed = "old_cache".into();
         app.inventory_removal.as_mut().unwrap().visible = true;
-        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 25, &refresh);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            25,
+            &refresh,
+        );
+        assert!(app.inventory_removal_request.is_none());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('y')), 25, &refresh);
         assert_eq!(
-            app.inventory_removal_request.as_ref().unwrap().key,
+            app.inventory_removal_request.as_ref().unwrap()[0].key,
             "old_cache"
         );
         assert!(app.inventory_removal.as_ref().unwrap().pending);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 25, &refresh);
+        assert!(app.inventory_removal.as_ref().unwrap().dismissed);
     }
 
     #[tokio::test]
