@@ -1,0 +1,994 @@
+//! Selectable runtime inventories with guarded removal. Sizes are not reclaimable space.
+use super::*;
+use crate::{
+    app::InventoryView,
+    model::{Container, Image, Snapshot},
+};
+use crossterm::event::KeyCode;
+use ratatui::widgets::TableState;
+
+const IMAGE_FILTERS: &[&str] = &[
+    "All",
+    "Running",
+    "Stopped-only",
+    "Unreferenced",
+    "Untagged",
+    "Unknown",
+];
+const VOLUME_FILTERS: &[&str] = &[
+    "Managed",
+    "Running",
+    "Stopped-only",
+    "Unreferenced",
+    "Unknown",
+    "Bind mounts",
+];
+const SORTS: &[&str] = &["Usage ↓", "Name ↑", "Size ↓"];
+
+#[derive(Debug)]
+struct Entry {
+    key: String,
+    name: String,
+    tags: String,
+    size: Option<u64>,
+    status: &'static str,
+    running: usize,
+    stopped: usize,
+    project: String,
+    extra: String,
+    containers: Vec<String>,
+    untagged: bool,
+}
+
+fn references<'a>(image: &Image, containers: &'a [Container]) -> Vec<&'a Container> {
+    containers
+        .iter()
+        .filter(
+            |c| match c.image_id.as_deref().filter(|id| !id.is_empty()) {
+                Some(id) => id == image.id,
+                None => image.tags.contains(&c.image),
+            },
+        )
+        .collect()
+}
+
+fn usage(containers: &[&Container], complete: bool) -> (usize, usize, &'static str) {
+    let running = containers.iter().filter(|c| c.running()).count();
+    let stopped = containers.len() - running;
+    (
+        running,
+        stopped,
+        if running > 0 {
+            "running"
+        } else if stopped > 0 {
+            "stopped-only"
+        } else if complete {
+            "unreferenced"
+        } else {
+            "unknown"
+        },
+    )
+}
+
+fn filters(mode: OverviewMode) -> &'static [&'static str] {
+    if mode == OverviewMode::Images {
+        IMAGE_FILTERS
+    } else {
+        VOLUME_FILTERS
+    }
+}
+
+fn image_name(tag: &str) -> (&str, &str) {
+    // Registry ports are not tag separators. Digest references are kept intact.
+    if tag.contains('@') {
+        return (tag, "digest");
+    }
+    match tag.rsplit_once(':') {
+        Some((name, tag)) if !tag.contains('/') => (name, tag),
+        _ => (tag, "latest"),
+    }
+}
+
+fn entries(snapshot: &Snapshot, mode: OverviewMode, binds: bool) -> Vec<Entry> {
+    if mode == OverviewMode::Images {
+        let complete = snapshot
+            .containers
+            .iter()
+            .all(|c| c.image_id.as_ref().is_some_and(|id| !id.is_empty()));
+        return snapshot
+            .images
+            .iter()
+            .flatten()
+            .map(|image| {
+                let refs = references(image, &snapshot.containers);
+                let (running, stopped, status) = usage(&refs, complete);
+                let mut names = std::collections::BTreeSet::new();
+                let mut tags = std::collections::BTreeSet::new();
+                for tag in &image.tags {
+                    let (name, tag) = image_name(tag);
+                    names.insert(safe_text(name));
+                    tags.insert(safe_text(tag));
+                }
+                Entry {
+                    key: image.id.clone(),
+                    name: if names.is_empty() {
+                        "<untagged>".into()
+                    } else {
+                        names.into_iter().collect::<Vec<_>>().join(", ")
+                    },
+                    tags: tags.into_iter().collect::<Vec<_>>().join(", "),
+                    size: image.size,
+                    status,
+                    running,
+                    stopped,
+                    project: String::new(),
+                    extra: format!(
+                        "Tags: {}",
+                        image
+                            .tags
+                            .iter()
+                            .map(|tag| safe_text(tag))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    containers: refs
+                        .iter()
+                        .map(|c| format!("{} ({})", safe_text(&c.name), safe_text(&c.state)))
+                        .collect(),
+                    untagged: image.tags.is_empty(),
+                }
+            })
+            .collect();
+    }
+    if binds {
+        let mut mounts = std::collections::BTreeMap::<&str, Vec<&Container>>::new();
+        for container in &snapshot.containers {
+            for mount in &container.bind_mounts {
+                let refs = mounts.entry(mount).or_default();
+                if !refs.iter().any(|c| c.key() == container.key()) {
+                    refs.push(container);
+                }
+            }
+        }
+        return mounts
+            .into_iter()
+            .map(|(mount, refs)| {
+                let (running, stopped, status) = usage(&refs, true);
+                Entry {
+                    key: mount.into(),
+                    name: safe_text(mount),
+                    tags: "bind".into(),
+                    size: None,
+                    status,
+                    running,
+                    stopped,
+                    project: String::new(),
+                    extra: "Host path → container destination; not a managed volume".into(),
+                    containers: refs
+                        .iter()
+                        .map(|c| format!("{} ({})", safe_text(&c.name), safe_text(&c.state)))
+                        .collect(),
+                    untagged: false,
+                }
+            })
+            .collect();
+    }
+    snapshot
+        .volumes
+        .iter()
+        .map(|volume| {
+            let refs: Vec<_> = snapshot
+                .containers
+                .iter()
+                .filter(|c| c.volumes.contains(&volume.name))
+                .collect();
+            let (running, stopped, status) = usage(&refs, true);
+            let driver = volume
+                .details
+                .strip_prefix("driver: ")
+                .unwrap_or("unknown")
+                .split(" · ")
+                .next()
+                .unwrap_or("unknown");
+            Entry {
+                key: volume.name.clone(),
+                name: safe_text(&volume.name),
+                tags: safe_text(driver),
+                size: None,
+                status,
+                running,
+                stopped,
+                project: volume
+                    .project
+                    .as_deref()
+                    .map(safe_text)
+                    .unwrap_or_else(|| "—".into()),
+                extra: safe_text(&volume.details),
+                containers: refs
+                    .iter()
+                    .map(|c| format!("{} ({})", safe_text(&c.name), safe_text(&c.state)))
+                    .collect(),
+                untagged: false,
+            }
+        })
+        .collect()
+}
+
+fn rank(entry: &Entry) -> usize {
+    match entry.status {
+        "running" => 0,
+        "stopped-only" => 1,
+        "unreferenced" => 2,
+        _ => 3,
+    }
+}
+
+fn visible(
+    mut rows: Vec<Entry>,
+    view: &InventoryView,
+    mode: OverviewMode,
+    query: &str,
+) -> Vec<Entry> {
+    let query = query.to_lowercase();
+    rows.retain(|row| {
+        let filter = match view.filter {
+            1 => row.status == "running",
+            2 => row.status == "stopped-only",
+            3 => row.status == "unreferenced",
+            4 if mode == OverviewMode::Images => row.untagged,
+            4 => row.status == "unknown",
+            5 if mode == OverviewMode::Images => row.status == "unknown",
+            _ => true,
+        };
+        filter
+            && (query.is_empty()
+                || format!(
+                    "{} {} {} {} {} {}",
+                    row.name,
+                    row.tags,
+                    row.key,
+                    row.project,
+                    row.extra,
+                    row.containers.join(" ")
+                )
+                .to_lowercase()
+                .contains(&query))
+    });
+    rows.sort_by(|a, b| {
+        let order = match view.sort {
+            1 => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            2 => b.size.cmp(&a.size),
+            _ => rank(a).cmp(&rank(b)),
+        };
+        order
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.key.cmp(&b.key))
+    });
+    rows
+}
+
+fn reconcile(view: &mut InventoryView, rows: &[Entry]) {
+    view.index = view
+        .selected
+        .as_ref()
+        .and_then(|key| rows.iter().position(|row| &row.key == key))
+        .unwrap_or(view.index)
+        .min(rows.len().saturating_sub(1));
+    view.selected = rows.get(view.index).map(|row| row.key.clone());
+    if rows.is_empty() {
+        view.details = false;
+        view.offset = 0;
+    }
+}
+
+/// Navigation is called only after editors, dialogs and embedded shells consume keys.
+pub fn begin_removal(app: &mut App) {
+    if app.demo {
+        app.notice = "Demo mode: resource deletion is disabled".into();
+        return;
+    }
+    let key = (app.inventory_engine, app.overview_mode);
+    let view = app.inventory_views.get(&key).cloned().unwrap_or_default();
+    if key.1 == OverviewMode::Volumes && view.filter == 5 {
+        app.notice = "Bind mounts cannot be deleted from Tha".into();
+        return;
+    }
+    let Some(engine) = app
+        .engines
+        .get(key.0)
+        .filter(|engine| engine.error.is_none() && engine.alias.is_none())
+    else {
+        app.notice = "Select a connected primary runtime".into();
+        return;
+    };
+    let Some(snapshot) = &engine.snapshot else {
+        return;
+    };
+    let rows = visible(entries(snapshot, key.1, false), &view, key.1, &view.query);
+    let index = view
+        .selected
+        .as_ref()
+        .and_then(|key| rows.iter().position(|row| &row.key == key))
+        .unwrap_or(view.index);
+    let Some(row) = rows.get(index) else {
+        app.notice = "Select a resource first".into();
+        return;
+    };
+    if row.status != "unreferenced" {
+        app.notice = "Deletion requires no running or stopped references and known usage".into();
+        return;
+    }
+    let Some(identity) = snapshot.engine_id.clone().filter(|id| !id.is_empty()) else {
+        app.notice = "Runtime identity unavailable; deletion refused".into();
+        return;
+    };
+    let request = crate::backend::RemovalRequest {
+        connection: engine.connection.clone(),
+        identity,
+        key: row.key.clone(),
+        volume: key.1 == OverviewMode::Volumes,
+    };
+    if let Err(error) = request.validate(snapshot) {
+        app.notice = format!("{error:#}");
+        return;
+    }
+    app.inventory_removal = Some(crate::app::InventoryRemoval {
+        request,
+        typed: String::new(),
+        visible: false,
+        pending: false,
+    });
+}
+
+pub fn draw_removal(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(removal) = app.inventory_removal.as_mut() else {
+        return;
+    };
+    removal.visible = false;
+    let dialog = centered(area, 100, 19);
+    frame.render_widget(Clear, dialog);
+    let block = Block::bordered().title(" Confirm resource deletion ");
+    let inner = block.inner(dialog);
+    frame.render_widget(block, dialog);
+    if area.width < 70 || area.height < 19 {
+        frame.render_widget(
+            Paragraph::new("Resize to at least 70 × 19 to review deletion. Esc cancels.")
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
+    let text = format!(
+        "Runtime: {}\n{}: {}\n\n{}\nRunning AND stopped container references are checked again before removal.\nNo force deletion or automatic pruning.\n\nType this exact {} and press Enter:\n{}\n\n> {}▏\n\n{}",
+        safe_text(&removal.request.connection.name),
+        if removal.request.volume {
+            "Volume"
+        } else {
+            "Image ID"
+        },
+        safe_text(&removal.request.key),
+        if removal.request.volume {
+            "WARNING: deleting this volume permanently destroys its stored data."
+        } else {
+            "This removes the selected local image. Shared parent images are not pruned."
+        },
+        if removal.request.volume {
+            "volume name"
+        } else {
+            "image ID"
+        },
+        safe_text(&removal.request.key),
+        safe_text(&removal.typed),
+        if removal.pending {
+            "Removal in progress; do not assume cancellation or rollback."
+        } else {
+            "Enter Confirm · Esc Cancel"
+        }
+    );
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+    if paragraph.line_count(inner.width) > inner.height as usize {
+        frame.render_widget(
+            Paragraph::new(
+                "Resize wider/taller to review the complete deletion confirmation. Esc cancels.",
+            )
+            .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
+    removal.visible = true;
+    frame.render_widget(paragraph, inner);
+}
+
+pub fn navigate(app: &mut App, code: KeyCode, height: usize) {
+    let key = (app.inventory_engine, app.overview_mode);
+    let mut view = app.inventory_views.get(&key).cloned().unwrap_or_default();
+    let rows = app
+        .engines
+        .get(key.0)
+        .and_then(|engine| engine.snapshot.as_ref())
+        .map(|snapshot| {
+            visible(
+                entries(
+                    snapshot,
+                    key.1,
+                    key.1 == OverviewMode::Volumes && view.filter == 5,
+                ),
+                &view,
+                key.1,
+                &view.query,
+            )
+        })
+        .unwrap_or_default();
+    reconcile(&mut view, &rows);
+    let amount = height.saturating_sub(9).max(1);
+    if view.details
+        && matches!(
+            code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Char('j' | 'k')
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+        )
+    {
+        view.details_scroll = match code {
+            KeyCode::Up | KeyCode::Char('k') => view.details_scroll.saturating_sub(1),
+            KeyCode::PageUp => view.details_scroll.saturating_sub(amount),
+            KeyCode::PageDown => view
+                .details_scroll
+                .saturating_add(amount)
+                .min(u16::MAX as usize),
+            KeyCode::Home => 0,
+            KeyCode::End => u16::MAX as usize,
+            _ => view.details_scroll.saturating_add(1).min(u16::MAX as usize),
+        };
+    } else {
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => view.index = view.index.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => view.index = view.index.saturating_add(1),
+            KeyCode::PageUp => view.index = view.index.saturating_sub(amount),
+            KeyCode::PageDown => view.index = view.index.saturating_add(amount),
+            KeyCode::Home => view.index = 0,
+            KeyCode::End | KeyCode::Char('G') => view.index = rows.len().saturating_sub(1),
+            KeyCode::Char('g') if view.pending_g => view.index = 0,
+            KeyCode::Enter if !rows.is_empty() => {
+                view.details = !view.details;
+                view.details_scroll = 0;
+            }
+            KeyCode::Esc => view.details = false,
+            KeyCode::Char('f') => {
+                view.filter = (view.filter + 1) % filters(key.1).len();
+                view.index = 0;
+                view.selected = None;
+                view.offset = 0;
+                view.details = false;
+            }
+            KeyCode::Char('s') => view.sort = (view.sort + 1) % SORTS.len(),
+            _ => {}
+        }
+        if !matches!(code, KeyCode::Char('f')) {
+            view.index = view.index.min(rows.len().saturating_sub(1));
+            view.selected = rows.get(view.index).map(|row| row.key.clone());
+        }
+    }
+    view.pending_g = code == KeyCode::Char('g') && !view.pending_g;
+    app.inventory_views.insert(key, view);
+}
+
+pub fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
+    let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+    let names: Vec<_> = app
+        .engines
+        .iter()
+        .map(|engine| safe_text(&engine.connection.name))
+        .collect();
+    app.inventory_engine = app
+        .inventory_engine
+        .min(app.engines.len().saturating_sub(1));
+    frame.render_widget(
+        Tabs::new(names)
+            .select(app.inventory_engine)
+            .highlight_style(selected()),
+        parts[0],
+    );
+    let block = pane(
+        if app.overview_mode == OverviewMode::Images {
+            " Images overview ".into()
+        } else {
+            " Volumes overview ".into()
+        },
+        true,
+    );
+    let inner = block.inner(parts[1]);
+    frame.render_widget(block, parts[1]);
+    draw(frame, app, inner);
+}
+
+pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let key = (app.inventory_engine, app.overview_mode);
+    let mut view = app.inventory_views.get(&key).cloned().unwrap_or_default();
+    let Some(engine) = app.engines.get(key.0) else {
+        frame.render_widget(Paragraph::new("Select a runtime."), area);
+        return;
+    };
+    let Some(snapshot) = engine.snapshot.as_ref() else {
+        frame.render_widget(
+            Paragraph::new("Runtime unavailable; inventory cannot be read."),
+            area,
+        );
+        return;
+    };
+    let binds = key.1 == OverviewMode::Volumes && view.filter == 5;
+    let unavailable = if key.1 == OverviewMode::Images {
+        snapshot.images.is_none()
+    } else {
+        !binds && !snapshot.volumes_available
+    };
+    let all = entries(snapshot, key.1, binds);
+    let total = all.len();
+    let used = all
+        .iter()
+        .filter(|row| row.running + row.stopped > 0)
+        .count();
+    let unused = all
+        .iter()
+        .filter(|row| row.status == "unreferenced")
+        .count();
+    let query = if app.input_mode == InputMode::InventorySearch {
+        app.input.clone()
+    } else {
+        view.query.clone()
+    };
+    let rows = visible(all, &view, key.1, &query);
+    reconcile(&mut view, &rows);
+    let parts = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{}  ·  {}  ·  Filter: {}  ·  Sort: {}{}",
+            safe_text(&engine.connection.name),
+            if binds { "Bind mounts" } else { "inventory" },
+            filters(key.1)[view.filter % filters(key.1).len()],
+            SORTS[view.sort % SORTS.len()],
+            if engine.error.is_some() {
+                "  ·  STALE snapshot"
+            } else {
+                ""
+            }
+        ))
+        .style(muted()),
+        parts[0],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{} / {total} shown · {used} used · {unused} unreferenced{}",
+            rows.len(),
+            if query.is_empty() {
+                String::new()
+            } else {
+                format!(" · /{}", safe_text(&query))
+            }
+        )),
+        parts[1],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Row {} / {} · / Search  f Filter  s Sort  Enter Details  d/Del Remove unused",
+            if rows.is_empty() { 0 } else { view.index + 1 },
+            rows.len()
+        ))
+        .style(muted()),
+        parts[3],
+    );
+    let body = parts[2];
+    if unavailable || rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(if unavailable {
+                "Inventory unavailable for this runtime. See Containers overview warnings."
+            } else if total == 0 {
+                "No resources reported by this runtime."
+            } else {
+                "No matches. / edits search; f changes the status filter."
+            })
+            .wrap(Wrap { trim: false }),
+            body,
+        );
+    } else {
+        let (table_area, details_area) = if view.details && body.width >= 110 {
+            let split =
+                Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+                    .split(body);
+            (Some(split[0]), Some(split[1]))
+        } else if view.details {
+            (None, Some(body))
+        } else {
+            (Some(body), None)
+        };
+        if let Some(table_area) = table_area {
+            let images = key.1 == OverviewMode::Images;
+            let wide = table_area.width >= 92;
+            let headers = if wide {
+                vec![
+                    if images { "Image" } else { "Volume / source" },
+                    if images { "Tags" } else { "Driver" },
+                    "Size",
+                    "Status",
+                    "Refs",
+                    if images { "ID" } else { "Project" },
+                ]
+            } else if table_area.width >= 50 {
+                vec![
+                    if images {
+                        "Image / tags"
+                    } else {
+                        "Volume / source"
+                    },
+                    "Size",
+                    "Status",
+                    "Refs",
+                ]
+            } else {
+                vec!["Name", "Status"]
+            };
+            let constraints = if wide {
+                vec![
+                    Constraint::Min(18),
+                    Constraint::Length(14),
+                    Constraint::Length(10),
+                    Constraint::Length(13),
+                    Constraint::Length(5),
+                    Constraint::Length(14),
+                ]
+            } else if table_area.width >= 50 {
+                vec![
+                    Constraint::Min(12),
+                    Constraint::Length(10),
+                    Constraint::Length(13),
+                    Constraint::Length(5),
+                ]
+            } else {
+                vec![Constraint::Min(8), Constraint::Length(13)]
+            };
+            let display_rows = rows.iter().map(|row| {
+                let size = row
+                    .size
+                    .map(metrics::bytes)
+                    .unwrap_or_else(|| "unknown".into());
+                let status_style = match row.status {
+                    "running" => accent(app, Color::Green),
+                    "stopped-only" => accent(app, Color::Yellow),
+                    _ => muted(),
+                };
+                let name = if !wide && images && !row.tags.is_empty() {
+                    format!("{}:{}", row.name, row.tags)
+                } else {
+                    row.name.clone()
+                };
+                let name_width = table_area.width.saturating_sub(if wide {
+                    68
+                } else if table_area.width >= 50 {
+                    36
+                } else {
+                    17
+                }) as usize;
+                let mut cells = vec![Cell::from(ellipsize_line(Line::from(name), name_width))];
+                if wide {
+                    cells.push(Cell::from(ellipsize_line(Line::from(row.tags.clone()), 14)));
+                }
+                if table_area.width >= 50 {
+                    cells.push(Cell::from(Line::from(size).alignment(Alignment::Right)));
+                }
+                cells.push(Cell::from(row.status).style(status_style));
+                if table_area.width >= 50 {
+                    cells.push(Cell::from(
+                        Line::from((row.running + row.stopped).to_string())
+                            .alignment(Alignment::Right),
+                    ));
+                }
+                if wide {
+                    cells.push(Cell::from(if images {
+                        safe_text(&row.key)
+                            .trim_start_matches("sha256:")
+                            .chars()
+                            .take(12)
+                            .collect::<String>()
+                    } else {
+                        row.project.clone()
+                    }));
+                }
+                TableRow::new(cells)
+            });
+            let mut state = TableState::default()
+                .with_offset(view.offset)
+                .with_selected(Some(view.index));
+            frame.render_stateful_widget(
+                Table::new(display_rows, constraints)
+                    .header(
+                        TableRow::new(headers)
+                            .style(Style::default().add_modifier(Modifier::BOLD))
+                            .bottom_margin(1),
+                    )
+                    .column_spacing(2)
+                    .row_highlight_style(selected())
+                    .highlight_symbol("▸ "),
+                table_area,
+                &mut state,
+            );
+            view.offset = state.offset();
+        }
+        if let Some(details_area) = details_area {
+            let row = &rows[view.index];
+            let block = Block::bordered()
+                .title(" Details · Esc Back ")
+                .border_style(muted());
+            let inner = block.inner(details_area);
+            frame.render_widget(block, details_area);
+            if inner.width > 0 {
+                let mut lines = vec![
+                    Line::styled(
+                        row.name.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Line::from(format!("ID / key: {}", safe_text(&row.key))),
+                    Line::from(row.extra.clone()),
+                    Line::from(format!(
+                        "Status: {} · {} running / {} stopped",
+                        row.status, row.running, row.stopped
+                    )),
+                    Line::from(format!(
+                        "Size: {}",
+                        row.size
+                            .map(metrics::bytes)
+                            .unwrap_or_else(|| "unknown (no filesystem scan)".into())
+                    )),
+                    Line::from("Container references:"),
+                ];
+                lines.extend(
+                    row.containers
+                        .iter()
+                        .map(|name| Line::from(format!("  {name}"))),
+                );
+                if row.containers.is_empty() {
+                    lines.push(Line::from("  None reported"));
+                }
+                lines.push(Line::styled(if key.1 == OverviewMode::Images { "Sizes may include shared layers, not reclaimable space. Untagged does not imply unused." } else { "Unreferenced does not mean safe to delete. Bind mounts are not managed volumes." }, muted()));
+                let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+                view.details_scroll = view
+                    .details_scroll
+                    .min(
+                        paragraph
+                            .line_count(inner.width)
+                            .saturating_sub(inner.height as usize),
+                    )
+                    .min(u16::MAX as usize);
+                frame.render_widget(paragraph.scroll((view.details_scroll as u16, 0)), inner);
+            }
+        }
+    }
+    app.inventory_views.insert(key, view);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+    #[test]
+    fn ids_override_retagged_names_and_missing_identity_is_unknown() {
+        let image = Image {
+            id: "sha256:old".into(),
+            tags: vec!["app:latest".into()],
+            size: None,
+        };
+        let containers = vec![
+            Container {
+                image_id: Some("sha256:new".into()),
+                image: "app:latest".into(),
+                state: "running".into(),
+                ..Default::default()
+            },
+            Container {
+                image_id: Some(image.id.clone()),
+                state: "exited".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            usage(&references(&image, &containers), true),
+            (0, 1, "stopped-only")
+        );
+        assert_eq!(usage(&[], false), (0, 0, "unknown"));
+        assert_eq!(
+            image_name("localhost:5055/app:dev"),
+            ("localhost:5055/app", "dev")
+        );
+    }
+    #[test]
+    fn sorting_filtering_search_and_stable_selection_cover_full_metadata() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        let snapshot = app.engines[0].snapshot.as_mut().unwrap();
+        for c in &mut snapshot.containers {
+            c.image_id = Some(
+                if c.image == "redis:7" {
+                    "sha256:demo-redis"
+                } else {
+                    "sha256:demo-api"
+                }
+                .into(),
+            );
+        }
+        let mut view = InventoryView::default();
+        let all = || entries(snapshot, OverviewMode::Images, false);
+        let rows = visible(all(), &view, OverviewMode::Images, "");
+        assert_eq!(rows[0].status, "running");
+        assert_eq!(rows[1].status, "stopped-only");
+        assert_eq!(rows[2].status, "unreferenced");
+        assert_eq!(
+            visible(all(), &view, OverviewMode::Images, "SCRATCH-REDIS").len(),
+            1
+        );
+        assert_eq!(
+            visible(all(), &view, OverviewMode::Images, "sha256:unused").len(),
+            1
+        );
+        view.filter = 4;
+        assert_eq!(visible(all(), &view, OverviewMode::Images, "").len(), 1);
+        view.filter = 0;
+        view.selected = Some("sha256:demo-api".into());
+        view.sort = 2;
+        let rows = visible(all(), &view, OverviewMode::Images, "");
+        reconcile(&mut view, &rows);
+        assert_eq!(rows[view.index].key, "sha256:demo-api");
+        let volumes = visible(
+            entries(snapshot, OverviewMode::Volumes, false),
+            &InventoryView::default(),
+            OverviewMode::Volumes,
+            "",
+        );
+        assert_eq!(volumes[0].status, "running");
+        assert_eq!(volumes[1].name, "old_cache");
+        assert_eq!(entries(snapshot, OverviewMode::Volumes, true).len(), 1);
+    }
+    #[test]
+    fn selection_follows_identity_across_refresh_and_table_scrolls_to_last_row() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.overview_mode = OverviewMode::Images;
+        let images: Vec<_> = (0..100)
+            .map(|i| Image {
+                id: format!("id-{i}"),
+                tags: vec![format!("image{i:03}:latest")],
+                size: Some(i),
+            })
+            .collect();
+        app.engines[0].snapshot = Some(Snapshot {
+            images: Some(images),
+            ..Default::default()
+        });
+        navigate(&mut app, KeyCode::End, 15);
+        let key = (0, OverviewMode::Images);
+        let mut terminal = Terminal::new(TestBackend::new(100, 15)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut app, frame.area()))
+            .unwrap();
+        assert_eq!(app.inventory_views[&key].selected.as_deref(), Some("id-99"));
+        assert!(app.inventory_views[&key].offset > 0);
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("image099"));
+        app.engines[0]
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .images
+            .as_mut()
+            .unwrap()
+            .push(Image {
+                id: "inserted".into(),
+                tags: vec!["aaa:new".into()],
+                size: None,
+            });
+        terminal
+            .draw(|frame| draw(frame, &mut app, frame.area()))
+            .unwrap();
+        assert_eq!(app.inventory_views[&key].selected.as_deref(), Some("id-99"));
+        assert_eq!(app.inventory_views[&key].index, 100);
+        app.engines[0]
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .images
+            .as_mut()
+            .unwrap()
+            .clear();
+        terminal
+            .draw(|frame| draw(frame, &mut app, frame.area()))
+            .unwrap();
+        assert!(app.inventory_views[&key].selected.is_none());
+        assert_eq!(app.inventory_views[&key].offset, 0);
+    }
+    #[test]
+    fn bind_mounts_are_grouped_without_duplicate_container_references() {
+        let snapshot = Snapshot {
+            containers: vec![
+                Container {
+                    id: "one".into(),
+                    name: "web".into(),
+                    state: "running".into(),
+                    bind_mounts: vec!["/host → /app".into(), "/host → /app".into()],
+                    ..Default::default()
+                },
+                Container {
+                    id: "two".into(),
+                    name: "old-web".into(),
+                    state: "exited".into(),
+                    bind_mounts: vec!["/host → /app".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let rows = entries(&snapshot, OverviewMode::Volumes, true);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].running, rows[0].stopped), (1, 1));
+        assert_eq!(
+            visible(
+                rows,
+                &InventoryView {
+                    filter: 5,
+                    ..Default::default()
+                },
+                OverviewMode::Volumes,
+                "OLD-WEB"
+            )
+            .len(),
+            1
+        );
+    }
+    #[test]
+    fn tables_details_empty_and_unavailable_views_survive_resize() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        for mode in [OverviewMode::Images, OverviewMode::Volumes] {
+            app.overview_mode = mode;
+            for size in [(150, 40), (65, 20), (20, 8), (1, 1)] {
+                for details in [false, true] {
+                    app.inventory_views.entry((0, mode)).or_default().details = details;
+                    let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
+                    terminal
+                        .draw(|frame| draw(frame, &mut app, frame.area()))
+                        .unwrap();
+                }
+            }
+        }
+        app.engines[0].snapshot.as_mut().unwrap().volumes_available = false;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut app, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Inventory unavailable"));
+    }
+}

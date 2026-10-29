@@ -13,12 +13,28 @@ installation or sudo is needed. The following downloads the latest stable
 release, verifies its SHA-256 checksum, and installs `tha` into `~/.local/bin`.
 Requires `curl`, `tar`, and either `sha256sum` (Linux) or `shasum` (macOS).
 
+Choose an install mode with `THA_MODE` (the default is `standalone`):
+
+| Mode | What it installs |
+| --- | --- |
+| `standalone` | Only the `tha` binary. Metrics are sampled while the UI is open; no background process. |
+| `service` | The binary plus the per-user [background collector](#cpu-and-memory) (launchd/systemd, no sudo), started immediately so History keeps 24 hours of metrics. |
+
+For service mode, run `export THA_MODE=service` first, then paste the installer.
+Re-running the installer upgrades in place; a running service is stopped before the
+binary is replaced and started again afterwards, in either mode.
+
 **Release downloads become available after the first version tag is published.**
 Until then, use the source-build instructions below.
 
 ```sh
 (
   set -eu
+  mode="${THA_MODE:-standalone}"
+  case "$mode" in
+    standalone|service) ;;
+    *) echo "THA_MODE must be standalone or service, not '$mode'." >&2; exit 1 ;;
+  esac
   case "$(uname -s)-$(uname -m)" in
     Linux-x86_64|Linux-amd64) asset=tha-linux-amd64.tar.gz ;;
     Linux-aarch64|Linux-arm64) asset=tha-linux-arm64.tar.gz ;;
@@ -45,9 +61,22 @@ Until then, use the source-build instructions below.
     fi
   )
   tar -xzf "$tmp/$asset" -C "$tmp" tha
+  bin="$HOME/.local/bin/tha"
+  running=0
+  # Never replace the executable under a running collector.
+  if [ -x "$bin" ] && "$bin" service status 2>/dev/null | grep -q ': running$'; then
+    "$bin" service stop
+    running=1
+  fi
   mkdir -p "$HOME/.local/bin"
-  install -m 755 "$tmp/tha" "$HOME/.local/bin/tha"
-  "$HOME/.local/bin/tha" --version
+  install -m 755 "$tmp/tha" "$bin"
+  "$bin" --version
+  if [ "$mode" = service ]; then
+    "$bin" service install
+    "$bin" service start
+  elif [ "$running" = 1 ]; then
+    "$bin" service start
+  fi
 )
 ```
 
@@ -57,6 +86,11 @@ Then run `~/.local/bin/tha`, or add `~/.local/bin` to your `PATH`:
 export PATH="$HOME/.local/bin:$PATH"
 tha
 ```
+
+To switch an existing install from `service` to `standalone`, run
+`tha service uninstall` (history and configuration are kept). To switch from
+`standalone` to `service`, re-run the installer with `THA_MODE=service`, or run
+`tha service install && tha service start`.
 
 Linux archives are statically linked with musl, avoiding a dependency on the
 build runner's glibc version. ARM means **64-bit ARM**, not ARMv7. The macOS binary
@@ -78,7 +112,8 @@ interactive exec requires an installed runtime CLI.
 ```sh
 make demo       # Try the UI without contacting any runtime
 make run        # Discover and browse your actual engines
-make install    # Install tha into ~/.cargo/bin, or your configured Cargo root
+make install                # Standalone: install tha into ~/.cargo/bin (or your Cargo root)
+make install MODE=service   # Also install and start the per-user background collector
 tha
 ```
 
@@ -217,7 +252,7 @@ your navigation. Demo mode never auto-opens a project.
 | `Esc` (Performance expanded) | Restore compact view first |
 | `o` / `:sort-contexts` | Choose connected-first, name, CPU, or memory context order |
 | `S` / `s` / `r` / `d` in Explorer | Start / Stop / Restart / Delete selected container or Compose workload |
-| `1` / `2` / `3` / `4` / `5` | Overview / Logs / Networks / Exec / Layers on the right |
+| `1` / `2` / `3` / `4` / `5` / `6` | Overview / Logs / Networks / Exec / Metrics / Layers on the right |
 | `a` / `:actions` | Contextual lifecycle menu with eligibility counts and disabled reasons |
 | `F3` in Logs / `:filter-logs` | Edit structured retained-log filters |
 | `:clear-log-filter` | Clear filters without clearing highlighted search |
@@ -280,18 +315,79 @@ semantic multiline grouping, and export are follow-up work.
 
 ## CPU and memory
 
-### Background collection and container History
+### Runtime Images and Volumes
 
-Press **`6`** on a container (or `:history`) for CPU, RAM, disk read/write and
+Use **F7 / F8** to cycle backward/forward through Containers, Images and Volumes.
+**Shift+Left / Shift+Right** also cycles these three overview screens.
+Existing configured navigation bindings take precedence over these defaults.
+Or switch directly with **Alt+1** (Containers),
+**Alt+2** (Images, also `:images`), and **Alt+3** (Volumes, also `:volumes`).
+On macOS these are **Option+1/2/3**; configure your terminal's Option key to send
+Alt/Meta (Esc-prefixed keys), rather than special characters. The commands work
+when a terminal intercepts these shortcuts.
+Images and Volumes are not container detail tabs. Use **Left/Right** to select
+a runtime and **Up/Down**, **j/k**, or **PageUp/PageDown** to select table rows.
+**gg / G** (or Home / End) selects the first / last row. Tables sort running
+references first, then stopped-only, unreferenced, and unknown usage.
+**s** cycles usage / name / descending size sorting (unknown sizes last).
+**/** opens case-insensitive search across names, tags, IDs, projects, mount
+metadata and referencing containers. Search previews as you type; Enter applies,
+Esc cancels, and Ctrl-U clears the query. **f** cycles status filters; Images also
+offers Untagged, and Volumes offers a separate Bind mounts filter.
+**Enter** opens full details alongside the table on wide terminals, or in place
+of the table on smaller terminals; j/k and paging scroll details. **Esc** closes
+details first, then returns to Containers. **Alt+1** returns without changing its selection or detail
+tab. Plain **1–6** retain their existing container detail-tab shortcuts; **7/8**
+are not assigned. Both inventories include resources outside the current workspace.
+Selection, search, filter and sort are kept independently for each runtime/view
+during the session. Selection follows resource identity across refreshes.
+
+Both views show running and stopped container references. Images include tags,
+IDs and reported sizes; untagged does not necessarily mean unused. Usage is marked
+unknown when missing image IDs prevent proving that an image is unreferenced.
+Volume driver/mountpoint metadata is shown when reported; sizes remain unknown
+rather than scanning filesystems. Shared image layers mean image sizes cannot be
+added up to estimate reclaimable space. Unreferenced resources are not necessarily
+safe to delete.
+
+**Delete** (or **d**) offers explicit removal of one **unreferenced image or managed volume**.
+Type the full image ID or exact volume name in the confirmation. Deleting a volume
+permanently destroys its stored data. Tha rechecks runtime identity and all running
+and stopped container references before sending a non-forced removal. Referenced
+resources, unknown image usage, bind mounts and demo mode are protected. There is
+no bulk prune, forced removal, or parent-image pruning. Failed/time-out responses
+are not retried automatically; refresh and verify the outcome before trying again.
+
+Compose projects disappear from the Containers explorer after their final
+container is removed and a successful inventory refresh arrives. Retained labelled
+networks/volumes do not recreate empty stacks: they remain available under runtime
+resources and in Volumes. Stopped containers still keep their project visible.
+
+Docker-compatible runtimes (including Podman) use the existing snapshot inventory.
+Unsupported or failed inventory queries display an unavailable message, not an
+empty inventory; native containerd inventory is currently unavailable.
+
+### Background collection and container Metrics
+
+Press **`5`** on a container (or `:metrics`; `:history` remains an alias) for CPU, RAM, disk read/write and
 network receive/transmit charts. **`[` / `]`** choose 1 minute, 5 minutes,
 15 minutes, 1 hour or 24 hours. **Left/right** browse the timeline; **`f`** returns
 to live. **`c`** enables a shared time cursor and **`h` / `l`** inspect readings.
-**`z`** enlarges History across the terminal and **Esc** restores the split view.
+**`z`** enlarges Metrics across the terminal and **Esc** restores the split view.
 Small terminals show one metric group at a time; **`j` / `k`** switches groups.
 Times are UTC. Downsampled charts preserve bucket peaks; cursor values are bucket
 averages. Unsupported/missing data stays absent, not zero. Disk/network rates use
 actual elapsed time and reset safely if counters decrease; totals are retained
 in the database. These are runtime-reported container I/O, not filesystem size.
+
+Metrics uses gap-aware Braille line charts with labeled, zero-based vertical axes.
+CPU is shown in percent (**100% = one core**) and the inspected reading also shows
+cores; memory and I/O retain absolute byte/rate units. Each runtime/container/range
+has independent adaptive scales, based on its own weighted averages and peaks.
+Scales expand immediately with headroom; they shrink only after 30 seconds of
+sustained lower demand, and stay fixed while inspecting a paused window. CPU/RAM
+show a dotted average reference; paired I/O lines use blue for read/receive and the
+second color for write/transmit. Peak markers preserve spikes after downsampling.
 
 Collection is **opt-in** and read-only:
 
@@ -307,8 +403,9 @@ tha history compact           # Offline maintenance; stop daemon first
 tha --standalone               # No daemon/history DB; session-only sampling
 ```
 
-Alternatively, `make install MODE=service` explicitly installs and starts the
-user service. Plain `make install` remains CLI-only. No sudo or system-wide
+Alternatively, install in service mode with the [quick installer](#quick-install)
+(`THA_MODE=service`) or `make install MODE=service`; both install and start the
+user service. The default `standalone` mode installs only the CLI. No sudo or system-wide
 service is used. Services run as your user and need the same runtime/socket
 permissions and CLI availability as interactive Tha. Use
 `tha --config /absolute/path/config.toml service install` to pin a configuration.
@@ -322,7 +419,7 @@ not start/stop containers, collect logs, pull images, or store container secrets
 The UI automatically uses daemon metrics while its writer lock is active;
 starting/stopping the daemon hands collection between modes. Missing daemon
 targets stay unavailable instead of triggering a second metrics collector.
-Without a daemon, History is session-only and currently limited to the most
+Without a daemon, Metrics is session-only and currently limited to the most
 recent **60 sampling batches**, clearly labelled in the view.
 
 Default history paths:
@@ -584,13 +681,16 @@ a partial **new** export file, never a truncated existing file.
 
 ## Image layers
 
-Press **`5`** (or `:layers`) with one container selected, including a one-container
+Press **`6`** (or `:layers`) with one container selected, including a one-container
 service. Tha asynchronously inspects the container's resolved image, never a mutable
 tag. The view separates **uncompressed filesystem diff IDs** (base → top) from
 **build history** (base → top). `j`/`k`, paging, and `gg`/`G` select rows; Enter opens
 details, where `j`/`k` scroll and Enter/Esc returns. `:reload-layers` retries a failed
 lookup. Switching selection/endpoints cancels the previous lookup and discards late
 results. Demo mode uses explicit seeded metadata without contacting an engine.
+The list is a selectable table with row number, kind, size, and a shortened diff
+ID. Enter shows the full identifier or wrapped instruction/comment separately,
+without losing your table selection or scroll position on return.
 
 Filesystem sizes and history-to-filesystem mappings are shown as unavailable when
 the runtime does not provide them. A zero-byte history step is **not** assumed to

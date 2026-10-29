@@ -16,7 +16,10 @@ run: ## Run Tha (use ARGS="..." for CLI options)
 demo: ## Explore fixture workloads without a running engine
 	cargo run --locked -- --demo
 
-install: ## Install tha into Cargo's bin directory (no sudo)
+MODE ?= standalone
+
+install: ## Install tha into Cargo's bin directory (MODE=standalone|service, no sudo)
+	@case "$(MODE)" in standalone|service) ;; *) echo "MODE must be standalone or service" >&2; exit 1 ;; esac
 	cargo install --path . --locked
 	@if [ "$(MODE)" = "service" ]; then "$${CARGO_HOME:-$$HOME/.cargo}/bin/tha" service install && "$${CARGO_HOME:-$$HOME/.cargo}/bin/tha" service start; fi
 

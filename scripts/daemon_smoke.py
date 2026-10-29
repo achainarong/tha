@@ -195,7 +195,8 @@ def main():
                 raise AssertionError(f"Missing {value!r}:\n"+"\n".join(screen.display))
 
             drain(1)
-            keys(b"/history-container-0\rG6z")
+            keys(b"/history-container-0\rG5z")
+            expect("Metrics ·")
             expect("1 minute")
             expect("Disk read / write")
             expect("Network receive / transmit")

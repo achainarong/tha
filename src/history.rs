@@ -623,12 +623,121 @@ pub struct View {
     pub loading: bool,
     pub error: Option<String>,
     pub generation: u64,
+    scale_cache: std::collections::VecDeque<((String, String, usize), ChartScale)>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChartScale {
+    pub limits: [f64; 4],
+    pub averages: [Option<f64>; 6],
+    pub peaks: [Option<f64>; 6],
+    last_end: i64,
+    below_since: [Option<i64>; 4],
+    paused_bounds: Option<(i64, i64)>,
+}
+
+fn rounded_limit(group: usize, value: f64) -> f64 {
+    let minimum = if group == 0 {
+        0.1
+    } else if group == 1 {
+        1024.0 * 1024.0
+    } else {
+        1.0
+    };
+    let value = value.max(minimum);
+    if group == 0 {
+        let base = 10f64.powf(value.log10().floor());
+        for multiple in [1.0, 2.0, 2.5, 5.0, 10.0] {
+            if multiple * base >= value {
+                return multiple * base;
+            }
+        }
+    }
+    let step = 2f64.powf(value.log2().floor()) / 4.0;
+    (value / step).ceil() * step
+}
+
+impl ChartScale {
+    fn update(&mut self, data: &Data, paused: bool) {
+        let mut sums = [0.0; 6];
+        let mut counts = [0u64; 6];
+        self.peaks = [None; 6];
+        for point in &data.points {
+            for metric in 0..6 {
+                if let Some(value) =
+                    point.values[metric].filter(|value| value.is_finite() && *value >= 0.0)
+                {
+                    sums[metric] += value * point.valid[metric] as f64;
+                    counts[metric] = counts[metric].saturating_add(point.valid[metric]);
+                }
+                if let Some(peak) = point.peaks[metric]
+                    .or(point.values[metric])
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                {
+                    self.peaks[metric] = Some(self.peaks[metric].unwrap_or(0.0).max(peak));
+                }
+            }
+        }
+        self.averages = std::array::from_fn(|metric| {
+            (counts[metric] > 0).then(|| sums[metric] / counts[metric] as f64)
+        });
+        let paused_bounds = paused.then_some((data.start_ms, data.end_ms));
+        let reset = self.limits[0] == 0.0 || self.paused_bounds != paused_bounds;
+        let frozen = paused && !reset;
+        for (group, metrics) in [&[0][..], &[1][..], &[2, 3][..], &[4, 5][..]]
+            .iter()
+            .enumerate()
+        {
+            let peak = metrics
+                .iter()
+                .filter_map(|&metric| self.peaks[metric])
+                .fold(0.0, f64::max);
+            let mean = metrics
+                .iter()
+                .filter_map(|&metric| self.averages[metric])
+                .fold(0.0, f64::max);
+            let target = rounded_limit(group, (peak * 1.15).max(mean * 1.25));
+            if reset || (!frozen && target > self.limits[group]) {
+                self.limits[group] = target;
+                self.below_since[group] = None;
+            } else if !frozen && data.end_ms > self.last_end {
+                if target <= self.limits[group] * 0.65 {
+                    let since = self.below_since[group].get_or_insert(data.end_ms);
+                    if data.end_ms.saturating_sub(*since) >= 30_000 {
+                        self.limits[group] = target;
+                        self.below_since[group] = None;
+                    }
+                } else {
+                    self.below_since[group] = None;
+                }
+            }
+        }
+        self.last_end = data.end_ms;
+        self.paused_bounds = paused_bounds;
+    }
 }
 pub struct Event {
     pub generation: u64,
     pub data: Result<Data, String>,
 }
 impl View {
+    /// Bounded LRU, keyed by runtime identity, immutable container key and selected range.
+    pub fn chart_scale(&mut self, runtime: String, container: String) -> ChartScale {
+        let key = (runtime, container, self.range);
+        let mut scale = self
+            .scale_cache
+            .iter()
+            .position(|(old, _)| old == &key)
+            .and_then(|index| self.scale_cache.remove(index))
+            .map(|(_, scale)| scale)
+            .unwrap_or_default();
+        scale.update(&self.data, self.end_ms.is_some());
+        self.scale_cache.push_back((key, scale.clone()));
+        while self.scale_cache.len() > 128 {
+            self.scale_cache.pop_front();
+        }
+        scale
+    }
     pub fn bounds(&self) -> (i64, i64) {
         let end = self.end_ms.unwrap_or_else(now_ms);
         (end - RANGES[self.range], end)
@@ -792,6 +901,61 @@ pub(crate) mod tests {
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(Store::open(&link, 16 * 1024 * 1024).is_err());
         assert!(reader(&link).is_err());
+    }
+    #[test]
+    fn adaptive_scales_are_container_scoped_weighted_and_stable_when_paused() {
+        let data = |end, peak| Data {
+            start_ms: end - 60_000,
+            end_ms: end,
+            points: vec![Point {
+                at_ms: end - 1000,
+                values: [Some(peak); 6],
+                peaks: [Some(peak); 6],
+                count: 1,
+                valid: [1; 6],
+            }],
+            ..Default::default()
+        };
+        let mut view = View {
+            data: data(60_000, 8.0),
+            ..Default::default()
+        };
+        let normal = view.chart_scale("runtime".into(), "one".into());
+        assert_eq!(normal.limits[0], 10.0);
+        view.data = data(61_000, 150.0);
+        let spike = view.chart_scale("runtime".into(), "one".into());
+        assert!(spike.limits[0] >= 150.0);
+        view.data = data(62_000, 2.0);
+        assert!(view.chart_scale("runtime".into(), "two".into()).limits[0] < spike.limits[0]);
+        assert_eq!(
+            view.chart_scale("runtime".into(), "one".into()).limits[0],
+            spike.limits[0]
+        );
+        view.data = data(93_000, 2.0);
+        let low = view.chart_scale("runtime".into(), "one".into());
+        assert!(low.limits[0] < spike.limits[0]);
+        view.end_ms = Some(93_000);
+        let paused = view.chart_scale("runtime".into(), "one".into());
+        view.data.points.clear();
+        assert_eq!(
+            view.chart_scale("runtime".into(), "one".into()).limits,
+            paused.limits
+        );
+        view.data = data(94_000, 4.0);
+        view.data.points.push(Point {
+            at_ms: 93_000,
+            values: [Some(10.0); 6],
+            peaks: [Some(10.0); 6],
+            count: 3,
+            valid: [3; 6],
+        });
+        let weighted = view.chart_scale("runtime".into(), "three".into());
+        assert_eq!(weighted.averages[0], Some(8.5));
+        assert_eq!(weighted.peaks[0], Some(10.0));
+        for i in 0..150 {
+            view.chart_scale("runtime".into(), format!("container-{i}"));
+        }
+        assert_eq!(view.scale_cache.len(), 128);
     }
     #[test]
     fn ranges_and_pan_are_bounded_to_retention() {

@@ -325,12 +325,21 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
             .unwrap_or_default()
             .into_keys()
             .collect();
-        let volumes = item
-            .mounts
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|mount| mount.name)
+        let mounts = item.mounts.unwrap_or_default();
+        let bind_mounts = mounts
+            .iter()
+            .filter(|mount| mount.typ.as_ref().is_some_and(|kind| kind == "bind"))
+            .filter_map(|mount| {
+                mount.source.as_ref().map(|source| {
+                    format!(
+                        "{} → {}",
+                        source,
+                        mount.destination.as_deref().unwrap_or("?")
+                    )
+                })
+            })
             .collect();
+        let volumes = mounts.into_iter().filter_map(|mount| mount.name).collect();
         let image_platform = item
             .image_manifest_descriptor
             .as_ref()
@@ -369,6 +378,7 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
             port_bindings,
             networks,
             volumes,
+            bind_mounts,
             namespace: None,
         });
     }
@@ -435,6 +445,7 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
     }
     match docker.list_volumes(None::<ListVolumesOptions>).await {
         Ok(volumes) => {
+            result.volumes_available = true;
             result.warnings.extend(volumes.warnings.unwrap_or_default());
             for volume in volumes.volumes.unwrap_or_default() {
                 let labels = volume.labels.into_iter().collect();
@@ -455,7 +466,7 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
                     external: project.is_none() || owners.len() > 1,
                     name: volume.name,
                     project,
-                    details: format!("driver: {}", volume.driver),
+                    details: format!("driver: {} · mount: {}", volume.driver, volume.mountpoint),
                 });
             }
         }

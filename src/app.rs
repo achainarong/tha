@@ -5,7 +5,7 @@ use crate::{
     model::{Condition, Container, Snapshot, Tone},
     workspace::Project,
 };
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -98,10 +98,39 @@ pub enum Tab {
     History,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OverviewMode {
+    #[default]
+    Containers,
+    Images,
+    Volumes,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct InventoryView {
+    pub query: String,
+    pub filter: usize,
+    pub sort: usize,
+    pub selected: Option<String>,
+    pub index: usize,
+    pub offset: usize,
+    pub details: bool,
+    pub details_scroll: usize,
+    pub pending_g: bool,
+}
+
+pub struct InventoryRemoval {
+    pub request: crate::backend::RemovalRequest,
+    pub typed: String,
+    pub visible: bool,
+    pub pending: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
     Search,
+    InventorySearch,
     Command,
     LogFilter,
     ExportLogs,
@@ -207,6 +236,11 @@ pub enum PerformanceScope {
 }
 
 pub struct App {
+    pub overview_mode: OverviewMode,
+    pub inventory_engine: usize,
+    pub inventory_views: HashMap<(usize, OverviewMode), InventoryView>,
+    pub inventory_removal: Option<InventoryRemoval>,
+    pub inventory_removal_request: Option<crate::backend::RemovalRequest>,
     pub discover_connections: bool,
     pub history_view: crate::history::View,
     pub history_database: Option<PathBuf>,
@@ -332,6 +366,11 @@ impl App {
             performance_focus: false,
             performance_scroll: 0,
             performance_offset: 0,
+            overview_mode: OverviewMode::Containers,
+            inventory_engine: 0,
+            inventory_views: HashMap::new(),
+            inventory_removal: None,
+            inventory_removal_request: None,
             detail_scroll: 0,
             log_view: LogView::new(true),
             log_filter_text: "{}".into(),
@@ -385,6 +424,7 @@ impl App {
     }
 
     pub fn update_engine(&mut self, index: usize, result: Result<Snapshot, String>) {
+        let refreshed = result.is_ok();
         self.invalidate_presentations();
         let performance_engine = self.performance_engine();
         match result {
@@ -431,6 +471,25 @@ impl App {
                     })
                     .map(|other| self.engines[other].connection.name.clone())
             });
+        }
+        if refreshed
+            && self.project.as_ref().is_some_and(|project| {
+                project.engine == index
+                    && self.engines[index]
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| {
+                            !snapshot
+                                .containers
+                                .iter()
+                                .any(|container| project.contains(container))
+                        })
+            })
+        {
+            while self.back() {}
+            self.project = None;
+            self.detail_scroll = 0;
+            self.notice = "Compose project has no containers; returned to all runtimes. Retained resources are still available.".into();
         }
         self.refresh_tree();
         self.restore_performance_focus(performance_engine);
@@ -2204,19 +2263,10 @@ fn workload_tree(index: usize, snapshot: &Snapshot, namespace: Option<&String>) 
         .iter()
         .filter(|c| c.namespace.as_ref() == namespace)
         .collect();
-    let mut projects: BTreeSet<_> = containers
+    let projects: BTreeSet<_> = containers
         .iter()
         .filter_map(|c| c.project.as_ref())
         .collect();
-    if namespace.is_none() {
-        projects.extend(
-            snapshot
-                .networks
-                .iter()
-                .chain(&snapshot.volumes)
-                .filter_map(|r| r.project.as_ref()),
-        );
-    }
     let mut nodes = Vec::new();
     for project in projects {
         let scope = Scope::Project {
@@ -2313,7 +2363,11 @@ fn resource_nodes(index: usize, snapshot: &Snapshot, project: Option<&String>) -
                             c.project.as_ref() == Some(project) && r.containers.contains(&c.name)
                         })
                 } else {
-                    r.project.is_none() || r.external
+                    r.project.is_none()
+                        || r.external
+                        || !snapshot.containers.iter().any(|container| {
+                            container.namespace.is_none() && container.project == r.project
+                        })
                 }
             })
             .map(|r| {
@@ -3712,7 +3766,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_only_projects_show_zero_counts() {
+    fn resource_only_projects_do_not_create_ghost_workloads_and_resources_remain_visible() {
         let mut app = app();
         app.update_engine(
             0,
@@ -3726,8 +3780,68 @@ mod tests {
             }),
         );
         let tree = engine_tree(0, &app.engines[0]);
-        assert_eq!(tree.children[0].row.title, "empty [0/0 running]");
-        assert_eq!(tree.children[0].children[0].row.title, "Services (0)");
+        assert!(
+            !tree
+                .children
+                .iter()
+                .any(|node| matches!(node.row.scope, Scope::Project { .. }))
+        );
+        assert!(tree.children.iter().any(|node| {
+            node.children
+                .iter()
+                .any(|resource| resource.row.title.contains("empty_default"))
+        }));
+    }
+
+    #[test]
+    fn deleting_last_compose_container_leaves_resources_but_exits_workspace_on_successful_refresh()
+    {
+        let mut app = app();
+        app.engines[0]
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .volumes
+            .push(crate::model::Resource {
+                name: "shop_data".into(),
+                project: Some("shop".into()),
+                ..Default::default()
+            });
+        app.open_project(Project {
+            engine: 0,
+            namespace: None,
+            name: "shop".into(),
+        });
+        let original = app.engines[0].snapshot.clone().unwrap();
+        app.update_engine(0, Err("temporary failure".into()));
+        assert!(
+            app.project.is_some(),
+            "A failed refresh must not claim a stack was removed"
+        );
+        let mut remaining = original.clone();
+        remaining
+            .containers
+            .retain(|container| container.project.as_deref() != Some("shop"));
+        app.update_engine(0, Ok(remaining));
+        assert!(app.project.is_none());
+        let tree = engine_tree(0, &app.engines[0]);
+        assert!(
+            !tree.children.iter().any(
+                |node| matches!(&node.row.scope,Scope::Project {project,..} if project=="shop")
+            )
+        );
+        assert!(!app.engines[0].snapshot.as_ref().unwrap().volumes.is_empty());
+        let mut stopped = original;
+        for container in &mut stopped.containers {
+            container.state = "exited".into();
+        }
+        app.update_engine(0, Ok(stopped));
+        assert!(
+            engine_tree(0, &app.engines[0]).children.iter().any(
+                |node| matches!(&node.row.scope,Scope::Project {project,..} if project=="shop")
+            ),
+            "Stopped containers must remain visible"
+        );
     }
 
     #[test]

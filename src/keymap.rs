@@ -46,7 +46,8 @@ impl Keymap {
                 "logs" => KeyCode::Char('2'),
                 "networks" => KeyCode::Char('3'),
                 "exec" => KeyCode::Char('4'),
-                "layers" => KeyCode::Char('5'),
+                "metrics" => KeyCode::Char('5'),
+                "layers" => KeyCode::Char('6'),
                 "open-exec" => KeyCode::Char('e'),
                 "actions" => KeyCode::Char('a'),
                 "performance" => KeyCode::Char('p'),
@@ -89,6 +90,19 @@ mod tests {
                 "{key}"
             );
         }
+        let map = Keymap::parse(&BTreeMap::from([
+            ("m".into(), "metrics".into()),
+            ("l".into(), "layers".into()),
+        ]))
+        .unwrap();
+        assert_eq!(
+            map.translate(KeyEvent::from(KeyCode::Char('m'))).code,
+            KeyCode::Char('5')
+        );
+        assert_eq!(
+            map.translate(KeyEvent::from(KeyCode::Char('l'))).code,
+            KeyCode::Char('6')
+        );
         assert!(
             Keymap::parse(&BTreeMap::from([(
                 "x".into(),

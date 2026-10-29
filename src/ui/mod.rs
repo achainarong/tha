@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, Choice, InputMode, PerformanceScope, ResourceKind, Scope, Tab},
+    app::{App, Choice, InputMode, OverviewMode, PerformanceScope, ResourceKind, Scope, Tab},
     config::BackendKind,
     logs::view::{self as log_view, Field},
     metrics,
@@ -18,6 +18,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 mod history;
+pub mod inventory;
 
 pub const COMMANDS: &[(&str, &str)] = &[
     (
@@ -26,8 +27,20 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     ("overview", "Show workload overview"),
     (
+        "metrics",
+        "Analyze the selected container's CPU, RAM, disk and network metrics (5)",
+    ),
+    (
+        "images",
+        "Switch to Images overview (Alt/Option+2; guarded unused-image removal)",
+    ),
+    (
+        "volumes",
+        "Switch to Volumes overview (Alt/Option+3; guarded unused-volume removal)",
+    ),
+    (
         "history",
-        "Analyze the selected container's CPU, RAM, disk and network history",
+        "Alias for metrics: live and historical container readings (5)",
     ),
     ("logs", "Open logs for the selected workload"),
     ("networks", "Show network membership"),
@@ -37,7 +50,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("exec", "Open a shell in the selected container"),
     (
         "layers",
-        "Inspect resolved image filesystem layers and build history (5)",
+        "Inspect resolved image filesystem layers and build history (6)",
     ),
     ("reload-layers", "Retry image layers lookup (read-only)"),
     (
@@ -113,6 +126,9 @@ fn condition_style(app: &App, condition: Condition) -> Style {
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.reconcile_detail_tab();
     app.action_review_visible = false;
+    if let Some(removal) = app.inventory_removal.as_mut() {
+        removal.visible = false;
+    }
     app.log_export_review_visible = false;
     let area = frame.area();
     if area.width < 32 || area.height < 10 {
@@ -141,11 +157,34 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Span::styled(" ⊤ Tha ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(if app.demo { " Demo · " } else { " " }),
         Span::styled(
+            format!(
+                "{} · {} · {}  ",
+                if app.overview_mode == OverviewMode::Containers {
+                    "[Containers]"
+                } else {
+                    "Containers"
+                },
+                if app.overview_mode == OverviewMode::Images {
+                    "[Images]"
+                } else {
+                    "Images"
+                },
+                if app.overview_mode == OverviewMode::Volumes {
+                    "[Volumes]"
+                } else {
+                    "Volumes"
+                }
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
             format!("{connected} connected / {} configured", app.engines.len()),
             muted(),
         ),
     ]);
-    let breadcrumb = if let Some(project) = &app.project {
+    let breadcrumb = if app.overview_mode != OverviewMode::Containers {
+        " Shift+←/→ or F7/F8 Overview · ←/→ Runtime · ↑/↓ Select · / Search · Enter Details".into()
+    } else if let Some(project) = &app.project {
         format!(
             " All runtimes › {}{} › {}  · Backspace Back",
             safe_text(&app.engines[project.engine].connection.name),
@@ -163,9 +202,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Paragraph::new(vec![header, Line::styled(breadcrumb, muted())]),
         layout[0],
     );
-    let history_zoom = app.tab == Tab::History && app.history_view.expanded;
-    let expanded =
-        !history_zoom && app.performance_open && app.performance_expanded && layout[1].height >= 20;
+    let history_zoom = app.overview_mode == OverviewMode::Containers
+        && app.tab == Tab::History
+        && app.history_view.expanded;
+    let expanded = app.overview_mode == OverviewMode::Containers
+        && !history_zoom
+        && app.performance_open
+        && app.performance_expanded
+        && layout[1].height >= 20;
     let body = if expanded {
         let parts = Layout::vertical([
             Constraint::Min(8),
@@ -177,7 +221,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         layout[1]
     };
-    if history_zoom {
+    if app.overview_mode != OverviewMode::Containers {
+        inventory::draw_overview(frame, app, body);
+    } else if history_zoom {
         history::draw(frame, app, body);
     } else if area.width >= 110 {
         let tree_width = (area.width / 2).clamp(52, 72);
@@ -214,6 +260,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.action_confirmation.is_some() || app.action_results_visible {
         draw_action(frame, app, area);
     }
+    inventory::draw_removal(frame, app, area);
 }
 
 fn draw_log_editor(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -867,8 +914,8 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::Logs => "2 Logs",
         Tab::Networks => "3 Networks",
         Tab::Exec => "4 Exec",
-        Tab::Layers => "5 Layers",
-        Tab::History => "6 History",
+        Tab::Layers => "6 Layers",
+        Tab::History => "5 Metrics",
     };
     let exec_context = if app.tab == Tab::Exec {
         app.sessions
@@ -896,26 +943,26 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Min(1),
     ])
     .split(inner);
-    let mut names = if inner.width >= 62 {
-        vec!["1 Overview", "2 Logs", "3 Networks", "4 Exec", "5 Layers"]
-    } else if inner.width >= 44 {
-        vec!["1 Info", "2 Logs", "3 Net", "4 Exec", "5 Layers"]
+    let mut names = if inner.width >= 82 {
+        vec!["1 Overview", "2 Logs", "3 Networks", "4 Exec"]
+    } else if inner.width >= 70 {
+        vec!["1 Info", "2 Logs", "3 Net", "4 Exec"]
     } else {
-        vec!["1", "2", "3", "4", "5"]
+        vec!["1", "2", "3", "4"]
     };
-    if !app.layers_available() {
-        names.pop();
-    }
     if app.performance_container().is_some() {
-        names.push(if inner.width >= 44 { "6 History" } else { "6" });
+        names.push(if inner.width >= 44 { "5 Metrics" } else { "5" });
+    }
+    if app.layers_available() {
+        names.push(if inner.width >= 44 { "6 Layers" } else { "6" });
     }
     let active = match app.tab {
         Tab::Overview => 0,
         Tab::Logs => 1,
         Tab::Networks => 2,
         Tab::Exec => 3,
-        Tab::Layers => 4,
-        Tab::History => names.len().saturating_sub(1),
+        Tab::Layers => names.len().saturating_sub(1),
+        Tab::History => 4,
     };
     frame.render_widget(
         Tabs::new(names)
@@ -1026,8 +1073,89 @@ fn draw_layers(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         State::Ready(image) => image,
     };
-    let mut lines = vec![Line::from(format!("Resolved image: {}", image.id))];
-    let mut selected_line = 0;
+    if !app.layers.expanded {
+        let parts = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        frame.render_widget(
+            Paragraph::new(ellipsize_line(
+                Line::from(format!("Image: {}", image.id)),
+                area.width as usize,
+            ))
+            .style(muted()),
+            parts[0],
+        );
+        frame.render_widget(Paragraph::new(format!("Filesystem layers ({}) · Build history ({})\nBase → top · separate sections, not a guessed layer/step mapping",image.filesystem.len(),image.history.len())).style(muted()),parts[1]);
+        let mut rows = Vec::new();
+        for (index, id) in image.filesystem.iter().enumerate() {
+            rows.push(TableRow::new(vec![
+                Cell::from((index + 1).to_string()),
+                Cell::from("Filesystem"),
+                Cell::from("unknown"),
+                Cell::from(ellipsize_line(
+                    Line::from(safe_text(id)),
+                    parts[2].width.saturating_sub(32) as usize,
+                )),
+            ]));
+        }
+        for (index, step) in image.history.iter().enumerate() {
+            rows.push(TableRow::new(vec![
+                Cell::from((index + 1).to_string()),
+                Cell::from(if step.empty_layer == Some(true) {
+                    "Metadata"
+                } else {
+                    "Build step"
+                }),
+                Cell::from(
+                    step.size
+                        .map(metrics::bytes)
+                        .unwrap_or_else(|| "unknown".into()),
+                ),
+                Cell::from("instruction hidden · Enter details"),
+            ]));
+        }
+        app.layers.selected = app.layers.selected.min(image.rows().saturating_sub(1));
+        let mut state = ratatui::widgets::TableState::default()
+            .with_offset(app.layers.offset)
+            .with_selected((image.rows() > 0).then_some(app.layers.selected));
+        frame.render_stateful_widget(
+            Table::new(
+                rows,
+                [
+                    Constraint::Length(3),
+                    Constraint::Length(10),
+                    Constraint::Length(10),
+                    Constraint::Min(1),
+                ],
+            )
+            .header(
+                TableRow::new(["#", "Kind", "Size", "Diff ID / instruction"])
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
+            )
+            .column_spacing(1)
+            .row_highlight_style(selected())
+            .highlight_symbol("▸ "),
+            parts[2],
+            &mut state,
+        );
+        app.layers.offset = state.offset();
+        frame.render_widget(
+            Paragraph::new("j/k Select · Enter Details · :reload-layers Retry").style(muted()),
+            parts[3],
+        );
+        return;
+    }
+    let mut lines = vec![
+        Line::styled(
+            "Layer details",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::from(format!("Resolved image: {}", image.id)),
+    ];
     if app.layers.expanded {
         lines.push(Line::styled(
             "Enter/Esc Back · j/k/PgUp/PgDn Scroll",
@@ -1057,86 +1185,16 @@ fn draw_layers(frame: &mut Frame, app: &mut App, area: Rect) {
                     .map(metrics::bytes)
                     .unwrap_or_else(|| "unavailable".into())
             )));
-            lines.push(Line::from(format!("Instruction: {}", step.instruction)));
+            lines.push(Line::from("Instruction:"));
+            lines.push(Line::from(step.instruction.clone()));
             if !step.comment.is_empty() {
-                lines.push(Line::from(format!("Comment: {}", step.comment)));
+                lines.push(Line::from("Comment:"));
+                lines.push(Line::from(step.comment.clone()));
             }
         }
-    } else {
-        lines.push(Line::styled(
-            "j/k Select · Enter Details · :reload-layers Retry",
-            muted(),
-        ));
-        lines.push(Line::from(format!(
-            "Filesystem layers ({}) · base → top · sizes unavailable",
-            image.filesystem.len()
-        )));
-        for (index, id) in image.filesystem.iter().enumerate() {
-            if index == app.layers.selected {
-                selected_line = lines.len();
-            }
-            lines.push(Line::styled(
-                format!(
-                    "{} {}. {id}",
-                    if index == app.layers.selected {
-                        "▸"
-                    } else {
-                        " "
-                    },
-                    index + 1
-                ),
-                if index == app.layers.selected {
-                    selected()
-                } else {
-                    Style::default()
-                },
-            ));
-        }
-        lines.push(Line::from(format!(
-            "Build history ({}) · base → top · separate from diff IDs",
-            image.history.len()
-        )));
-        for (index, step) in image.history.iter().enumerate() {
-            let active = index + image.filesystem.len() == app.layers.selected;
-            if active {
-                selected_line = lines.len();
-            }
-            lines.push(Line::styled(
-                format!(
-                    "{} {}. {} · {}{}",
-                    if active { "▸" } else { " " },
-                    index + 1,
-                    step.size
-                        .map(metrics::bytes)
-                        .unwrap_or_else(|| "size unavailable".into()),
-                    "instruction hidden (Enter details)",
-                    if step.empty_layer == Some(true) {
-                        " [metadata-only]"
-                    } else {
-                        ""
-                    }
-                ),
-                if active { selected() } else { Style::default() },
-            ));
-        }
-        for warning in &image.warnings {
-            lines.push(Line::styled(warning.clone(), accent(app, Color::Yellow)));
-        }
-        lines.push(Line::styled(
-            "Build history may contain secrets; Enter reveals the selected step.",
-            muted(),
-        ));
     }
-    if !app.layers.expanded && image.rows() > 0 {
-        let position = Paragraph::new(lines[..selected_line].to_vec())
-            .wrap(Wrap { trim: false })
-            .line_count(area.width);
-        if position < app.detail_scroll {
-            app.detail_scroll = position;
-        }
-        if position >= app.detail_scroll + area.height as usize {
-            app.detail_scroll = position.saturating_sub(area.height.saturating_sub(1) as usize);
-        }
+    for warning in &image.warnings {
+        lines.push(Line::styled(warning.clone(), accent(app, Color::Yellow)));
     }
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     app.detail_scroll = app
@@ -2225,6 +2283,14 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Line::styled("Log dialog · Enter Apply/Export · Esc Cancel", muted()),
             Line::from(safe_text(notice)),
         ]
+    } else if app.input_mode == InputMode::InventorySearch {
+        vec![
+            Line::from(format!("/{}▏", safe_text(&app.input))),
+            Line::styled(
+                "Search names, tags, IDs, projects and container references · Enter Apply · Esc Cancel · Ctrl-U Clear",
+                muted(),
+            ),
+        ]
     } else if app.input_mode == InputMode::Search {
         vec![
             Line::from(format!("/{}▏", safe_text(&app.input))),
@@ -2234,18 +2300,20 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]
     } else {
-        let hints = if app.exec_input && app.tab == Tab::Exec {
+        let hints = if app.overview_mode != OverviewMode::Containers {
+            "Shift+←/→ Overview · j/k Select · / Search · f Filter · s Sort · Enter Details · Esc Back · r Refresh"
+        } else if app.exec_input && app.tab == Tab::Exec {
             "Ctrl-] Navigate · SHELL INPUT · Keys go to the selected container session"
         } else if app.performance_focus {
             "Performance · P Scope  z Zoom  j/k Select  Enter Inspect  p Close  Tab Pane  ? Keys"
         } else if app.detail_focus && app.tab == Tab::History {
-            "History · [/ ] Range  ←/→ Pan  c Cursor  h/l Inspect  f Live  z Enlarge  Esc Restore"
+            "Metrics · [/ ] Range  ←/→ Pan  c Cursor  h/l Inspect  f Live  z Enlarge  Esc Restore"
         } else if app.detail_focus && app.tab == Tab::Exec {
             "F6 Sessions · Enter Input · :close-exec Close slot · j/k Scroll · Tab Explorer · ? Keys"
         } else if app.detail_focus && app.tab == Tab::Logs {
             "? Keys  F3 Filter  :export-logs  w Wrap  / Search  n/N Match  j/k Scroll  f Follow  Tab Explorer"
         } else {
-            "? Keys  a Actions  p Performance  Space Toggle  Enter Open  e Exec  Tab Pane  1..5 Views  : Commands"
+            "Shift+←/→ Overview  ? Keys  a Actions  p Performance  Enter Open  e Exec  Tab Pane  1..6 Details  : Commands"
         };
         vec![Line::styled(hints, muted()), Line::from(safe_text(notice))]
     };
@@ -2310,7 +2378,8 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         "                  Container or Compose rows only; confirmation required\n",
         "                  y/Enter confirms; n/Esc cancels; Delete: type name + Enter\n",
         "                  Delete stopped containers only; keep networks/volumes/images\n",
-        "1..6              Overview / Logs / Net / Exec / Layers / History\n",
+        "1..6              Overview / Logs / Net / Exec / Metrics / Layers\n",
+        "Shift+←/→, F7/F8   Cycle overviews · Alt+1/2/3 direct\n",
         "a                 Contextual actions with disabled reasons (Explorer)\n",
         "Enter in Layers   Expand details; Esc returns; no image pulls\n",
         "F6 / :exec-sessions Switch retained shells (navigation mode only)\n",
@@ -2639,7 +2708,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("5 Layers"));
+        assert!(text.contains("6 Layers"));
         let unsupported: Vec<_> = app
             .rows
             .iter()
@@ -2661,7 +2730,7 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect();
-            assert!(!text.contains("5 Layers"));
+            assert!(!text.contains("6 Layers"));
         }
     }
 
@@ -3018,7 +3087,7 @@ mod tests {
         let mut app = App::new(crate::demo::connections(), 100, true, true);
         crate::demo::populate(&mut app);
         app.help = true;
-        app.help_scroll = 17;
+        app.help_scroll = 18;
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let text: String = terminal
@@ -3541,7 +3610,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("5 Layers"));
+        assert!(text.contains("6 Layers"));
         assert!(text.contains("Filesystem layers (1)"));
         assert!(text.contains("Build history (1)"));
         app.layers.selected = 1;

@@ -43,7 +43,7 @@ class Engine(socketserver.BaseRequestHandler):
             elif url.path.endswith("/info"):
                 data = {"ID": "lifecycle-fixture", "NCPU": 2, "MemTotal": 1024 * 1024 * 1024}
             elif url.path.endswith("/containers/json"):
-                data = [{"Id": key, "Names": ["/fixture-" + key], "Image": "fixture:latest", "State": state,
+                data = [{"Id": key, "Names": ["/fixture-" + key], "Image": "fixture:latest", "ImageID": "sha256:"+"a"*64, "State": state,
                          "Status": "Up" if state == "running" else "Exited (0)", "Labels": {
                              "com.docker.compose.project": "fixture-project", "com.docker.compose.service": "api"}}
                         for key, state in states.items()]
@@ -54,6 +54,18 @@ class Engine(socketserver.BaseRequestHandler):
                 else:
                     data = {"Id": key, "Name": "/fixture-" + key, "State": {"Status": states[key], "Running": states[key] == "running"},
                             "Config": {"Labels": {"com.docker.compose.project": "fixture-project", "com.docker.compose.service": "api"}}}
+            elif method == "DELETE" and "/images/" in url.path:
+                assert url.path.endswith("sha256:"+"c"*64)
+                assert parse_qs(url.query)=={"force":["false"],"noprune":["true"]}
+                self.server.unused_image=False
+                self.server.resource_writes.append(path)
+                data=[]
+            elif method == "DELETE" and "/volumes/" in url.path:
+                assert url.path.endswith("/cache_unused")
+                assert parse_qs(url.query)=={"force":["false"]}
+                self.server.unused_volume=False
+                self.server.resource_writes.append(path)
+                code,data=204,None
             elif method in ["POST", "DELETE"]:
                 assert "/containers/" in url.path, "Unexpected mutation: " + path
                 target = url.path.split("/containers/")[1]
@@ -70,12 +82,14 @@ class Engine(socketserver.BaseRequestHandler):
                 self.server.writes.append((method, target, url.query))
                 code, data = 204, None
             elif url.path.endswith("/volumes"):
-                data = {"Volumes": [], "Warnings": []}
+                data = {"Volumes": [{"Name":"cache_unused","Driver":"local","Mountpoint":"/data","Labels":{"com.docker.compose.project":"fixture-project"},"Scope":"local","Options":{}}] if self.server.unused_volume else [], "Warnings": []}
             elif "/stats" in url.path:
                 data = {"cpu_stats": {"cpu_usage": {"total_usage": 100}, "system_cpu_usage": 1000, "online_cpus": 2},
                         "memory_stats": {"usage": 1024, "limit": 4096}}
-            elif url.path.endswith("/networks") or url.path.endswith("/images/json"):
-                data = []
+            elif url.path.endswith("/images/json"):
+                data=[{"Id":"sha256:"+"c"*64,"ParentId":"","RepoTags":[],"RepoDigests":[],"Created":1,"Size":1024,"SharedSize":-1,"Labels":{},"Containers":0}] if self.server.unused_image else []
+            elif url.path.endswith("/networks"):
+                data = [{"Name":"fixture-project_default","Id":"retained-network","Driver":"bridge","Scope":"local","Labels":{"com.docker.compose.project":"fixture-project"}}]
             else:
                 code, data = 404, {"message": "unsupported fixture endpoint"}
         body = b"" if code == 204 else json.dumps(data).encode()
@@ -121,6 +135,9 @@ else:
         server.lock = threading.Lock()
         server.states = {"a": "running", "b": "running"}
         server.writes = []
+        server.resource_writes=[]
+        server.unused_image=True
+        server.unused_volume=True
         server.offline = offline
         threading.Thread(target=server.serve_forever, daemon=True).start()
         config = directory / "config.toml"
@@ -275,11 +292,33 @@ else:
             keys(b"\r")
             assert runtime_log.read_text() == "stop\nstart\nrestart\n"
             assert len(server.writes) == 10
+            with server.lock:
+                server.states.clear()  # external Compose removal; retain its labelled resources
+            keys(b":refresh\r")
+            expect("Shared Networks")
+            assert "fixture-project [0/0 running]" not in "\n".join(screen.display),"Retained resources recreated a deleted Compose stack"
+            keys(b"\x1b[1;2C")  # Shift+Right -> Images
+            expect("Images overview")
+            expect("unreferenced")
+            keys(b"\x1b[3~")  # Delete
+            expect("Confirm resource deletion")
+            keys(b"\r")
+            assert not server.resource_writes,"Empty confirmation must not delete"
+            keys(("sha256:"+"c"*64).encode()+b"\r")
+            expect("No resources reported")
+            assert len(server.resource_writes)==1
+            keys(b"\x1b[1;2C")  # Shift+Right -> Volumes
+            expect("cache_unused")
+            keys(b"\x1b[3~")
+            expect("permanently destroys")
+            keys(b"cache_unused\r")
+            expect("No resources reported")
+            assert len(server.resource_writes)==2
             keys(b"\x03")
             process.wait(timeout=5)
             assert process.returncode == 0
             assert termios.tcgetattr(slave) == original
-            print("PASS: container safeguards, runtime Stop/offline/relaunch/Start/Restart, animated slow-action feedback/elapsed time, navigation while pending, truthful runtime state, background results, terminal restoration; mock mutations only")
+            print("PASS: container safeguards, runtime lifecycle, Shift-arrow overviews, exact-confirmation unused image/volume deletion and refresh, no force/pruning, background results, terminal restoration; mock mutations only")
         finally:
             if process.poll() is None:
                 process.kill()

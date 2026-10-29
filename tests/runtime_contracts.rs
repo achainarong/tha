@@ -16,6 +16,7 @@ use tokio::{
 struct MockEngine {
     path: PathBuf,
     task: JoinHandle<()>,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 impl Drop for MockEngine {
     fn drop(&mut self) {
@@ -41,6 +42,8 @@ impl MockEngine {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let listener = UnixListener::bind(&path).unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
         let task = tokio::spawn(async move {
             let mut samples = 0u64;
             let mut info_reads = 0u64;
@@ -64,6 +67,19 @@ impl MockEngine {
                     }
                 }
                 let request = String::from_utf8_lossy(&bytes);
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(request.lines().next().unwrap_or_default().to_owned());
+                if request.starts_with("DELETE ") {
+                    let body = "[]";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    continue;
+                }
                 if podman && (request.contains("/version ") || request.contains("/info ")) {
                     let body = if request.contains("/version ") {
                         serde_json::json!({"ApiVersion":"1.44", "Version":"6.1.4", "Components":[{"Name":"Podman Engine", "Version":"6.1.4"}]})
@@ -82,6 +98,7 @@ impl MockEngine {
                     let body = serde_json::json!([{
                         "Id":"api123", "Names":["/shop-api-1"], "Image":"mutable:latest",
                         "ImageID":format!("sha256:{}", "a".repeat(64)), "State":"running",
+                        "Mounts":[{"Type":"volume","Name":"shop_data"}],
                         "ImageManifestDescriptor": {
                             "digest":format!("sha256:{}", "b".repeat(64)),
                             "mediaType":"application/vnd.oci.image.manifest.v1+json",
@@ -128,7 +145,7 @@ impl MockEngine {
                     } else {
                         (
                             "200 OK",
-                            serde_json::json!([{"Id":format!("sha256:{}", "a".repeat(64)),"ParentId":"","RepoTags":["shop:latest"],"RepoDigests":[],"Created":1,"Size":1024,"SharedSize":-1,"VirtualSize":1024,"Labels":{},"Containers":1}]),
+                            serde_json::json!([{"Id":format!("sha256:{}", "a".repeat(64)),"ParentId":"","RepoTags":["shop:latest"],"RepoDigests":[],"Created":1,"Size":1024,"SharedSize":-1,"VirtualSize":1024,"Labels":{},"Containers":1},{"Id":format!("sha256:{}","c".repeat(64)),"ParentId":"","RepoTags":[],"RepoDigests":[],"Created":1,"Size":1024,"SharedSize":-1,"Labels":{},"Containers":0}]),
                         )
                     };
                     let body = body.to_string();
@@ -194,7 +211,7 @@ impl MockEngine {
                 } else if request.contains("/containers/json") {
                     (
                         "200 OK",
-                        r#"[{"Id":"api123","Names":["/shop-api-1"],"Image":"shop:latest","State":"running","Status":"Up 1 hour","Labels":{"com.docker.compose.project":"shop","com.docker.compose.service":"api","com.docker.compose.project.working_dir":"/projects/shop"},"Ports":[{"IP":"127.0.0.1","PrivatePort":3000,"PublicPort":8080,"Type":"tcp"}],"NetworkSettings":{"Networks":{"shop_default":{}}},"Mounts":[{"Type":"volume","Name":"shop_data"}]}]"#,
+                        r#"[{"Id":"api123","Names":["/shop-api-1"],"Image":"shop:latest","State":"running","Status":"Up 1 hour","Labels":{"com.docker.compose.project":"shop","com.docker.compose.service":"api","com.docker.compose.project.working_dir":"/projects/shop"},"Ports":[{"IP":"127.0.0.1","PrivatePort":3000,"PublicPort":8080,"Type":"tcp"}],"NetworkSettings":{"Networks":{"shop_default":{}}},"Mounts":[{"Type":"volume","Name":"shop_data"},{"Type":"bind","Source":"/projects/shop","Destination":"/app"}]}]"#,
                     )
                 } else if request.contains("/networks") {
                     if network_failure {
@@ -211,7 +228,7 @@ impl MockEngine {
                 } else if request.contains("/volumes") {
                     (
                         "200 OK",
-                        r#"{"Volumes":[{"Name":"shop_data","Driver":"local","Mountpoint":"/data","Labels":{"com.docker.compose.project":"shop"},"Scope":"local","Options":{}}],"Warnings":[]}"#,
+                        r#"{"Volumes":[{"Name":"shop_data","Driver":"local","Mountpoint":"/data","Labels":{"com.docker.compose.project":"shop"},"Scope":"local","Options":{}},{"Name":"unused_cache","Driver":"local","Mountpoint":"/unused","Labels":{},"Scope":"local","Options":{}}],"Warnings":[]}"#,
                     )
                 } else {
                     ("404 Not Found", r#"{"message":"unknown test endpoint"}"#)
@@ -223,7 +240,11 @@ impl MockEngine {
                 let _ = stream.write_all(response.as_bytes()).await;
             }
         });
-        Self { path, task }
+        Self {
+            path,
+            task,
+            requests,
+        }
     }
 
     fn connection(&self) -> Connection {
@@ -233,6 +254,109 @@ impl MockEngine {
             endpoint: format!("unix://{}", self.path.display()),
         }
     }
+}
+
+#[tokio::test]
+async fn resource_removal_rechecks_references_identity_and_never_forces_or_prunes() {
+    let engine = MockEngine::start_with_manifest(false, true);
+    let base = backend::RemovalRequest {
+        connection: engine.connection(),
+        identity: "engine-one".into(),
+        key: format!("sha256:{}", "c".repeat(64)),
+        volume: false,
+    };
+    backend::remove_unused(base.clone()).await.unwrap();
+    let volume = backend::RemovalRequest {
+        key: "unused_cache".into(),
+        volume: true,
+        ..base.clone()
+    };
+    backend::remove_unused(volume).await.unwrap();
+    let deletes = || {
+        engine
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.starts_with("DELETE "))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(deletes().len(), 2);
+    assert!(deletes()[0].contains("force=false"));
+    assert!(deletes()[0].contains("noprune=true"));
+    assert!(deletes()[1].contains("unused_cache"));
+    assert!(deletes()[1].contains("force=false"));
+    assert!(
+        backend::remove_unused(backend::RemovalRequest {
+            key: format!("sha256:{}", "a".repeat(64)),
+            ..base.clone()
+        })
+        .await
+        .is_err()
+    );
+    assert!(
+        backend::remove_unused(backend::RemovalRequest {
+            key: "shop_data".into(),
+            volume: true,
+            ..base.clone()
+        })
+        .await
+        .is_err()
+    );
+    assert!(
+        backend::remove_unused(backend::RemovalRequest {
+            identity: "replaced-runtime".into(),
+            ..base.clone()
+        })
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        deletes().len(),
+        2,
+        "Failed safety checks must not send a DELETE"
+    );
+    let mut stopped = backend::snapshot(&engine.connection()).await.unwrap();
+    for container in &mut stopped.containers {
+        container.state = "exited".into();
+    }
+    assert!(
+        backend::RemovalRequest {
+            key: format!("sha256:{}", "a".repeat(64)),
+            ..base.clone()
+        }
+        .validate(&stopped)
+        .is_err()
+    );
+    assert!(
+        backend::RemovalRequest {
+            key: "shop_data".into(),
+            volume: true,
+            ..base.clone()
+        }
+        .validate(&stopped)
+        .is_err()
+    );
+    let missing = MockEngine::start(false);
+    assert!(
+        backend::remove_unused(backend::RemovalRequest {
+            connection: missing.connection(),
+            identity: "engine-one".into(),
+            key: format!("sha256:{}", "c".repeat(64)),
+            volume: false
+        })
+        .await
+        .is_err()
+    );
+    assert!(
+        !missing
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.starts_with("DELETE "))
+    );
 }
 
 #[tokio::test]
@@ -254,9 +378,22 @@ async fn docker_inventory_preserves_ownership_and_attachments() {
     );
     assert_eq!(snapshot.networks[0].containers, ["shop-api-1"]);
     assert_eq!(snapshot.volumes[0].containers, ["shop-api-1"]);
+    assert!(snapshot.volumes_available);
+    assert!(snapshot.volumes[0].details.contains("mount: /data"));
+    assert_eq!(snapshot.containers[0].volumes, ["shop_data"]);
+    assert_eq!(
+        snapshot.containers[0].bind_mounts,
+        ["/projects/shop → /app"]
+    );
     assert!(!snapshot.networks[0].external);
-    assert_eq!(snapshot.images.as_ref().unwrap()[0].tags, ["shop:latest"]);
-    assert_eq!(snapshot.images.as_ref().unwrap()[0].size, Some(1024));
+    let image = snapshot
+        .images
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|image| image.tags == ["shop:latest"])
+        .unwrap();
+    assert_eq!(image.size, Some(1024));
 }
 
 #[tokio::test]

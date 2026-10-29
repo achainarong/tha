@@ -54,8 +54,8 @@ def main():
 
     try:
         expect("Tha")
-        keys(b"/shop-api-1\rG5")
-        expect("5 Layers")
+        keys(b"/shop-api-1\rG6")
+        expect("6 Layers")
         expect("Filesystem layers (2)")
         expect("Build history (2)")
         keys(b"G\r")
@@ -95,17 +95,45 @@ def main():
         assert destination.read_bytes() == original_export
         keys(b":clear-log-filter\r")
         expect("Filter: off")
-        keys(b"5")
+        keys(b"\x1b[19~")  # F8 -> Images overview
+        expect("Images overview")
+        expect("Sort: Usage")
+        expect("Status")
+        keys(b"/redis\r")
+        expect("1 / 3 shown")
+        keys(b"\r")
+        expect("Details")
+        expect("redis:7")
+        keys(b"\x1b")
+        expect("Images overview")
+        keys(b"/\x15\r")  # clear applied query
+        expect("3 / 3 shown")
+        keys(b"fs")
+        expect("Filter: Running")
+        expect("Sort: Name")
+        keys(b"\x1b[19~")  # F8 -> Volumes overview
+        expect("Volumes overview")
+        expect("shop_data")
+        expect("old_cache")
+        keys(b"fffff\r")
+        expect("Bind mounts")
+        expect("/home/demo/shop")
+        keys(b"\x1b")
+        keys(b"\x1b[18~")  # F7 -> Images, retaining its filter/sort
+        expect("Filter: Running")
+        expect("Sort: Name")
+        keys(b"\x1b[18~")  # F7 -> Containers
+        keys(b"6")
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 15, 50, 0, 0))
         screen.resize(15, 50)
         os.kill(process.pid, signal.SIGWINCH)
         drain()
-        expect("5 Layers")
+        expect("6 Layers")
         keys(b"\x03")
         process.wait(timeout=5)
         assert process.returncode == 0
         assert termios.tcgetattr(slave) == original
-        print("PASS: Layers/details, contextual disabled reasons, F3 severity filtering, private JSONL export, overwrite refusal, clearing filters, resize, terminal restoration; demo only")
+        print("PASS: selectable inventory tables, search/clear, filters/sort, image and bind-mount details, F7/F8 overview cycling/state retention, Layers/details, log filtering/private export, resize, terminal restoration; demo only")
     finally:
         if process.poll() is None:
             process.kill()

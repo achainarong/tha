@@ -313,6 +313,8 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let (layers_tx, mut layers_rx) = mpsc::channel::<tha::layers::Event>(4);
     let mut layers_task: Option<AbortTask> = None;
     let (export_tx, mut export_rx) = mpsc::channel::<String>(4);
+    let (removal_tx, mut removal_rx) = mpsc::channel::<String>(1);
+    let mut removal_task: Option<AbortTask> = None;
     let mut export_task: Option<AbortTask> = None;
     let (action_tx, mut action_rx) = mpsc::channel::<tha::actions::Update>(64);
     let mut action_tasks = std::collections::BTreeMap::<u64, AbortTask>::new();
@@ -420,6 +422,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 }
             },
             Some(result) = export_rx.recv() => { app.log_export_busy = false; app.notice = result; export_task = None; redraw_now = true; },
+            Some(result)=removal_rx.recv()=> {app.inventory_removal=None;app.notice=result;removal_task=None;refresh_tx.send_modify(|value|*value=value.wrapping_add(1));redraw_now=true;},
             Some(update) = action_rx.recv() => {
                 let operation = update.operation;
                 let finished = matches!(&update.event, tha::actions::Event::Finished);
@@ -567,6 +570,18 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
             }
             // Input/operation feedback is not delayed until the next animation tick.
             // Resolve view targets first so navigation never paints the previous target's layers.
+            if let Some(request) = app.inventory_removal_request.take() {
+                let sender = removal_tx.clone();
+                removal_task = Some(AbortTask(tokio::spawn(async move {
+                    let message = match tha::backend::remove_unused(request).await {
+                        Ok(()) => "Resource deletion completed; refreshing inventory".into(),
+                        Err(error) => format!(
+                            "Resource removal failed or outcome unknown: {error:#}. Refresh before retrying."
+                        ),
+                    };
+                    let _ = sender.send(message).await;
+                })));
+            }
             update_layers(&mut app, &mut layers_task, &layers_tx);
             update_platform(&mut app, &mut platform_task, &platform_tx);
             update_logs(&mut app, &mut log_task, &log_tx, log_capacity);
@@ -579,6 +594,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     drop(history_task);
     drop(action_tasks);
     drop(layers_task);
+    drop(removal_task);
     drop(export_task);
     drop(terminal);
     drop(_restore);
@@ -866,6 +882,53 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return true;
     }
+    if let Some(removal) = app.inventory_removal.as_mut() {
+        if !removal.pending {
+            match key.code {
+                KeyCode::Esc => app.inventory_removal = None,
+                KeyCode::Enter
+                    if removal.visible
+                        && removal.typed == removal.request.key
+                        && key.kind == KeyEventKind::Press
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    let current = app.engines.iter().any(|engine| {
+                        engine.error.is_none()
+                            && engine.alias.is_none()
+                            && engine.connection.endpoint == removal.request.connection.endpoint
+                            && engine
+                                .snapshot
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.engine_id.as_deref())
+                                == Some(removal.request.identity.as_str())
+                    });
+                    if current {
+                        removal.pending = true;
+                        app.inventory_removal_request = Some(removal.request.clone());
+                    } else {
+                        app.inventory_removal = None;
+                        app.notice = "Runtime changed; deletion cancelled".into();
+                    }
+                }
+                KeyCode::Backspace => {
+                    removal.typed.pop();
+                }
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && !ch.is_control()
+                        && removal.typed.len() + ch.len_utf8() <= 4096 =>
+                {
+                    removal.typed.push(ch)
+                }
+                _ => {}
+            }
+        }
+        return false;
+    }
     if app.action_confirmation.is_some() {
         use tha::actions::Action;
         let deleting = app.action_confirmation.as_ref().unwrap().request.action == Action::Delete;
@@ -1000,6 +1063,41 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         }
         return false;
     }
+    if app.input_mode == InputMode::InventorySearch {
+        let view = app
+            .inventory_views
+            .entry((app.inventory_engine, app.overview_mode))
+            .or_default();
+        match key.code {
+            KeyCode::Esc => {
+                app.input_mode = InputMode::Normal;
+                app.input.clear();
+            }
+            KeyCode::Enter => {
+                view.query = std::mem::take(&mut app.input);
+                view.index = 0;
+                view.selected = None;
+                view.offset = 0;
+                app.input_mode = InputMode::Normal;
+            }
+            KeyCode::Backspace => {
+                app.input.pop();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.input.clear()
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && app.input.len() + ch.len_utf8() <= 1024 =>
+            {
+                app.input.push(ch)
+            }
+            _ => {}
+        }
+        return false;
+    }
     if app.input_mode != InputMode::Normal {
         match key.code {
             KeyCode::Esc => {
@@ -1072,8 +1170,96 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         return false;
     }
     // Only navigation reaches this point. Editors, confirmations and PTYs retain raw keys.
+    if key.modifiers == KeyModifiers::ALT {
+        let mode = match key.code {
+            KeyCode::Char('1') => Some(tha::app::OverviewMode::Containers),
+            KeyCode::Char('2') => Some(tha::app::OverviewMode::Images),
+            KeyCode::Char('3') => Some(tha::app::OverviewMode::Volumes),
+            _ => None,
+        };
+        if let Some(mode) = mode {
+            switch_overview(app, mode);
+            return false;
+        }
+    }
     let key = app.keymap.translate(key);
+    if (matches!(key.code, KeyCode::F(7) | KeyCode::F(8)) && key.modifiers.is_empty())
+        || (matches!(key.code, KeyCode::Left | KeyCode::Right)
+            && key.modifiers == KeyModifiers::SHIFT)
+    {
+        use tha::app::OverviewMode::*;
+        let forward = matches!(key.code, KeyCode::F(8) | KeyCode::Right);
+        let next = match (app.overview_mode, forward) {
+            (Containers, true) | (Volumes, false) => Images,
+            (Images, true) | (Containers, false) => Volumes,
+            _ => Containers,
+        };
+        switch_overview(app, next);
+        return false;
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if app.overview_mode != tha::app::OverviewMode::Containers {
+        match key.code {
+            KeyCode::Delete | KeyCode::Char('d') if key.modifiers.is_empty() => {
+                ui::inventory::begin_removal(app)
+            }
+            KeyCode::Esc
+                if app
+                    .inventory_views
+                    .get(&(app.inventory_engine, app.overview_mode))
+                    .is_some_and(|view| view.details) =>
+            {
+                ui::inventory::navigate(app, key.code, height)
+            }
+            KeyCode::Esc => switch_overview(app, tha::app::OverviewMode::Containers),
+            KeyCode::Char('q') => return true,
+            KeyCode::Char(':') => {
+                app.input_mode = InputMode::Command;
+                app.input.clear();
+            }
+            KeyCode::Char('?') => {
+                app.help = true;
+                app.help_scroll = 0;
+            }
+            KeyCode::Left | KeyCode::Right => {
+                app.inventory_engine = if key.code == KeyCode::Left {
+                    app.inventory_engine.saturating_sub(1)
+                } else {
+                    app.inventory_engine
+                        .saturating_add(1)
+                        .min(app.engines.len().saturating_sub(1))
+                };
+            }
+            KeyCode::Char('/') => {
+                let view = app
+                    .inventory_views
+                    .entry((app.inventory_engine, app.overview_mode))
+                    .or_default();
+                app.input = view.query.clone();
+                view.details = false;
+                app.input_mode = InputMode::InventorySearch;
+            }
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::Enter
+            | KeyCode::Char('j' | 'k' | 'g' | 'G' | 'f' | 's')
+                if !ctrl =>
+            {
+                ui::inventory::navigate(app, key.code, height)
+            }
+            KeyCode::Char('r') => refresh.send_modify(|value| *value += 1),
+            KeyCode::Char('1'..='6') if key.modifiers.is_empty() => {
+                switch_overview(app, tha::app::OverviewMode::Containers);
+                return handle_key(app, key, height, refresh);
+            }
+            _ => {}
+        }
+        return false;
+    }
     if app.detail_focus
         && app.tab == Tab::History
         && !ctrl
@@ -1251,7 +1437,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             app.performance_focus = false;
             app.exec_input = false;
         }
-        KeyCode::Char('5') if !ctrl => {
+        KeyCode::Char('6') if !ctrl => {
             if !app.layers_available() {
                 return false;
             }
@@ -1261,7 +1447,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             app.layers.expanded = false;
             app.detail_scroll = 0;
         }
-        KeyCode::Char('6') if !ctrl && app.performance_container().is_some() => {
+        KeyCode::Char('5') if !ctrl && app.performance_container().is_some() => {
             app.tab = Tab::History;
             app.detail_focus = true;
             app.performance_focus = false;
@@ -1418,7 +1604,22 @@ fn move_by(app: &mut App, amount: isize, _height: usize) {
     }
 }
 
+fn switch_overview(app: &mut App, mode: tha::app::OverviewMode) {
+    if app.overview_mode == tha::app::OverviewMode::Containers
+        && mode != tha::app::OverviewMode::Containers
+    {
+        app.inventory_engine = app.current().map(|row| row.engine).unwrap_or(0);
+    }
+    app.overview_mode = mode;
+}
+
 fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
+    if matches!(
+        command,
+        "overview" | "logs" | "networks" | "layers" | "history" | "metrics" | "exec"
+    ) {
+        switch_overview(app, tha::app::OverviewMode::Containers);
+    }
     app.notice.clear();
     match command {
         "quit" | "q" => return true,
@@ -1461,13 +1662,21 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
             app.performance_focus = false;
             app.detail_scroll = 0;
         }
-        "history" => {
+        "images" | "volumes" => {
+            let mode = if command == "images" {
+                tha::app::OverviewMode::Images
+            } else {
+                tha::app::OverviewMode::Volumes
+            };
+            switch_overview(app, mode);
+        }
+        "history" | "metrics" => {
             if app.performance_container().is_some() {
                 app.tab = Tab::History;
                 app.detail_focus = true;
                 app.performance_focus = false;
             } else {
-                app.notice = "Select a container to open History".into();
+                app.notice = "Select a container to open Metrics".into();
             }
         }
         "reload-layers" => {
@@ -1531,14 +1740,14 @@ mod tests {
         let mut app = app();
         let (tx, _) = watch::channel(0);
         app.selected = 0;
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('6')), 20, &tx);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('5')), 20, &tx);
         assert_eq!(app.tab, Tab::Overview);
         app.selected = app
             .rows
             .iter()
             .position(|row| matches!(row.scope, tha::app::Scope::Container(_)))
             .unwrap();
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('6')), 20, &tx);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('5')), 20, &tx);
         assert_eq!(app.tab, Tab::History);
         assert!(app.detail_focus);
         handle_key(&mut app, KeyEvent::from(KeyCode::Char(']')), 20, &tx);
@@ -2690,12 +2899,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unused_resource_removal_requires_exact_visible_confirmation_and_protects_used_volumes()
+    {
+        use tha::app::OverviewMode;
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.demo = false;
+        switch_overview(&mut app, OverviewMode::Volumes);
+        ui::inventory::navigate(&mut app, KeyCode::Home, 25);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Delete), 25, &refresh);
+        assert!(
+            app.inventory_removal.is_none(),
+            "Used volumes must be refused"
+        );
+        ui::inventory::navigate(&mut app, KeyCode::End, 25);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Delete), 25, &refresh);
+        assert_eq!(
+            app.inventory_removal.as_ref().unwrap().request.key,
+            "old_cache"
+        );
+        for ch in "old_cache".chars() {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char(ch)), 25, &refresh);
+        }
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 25, &refresh);
+        assert!(
+            app.inventory_removal_request.is_none(),
+            "An unrendered or tiny confirmation cannot confirm"
+        );
+        app.inventory_removal.as_mut().unwrap().visible = true;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+            25,
+            &refresh,
+        );
+        assert_eq!(
+            app.overview_mode,
+            OverviewMode::Volumes,
+            "Dialogs retain keyboard ownership"
+        );
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 25, &refresh);
+        assert!(app.inventory_removal.is_none());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Delete), 25, &refresh);
+        app.inventory_removal.as_mut().unwrap().typed = "old_cache".into();
+        app.inventory_removal.as_mut().unwrap().visible = true;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 25, &refresh);
+        assert_eq!(
+            app.inventory_removal_request.as_ref().unwrap().key,
+            "old_cache"
+        );
+        assert!(app.inventory_removal.as_ref().unwrap().pending);
+    }
+
+    #[tokio::test]
+    async fn inventory_table_navigation_search_details_and_overview_cycle_are_isolated() {
+        use tha::app::OverviewMode;
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        let selected = app.selected;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT),
+            25,
+            &refresh,
+        );
+        assert_eq!(app.overview_mode, OverviewMode::Volumes);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+            25,
+            &refresh,
+        );
+        assert_eq!(app.overview_mode, OverviewMode::Containers);
+        handle_key(&mut app, KeyEvent::from(KeyCode::F(8)), 25, &refresh);
+        assert_eq!(app.overview_mode, OverviewMode::Images);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('G')), 25, &refresh);
+        let view_key = (app.inventory_engine, app.overview_mode);
+        assert_eq!(app.inventory_views[&view_key].index, 2);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('g')), 25, &refresh);
+        assert_eq!(app.inventory_views[&view_key].index, 2);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('g')), 25, &refresh);
+        assert_eq!(app.inventory_views[&view_key].index, 0);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 25, &refresh);
+        assert!(app.inventory_views[&view_key].details);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 25, &refresh);
+        assert!(!app.inventory_views[&view_key].details);
+        assert_eq!(app.overview_mode, OverviewMode::Images);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('/')), 25, &refresh);
+        for c in "redis".chars() {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char(c)), 25, &refresh);
+        }
+        handle_key(&mut app, KeyEvent::from(KeyCode::F(8)), 25, &refresh);
+        assert_eq!(
+            app.overview_mode,
+            OverviewMode::Images,
+            "Function keys must not switch while editing"
+        );
+        assert_eq!(app.input_mode, InputMode::InventorySearch);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 25, &refresh);
+        assert_eq!(app.inventory_views[&view_key].query, "redis");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('/')), 25, &refresh);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            25,
+            &refresh,
+        );
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 25, &refresh);
+        assert_eq!(
+            app.inventory_views[&view_key].query, "redis",
+            "Cancel must restore the applied query"
+        );
+        handle_key(&mut app, KeyEvent::from(KeyCode::F(8)), 25, &refresh);
+        assert_eq!(app.overview_mode, OverviewMode::Volumes);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('f')), 25, &refresh);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('s')), 25, &refresh);
+        handle_key(&mut app, KeyEvent::from(KeyCode::F(7)), 25, &refresh);
+        assert_eq!(app.inventory_views[&view_key].query, "redis");
+        handle_key(&mut app, KeyEvent::from(KeyCode::F(7)), 25, &refresh);
+        assert_eq!(app.overview_mode, OverviewMode::Containers);
+        assert_eq!(app.selected, selected);
+        assert!(app.action_request.is_none());
+        handle_key(&mut app, KeyEvent::from(KeyCode::F(7)), 25, &refresh);
+        assert_eq!(app.overview_mode, OverviewMode::Volumes);
+        assert_eq!(app.inventory_views[&(0, OverviewMode::Volumes)].filter, 1);
+    }
+
+    #[tokio::test]
+    async fn inventory_shortcuts_and_commands_switch_read_only_runtime_views() {
+        use tha::app::OverviewMode;
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        let selected = app.selected;
+        let tab = app.tab;
+        app.detail_scroll = 99;
+        for (key, command, mode) in [
+            ('2', "images", OverviewMode::Images),
+            ('3', "volumes", OverviewMode::Volumes),
+        ] {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::ALT),
+                20,
+                &refresh,
+            );
+            assert_eq!(app.overview_mode, mode);
+            assert_eq!(app.tab, tab);
+            assert_eq!(app.detail_scroll, 99);
+            handle_key(&mut app, KeyEvent::from(KeyCode::Down), 20, &refresh);
+            assert_eq!(app.selected, selected);
+            assert_eq!(app.inventory_views[&(app.inventory_engine, mode)].index, 1);
+            handle_key(&mut app, KeyEvent::from(KeyCode::Right), 20, &refresh);
+            assert_eq!(app.inventory_engine, 1);
+            assert!(
+                !app.inventory_views
+                    .contains_key(&(app.inventory_engine, mode))
+            );
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')), 20, &refresh);
+            assert!(
+                app.picker.is_none(),
+                "Inventory navigation must not open hidden workload actions"
+            );
+            assert!(app.action_request.is_none());
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
+                20,
+                &refresh,
+            );
+            assert_eq!(app.overview_mode, OverviewMode::Containers);
+            execute(&mut app, command, &refresh);
+            assert_eq!(app.overview_mode, mode);
+            app.input_mode = InputMode::Search;
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::ALT),
+                20,
+                &refresh,
+            );
+            assert_eq!(app.input, key.to_string());
+            assert_eq!(app.overview_mode, mode);
+            app.input.clear();
+            app.input_mode = InputMode::Normal;
+            handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 20, &refresh);
+            assert_eq!(app.overview_mode, OverviewMode::Containers);
+            assert_eq!(app.selected, selected);
+            assert_eq!(app.detail_scroll, 99);
+        }
+        for key in ['7', '8'] {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char(key)), 20, &refresh);
+            assert_eq!(app.overview_mode, OverviewMode::Containers);
+            assert_eq!(app.tab, tab);
+        }
+        execute(&mut app, "images", &refresh);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('3')), 20, &refresh);
+        assert_eq!(app.overview_mode, OverviewMode::Containers);
+        assert_eq!(app.tab, Tab::Networks);
+    }
+
+    #[tokio::test]
     async fn unsupported_layers_shortcuts_are_blocked_and_pending_lookup_is_cancelled() {
         let mut app = app();
         let (refresh, _) = watch::channel(0);
         app.selected = 0;
         assert!(!app.layers_available());
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('5')), 20, &refresh);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('6')), 20, &refresh);
         assert_eq!(app.tab, Tab::Overview);
         execute(&mut app, "layers", &refresh);
         assert_eq!(app.tab, Tab::Overview);
@@ -2712,7 +3120,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn number_five_loads_demo_layers_and_enter_and_escape_toggle_read_only_details() {
+    async fn number_six_loads_demo_layers_and_enter_and_escape_toggle_read_only_details() {
         let mut app = app();
         let (tx, _) = watch::channel(0);
         app.selected = app
@@ -2722,7 +3130,7 @@ mod tests {
             .unwrap();
         handle_key(
             &mut app,
-            KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE),
             20,
             &tx,
         );

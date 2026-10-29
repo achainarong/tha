@@ -34,6 +34,7 @@ pub fn populate(app: &mut App) {
     };
     let mut api = container("api-1", "shop-api-1", "shop", "api");
     api.ports = vec!["127.0.0.1:8080 → 3000/tcp".into()];
+    api.bind_mounts = vec!["/home/demo/shop → /app".into()];
     let mut db = container("db-1", "shop-postgres-1", "shop", "postgres");
     db.volumes = vec!["shop_data".into()];
     app.update_engine(
@@ -75,13 +76,39 @@ pub fn populate(app: &mut App) {
                     ..Default::default()
                 },
             ],
-            volumes: vec![Resource {
-                name: "shop_data".into(),
-                project: Some("shop".into()),
-                containers: vec!["shop-postgres-1".into()],
-                details: "driver: local".into(),
-                ..Default::default()
-            }],
+            volumes_available: true,
+            images: Some(vec![
+                crate::model::Image {
+                    id: "sha256:demo-api".into(),
+                    tags: vec!["api:latest".into()],
+                    size: Some(80 * 1024 * 1024),
+                },
+                crate::model::Image {
+                    id: "sha256:demo-redis".into(),
+                    tags: vec!["redis:7".into()],
+                    size: Some(32 * 1024 * 1024),
+                },
+                crate::model::Image {
+                    id: "sha256:unused".into(),
+                    tags: vec![],
+                    size: Some(16 * 1024 * 1024),
+                },
+            ]),
+            volumes: vec![
+                Resource {
+                    name: "shop_data".into(),
+                    project: Some("shop".into()),
+                    containers: vec!["shop-postgres-1".into()],
+                    details: "driver: local".into(),
+                    ..Default::default()
+                },
+                Resource {
+                    name: "old_cache".into(),
+                    details: "driver: local · mount: /var/lib/docker/volumes/old_cache/_data"
+                        .into(),
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         }),
     );

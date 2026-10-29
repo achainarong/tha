@@ -110,6 +110,7 @@ pub struct Container {
     pub port_bindings: Vec<PortBinding>,
     pub networks: Vec<String>,
     pub volumes: Vec<String>,
+    pub bind_mounts: Vec<String>,
     pub managed: bool,
 }
 
@@ -286,6 +287,7 @@ pub struct Snapshot {
     pub containers: Vec<Container>,
     pub networks: Vec<Resource>,
     pub volumes: Vec<Resource>,
+    pub volumes_available: bool,
     pub images: Option<Vec<Image>>,
     pub namespaces: Vec<String>,
     pub warnings: Vec<String>,

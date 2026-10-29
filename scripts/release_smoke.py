@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -118,6 +119,48 @@ shutil.copyfile(Path(os.environ['FIXTURES']) / url.rsplit('/',1)[1], args[args.i
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual(destination.read_text(), "previous-install")
                 self.assertEqual(list(self.directory.glob("tha-install.*")), [])
+
+    def test_installer_modes_manage_the_user_service_around_the_binary_swap(self):
+        fixtures = self.directory / "fixtures"
+        fixtures.mkdir()
+        fake = b'#!/bin/sh\necho "new:$*" >> "$HOME/calls"\n'
+        fixture_archive(fixtures / ASSETS[0], {"tha": fake, "LICENSE": b"MIT\n", "README.md": b"fixture\n"})
+        (fixtures / "SHA256SUMS").write_text(f"{hashlib.sha256((fixtures / ASSETS[0]).read_bytes()).hexdigest()}  {ASSETS[0]}\n")
+        self.program("uname", "import sys\nprint('Linux' if sys.argv[1]=='-s' else 'x86_64')")
+        self.program("curl", """import os,sys,shutil
+from pathlib import Path
+args=sys.argv[1:]
+shutil.copyfile(Path(os.environ['FIXTURES']) / args[4].rsplit('/',1)[1], args[args.index('-o')+1])
+""")
+        home = Path(self.env["HOME"])
+        destination = home / ".local/bin/tha"
+        old = ('#!/bin/sh\necho "old:$*" >> "$HOME/calls"\n'
+               '[ "$*" = "service status" ] && [ "$OLD_RUNNING" = 1 ] && echo "Tha service: running"\nexit 0\n')
+        new_service = ["new:--version", "new:service install", "new:service start"]
+        cases = [("standalone", None, ["new:--version"]),
+                 ("service", None, new_service),
+                 ("standalone", "0", ["old:service status", "new:--version"]),
+                 ("standalone", "1", ["old:service status", "old:service stop", "new:--version", "new:service start"]),
+                 ("service", "1", ["old:service status", "old:service stop"] + new_service),
+                 ("bogus", None, None)]
+        for mode, previous, expected in cases:
+            with self.subTest(mode=mode, previous=previous):
+                shutil.rmtree(home, ignore_errors=True)
+                destination.parent.mkdir(parents=True)
+                if previous is not None:
+                    destination.write_text(old)
+                    destination.chmod(0o755)
+                result = self.run_shell(self.installer, FIXTURES=str(fixtures), THA_MODE=mode,
+                                        OLD_RUNNING=previous or "0")
+                calls = (home / "calls").read_text().splitlines() if (home / "calls").exists() else []
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("THA_MODE must be standalone or service", result.stderr)
+                    self.assertEqual(calls, [])
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(calls, expected)
+                    self.assertEqual(destination.read_bytes(), fake)
 
     def test_version_step_matches_tag_and_classifies_prereleases(self):
         script = self.step("validate", "Require the tag to match Cargo.toml")

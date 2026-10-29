@@ -89,6 +89,7 @@ pub struct View {
     pub state: State,
     pub selected: usize,
     pub expanded: bool,
+    pub offset: usize,
 }
 
 impl View {
@@ -102,6 +103,7 @@ impl View {
         self.key = key;
         self.selected = 0;
         self.expanded = false;
+        self.offset = 0;
     }
     pub fn complete(&mut self, event: Event) {
         if self.key.as_ref() == Some(&event.key) && self.generation == event.generation {
