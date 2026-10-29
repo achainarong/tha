@@ -190,6 +190,7 @@ pub struct App {
     pub action_confirmation: Option<crate::actions::Confirmation>,
     pub action_request: Option<crate::actions::Request>,
     pub action_progress: Option<crate::actions::Progress>,
+    pub action_results_visible: bool,
     pub action_review_visible: bool,
     startup_cwd: Option<PathBuf>,
     startup_pending: HashSet<usize>,
@@ -266,6 +267,7 @@ impl App {
             action_confirmation: None,
             action_request: None,
             action_progress: None,
+            action_results_visible: false,
             action_review_visible: false,
             startup_cwd: None,
             startup_pending: HashSet::new(),
@@ -451,10 +453,15 @@ impl App {
     }
 
     pub fn request_action(&mut self, action: crate::actions::Action) {
-        if self.action_progress.is_some()
+        if self
+            .action_progress
+            .as_ref()
+            .is_some_and(|progress| !progress.finished)
             || self.action_request.is_some()
             || self.action_confirmation.is_some()
         {
+            self.notice =
+                "A lifecycle action is already active; :action-results shows progress".into();
             return;
         }
         let request = self.plan_action(action);
@@ -476,6 +483,14 @@ impl App {
         &self,
         action: crate::actions::Action,
     ) -> anyhow::Result<crate::actions::Request> {
+        if self
+            .action_progress
+            .as_ref()
+            .is_some_and(|progress| !progress.finished)
+            || self.action_request.is_some()
+        {
+            anyhow::bail!("A lifecycle action is already active; :action-results shows progress");
+        }
         if self.demo {
             anyhow::bail!("Demo mode: lifecycle mutations are disabled");
         }
@@ -624,7 +639,38 @@ impl App {
             finished: false,
             scroll: 0,
         });
+        self.action_results_visible = false;
+        self.notice.clear();
         self.action_request = Some(request);
+    }
+
+    pub fn action_status(&self) -> Option<String> {
+        use crate::actions::Status;
+        let progress = self.action_progress.as_ref()?;
+        let completed = progress.results.iter().flatten().count();
+        let count = |predicate: fn(&Status) -> bool| {
+            progress
+                .results
+                .iter()
+                .flatten()
+                .filter(|status| predicate(status))
+                .count()
+        };
+        let summary = if progress.finished {
+            format!(
+                "finished · {} succeeded, {} failed, {} unknown, {} skipped",
+                count(|status| matches!(status, Status::Succeeded)),
+                count(|status| matches!(status, Status::Failed(_))),
+                count(|status| matches!(status, Status::Unknown(_))),
+                count(|status| matches!(status, Status::Skipped(_))),
+            )
+        } else {
+            format!("{completed}/{} completed", progress.results.len())
+        };
+        Some(format!(
+            "{} · {summary} · :action-results",
+            progress.request.action.label()
+        ))
     }
 
     pub fn apply_metrics(&mut self, event: crate::metrics::Event) {

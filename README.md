@@ -485,7 +485,8 @@ extracts layers, or exports history automatically.
 
 ## Container and Compose lifecycle actions
 
-With **Explorer focused**, select a container, Compose service, or Compose project:
+With **Explorer focused**, select a container, Compose service/project, **Services**
+group, **Standalone** group, or connected runtime parent:
 
 Press **`a`** to see all four lifecycle actions, eligible target counts, and the
 reason an action is disabled. Selecting an enabled action opens the same safety
@@ -499,15 +500,23 @@ retarget the menu.
 - **`d`** deletes stopped containers (`created`, `exited`, or `dead`) only. Stop all
   members first; a group with running/paused/restarting/unknown members is refused.
 
-These work through the Docker-compatible API for **Docker and Podman**. Runtime
-contexts, generic grouping/resource rows, unavailable/aliased connections,
-Kubernetes-managed workloads, demo mode, and native containerd cannot be mutated.
+These work through the Docker-compatible API for **Docker and Podman**. Services
+groups target their project's existing containers; Standalone groups target only
+non-Compose containers; runtime parents target existing workloads in that connected
+runtime (and the current project focus, if active). Parent operations do not stop or
+restart the runtime daemon/VM itself. **Delete remains disabled on these three parent
+types**; select a container, service, or project for deletion.
+
+Network/volume rows, namespaces, unavailable/aliased connections, Kubernetes-managed
+workloads, demo mode, and native containerd cannot be mutated. A parent selection
+containing any Kubernetes-managed or namespaced container is refused in full,
+even if that member would otherwise be skipped by the requested action.
 While Exec owns input, all these keys go to the shell. `Ctrl-d` remains half-page
 navigation in Tha and EOF inside Exec; it is never a delete shortcut.
 
 Every action opens a scrollable confirmation listing the exact runtime, endpoint,
 container names/IDs, target count, and skipped count. **`y` confirms Start/Stop/
-Restart; Enter or Esc cancels by default.** Delete requires typing the selected
+Restart; n, Enter or Esc cancels by default.** Delete requires typing the selected
 container/service/project name exactly, then Enter. Esc cancels deletion. A
 terminal of at least 60 × 18 is required to review and confirm actions.
 
@@ -525,7 +534,14 @@ Runtime identity, container IDs/names, Compose labels, management metadata, and
 eligible states are rechecked before writes. Targets remain frozen when inventory
 refreshes; newly discovered replicas are not silently added. Operations run
 sequentially off the UI thread, with per-container outcomes and a refresh when
-finished. Bulk operations are **not atomic** and have no automatic rollback.
+each container finishes and when the operation completes. Confirming closes the
+dialog immediately: navigation, logs, and Exec remain available while the action
+runs in the background. The footer shows progress and a retained completion/error
+summary; `:action-results` opens the per-container details. Enter/Esc closes those
+details even while an action is running, without canceling it. Only one lifecycle
+operation can run at a time. Results remain available until the next confirmed
+operation; they are not saved across restarts.
+Bulk operations are **not atomic** and have no automatic rollback.
 Normal API rejections are reported per member; ambiguous failures/timeouts are
 shown as **outcome unknown**, stop remaining mutations, and are never retried
 automatically. Inspect current state before explicitly confirming another action.

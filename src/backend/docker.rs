@@ -288,11 +288,9 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
                 )
                 .ok()
             });
-        let image_id = item
-            .image_manifest_descriptor
-            .as_ref()
-            .and_then(|descriptor| descriptor.digest.clone())
-            .or(item.image_id);
+        // A manifest digest identifies a manifest, not the local image config ID
+        // accepted by image inspect/history. Keep platform metadata separate.
+        let image_id = item.image_id;
         result.containers.push(Container {
             id: item.id.unwrap_or_default(),
             name,

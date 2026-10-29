@@ -57,6 +57,16 @@ impl Request {
         if connection.kind != BackendKind::Docker {
             bail!("Lifecycle actions support Docker and Podman API connections only");
         }
+        if action == Action::Delete
+            && matches!(
+                scope,
+                Scope::Engine | Scope::Services { .. } | Scope::Standalone(_)
+            )
+        {
+            bail!(
+                "Delete is disabled on runtime and grouping rows; select a container, Compose service, or Compose project"
+            );
+        }
         let name = match scope {
             Scope::Container(_) => containers
                 .first()
@@ -64,8 +74,14 @@ impl Request {
                 .unwrap_or_default(),
             Scope::Project { project, .. } => project.clone(),
             Scope::Service { service, .. } => service.clone(),
+            Scope::Engine => format!("{} / workloads", connection.name),
+            Scope::Services {
+                namespace: None,
+                project,
+            } => format!("{project} / Services"),
+            Scope::Standalone(None) => "Standalone containers".into(),
             _ => bail!(
-                "Select a container, Compose service, or Compose project; context actions are disabled"
+                "Select a container, Compose workload, Services group, Standalone group, or connected runtime; namespace and resource actions are disabled"
             ),
         };
         let Some(identity) = identity.filter(|identity| !identity.is_empty()) else {
@@ -331,11 +347,90 @@ mod tests {
     }
 
     #[test]
+    fn workload_parents_allow_lifecycle_but_never_delete() {
+        for (scope, label) in [
+            (Scope::Engine, "Podman / fixture / workloads"),
+            (
+                Scope::Services {
+                    namespace: None,
+                    project: "fixture".into(),
+                },
+                "fixture / Services",
+            ),
+            (Scope::Standalone(None), "Standalone containers"),
+        ] {
+            for action in [Action::Start, Action::Stop, Action::Restart] {
+                let request = Request::build(
+                    0,
+                    &connection(),
+                    Some("engine"),
+                    &scope,
+                    vec![container("running"), container("exited")],
+                    action,
+                )
+                .unwrap();
+                assert_eq!(request.name, label);
+                assert_eq!(request.containers.len(), 1);
+                assert_eq!(request.skipped, 1);
+            }
+            assert!(
+                Request::build(
+                    0,
+                    &connection(),
+                    Some("engine"),
+                    &scope,
+                    vec![container("exited")],
+                    Action::Delete
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("Delete is disabled")
+            );
+        }
+    }
+
+    #[test]
+    fn broad_runtime_operations_fail_closed_when_any_member_is_managed() {
+        for scoped in [false, true] {
+            let mut protected = container("exited");
+            if scoped {
+                protected.namespace = Some("k8s.io".into());
+            } else {
+                protected.managed = true;
+            }
+            assert!(
+                Request::build(
+                    0,
+                    &connection(),
+                    Some("engine"),
+                    &Scope::Engine,
+                    vec![container("running"), protected],
+                    Action::Stop
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be changed")
+            );
+        }
+    }
+
+    #[test]
     fn unsupported_scopes_runtime_missing_identity_and_managed_targets_are_rejected() {
         for scope in [
-            Scope::Engine,
-            Scope::Standalone(None),
             Scope::Namespace("k8s.io".into()),
+            Scope::Standalone(Some("k8s.io".into())),
+            Scope::Services {
+                namespace: Some("k8s.io".into()),
+                project: "fixture".into(),
+            },
+            Scope::Resources {
+                project: None,
+                kind: crate::app::ResourceKind::Network,
+            },
+            Scope::Resource {
+                name: "data".into(),
+                kind: crate::app::ResourceKind::Volume,
+            },
         ] {
             assert!(
                 Request::build(

@@ -13,7 +13,10 @@ fn help_and_version_use_lowercase_executable_name() {
     assert!(help.contains("Usage: tha"));
     assert!(help.contains("--overview"));
     let output = command().arg("--version").output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "tha 0.1.0");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        concat!("tha ", env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[test]

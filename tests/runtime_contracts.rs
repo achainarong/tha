@@ -26,6 +26,10 @@ impl Drop for MockEngine {
 
 impl MockEngine {
     fn start(network_failure: bool) -> Self {
+        Self::start_with_manifest(network_failure, false)
+    }
+
+    fn start_with_manifest(network_failure: bool, manifest: bool) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "tha-{}-{}.sock",
@@ -55,6 +59,35 @@ impl MockEngine {
                     }
                 }
                 let request = String::from_utf8_lossy(&bytes);
+                if manifest && request.contains("/containers/json") {
+                    let body = serde_json::json!([{
+                        "Id":"api123", "Names":["/shop-api-1"], "Image":"mutable:latest",
+                        "ImageID":format!("sha256:{}", "a".repeat(64)), "State":"running",
+                        "ImageManifestDescriptor": {
+                            "digest":format!("sha256:{}", "b".repeat(64)),
+                            "mediaType":"application/vnd.oci.image.manifest.v1+json",
+                            "size":1234,
+                            "platform":{"os":"linux", "architecture":"arm64", "variant":"v8"}
+                        }
+                    }])
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    continue;
+                }
+                if request.contains("/images/") && request.contains(&"b".repeat(64)) {
+                    let body =
+                        r#"{"message":"No such image: manifest digests are not local image IDs"}"#;
+                    let response = format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    continue;
+                }
                 if request.contains("/history") {
                     let body = serde_json::json!([
                         {"Id":"<missing>","Created":2,"CreatedBy":"ENV MODE=production","Tags":[],"Size":0,"Comment":"metadata is not inferred from this zero"},
@@ -228,6 +261,21 @@ async fn layers_use_resolved_metadata_and_do_not_guess_zero_byte_history_mapping
 }
 
 #[tokio::test]
+async fn layers_use_local_image_id_while_platform_uses_the_distinct_manifest_descriptor() {
+    let engine = MockEngine::start_with_manifest(false, true);
+    let connection = engine.connection();
+    let snapshot = backend::snapshot(&connection).await.unwrap();
+    let container = &snapshot.containers[0];
+    let image = tha::layers::lookup(&connection, container).await.unwrap();
+    assert_eq!(image.id, format!("sha256:{}", "a".repeat(64)));
+    assert_eq!(container.image_id.as_deref(), Some(image.id.as_str()));
+    assert_eq!(image.filesystem, ["sha256:base-diff", "sha256:top-diff"]);
+    assert_eq!(image.history.len(), 2);
+    let platform = tha::platform::lookup(&connection, container).await.unwrap();
+    assert_eq!(platform.label(), "linux/arm64/v8 (ARM64)");
+}
+
+#[tokio::test]
 async fn partial_resource_failure_does_not_hide_containers() {
     let engine = MockEngine::start(true);
     let snapshot = backend::snapshot(&engine.connection()).await.unwrap();
@@ -395,6 +443,37 @@ async fn live_docker_inventory() {
     let snapshot = backend::snapshot(&connection).await.unwrap();
     assert!(!snapshot.version.is_empty());
     assert!(snapshot.engine_id.is_some());
+}
+
+#[tokio::test]
+#[ignore = "Read-only layers check; requires THA_TEST_DOCKER_SOCKET and THA_TEST_DOCKER_CONTAINER with a locally available layered image"]
+async fn live_docker_layers() {
+    let connection = Connection {
+        name: "explicit live layers check".into(),
+        kind: BackendKind::Docker,
+        endpoint: std::env::var("THA_TEST_DOCKER_SOCKET").expect("Set THA_TEST_DOCKER_SOCKET"),
+    };
+    let target =
+        std::env::var("THA_TEST_DOCKER_CONTAINER").expect("Set exact container name or full ID");
+    let snapshot = backend::snapshot(&connection).await.unwrap();
+    let container = snapshot
+        .containers
+        .iter()
+        .find(|container| container.id == target || container.name == target)
+        .expect("Container is not present on this explicit engine");
+    let image = tha::layers::lookup(&connection, container).await.unwrap();
+    assert!(
+        !image.filesystem.is_empty(),
+        "Choose a fixture with filesystem layers"
+    );
+    if let Some(id) = &container.image_id {
+        assert_eq!(&image.id, id);
+    }
+    println!(
+        "Read-only layers lookup: {} filesystem layers, {} history steps",
+        image.filesystem.len(),
+        image.history.len()
+    );
 }
 
 #[tokio::test]

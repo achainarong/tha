@@ -128,6 +128,10 @@ def main():
             expect("Runtime: Mock lifecycle")  # Never confirm an action on any host runtime.
             expect("2 target(s)")
             keys(b"y")
+            expect(":action-results")
+            assert "Confirm " not in "\n".join(screen.display)
+            assert "Please wait" not in "\n".join(screen.display)
+            keys(b":action-results\r")
             expect(action + " \u00b7 Results")
             expect("Succeeded")
             keys(b"\r")
@@ -139,6 +143,11 @@ def main():
             expect("Confirm Stop")
             expect("Runtime: Mock lifecycle")
             assert not server.writes
+            keys(b"n")
+            assert "Confirm Stop" not in "\n".join(screen.display)
+            assert not server.writes
+            keys(b"s")
+            expect("Confirm Stop")
             keys(b"\r")  # Enter cancels by default.
             assert not server.writes
             confirmed(b"s", "Stop")
@@ -159,6 +168,8 @@ def main():
             expect("Name does not match")
             assert len(server.writes) == 8
             keys(b"\x1b[200~fixture-project\x1b[201~\r")
+            expect("Delete \u00b7 finished")
+            keys(b":action-results\r")
             expect("Delete \u00b7 Results")
             expect("Succeeded")
             assert len(server.writes) == 10

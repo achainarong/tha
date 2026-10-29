@@ -338,10 +338,10 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                     match event {
                         tha::actions::Event::Result { index, status } => {
                             if let Some(result) = progress.results.get_mut(index) { *result = Some(status); }
+                            refresh_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
                         }
                         tha::actions::Event::Finished => {
                             progress.finished = true;
-                            app.notice = format!("{} finished; inspect per-container results. No automatic retry or rollback.", progress.request.action.label());
                             action_task = None;
                             refresh_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
                         }
@@ -683,6 +683,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             KeyCode::Esc => app.action_confirmation = None,
             KeyCode::Enter if deleting => app.confirm_action(),
             KeyCode::Enter => app.action_confirmation = None, // Cancel is the default.
+            KeyCode::Char('n') if !deleting => app.action_confirmation = None,
             KeyCode::Char('y')
                 if !deleting
                     && !key
@@ -731,10 +732,14 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         }
         return false;
     }
-    if let Some(progress) = &mut app.action_progress {
+    if app.action_results_visible {
+        let Some(progress) = &mut app.action_progress else {
+            app.action_results_visible = false;
+            return false;
+        };
         match key.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') if progress.finished => {
-                app.action_progress = None
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                app.action_results_visible = false
             }
             KeyCode::Up | KeyCode::PageUp => {
                 progress.scroll = progress
@@ -1156,6 +1161,13 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
             app.detail_scroll = 0;
         }
         "actions" => app.open_actions(),
+        "action-results" => {
+            if app.action_progress.is_some() {
+                app.action_results_visible = true;
+            } else {
+                app.notice = "No lifecycle action results yet".into();
+            }
+        }
         "filter-logs" => {
             app.tab = Tab::Logs;
             app.detail_focus = true;
@@ -1660,6 +1672,184 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_background_work_keeps_navigation_and_retains_results() {
+        use tha::actions::{Action, Status};
+        let (tx, _) = watch::channel(0);
+        let mut app = lifecycle_app("running");
+        app.request_action(Action::Restart);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('n')), 20, &tx);
+        assert!(app.action_confirmation.is_none());
+        assert!(app.action_request.is_none());
+
+        app.request_action(Action::Restart);
+        app.action_review_visible = true;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('y')), 20, &tx);
+        assert!(app.action_confirmation.is_none());
+        assert!(!app.action_results_visible);
+        assert!(app.action_status().unwrap().contains("0/1 completed"));
+        app.action_request.take(); // Simulate worker startup.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        terminal
+            .draw(|frame| tha::ui::draw(frame, &mut app))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!rendered.contains("Restart · Running"));
+        assert!(rendered.contains("0/1 completed"));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('2')), 20, &tx);
+        assert_eq!(app.tab, tha::app::Tab::Logs);
+        app.request_action(Action::Stop);
+        assert!(app.action_confirmation.is_none());
+        assert!(app.notice.contains("already active"));
+
+        execute(&mut app, "action-results", &tx);
+        assert!(app.action_results_visible);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 20, &tx);
+        assert!(!app.action_results_visible);
+        assert!(!app.action_progress.as_ref().unwrap().finished);
+        let progress = app.action_progress.as_mut().unwrap();
+        progress.results[0] = Some(Status::Unknown("lost response".into()));
+        progress.finished = true;
+        assert!(app.action_status().unwrap().contains("1 unknown"));
+        execute(&mut app, "action-results", &tx);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+        assert!(!app.action_results_visible);
+        assert!(matches!(
+            app.action_progress.as_ref().unwrap().results[0],
+            Some(Status::Unknown(_))
+        ));
+
+        // Retained results must neither block a new confirmation nor be cleared by cancellation.
+        app.request_action(Action::Restart);
+        assert!(app.action_confirmation.is_some());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('n')), 20, &tx);
+        assert!(app.action_status().unwrap().contains("1 unknown"));
+    }
+
+    #[test]
+    fn parent_lifecycle_shortcuts_confirm_only_the_selected_workloads() {
+        use tha::{actions::Action, app::Scope};
+        let (tx, _) = watch::channel(0);
+        for (scope, expected) in [
+            (
+                Scope::Engine,
+                vec!["fixture", "worker", "other", "standalone"],
+            ),
+            (
+                Scope::Services {
+                    namespace: None,
+                    project: "fixture-project".into(),
+                },
+                vec!["fixture", "worker"],
+            ),
+            (Scope::Standalone(None), vec!["standalone"]),
+        ] {
+            for (key, state, action) in [
+                ('S', "exited", Action::Start),
+                ('s', "running", Action::Stop),
+                ('r', "running", Action::Restart),
+            ] {
+                let mut app = lifecycle_app(state);
+                let mut snapshot = app.engines[0].snapshot.clone().unwrap();
+                let original = snapshot.containers[0].clone();
+                for (id, project, service) in [
+                    ("worker", Some("fixture-project"), Some("worker")),
+                    ("other", Some("other-project"), Some("api")),
+                    ("standalone", None, None),
+                ] {
+                    let mut member = original.clone();
+                    member.id = id.into();
+                    member.name = id.into();
+                    member.project = project.map(Into::into);
+                    member.service = service.map(Into::into);
+                    snapshot.containers.push(member);
+                }
+                app.update_engine(0, Ok(snapshot));
+                app.selected = app
+                    .rows
+                    .iter()
+                    .position(|row| matches!(row.scope, Scope::Project { .. }))
+                    .unwrap();
+                app.expand();
+                app.selected = app.rows.iter().position(|row| row.scope == scope).unwrap();
+                let row_key = app.current().unwrap().key.clone();
+                assert_eq!(
+                    app.action_availability(action, &row_key).unwrap(),
+                    expected.len()
+                );
+                assert!(
+                    app.action_availability(Action::Delete, &row_key)
+                        .unwrap_err()
+                        .contains("Delete is disabled")
+                );
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                    20,
+                    &tx,
+                );
+                let confirmation = app.action_confirmation.as_ref().unwrap();
+                assert_eq!(confirmation.request.action, action);
+                let ids = confirmation
+                    .request
+                    .containers
+                    .iter()
+                    .map(|container| container.id.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(ids.len(), expected.len());
+                assert!(expected.iter().all(|id| ids.contains(id)));
+                assert!(app.action_request.is_none());
+                let name = confirmation.request.name.clone();
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+                terminal
+                    .draw(|frame| tha::ui::draw(frame, &mut app))
+                    .unwrap();
+                assert!(app.action_review_visible);
+                let rendered = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(rendered.contains(&name));
+                assert!(rendered.contains(&format!("{} target(s)", expected.len())));
+                assert!(rendered.contains("Enter/Esc Cancel"));
+                // A refresh and changed selection must not add targets to this review.
+                let mut updated = app.engines[0].snapshot.clone().unwrap();
+                let mut replica = original;
+                replica.id = "new-replica".into();
+                replica.name = "new-replica".into();
+                updated.containers.push(replica);
+                app.update_engine(0, Ok(updated));
+                app.selected = 0;
+                app.action_review_visible = true;
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                    20,
+                    &tx,
+                );
+                let request = app.action_request.as_ref().unwrap();
+                assert_eq!(request.containers.len(), expected.len());
+                assert!(
+                    request
+                        .containers
+                        .iter()
+                        .all(|container| container.id != "new-replica")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn lifecycle_shortcuts_require_confirmation_and_enter_defaults_to_cancel() {
         let (tx, _) = watch::channel(0);
         for (key, state, action) in [
@@ -1784,7 +1974,6 @@ mod tests {
             "control",
             "repeat",
             "demo",
-            "context",
             "offline",
             "alias",
         ] {
@@ -1802,7 +1991,6 @@ mod tests {
                 "control" => key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
                 "repeat" => key.kind = KeyEventKind::Repeat,
                 "demo" => app.demo = true,
-                "context" => app.selected = 0,
                 "offline" => app.engines[0].error = Some("offline".into()),
                 _ => app.engines[0].alias = Some("primary".into()),
             }

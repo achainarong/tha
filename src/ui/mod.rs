@@ -15,8 +15,14 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState, Sparkline, Table, Tabs, Wrap,
     },
 };
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 pub const COMMANDS: &[(&str, &str)] = &[
+    (
+        "action-results",
+        "Review background lifecycle progress and results",
+    ),
     ("overview", "Show workload overview"),
     ("logs", "Open logs for the selected workload"),
     ("networks", "Show network membership"),
@@ -175,7 +181,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.picker.is_some() {
         draw_picker(frame, app, area);
     }
-    if app.action_confirmation.is_some() || app.action_progress.is_some() {
+    if app.action_confirmation.is_some() || app.action_results_visible {
         draw_action(frame, app, area);
     }
 }
@@ -322,7 +328,7 @@ fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
             format!("  ID: {}", safe_text(&container.id)),
             muted(),
         ));
-        if let Some(progress) = &app.action_progress {
+        if let Some(progress) = app.action_progress.as_ref().filter(|_| finished.is_some()) {
             let (text, style) = match &progress.results[index] {
                 Some(Status::Succeeded) => ("Succeeded".into(), accent(app, Color::Green)),
                 Some(status @ Status::Failed(_)) => (status.text(), accent(app, Color::Red)),
@@ -351,7 +357,7 @@ fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
                 safe_text(&confirmation.typed)
             )
         } else {
-            "y Confirm · Enter/Esc Cancel (default)".into()
+            "y Confirm · n Cancel · Enter/Esc Cancel (default)".into()
         };
         format!(
             "{hint}\n{}",
@@ -367,7 +373,7 @@ fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
         if progress.finished {
             "Enter/Esc Close · Inventory refresh requested\nNo automatic retry or rollback; inspect unknown outcomes.".into()
         } else {
-            "Checking / applying confirmed targets. Please wait.\nQuitting cannot undo a request already sent to the runtime.".into()
+            "Enter/Esc Close · Actions continue in the background.\nQuitting cannot undo a request already sent to the runtime.".into()
         }
     };
     frame.render_widget(Paragraph::new(prompt).wrap(Wrap { trim: false }), parts[2]);
@@ -423,6 +429,36 @@ fn pane(title: String, focused: bool) -> Block<'static> {
         })
 }
 
+/// Truncate styled text by terminal cells, without splitting a grapheme cluster.
+fn ellipsize_line(mut line: Line<'_>, width: usize) -> Line<'_> {
+    if line.width() <= width {
+        return line;
+    }
+    let original = std::mem::take(&mut line.spans);
+    if width == 0 {
+        return line;
+    }
+    let mut remaining = width - UnicodeWidthStr::width("…");
+    for span in original {
+        let mut end = 0;
+        for (offset, grapheme) in span.content.grapheme_indices(true) {
+            let cells = UnicodeWidthStr::width(grapheme);
+            if cells > remaining {
+                if end > 0 {
+                    line.spans
+                        .push(Span::styled(span.content[..end].to_owned(), span.style));
+                }
+                line.spans.push(Span::styled("…", span.style));
+                return line;
+            }
+            remaining -= cells;
+            end = offset + grapheme.len();
+        }
+        line.spans.push(span);
+    }
+    line
+}
+
 fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = pane(
         if app.tree_query.is_empty() {
@@ -435,6 +471,12 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = padded(block.inner(area));
     frame.render_widget(block, area);
     let show_metrics = inner.width >= 44;
+    // Match the table's fixed metric columns (9 + 11 cells) and two 1-cell gaps.
+    let workload_width = if show_metrics {
+        inner.width.saturating_sub(22)
+    } else {
+        inner.width
+    };
     let height = inner.height.saturating_sub(u16::from(show_metrics)) as usize;
     if app.selected < app.tree_offset {
         app.tree_offset = app.selected;
@@ -478,6 +520,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
             name.push(Span::raw(safe_text(&row.title)));
             if let Some(condition) = condition.filter(|condition| {
                 matches!(condition.tone, Tone::Error | Tone::Warning)
+                    && !matches!(condition.label, "errors" | "workload issues")
                     && (!matches!(row.scope, Scope::Engine)
                         || app.engines[row.engine].error.is_none()
                             && app.engines[row.engine].snapshot.is_some())
@@ -487,7 +530,10 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                     condition_style(app, condition),
                 ));
             }
-            let mut cells = vec![Cell::from(Line::from(name))];
+            let mut cells = vec![Cell::from(ellipsize_line(
+                Line::from(name),
+                workload_width as usize,
+            ))];
             if show_metrics {
                 let (cpu, memory) =
                     if matches!(row.scope, Scope::Resource { .. } | Scope::Resources { .. }) {
@@ -1586,10 +1632,15 @@ fn highlighted<'a>(
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let notice = match app.action_status() {
+        Some(status) if !app.notice.is_empty() => format!("{} · {status}", app.notice),
+        Some(status) => status,
+        None => app.notice.clone(),
+    };
     let lines = if matches!(app.input_mode, InputMode::LogFilter | InputMode::ExportLogs) {
         vec![
             Line::styled("Log dialog · Enter Apply/Export · Esc Cancel", muted()),
-            Line::from(safe_text(&app.notice)),
+            Line::from(safe_text(&notice)),
         ]
     } else if app.input_mode == InputMode::Search {
         vec![
@@ -1611,10 +1662,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             "? Keys  a Actions  p Performance  Space Toggle  Enter Open  e Exec  Tab Pane  1..5 Views  : Commands"
         };
-        vec![
-            Line::styled(hints, muted()),
-            Line::from(safe_text(&app.notice)),
-        ]
+        vec![Line::styled(hints, muted()), Line::from(safe_text(&notice))]
     };
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -2218,6 +2266,8 @@ mod tests {
                 name: "api".into(),
                 state: "running".into(),
                 health: Some("unhealthy".into()),
+                project: Some("shop".into()),
+                service: Some("api".into()),
                 ..Default::default()
             }],
             ..Default::default()
@@ -2245,7 +2295,9 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
-        assert!(text.contains("[workload issues]"));
+        assert!(!text.contains("[workload issues]"));
+        assert!(!text.contains("[errors]"));
+        assert!(text.contains("shop [1/1 running]"));
         assert!(
             buffer
                 .content
@@ -2344,6 +2396,7 @@ mod tests {
         app.action_progress.as_mut().unwrap().finished = true;
         app.action_progress.as_mut().unwrap().results[0] =
             Some(crate::actions::Status::Unknown("lost response".into()));
+        app.action_results_visible = true;
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let text: String = terminal
             .backend()
@@ -2456,5 +2509,79 @@ mod tests {
         let mut tiny = Terminal::new(TestBackend::new(50, 15)).unwrap();
         tiny.draw(|frame| draw(frame, &mut app)).unwrap();
         assert!(!app.log_export_review_visible);
+    }
+    #[test]
+    fn ellipsis_uses_display_cells_and_preserves_styles_and_whole_graphemes() {
+        assert_eq!(ellipsize_line(Line::from("exact"), 5).to_string(), "exact");
+        assert_eq!(ellipsize_line(Line::from("overflow"), 0).to_string(), "");
+        assert_eq!(ellipsize_line(Line::from("overflow"), 1).to_string(), "…");
+        assert_eq!(ellipsize_line(Line::from("abcdef"), 5).to_string(), "abcd…");
+        assert_eq!(ellipsize_line(Line::from("界界界"), 4).to_string(), "界…");
+        assert_eq!(
+            ellipsize_line(Line::from("e\u{301}e\u{301}e\u{301}"), 2).to_string(),
+            "e\u{301}…"
+        );
+        assert_eq!(
+            ellipsize_line(Line::from("👩‍💻abcdef"), 4).to_string(),
+            "👩‍💻a…"
+        );
+        let line = Line::from(vec![
+            Span::styled("● ", Style::default().fg(Color::Red)),
+            Span::raw("a long workload"),
+        ]);
+        let clipped = ellipsize_line(line, 8);
+        assert_eq!(clipped.to_string(), "● a lon…");
+        assert_eq!(clipped.spans[0].style.fg, Some(Color::Red));
+        assert_eq!(clipped.spans[1].style.fg, None);
+        assert!(clipped.width() <= 8);
+    }
+
+    #[test]
+    fn explorer_marks_truncated_labels_without_changing_metrics_or_full_overview_names() {
+        let name = "a-very-long-runtime-name-".repeat(5);
+        let mut app = App::new(
+            vec![crate::config::Connection {
+                name: name.clone(),
+                kind: BackendKind::Docker,
+                endpoint: "unix:///fixture.sock".into(),
+            }],
+            100,
+            false,
+            true,
+        );
+        app.update_engine(0, Ok(crate::model::Snapshot::default()));
+        for width in [35, 52, 78] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            terminal
+                .draw(|frame| draw_tree(frame, &mut app, frame.area()))
+                .unwrap();
+            let inner = padded(Block::bordered().inner(Rect::new(0, 0, width, 12)));
+            let metrics = inner.width >= 44;
+            let label_width = if metrics {
+                inner.width - 22
+            } else {
+                inner.width
+            };
+            let y = inner.y + u16::from(metrics);
+            let buffer = terminal.backend().buffer();
+            let label: String = (inner.x..inner.x + label_width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            assert!(label.ends_with('…'), "width {width}: {label:?}");
+            if metrics {
+                let values: String = (inner.x + label_width..inner.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                assert!(values.contains("0.0%"), "{values:?}");
+                assert!(values.contains("0 B"), "{values:?}");
+                assert!(!values.contains('…'));
+            }
+        }
+        let overview: String = overview_lines(&app)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(overview.contains(&name));
+        assert_eq!(app.engines[0].connection.name, name);
     }
 }
