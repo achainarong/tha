@@ -24,6 +24,7 @@ const VOLUME_FILTERS: &[&str] = &[
     "Bind mounts",
 ];
 const SORTS: &[&str] = &["Usage ↓", "Name ↑", "Size ↓"];
+const MAX_NAME_CELLS: usize = 82;
 
 #[derive(Debug)]
 struct Entry {
@@ -788,18 +789,16 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                     .map(|row| row.name.width().saturating_add(4))
                     .max()
                     .unwrap_or(18)
-                    .clamp(18, 64)
+                    .clamp(18, MAX_NAME_CELLS)
                     .min(available_name_width)
+            } else if wide {
+                available_name_width.min(MAX_NAME_CELLS)
             } else {
                 available_name_width
             };
             let constraints = if wide {
                 vec![
-                    if images {
-                        Constraint::Min(18)
-                    } else {
-                        Constraint::Length(name_width as u16)
-                    },
+                    Constraint::Length(name_width as u16),
                     Constraint::Length(14),
                     Constraint::Length(10),
                     Constraint::Length(13),
@@ -1327,23 +1326,70 @@ mod tests {
                     .unwrap();
                 let driver = header.find("Driver").unwrap();
                 let volume = header.find("Volume / source").unwrap();
-                let expected_width = (name.width() + 4).clamp(18, 64);
+                let expected_width = (name.width() + 4)
+                    .clamp(18, 82)
+                    .min(usize::from(width) - 68);
                 assert_eq!(driver - volume, expected_width + 2);
                 let visible_project = if width >= 220 {
                     project
                 } else {
-                    &project[..24]
+                    &project[..14]
                 };
                 assert!(
                     lines.iter().any(|line| line.contains(visible_project)),
                     "{lines:#?}"
                 );
-                if name.width() + 4 > 64 {
+                if name.width() + 4 > expected_width {
                     assert!(lines.iter().any(|line| line.contains('…')));
+                    let header_y = lines.iter().position(|line| line == header).unwrap();
+                    let row_y = header_y as u16 + 2;
+                    // A double-width grapheme may leave one spare cell before
+                    // the next column; the ellipsis must still stay inside Name.
+                    assert!((3..=4).any(|offset| {
+                        buffer[(driver as u16 - offset, row_y)].symbol() == "…"
+                    }));
+                    assert_eq!(buffer[(driver as u16, row_y)].symbol(), "l");
                 } else {
                     assert!(lines.iter().any(|line| line.contains(&name)));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn image_names_are_capped_at_82_cells_and_shrink_with_the_table() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.overview_mode = OverviewMode::Images;
+        app.engines[0].snapshot.as_mut().unwrap().images = Some(vec![Image {
+            id: format!("sha256:{}", "a".repeat(64)),
+            tags: vec![format!("registry.example/{}:latest", "x".repeat(100))],
+            size: Some(1024),
+        }]);
+        for width in [92, 120, 150, 220] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &mut app, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let lines: Vec<String> = (0..20)
+                .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            let header = lines
+                .iter()
+                .find(|line| line.contains("Image") && line.contains("Tags"))
+                .unwrap();
+            let name = header.find("Image").unwrap();
+            let tags = header.find("Tags").unwrap();
+            assert_eq!(tags - name, (usize::from(width) - 68).min(82) + 2);
+            assert!(lines.iter().any(|line| line.contains('…')));
+            assert!(lines.iter().any(|line| line.contains("latest")));
+            let row_y = lines
+                .iter()
+                .position(|line| line.contains("registry.example/"))
+                .unwrap();
+            assert_eq!(buffer[(tags as u16 - 3, row_y as u16)].symbol(), "…");
+            assert_eq!(buffer[(tags as u16, row_y as u16)].symbol(), "l");
         }
     }
 }
