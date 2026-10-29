@@ -280,6 +280,100 @@ semantic multiline grouping, and export are follow-up work.
 
 ## CPU and memory
 
+### Background collection and container History
+
+Press **`6`** on a container (or `:history`) for CPU, RAM, disk read/write and
+network receive/transmit charts. **`[` / `]`** choose 1 minute, 5 minutes,
+15 minutes, 1 hour or 24 hours. **Left/right** browse the timeline; **`f`** returns
+to live. **`c`** enables a shared time cursor and **`h` / `l`** inspect readings.
+**`z`** enlarges History across the terminal and **Esc** restores the split view.
+Small terminals show one metric group at a time; **`j` / `k`** switches groups.
+Times are UTC. Downsampled charts preserve bucket peaks; cursor values are bucket
+averages. Unsupported/missing data stays absent, not zero. Disk/network rates use
+actual elapsed time and reset safely if counters decrease; totals are retained
+in the database. These are runtime-reported container I/O, not filesystem size.
+
+Collection is **opt-in** and read-only:
+
+```sh
+tha daemon                    # Foreground collector; Ctrl-C stops it
+tha service install           # Write a per-user launchd/systemd definition
+tha service start             # Enable/start background collection
+tha service status
+tha service stop
+tha service uninstall         # Preserve history and configuration
+tha history status
+tha history compact           # Offline maintenance; stop daemon first
+tha --standalone               # No daemon/history DB; session-only sampling
+```
+
+Alternatively, `make install MODE=service` explicitly installs and starts the
+user service. Plain `make install` remains CLI-only. No sudo or system-wide
+service is used. Services run as your user and need the same runtime/socket
+permissions and CLI availability as interactive Tha. Use
+`tha --config /absolute/path/config.toml service install` to pin a configuration.
+Stop/uninstall the user service before removing or moving its executable.
+On macOS, a user agent starts after login; on Linux, a user manager must be
+available (collection after logout depends on the user's systemd setup).
+
+The daemon targets **one-second sampling**, retains a rolling **24 hours** of
+individual container readings in SQLite WAL mode, and survives restarts. It does
+not start/stop containers, collect logs, pull images, or store container secrets.
+The UI automatically uses daemon metrics while its writer lock is active;
+starting/stopping the daemon hands collection between modes. Missing daemon
+targets stay unavailable instead of triggering a second metrics collector.
+Without a daemon, History is session-only and currently limited to the most
+recent **60 sampling batches**, clearly labelled in the view.
+
+Default history paths:
+- macOS: `~/Library/Application Support/tha/metrics.sqlite`
+- Linux: `$XDG_STATE_HOME/tha/metrics.sqlite` (default `~/.local/state/tha/metrics.sqlite`)
+
+```toml
+history_disk_mb = 1024          # Approximate DB/WAL guard, 16–65536 MiB
+# history_database = "/private/user-owned/directory/metrics.sqlite"
+# discover_connections = false # Use only explicit [[connections]], also in daemon
+```
+
+Expired readings are deleted in small transactions at startup and during
+minute-based maintenance; cleanup continues between ingestions until caught up.
+Queries always exclude readings older than 24 hours. SQLite reuses freed pages;
+the database file may retain its high-water size. Periodic WAL checkpoints limit
+normal write-file growth; offline compaction reclaims free pages and needs spare
+disk space. The disk guard pauses sample storage with an explicit warning/dropped
+sample count rather than deleting recent history. It is not an OS filesystem
+quota: in-flight transactions/checkpoints need headroom. Increase the budget for
+larger fleets. Slow runtimes have gaps rather than an unbounded request backlog.
+At most two runtime stats batches (eight container requests each) run concurrently;
+the writer queue is bounded to eight batches and excess data is reported dropped.
+
+**Live data and persistence are separate.** Samples reach the UI over a private,
+same-user Unix socket every second. SQLite receives one transaction across runtime
+batches **every 15 seconds**, or earlier when the persistence buffer reaches
+20,000 readings / approximately 4 MiB. Normal shutdown flushes the remaining
+buffer. An unexpected crash can lose the unflushed window (normally up to 15
+seconds); this is a deliberate durability/performance tradeoff, not downsampling.
+Every individual collected tick is preserved when it is flushed.
+
+Opening a UI session fetches recent live readings as well as SQLite history. The
+merge excludes exact live timestamps from the SQL query, so a concurrent flush
+cannot create missing or duplicate ticks at the boundary. Genuine collection
+failures/downtime remain gaps. The recent live cache is bounded to 45 seconds,
+50,000 readings and approximately 16 MiB; overload can reduce available backfill.
+Live responses and clients have size/time/concurrency limits. The socket is mode
+0600 in the private history directory, and both peers verify same-user ownership.
+If the daemon is stopped while a UI remains open, its local session readings can
+overlay persisted history without writing to the database. Daemon-origin readings
+are not replayed as session samples, preventing duplicates during source handoff.
+
+Offline checks and collector measurements (no real runtimes or services):
+
+```sh
+uv run --with pyte python scripts/daemon_smoke.py
+uv run --with pyte python scripts/daemon_smoke.py --benchmark --containers 100 --binary target/release/tha
+cargo test --release --locked --lib history::tests::benchmark_one_day_storage_and_chart_query -- --ignored --nocapture
+```
+
 The explorer shows aligned CPU/Mem columns for runtimes, namespaces, Compose
 projects, services, and containers. Press **`p`** to expand the **bottom-left
 Performance panel**: per-runtime CPU sparklines, memory bars, and sample coverage.

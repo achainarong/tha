@@ -347,10 +347,23 @@ pub fn parse_usage(row: &Value) -> Result<crate::metrics::Usage> {
     if cpu.is_none() && used.is_none() {
         bail!("nerdctl stats unavailable (requires supported cgroups and permissions)");
     }
+    let pair = |field: &str| {
+        row.get(field)
+            .and_then(Value::as_str)
+            .and_then(|text| text.split_once('/'))
+            .map(|(a, b)| (parse_bytes(a), parse_bytes(b)))
+            .unwrap_or_default()
+    };
+    let (network_rx_bytes, network_tx_bytes) = pair("NetIO");
+    let (disk_read_bytes, disk_write_bytes) = pair("BlockIO");
     Ok(crate::metrics::Usage {
         cpu_percent: cpu,
         memory_bytes: used,
         memory_limit_bytes: limit,
+        network_rx_bytes,
+        network_tx_bytes,
+        disk_read_bytes,
+        disk_write_bytes,
         ..Default::default()
     })
 }
@@ -381,6 +394,18 @@ fn parse_bytes(text: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stats_io_pairs_are_cumulative_bytes_and_missing_is_not_zero() {
+        let usage = parse_usage(
+            &serde_json::json!({"CPUPerc":"1%","NetIO":"1KiB / 2KiB","BlockIO":"3kB / 4kB"}),
+        )
+        .unwrap();
+        assert_eq!(usage.network_rx_bytes, Some(1024));
+        assert_eq!(usage.network_tx_bytes, Some(2048));
+        assert_eq!(usage.disk_read_bytes, Some(3000));
+        assert_eq!(usage.disk_write_bytes, Some(4000));
+        assert_eq!(usage.disk_read_rate, None);
+    }
 
     #[test]
     fn extracts_only_safe_fields_and_compose_metadata() {

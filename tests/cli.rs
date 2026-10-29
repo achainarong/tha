@@ -5,6 +5,23 @@ fn command() -> Command {
 }
 
 #[test]
+fn daemon_service_and_history_help_do_not_require_a_terminal() {
+    for arguments in [
+        vec!["daemon", "--help"],
+        vec!["service", "--help"],
+        vec!["history", "--help"],
+        vec!["service", "install", "--help"],
+    ] {
+        let output = command().args(arguments).output().unwrap();
+        assert!(output.status.success());
+        assert!(!output.stdout.contains(&0x1b));
+    }
+    let output = command().args(["--demo", "daemon"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be combined"));
+}
+
+#[test]
 fn help_and_version_use_lowercase_executable_name() {
     let output = command().arg("--help").output().unwrap();
     assert!(output.status.success());

@@ -95,6 +95,7 @@ pub enum Tab {
     Networks,
     Exec,
     Layers,
+    History,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +207,11 @@ pub enum PerformanceScope {
 }
 
 pub struct App {
+    pub discover_connections: bool,
+    pub history_view: crate::history::View,
+    pub history_database: Option<PathBuf>,
+    pub metrics_database: Option<PathBuf>,
+    pub auto_history_database: Option<PathBuf>,
     presentations: PresentationCache,
     pub engines: Vec<Engine>,
     pub context_order: Vec<usize>,
@@ -250,6 +256,7 @@ pub struct App {
     pub pending_g: bool,
     pub demo: bool,
     pub metrics_refresh_seconds: u64,
+    pub local_metrics_refresh_seconds: u64,
     pub project: Option<Project>,
     history: Vec<NavigationState>,
     pub picker: Option<Picker>,
@@ -283,6 +290,11 @@ impl App {
     ) -> Self {
         let context_order = (0..connections.len()).collect();
         let mut app = Self {
+            discover_connections: true,
+            history_view: Default::default(),
+            history_database: None,
+            metrics_database: None,
+            auto_history_database: None,
             presentations: Default::default(),
             context_order,
             context_pins: Vec::new(),
@@ -341,6 +353,7 @@ impl App {
             pending_g: false,
             demo,
             metrics_refresh_seconds: 1,
+            local_metrics_refresh_seconds: 1,
             project: None,
             history: Vec::new(),
             picker: None,
@@ -726,6 +739,10 @@ impl App {
     }
 
     pub fn reconcile_detail_tab(&mut self) {
+        if self.tab == Tab::History && self.performance_container().is_none() {
+            self.tab = Tab::Overview;
+            self.history_view.expanded = false;
+        }
         if self.tab == Tab::Layers && !self.layers_available() {
             self.tab = Tab::Overview;
             self.detail_scroll = 0;
@@ -1100,7 +1117,13 @@ impl App {
             return;
         }
         if let Some(snapshot) = &engine.snapshot {
-            engine.metrics.apply(&snapshot.containers, event.batch);
+            if self.metrics_database.is_some() {
+                engine
+                    .metrics
+                    .apply_remote(&snapshot.containers, event.batch);
+            } else {
+                engine.metrics.apply(&snapshot.containers, event.batch);
+            }
         }
         self.invalidate_presentations();
     }

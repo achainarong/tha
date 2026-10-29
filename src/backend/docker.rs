@@ -530,6 +530,39 @@ pub fn parse_usage(
             usage
         }
     });
+    let network = |receive: bool| {
+        let networks = response
+            .networks
+            .as_ref()
+            .filter(|networks| !networks.is_empty())?;
+        networks.values().try_fold(0u64, |sum, value| {
+            sum.checked_add(if receive {
+                value.rx_bytes?
+            } else {
+                value.tx_bytes?
+            })
+        })
+    };
+    let disk = |operation: &str| {
+        let entries = response
+            .blkio_stats
+            .as_ref()?
+            .io_service_bytes_recursive
+            .as_ref()?;
+        let mut found = false;
+        let mut total = 0u64;
+        for entry in entries {
+            if entry
+                .op
+                .as_deref()
+                .is_some_and(|op| op.eq_ignore_ascii_case(operation))
+            {
+                found = true;
+                total = total.checked_add(entry.value?)?;
+            }
+        }
+        found.then_some(total)
+    };
     (
         Usage {
             cpu_percent,
@@ -539,6 +572,11 @@ pub fn parse_usage(
                 .filter(|value| *value > 0),
             cpu_warming: counters.is_some() && cpu_percent.is_none(),
             memory_working_set: working_set,
+            network_rx_bytes: network(true),
+            network_tx_bytes: network(false),
+            disk_read_bytes: disk("read"),
+            disk_write_bytes: disk("write"),
+            ..Default::default()
         },
         counters,
     )
@@ -547,6 +585,17 @@ pub fn parse_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn io_counters_sum_interfaces_and_devices_without_guessing_missing_values() {
+        let response=serde_json::from_value(serde_json::json!({"networks":{"eth0":{"rx_bytes":10,"tx_bytes":20},"eth1":{"rx_bytes":30,"tx_bytes":40}},"blkio_stats":{"io_service_bytes_recursive":[{"op":"Read","value":100},{"op":"Read","value":200},{"op":"Write","value":50},{"op":"Total","value":350}]}})).unwrap();
+        let (usage, _) = parse_usage(&response, None);
+        assert_eq!(usage.network_rx_bytes, Some(40));
+        assert_eq!(usage.network_tx_bytes, Some(60));
+        assert_eq!(usage.disk_read_bytes, Some(300));
+        assert_eq!(usage.disk_write_bytes, Some(50));
+        let (missing, _) = parse_usage(&Default::default(), None);
+        assert!(missing.network_rx_bytes.is_none() && missing.disk_write_bytes.is_none());
+    }
     #[test]
     fn parses_cpu_and_cgroup_working_set_without_guessing_missing_fields() {
         let response = serde_json::from_value(serde_json::json!({

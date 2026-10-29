@@ -31,13 +31,51 @@ async fn start() -> Result<()> {
     let cli = Cli::parse();
     let mut config = Config::load(cli.config.as_ref())?;
     config.monochrome |= cli.monochrome || std::env::var_os("NO_COLOR").is_some();
+    if let Some(command) = &cli.command {
+        match command {
+            tha::cli::Command::Daemon => {
+                if cli.demo || cli.standalone {
+                    bail!("daemon cannot be combined with --demo or --standalone");
+                }
+                let connections = connections(&cli, &config)?;
+                return tha::daemon::run(config, connections).await;
+            }
+            tha::cli::Command::Service { action } => {
+                return tha::service::run(*action, cli.config.as_deref()).await;
+            }
+            tha::cli::Command::History { action } => {
+                let path = tha::history::path(&config)?;
+                match action {
+                    tha::cli::HistoryAction::Status => {
+                        println!("{}\n{}", path.display(), tha::history::status(&path)?)
+                    }
+                    tha::cli::HistoryAction::Compact => {
+                        let budget = config.history_disk_mb * 1024 * 1024;
+                        tokio::task::spawn_blocking(move || -> Result<()> {
+                            let store = tha::history::Store::open(&path, budget)?;
+                            while store.prune_batch(tha::history::now_ms())? > 0 {}
+                            store.compact()?;
+                            println!(
+                                "Compacted {} ({} bytes)",
+                                path.display(),
+                                store.size_bytes()
+                            );
+                            Ok(())
+                        })
+                        .await??;
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
     let connections = if cli.demo {
         demo::connections()
     } else {
         connections(&cli, &config)?
     };
     if cli.list_connections {
-        let discovery = if cli.demo {
+        let discovery = if cli.demo || !config.discover_connections {
             Default::default()
         } else {
             discovery::podman::discover().await
@@ -73,13 +111,29 @@ async fn start() -> Result<()> {
         config.monochrome,
         cli.demo,
     );
+    app.discover_connections = config.discover_connections;
     if cli.demo {
         demo::populate(&mut app);
+    }
+    if !cli.demo && !cli.standalone {
+        let path = tha::history::path(&config)?;
+        app.auto_history_database = Some(path.clone());
+        if path.exists() {
+            app.history_database = Some(path.clone());
+        }
+        if tha::history::collector_running(&path)? {
+            app.metrics_database = Some(path);
+        }
     }
     app.log_view.wrap = config.log_wrap;
     app.exec_command = config.exec_command;
     app.sessions.set_limit(config.max_exec_sessions)?;
-    app.metrics_refresh_seconds = config.metrics_refresh_seconds;
+    app.local_metrics_refresh_seconds = config.metrics_refresh_seconds;
+    app.metrics_refresh_seconds = if app.metrics_database.is_some() {
+        1
+    } else {
+        config.metrics_refresh_seconds
+    };
     app.context_pins = config.context_order;
     app.refresh_tree();
     if !cli.demo {
@@ -87,7 +141,9 @@ async fn start() -> Result<()> {
     }
     if !cli.demo && !cli.overview {
         app.configure_startup(std::env::current_dir().context("Cannot read current directory")?);
-        app.wait_for_machine_discovery();
+        if app.discover_connections {
+            app.wait_for_machine_discovery();
+        }
     }
     app.keymap = tha::keymap::Keymap::parse(&config.bindings)?;
     app.custom_bindings = config.bindings;
@@ -124,15 +180,13 @@ fn connections(cli: &Cli, config: &Config) -> Result<Vec<Connection>> {
             endpoint,
         });
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let docker_config = std::env::var_os("DOCKER_CONFIG").map(PathBuf::from);
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-    connections.extend(discovery::discover(
-        home.as_deref(),
-        docker_config.as_deref(),
-        runtime_dir.as_deref(),
-    ));
+    if config.discover_connections {
+        connections.extend(tha::collector::discover_local());
+    }
     if connections.is_empty() {
+        if !config.discover_connections {
+            bail!("No connections configured; add [[connections]] or enable discover_connections");
+        }
         connections.push(Connection {
             name: "Docker / local".into(),
             kind: BackendKind::Docker,
@@ -210,13 +264,24 @@ fn sync_workers(
             continue;
         }
         let connection = engine.connection.clone();
-        slot.tasks.push(AbortTask(tokio::spawn(metrics::worker(
-            index,
-            connection.clone(),
-            targets[index].subscribe(),
-            channels.metrics.clone(),
-            app.metrics_refresh_seconds,
-        ))));
+        if let Some(path) = &app.metrics_database {
+            slot.tasks
+                .push(AbortTask(tokio::spawn(tha::daemon::metrics_worker(
+                    index,
+                    connection.clone(),
+                    targets[index].subscribe(),
+                    channels.metrics.clone(),
+                    path.clone(),
+                ))));
+        } else {
+            slot.tasks.push(AbortTask(tokio::spawn(metrics::worker(
+                index,
+                connection.clone(),
+                targets[index].subscribe(),
+                channels.metrics.clone(),
+                app.metrics_refresh_seconds,
+            ))));
+        }
         let sender = channels.snapshots.clone();
         let mut refresh = channels.refresh.clone();
         let generation = slot.generation;
@@ -270,23 +335,30 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
             &channels,
             refresh_seconds,
         );
-        let mut refresh = refresh_rx;
-        discovery_task = Some(AbortTask(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(refresh_seconds));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! { _ = interval.tick() => {}, changed = refresh.changed() => { if changed.is_err() { break; } } }
-                if discovery_tx
-                    .send(discovery::podman::discover().await)
-                    .await
-                    .is_err()
-                {
-                    break;
+        if app.discover_connections {
+            let mut refresh = refresh_rx;
+            discovery_task = Some(AbortTask(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(refresh_seconds));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! { _ = interval.tick() => {}, changed = refresh.changed() => { if changed.is_err() { break; } } }
+                    if discovery_tx
+                        .send(discovery::podman::discover().await)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-            }
-        })));
+            })));
+        }
     }
     let mut log_task: Option<AbortTask> = None;
+    let (history_tx, mut history_rx) = mpsc::channel::<tha::history::Event>(1);
+    let mut history_task: Option<AbortTask> = None;
+    let mut history_request: Option<(String, String, usize, Option<i64>)> = None;
+    let mut history_updated = std::time::Instant::now() - Duration::from_secs(2);
+    let mut source_checked = std::time::Instant::now();
     let log_capacity = app.logs.capacity();
     let mut redraw = tokio::time::interval(Duration::from_millis(70));
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -339,6 +411,14 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 redraw_now = true;
             },
             Some(event) = metrics_rx.recv() => { app.apply_metrics(event); redraw_now = true; },
+            Some(event) = history_rx.recv() => {
+                if event.generation == app.history_view.generation {
+                    app.history_view.loading = false;
+                    match event.data { Ok(data) => { app.history_view.data = data; app.history_view.error=None; }, Err(error) => app.history_view.error=Some(error) }
+                    history_task=None;
+                    redraw_now=true;
+                }
+            },
             Some(result) = export_rx.recv() => { app.log_export_busy = false; app.notice = result; export_task = None; redraw_now = true; },
             Some(update) = action_rx.recv() => {
                 let operation = update.operation;
@@ -355,8 +435,28 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 redraw_now = true;
             },
             _ = redraw.tick() => {
+                if source_checked.elapsed() >= Duration::from_secs(1) {
+                    source_checked=std::time::Instant::now();
+                    if let Some(path)=app.auto_history_database.clone() {
+                        if path.exists() { app.history_database=Some(path.clone()); }
+                        match tha::history::collector_running(&path) {
+                            Ok(running) if running != app.metrics_database.is_some() => {
+                                app.metrics_database=running.then_some(path);
+                                app.metrics_refresh_seconds=if running {1} else {app.local_metrics_refresh_seconds};
+                                for worker in &mut workers { worker.connection=None; }
+                                let available: Vec<_>=(0..app.engines.len()).map(|index|(index,true)).collect();
+                                sync_workers(&mut app,&available,&mut workers,&mut metric_targets,&channels,refresh_seconds);
+                                publish_metric_targets(&mut app,&metric_targets);
+                                app.notice=if running { "Connected to daemon metrics; local stats polling stopped" } else { "Daemon stopped; local stats sampling resumed" }.into();
+                            }
+                            Err(error)=>app.notice=format!("Cannot check daemon: {error:#}"),
+                            _=>{}
+                        }
+                    }
+                }
                 redraw_now = visual_deadline.is_some_and(|at| std::time::Instant::now() >= at)
                     || app.tab == Tab::Exec && app.sessions.active().is_some();
+                redraw_now |= app.tab == Tab::History && history_updated.elapsed() >= Duration::from_secs(1);
                 for notice in app.sessions.poll() {
                     redraw_now = true;
                     if Some(notice.id) == app.sessions.active_id() { app.exec_input = false; }
@@ -397,6 +497,74 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
             })));
         }
         if redraw_now {
+            if app.tab == Tab::History {
+                if let Some((index, container)) = app.performance_container() {
+                    let engine = &app.engines[index];
+                    let runtime = tha::history::runtime_key(
+                        &engine.connection,
+                        &engine
+                            .snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.engine_id.clone()),
+                    );
+                    let target = (runtime.clone(), container.key());
+                    let request = (
+                        runtime,
+                        container.key(),
+                        app.history_view.range,
+                        app.history_view.end_ms,
+                    );
+                    let changed = history_request.as_ref() != Some(&request);
+                    if changed
+                        || history_task.is_none()
+                            && history_updated.elapsed() >= Duration::from_secs(1)
+                            && app.history_view.end_ms.is_none()
+                    {
+                        history_task = None;
+                        if changed {
+                            app.history_view.data = Default::default();
+                            if history_request.as_ref().is_none_or(|old| {
+                                old.0 != request.0 || old.1 != request.1 || old.2 != request.2
+                            }) {
+                                app.history_view.cursor = None;
+                            }
+                            app.history_view.error = None;
+                        }
+                        app.history_view.target = Some(target.clone());
+                        app.history_view.generation = app.history_view.generation.wrapping_add(1);
+                        let generation = app.history_view.generation;
+                        let (start, end) = app.history_view.bounds();
+                        history_request = Some(request);
+                        history_updated = std::time::Instant::now();
+                        if let Some(path) = app.history_database.clone() {
+                            let sender = history_tx.clone();
+                            let session =
+                                engine.metrics.local_samples(&container.key(), start, end);
+                            app.history_view.loading = true;
+                            history_task = Some(AbortTask(tokio::spawn(async move {
+                                let data = tha::live::history_query_with_session(
+                                    path,
+                                    target.0,
+                                    target.1,
+                                    (start, end),
+                                    600,
+                                    session,
+                                )
+                                .await
+                                .map_err(|error| format!("{error:#}"));
+                                let _ = sender.send(tha::history::Event { generation, data }).await;
+                            })));
+                        } else {
+                            app.history_view.data =
+                                engine.metrics.local_history(&container.key(), start, end);
+                            app.history_view.loading = false;
+                        }
+                    }
+                }
+            } else {
+                history_task = None;
+                history_request = None;
+            }
             // Input/operation feedback is not delayed until the next animation tick.
             // Resolve view targets first so navigation never paints the previous target's layers.
             update_layers(&mut app, &mut layers_task, &layers_tx);
@@ -408,6 +576,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
         }
     }
     drop(log_task);
+    drop(history_task);
     drop(action_tasks);
     drop(layers_task);
     drop(export_task);
@@ -905,6 +1074,84 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
     // Only navigation reaches this point. Editors, confirmations and PTYs retain raw keys.
     let key = app.keymap.translate(key);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if app.detail_focus
+        && app.tab == Tab::History
+        && !ctrl
+        && !key.modifiers.contains(KeyModifiers::ALT)
+    {
+        let view = &mut app.history_view;
+        let handled = match key.code {
+            KeyCode::Char('[') => {
+                view.range_by(-1);
+                true
+            }
+            KeyCode::Char(']') => {
+                view.range_by(1);
+                true
+            }
+            KeyCode::Left | KeyCode::Right if view.cursor.is_none() => {
+                view.pan(if key.code == KeyCode::Left { -1 } else { 1 });
+                true
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                view.cursor = Some(
+                    view.cursor
+                        .unwrap_or(view.data.points.len().saturating_sub(1))
+                        .saturating_sub(1),
+                );
+                view.end_ms.get_or_insert_with(tha::history::now_ms);
+                true
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                view.cursor = Some(
+                    view.cursor
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                        .min(view.data.points.len().saturating_sub(1)),
+                );
+                view.end_ms.get_or_insert_with(tha::history::now_ms);
+                true
+            }
+            KeyCode::Char('c') => {
+                view.cursor = if view.cursor.is_some() {
+                    None
+                } else {
+                    Some(view.data.points.len().saturating_sub(1))
+                };
+                view.end_ms.get_or_insert_with(tha::history::now_ms);
+                true
+            }
+            KeyCode::Char('f') => {
+                view.end_ms = None;
+                view.cursor = None;
+                true
+            }
+            KeyCode::Char('z') => {
+                view.expanded = !view.expanded;
+                true
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                view.metric = (view.metric + 1) % 4;
+                true
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                view.metric = (view.metric + 3) % 4;
+                true
+            }
+            KeyCode::Esc if view.expanded => {
+                view.expanded = false;
+                true
+            }
+            KeyCode::Esc if view.cursor.is_some() => {
+                view.cursor = None;
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            return false;
+        }
+    }
     let lifecycle_key = !app.detail_focus
         && !key.modifiers.intersects(
             KeyModifiers::CONTROL
@@ -926,7 +1173,9 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         KeyCode::Char('r') if lifecycle_key => app.request_action(tha::actions::Action::Restart),
         KeyCode::Char('d') if lifecycle_key => app.request_action(tha::actions::Action::Delete),
         KeyCode::Char('q') => {
-            if app.performance_focus {
+            if app.tab == Tab::History && app.history_view.expanded {
+                app.history_view.expanded = false;
+            } else if app.performance_focus {
                 app.performance_focus = false;
             } else if app.detail_focus {
                 app.detail_focus = false;
@@ -935,7 +1184,9 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             }
         }
         KeyCode::Esc => {
-            if app.performance_open && app.performance_expanded {
+            if app.tab == Tab::History && app.history_view.expanded {
+                app.history_view.expanded = false;
+            } else if app.performance_open && app.performance_expanded {
                 app.performance_expanded = false;
             } else if app.tab == Tab::Layers && app.detail_focus && app.layers.expanded {
                 app.layers.expanded = false;
@@ -1009,6 +1260,11 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             app.performance_focus = false;
             app.layers.expanded = false;
             app.detail_scroll = 0;
+        }
+        KeyCode::Char('6') if !ctrl && app.performance_container().is_some() => {
+            app.tab = Tab::History;
+            app.detail_focus = true;
+            app.performance_focus = false;
         }
         KeyCode::Enter => {
             if app.performance_focus
@@ -1205,6 +1461,15 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
             app.performance_focus = false;
             app.detail_scroll = 0;
         }
+        "history" => {
+            if app.performance_container().is_some() {
+                app.tab = Tab::History;
+                app.detail_focus = true;
+                app.performance_focus = false;
+            } else {
+                app.notice = "Select a container to open History".into();
+            }
+        }
         "reload-layers" => {
             app.layers.select(None);
             app.detail_scroll = 0;
@@ -1261,6 +1526,42 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn history_navigation_is_container_only_and_does_not_steal_editor_or_shell_input() {
+        let mut app = app();
+        let (tx, _) = watch::channel(0);
+        app.selected = 0;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('6')), 20, &tx);
+        assert_eq!(app.tab, Tab::Overview);
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, tha::app::Scope::Container(_)))
+            .unwrap();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('6')), 20, &tx);
+        assert_eq!(app.tab, Tab::History);
+        assert!(app.detail_focus);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char(']')), 20, &tx);
+        assert_eq!(app.history_view.range, 1);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Left), 20, &tx);
+        assert!(app.history_view.end_ms.is_some());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('z')), 20, &tx);
+        assert!(app.history_view.expanded);
+        app.detail_focus = false;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 20, &tx);
+        assert!(!app.history_view.expanded);
+        app.detail_focus = true;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('f')), 20, &tx);
+        assert!(app.history_view.end_ms.is_none());
+        app.input_mode = InputMode::Search;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char(']')), 20, &tx);
+        assert_eq!(app.input, "]");
+        assert_eq!(app.history_view.range, 1);
+        app.input_mode = InputMode::Normal;
+        app.selected = 0;
+        app.reconcile_detail_tab();
+        assert_eq!(app.tab, Tab::Overview);
+    }
     fn app() -> App {
         let mut a = App::new(demo::connections(), 100, false, true);
         demo::populate(&mut a);

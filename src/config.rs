@@ -25,6 +25,10 @@ impl Connection {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub discover_connections: bool,
+    pub history_database: Option<PathBuf>,
+    /// Total database/WAL budget; sampling pauses with a visible warning if full.
+    pub history_disk_mb: u64,
     pub refresh_seconds: u64,
     pub metrics_refresh_seconds: u64,
     pub log_capacity: usize,
@@ -42,6 +46,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            discover_connections: true,
+            history_database: None,
+            history_disk_mb: 1024,
             refresh_seconds: 5,
             metrics_refresh_seconds: 1,
             log_capacity: 5000,
@@ -75,6 +82,9 @@ impl Config {
         };
         if !(1..=300).contains(&config.refresh_seconds) {
             bail!("refresh_seconds must be between 1 and 300");
+        }
+        if !(16..=65_536).contains(&config.history_disk_mb) {
+            bail!("history_disk_mb must be between 16 and 65536");
         }
         if !(1..=60).contains(&config.metrics_refresh_seconds) {
             bail!("metrics_refresh_seconds must be between 1 and 60");

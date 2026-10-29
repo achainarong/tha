@@ -31,5 +31,6 @@ jobs:
       - run: uv run --with pyte python scripts/podman_smoke.py
       - run: uv run --with pyte python scripts/actions_smoke.py
       - run: uv run --with pyte python scripts/features_smoke.py
+      - run: uv run --with pyte python scripts/daemon_smoke.py
       - run: uv run --with pyyaml python scripts/release_smoke.py
       - run: make release

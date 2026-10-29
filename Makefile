@@ -18,6 +18,7 @@ demo: ## Explore fixture workloads without a running engine
 
 install: ## Install tha into Cargo's bin directory (no sudo)
 	cargo install --path . --locked
+	@if [ "$(MODE)" = "service" ]; then "$${CARGO_HOME:-$$HOME/.cargo}/bin/tha" service install && "$${CARGO_HOME:-$$HOME/.cargo}/bin/tha" service start; fi
 
 uninstall: ## Uninstall tha using Cargo
 	cargo uninstall tha

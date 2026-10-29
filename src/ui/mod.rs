@@ -17,6 +17,7 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+mod history;
 
 pub const COMMANDS: &[(&str, &str)] = &[
     (
@@ -24,6 +25,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "Review background lifecycle progress and results",
     ),
     ("overview", "Show workload overview"),
+    (
+        "history",
+        "Analyze the selected container's CPU, RAM, disk and network history",
+    ),
     ("logs", "Open logs for the selected workload"),
     ("networks", "Show network membership"),
     ("refresh", "Refresh all engine snapshots"),
@@ -158,7 +163,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Paragraph::new(vec![header, Line::styled(breadcrumb, muted())]),
         layout[0],
     );
-    let expanded = app.performance_open && app.performance_expanded && layout[1].height >= 20;
+    let history_zoom = app.tab == Tab::History && app.history_view.expanded;
+    let expanded =
+        !history_zoom && app.performance_open && app.performance_expanded && layout[1].height >= 20;
     let body = if expanded {
         let parts = Layout::vertical([
             Constraint::Min(8),
@@ -170,7 +177,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         layout[1]
     };
-    if area.width >= 110 {
+    if history_zoom {
+        history::draw(frame, app, body);
+    } else if area.width >= 110 {
         let tree_width = (area.width / 2).clamp(52, 72);
         let panes =
             Layout::horizontal([Constraint::Length(tree_width), Constraint::Min(1)]).split(body);
@@ -859,6 +868,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::Networks => "3 Networks",
         Tab::Exec => "4 Exec",
         Tab::Layers => "5 Layers",
+        Tab::History => "6 History",
     };
     let exec_context = if app.tab == Tab::Exec {
         app.sessions
@@ -896,12 +906,16 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
     if !app.layers_available() {
         names.pop();
     }
+    if app.performance_container().is_some() {
+        names.push(if inner.width >= 44 { "6 History" } else { "6" });
+    }
     let active = match app.tab {
         Tab::Overview => 0,
         Tab::Logs => 1,
         Tab::Networks => 2,
         Tab::Exec => 3,
         Tab::Layers => 4,
+        Tab::History => names.len().saturating_sub(1),
     };
     frame.render_widget(
         Tabs::new(names)
@@ -968,6 +982,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::Logs => draw_logs(frame, app, body),
         Tab::Exec => draw_exec(frame, app, body),
         Tab::Layers => draw_layers(frame, app, body),
+        Tab::History => history::draw(frame, app, body),
         Tab::Overview | Tab::Networks => {
             let lines = if app.tab == Tab::Networks {
                 network_lines(app)
@@ -2223,6 +2238,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             "Ctrl-] Navigate · SHELL INPUT · Keys go to the selected container session"
         } else if app.performance_focus {
             "Performance · P Scope  z Zoom  j/k Select  Enter Inspect  p Close  Tab Pane  ? Keys"
+        } else if app.detail_focus && app.tab == Tab::History {
+            "History · [/ ] Range  ←/→ Pan  c Cursor  h/l Inspect  f Live  z Enlarge  Esc Restore"
         } else if app.detail_focus && app.tab == Tab::Exec {
             "F6 Sessions · Enter Input · :close-exec Close slot · j/k Scroll · Tab Explorer · ? Keys"
         } else if app.detail_focus && app.tab == Tab::Logs {
@@ -2293,7 +2310,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         "                  Container or Compose rows only; confirmation required\n",
         "                  y/Enter confirms; n/Esc cancels; Delete: type name + Enter\n",
         "                  Delete stopped containers only; keep networks/volumes/images\n",
-        "1 / 2 / 3 / 4 / 5 Overview / Logs / Networks / Exec / Layers\n",
+        "1..6              Overview / Logs / Net / Exec / Layers / History\n",
         "a                 Contextual actions with disabled reasons (Explorer)\n",
         "Enter in Layers   Expand details; Esc returns; no image pulls\n",
         "F6 / :exec-sessions Switch retained shells (navigation mode only)\n",

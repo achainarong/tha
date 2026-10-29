@@ -8,13 +8,34 @@ use std::{
 pub const HISTORY_LENGTH: usize = 60;
 pub const MAX_CONCURRENT_REQUESTS: usize = 8;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Usage {
     pub cpu_percent: Option<f64>,
     pub memory_bytes: Option<u64>,
     pub memory_limit_bytes: Option<u64>,
     pub cpu_warming: bool,
     pub memory_working_set: bool,
+    pub network_rx_bytes: Option<u64>,
+    pub network_tx_bytes: Option<u64>,
+    pub disk_read_bytes: Option<u64>,
+    pub disk_write_bytes: Option<u64>,
+    pub network_rx_rate: Option<f64>,
+    pub network_tx_rate: Option<f64>,
+    pub disk_read_rate: Option<f64>,
+    pub disk_write_rate: Option<f64>,
+}
+
+/// Rates use actual elapsed time. Missing/reset counters never become fake zeroes.
+pub fn io_rates(current: &mut Usage, previous: &Usage, elapsed: Duration) {
+    let rate = |value: Option<u64>, old: Option<u64>| {
+        let seconds = elapsed.as_secs_f64();
+        (seconds > 0.0).then_some(())?;
+        Some(value?.checked_sub(old?)? as f64 / seconds)
+    };
+    current.network_rx_rate = rate(current.network_rx_bytes, previous.network_rx_bytes);
+    current.network_tx_rate = rate(current.network_tx_bytes, previous.network_tx_bytes);
+    current.disk_read_rate = rate(current.disk_read_bytes, previous.disk_read_bytes);
+    current.disk_write_rate = rate(current.disk_write_bytes, previous.disk_write_bytes);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -79,6 +100,8 @@ pub struct Sample {
 struct Frame {
     values: HashMap<String, Usage>,
     sampled_at: Instant,
+    local: bool,
+    wall_ms: i64,
 }
 
 #[derive(Debug, Default)]
@@ -96,6 +119,69 @@ pub struct TimedUsage {
 }
 
 impl Store {
+    pub fn local_samples(&self, key: &str, start: i64, end: i64) -> Vec<crate::history::Sample> {
+        self.history
+            .iter()
+            .filter(|frame| frame.local)
+            .filter_map(|frame| {
+                let at = frame.wall_ms;
+                if at < start || at > end {
+                    return None;
+                }
+                Some(crate::history::Sample {
+                    key: key.into(),
+                    name: String::new(),
+                    at_ms: at,
+                    usage: frame.values.get(key).cloned(),
+                })
+            })
+            .collect()
+    }
+    pub fn apply_remote(&mut self, containers: &[Container], batch: Batch) {
+        self.apply(containers, batch);
+        if let Some(frame) = self.history.back_mut() {
+            frame.local = false;
+        }
+    }
+    pub fn local_history(&self, key: &str, start: i64, end: i64) -> crate::history::Data {
+        let points = self
+            .history
+            .iter()
+            .filter_map(|frame| {
+                let at_ms = frame.wall_ms;
+                if at_ms < start || at_ms > end {
+                    return None;
+                }
+                let usage = frame.values.get(key);
+                let values = usage
+                    .map(|u| {
+                        [
+                            u.cpu_percent,
+                            u.memory_bytes.map(|value| value as f64),
+                            u.disk_read_rate,
+                            u.disk_write_rate,
+                            u.network_rx_rate,
+                            u.network_tx_rate,
+                        ]
+                    })
+                    .unwrap_or([None; 6]);
+                Some(crate::history::Point {
+                    at_ms,
+                    values,
+                    peaks: values,
+                    count: 1,
+                    valid: values.map(|value| u64::from(value.is_some())),
+                })
+            })
+            .collect();
+        crate::history::Data {
+            points,
+            source: "Standalone session · last 60 sampling batches only".into(),
+            start_ms: start,
+            bucket_ms: 1,
+            end_ms: end,
+        }
+    }
     pub fn has_history(&self) -> bool {
         !self.history.is_empty()
     }
@@ -175,7 +261,13 @@ impl Store {
         if self.history.len() == HISTORY_LENGTH {
             self.history.pop_front();
         }
-        self.history.push_back(Frame { values, sampled_at });
+        self.history.push_back(Frame {
+            values,
+            sampled_at,
+            local: true,
+            wall_ms: crate::history::now_ms()
+                .saturating_sub(sampled_at.elapsed().as_millis() as i64),
+        });
     }
 
     pub fn summary<'a>(
@@ -393,15 +485,27 @@ pub fn bytes(value: u64) -> String {
 pub async fn worker(
     engine: usize,
     connection: crate::config::Connection,
+    targets: tokio::sync::watch::Receiver<Option<Target>>,
+    tx: tokio::sync::mpsc::Sender<Event>,
+    refresh_seconds: u64,
+) {
+    worker_with_limit(engine, connection, targets, tx, refresh_seconds, None).await;
+}
+
+pub async fn worker_with_limit(
+    engine: usize,
+    connection: crate::config::Connection,
     mut targets: tokio::sync::watch::Receiver<Option<Target>>,
     tx: tokio::sync::mpsc::Sender<Event>,
     refresh_seconds: u64,
+    limit: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(refresh_seconds));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut previous = HashMap::new();
     let mut identity = None;
     let mut rotation = 0usize;
+    let mut previous_io: HashMap<String, (Usage, Instant)> = HashMap::new();
     loop {
         tokio::select! {
             _ = interval.tick() => {},
@@ -409,11 +513,13 @@ pub async fn worker(
         }
         let Some(target) = targets.borrow().clone() else {
             previous.clear();
+            previous_io.clear();
             identity = None;
             continue;
         };
         if identity.as_ref() != Some(&target.identity) {
             previous.clear();
+            previous_io.clear();
             identity = Some(target.identity.clone());
         }
         let running: HashSet<_> = target
@@ -423,6 +529,7 @@ pub async fn worker(
             .map(Container::key)
             .collect();
         previous.retain(|key, _| running.contains(key));
+        previous_io.retain(|key, _| running.contains(key));
         let mut containers = target.containers.clone();
         // Rotate the bounded request queue so a very large/slow engine cannot
         // permanently starve containers at the end of its inventory.
@@ -431,11 +538,33 @@ pub async fn worker(
             containers.rotate_left(offset);
         }
         rotation = rotation.wrapping_add(MAX_CONCURRENT_REQUESTS);
-        let batch = tokio::select! {
+        // Global daemon budget. Waiting is bounded by the next sampling slot;
+        // no per-runtime queue can grow behind a slow engine.
+        let _permit = if let Some(limit) = &limit {
+            match tokio::time::timeout(Duration::from_millis(500), limit.acquire()).await {
+                Ok(Ok(permit)) => Some(permit),
+                _ => continue,
+            }
+        } else {
+            None
+        };
+        let mut batch = tokio::select! {
             batch = crate::backend::metrics(&connection, &containers, &previous) => batch,
             changed = targets.changed() => { if changed.is_err() { break; } else { continue; } }
         };
-        for (key, result) in &batch {
+        for (key, result) in &mut batch {
+            if let Ok(reading) = result {
+                if let Some((old, at)) = previous_io.get(key) {
+                    io_rates(
+                        &mut reading.usage,
+                        old,
+                        reading.sampled_at.saturating_duration_since(*at),
+                    );
+                }
+                previous_io.insert(key.clone(), (reading.usage.clone(), reading.sampled_at));
+            } else {
+                previous_io.remove(key);
+            }
             if let Ok(reading) = result
                 && let Some(counters) = reading.counters
             {
@@ -459,6 +588,48 @@ pub async fn worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn session_overlay_does_not_replay_daemon_observations() {
+        let mut store = Store::default();
+        let containers = vec![container("one")];
+        let now = Instant::now();
+        store.apply_remote(
+            &containers,
+            [("/one".into(), Ok(reading(Some(10.0), Some(100), now)))].into(),
+        );
+        let start = crate::history::now_ms() - 60_000;
+        let end = crate::history::now_ms() + 1000;
+        assert!(store.local_samples("/one", start, end).is_empty());
+        store.apply(
+            &containers,
+            [("/one".into(), Ok(reading(Some(55.0), Some(200), now)))].into(),
+        );
+        let samples = store.local_samples("/one", start, end);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].usage.as_ref().unwrap().cpu_percent, Some(55.0));
+    }
+    #[test]
+    fn io_rates_handle_elapsed_time_resets_and_missing_counters() {
+        let previous = Usage {
+            network_rx_bytes: Some(100),
+            disk_read_bytes: Some(20),
+            ..Default::default()
+        };
+        let mut next = Usage {
+            network_rx_bytes: Some(300),
+            disk_read_bytes: Some(40),
+            ..Default::default()
+        };
+        io_rates(&mut next, &previous, Duration::from_secs(2));
+        assert_eq!(next.network_rx_rate, Some(100.0));
+        assert_eq!(next.disk_read_rate, Some(10.0));
+        assert_eq!(next.network_tx_rate, None);
+        next.network_rx_bytes = Some(1);
+        io_rates(&mut next, &previous, Duration::from_secs(1));
+        assert_eq!(next.network_rx_rate, None);
+        io_rates(&mut next, &previous, Duration::ZERO);
+        assert_eq!(next.disk_read_rate, None);
+    }
     fn container(id: &str) -> Container {
         Container {
             id: id.into(),
