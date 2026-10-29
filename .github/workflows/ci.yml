@@ -1,0 +1,23 @@
+name: Check
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - run: make check
+      - run: make build
+      - run: uv run --with pyte python scripts/smoke.py
+      - run: uv run --with pyte python scripts/exec_smoke.py
+      - run: make release

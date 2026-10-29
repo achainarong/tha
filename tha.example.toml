@@ -1,0 +1,21 @@
+# Copy to $XDG_CONFIG_HOME/tha/config.toml or ~/.config/tha/config.toml.
+refresh_seconds = 5
+metrics_refresh_seconds = 1 # CPU/memory target cadence; independent of inventory refresh.
+log_capacity = 5000
+monochrome = false
+log_wrap = true # Initial state; press w in the log pane to toggle at any time.
+exec_command = ["sh"] # Use ["bash", "-l"] if your image has bash instead.
+
+# Discovery still runs alongside these explicit connections.
+# Docker API connections currently require a Unix socket. SSH/TLS contexts
+# remain visible but are marked unsupported rather than downgraded to plaintext.
+# [[connections]]
+# name = "OrbStack"
+# kind = "docker"
+# endpoint = "unix:///Users/you/.orbstack/run/docker.sock"
+
+# Native containerd requires nerdctl on PATH and access to the endpoint.
+# [[connections]]
+# name = "containerd / local"
+# kind = "containerd"
+# endpoint = "/run/containerd/containerd.sock"

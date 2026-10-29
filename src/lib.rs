@@ -1,0 +1,14 @@
+pub mod app;
+pub mod backend;
+pub mod cli;
+pub mod config;
+pub mod demo;
+pub mod discovery;
+pub mod exec;
+pub mod logs;
+pub mod metrics;
+pub mod model;
+pub mod platform;
+pub mod terminal;
+pub mod ui;
+pub mod workspace;

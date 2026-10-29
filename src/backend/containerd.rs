@@ -1,0 +1,300 @@
+//! Read-only nerdctl adapter. No shell interpolation or automatic VM startup.
+use crate::{
+    config::Connection,
+    model::{self, Container, Labels, Snapshot},
+};
+use anyhow::{Context, Result, bail};
+use serde_json::Value;
+use tokio::process::Command;
+
+pub fn command(connection: &Connection, namespace: Option<&str>) -> Command {
+    let mut command = Command::new("nerdctl");
+    command.kill_on_drop(true).arg("--address").arg(
+        connection
+            .endpoint
+            .strip_prefix("unix://")
+            .unwrap_or(&connection.endpoint),
+    );
+    if let Some(namespace) = namespace {
+        command.arg("--namespace").arg(namespace);
+    }
+    command
+}
+
+async fn output(mut command: Command) -> Result<String> {
+    let output = command
+        .output()
+        .await
+        .context("Cannot run nerdctl. Install nerdctl and make sure it is on PATH")?;
+    if !output.status.success() {
+        bail!(
+            "nerdctl failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+pub async fn platform(
+    connection: &Connection,
+    container: &Container,
+) -> Result<crate::platform::ImagePlatform> {
+    if let Some(platform) = &container.image_platform {
+        return Ok(platform.clone());
+    }
+    let id = match container
+        .image_id
+        .clone()
+        .filter(|id| crate::platform::immutable_image_id(id))
+    {
+        Some(id) => id,
+        None => {
+            let mut inspect = command(connection, container.namespace.as_deref());
+            inspect.args(["inspect", "--", &container.id]);
+            let value: Value = serde_json::from_str(&output(inspect).await?)?;
+            crate::platform::require_image_id(
+                value
+                    .pointer("/0/Image")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            )?
+        }
+    };
+    let mut inspect = command(connection, container.namespace.as_deref());
+    inspect.args(["image", "inspect", "--", &id]);
+    let value: Value = serde_json::from_str(&output(inspect).await?)?;
+    parse_platform(&value)
+}
+
+pub fn parse_platform(value: &Value) -> Result<crate::platform::ImagePlatform> {
+    let row = value
+        .as_array()
+        .and_then(|rows| rows.first())
+        .unwrap_or(value);
+    let text = |key| row.get(key).and_then(Value::as_str).map(str::to_owned);
+    crate::platform::ImagePlatform::new(text("Os"), text("Architecture"), text("Variant"))
+}
+
+pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
+    let mut namespaces_command = command(connection, None);
+    namespaces_command.args(["namespace", "ls", "--quiet"]);
+    let namespaces: Vec<String> = output(namespaces_command)
+        .await?
+        .lines()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let mut result = Snapshot {
+        version: "containerd via nerdctl".into(), namespaces: namespaces.clone(),
+        warnings: vec!["Native containerd adapter: network/volume inventory is not available in this MVP; logs require nerdctl-managed logging.".into()],
+        ..Default::default()
+    };
+    for namespace in namespaces {
+        let mut list = command(connection, Some(&namespace));
+        list.args(["ps", "--all", "--quiet", "--no-trunc"]);
+        let ids = match output(list).await {
+            Ok(ids) => ids,
+            Err(error) => {
+                result
+                    .warnings
+                    .push(format!("Namespace {namespace}: {error}"));
+                continue;
+            }
+        };
+        let ids: Vec<_> = ids.lines().filter(|id| !id.is_empty()).collect();
+        for chunk in ids.chunks(50) {
+            let mut inspect = command(connection, Some(&namespace));
+            inspect.arg("inspect").args(chunk);
+            // Inspect data can contain secrets. Extract only explicitly allowed fields;
+            // never render raw JSON, environment variables, or authentication data.
+            let value: Value = match output(inspect)
+                .await
+                .and_then(|text| Ok(serde_json::from_str(&text)?))
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    result
+                        .warnings
+                        .push(format!("Namespace {namespace}: {error}"));
+                    continue;
+                }
+            };
+            if let Some(items) = value.as_array() {
+                for item in items {
+                    result.containers.push(parse_container(item, &namespace));
+                }
+            }
+        }
+    }
+    result.containers.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(result)
+}
+
+pub fn parse_container(item: &Value, namespace: &str) -> Container {
+    let labels: Labels = item
+        .pointer("/Config/Labels")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    let text = |pointer| {
+        item.pointer(pointer)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let id = text("/Id");
+    let name = text("/Name").trim_start_matches('/').to_owned();
+    Container {
+        name: if name.is_empty() {
+            id.chars().take(12).collect()
+        } else {
+            name
+        },
+        id,
+        namespace: Some(namespace.into()),
+        image: text("/Config/Image"),
+        image_id: item.get("Image").and_then(Value::as_str).map(str::to_owned),
+        image_platform: None,
+        state: text("/State/Status"),
+        status: text("/State/Status"),
+        health: item
+            .pointer("/State/Health/Status")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        exit_code: item.pointer("/State/ExitCode").and_then(Value::as_i64),
+        oom_killed: item
+            .pointer("/State/OOMKilled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        error: item
+            .pointer("/State/Error")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned),
+        project: model::project(&labels),
+        service: model::service(&labels),
+        compose_working_dir: model::compose_working_dir(&labels),
+        managed: namespace == "k8s.io"
+            || labels.keys().any(|key| key.starts_with("io.kubernetes.")),
+        ..Default::default()
+    }
+}
+
+pub async fn usage(
+    connection: &Connection,
+    container: &Container,
+) -> Result<crate::metrics::Reading> {
+    let mut stats = command(connection, container.namespace.as_deref());
+    stats.args([
+        "stats",
+        "--no-stream",
+        "--no-trunc",
+        "--format",
+        "{{json .}}",
+        "--",
+        &container.id,
+    ]);
+    let text = output(stats).await?;
+    let row: Value = serde_json::from_str(text.trim())
+        .context("nerdctl did not return a single JSON stats row")?;
+    let usage = parse_usage(&row)?;
+    Ok(crate::metrics::Reading {
+        usage,
+        counters: None,
+        sampled_at: std::time::Instant::now(),
+    })
+}
+
+pub fn parse_usage(row: &Value) -> Result<crate::metrics::Usage> {
+    let cpu = row
+        .get("CPUPerc")
+        .and_then(Value::as_str)
+        .and_then(|text| text.trim().strip_suffix('%'))
+        .and_then(|number| number.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    let memory = row
+        .get("MemUsage")
+        .and_then(Value::as_str)
+        .and_then(|text| text.split_once('/'));
+    let used = memory.and_then(|(used, _)| parse_bytes(used));
+    let limit = memory
+        .and_then(|(_, limit)| parse_bytes(limit))
+        .filter(|value| *value > 0);
+    if cpu.is_none() && used.is_none() {
+        bail!("nerdctl stats unavailable (requires supported cgroups and permissions)");
+    }
+    Ok(crate::metrics::Usage {
+        cpu_percent: cpu,
+        memory_bytes: used,
+        memory_limit_bytes: limit,
+        ..Default::default()
+    })
+}
+
+fn parse_bytes(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let number = text[..split].parse::<f64>().ok()?;
+    let multiplier = match text[split..].trim() {
+        "" | "B" => 1.0,
+        "KiB" => 1024.0,
+        "MiB" => 1024f64.powi(2),
+        "GiB" => 1024f64.powi(3),
+        "TiB" => 1024f64.powi(4),
+        "PiB" => 1024f64.powi(5),
+        "kB" | "KB" => 1000.0,
+        "MB" => 1000f64.powi(2),
+        "GB" => 1000f64.powi(3),
+        "TB" => 1000f64.powi(4),
+        _ => return None,
+    };
+    let bytes = number * multiplier;
+    (bytes.is_finite() && bytes >= 0.0 && bytes < u64::MAX as f64).then_some(bytes.round() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_only_safe_fields_and_compose_metadata() {
+        let value = serde_json::json!({"Id":"123", "Name":"/api", "Config":{"Image":"app:latest", "Env":["TOKEN=secret"], "Labels":{"nerdctl/compose/project":"shop", "nerdctl/compose/service":"api"}}, "State":{"Status":"running"}});
+        let c = parse_container(&value, "default");
+        assert_eq!(c.name, "api");
+        assert_eq!(c.project.as_deref(), Some("shop"));
+        assert_eq!(c.namespace.as_deref(), Some("default"));
+        assert!(!format!("{c:?}").contains("secret"));
+        assert!(parse_container(&value, "k8s.io").managed);
+    }
+
+    #[test]
+    fn stats_formats_and_unavailable_values_are_handled_explicitly() {
+        let usage =
+            parse_usage(&serde_json::json!({"CPUPerc":"12.34%", "MemUsage":"12.5MiB / 1GiB"}))
+                .unwrap();
+        assert_eq!(usage.cpu_percent, Some(12.34));
+        assert_eq!(usage.memory_bytes, Some(13_107_200));
+        assert_eq!(usage.memory_limit_bytes, Some(1_073_741_824));
+        assert_eq!(parse_bytes("1.5 MB"), Some(1_500_000));
+        assert_eq!(parse_bytes("--"), None);
+        assert!(parse_usage(&serde_json::json!({"CPUPerc":"--", "MemUsage":"-- / --"})).is_err());
+        assert!(parse_usage(&serde_json::json!({"CPUPerc":"NaN%", "MemUsage":"unknown"})).is_err());
+        let zero =
+            parse_usage(&serde_json::json!({"CPUPerc":"0.00%", "MemUsage":"0B / 0B"})).unwrap();
+        assert_eq!(zero.cpu_percent, Some(0.0));
+        assert_eq!(zero.memory_bytes, Some(0));
+        assert_eq!(zero.memory_limit_bytes, None);
+    }
+
+    #[test]
+    fn image_platform_parser_uses_resolved_image_fields() {
+        let image = serde_json::json!([{"Os":"linux", "Architecture":"arm64", "Variant":"v8"}]);
+        assert_eq!(
+            parse_platform(&image).unwrap().label(),
+            "linux/arm64/v8 (ARM64)"
+        );
+        assert!(parse_platform(&serde_json::json!([{"Os":"linux"}])).is_err());
+    }
+}
