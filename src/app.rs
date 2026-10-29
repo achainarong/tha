@@ -5,7 +5,7 @@ use crate::{
     model::{Condition, Container, Snapshot, Tone},
     workspace::Project,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -2277,33 +2277,28 @@ fn workload_tree(index: usize, snapshot: &Snapshot, namespace: Option<&String>) 
         .iter()
         .filter(|c| c.namespace.as_ref() == namespace)
         .collect();
-    let projects: BTreeSet<_> = containers
-        .iter()
-        .filter_map(|c| c.project.as_ref())
-        .collect();
+    let mut projects: BTreeMap<&String, BTreeMap<&str, Vec<&Container>>> = BTreeMap::new();
+    for &container in &containers {
+        if let Some(project) = &container.project {
+            projects
+                .entry(project)
+                .or_default()
+                .entry(container.service.as_deref().unwrap_or("Unassigned service"))
+                .or_default()
+                .push(container);
+        }
+    }
     let mut nodes = Vec::new();
-    for project in projects {
+    for (project, services) in projects {
         let scope = Scope::Project {
             namespace: namespace.cloned(),
             project: project.clone(),
         };
-        let members: Vec<_> = containers
-            .iter()
-            .copied()
-            .filter(|c| c.project.as_ref() == Some(project))
-            .collect();
-        let services: BTreeSet<_> = members
-            .iter()
-            .map(|c| c.service.as_deref().unwrap_or("Unassigned service"))
-            .collect();
+        let member_count: usize = services.values().map(Vec::len).sum();
+        let running = services.values().flatten().filter(|c| c.running()).count();
         let service_nodes: Vec<_> = services
             .into_iter()
-            .map(|service| {
-                let instances: Vec<_> = members
-                    .iter()
-                    .copied()
-                    .filter(|c| c.service.as_deref().unwrap_or("Unassigned service") == service)
-                    .collect();
+            .map(|(service, instances)| {
                 let running = instances.iter().filter(|c| c.running()).count();
                 let title = format!("{service} [{running}/{} running]", instances.len());
                 node(
@@ -2333,11 +2328,10 @@ fn workload_tree(index: usize, snapshot: &Snapshot, namespace: Option<&String>) 
         if namespace.is_none() {
             project_nodes.extend(resource_nodes(index, snapshot, Some(project)));
         }
-        let running = members.iter().filter(|c| c.running()).count();
         nodes.push(node(
             index,
             scope,
-            format!("{project} [{running}/{} running]", members.len()),
+            format!("{project} [{running}/{member_count} running]"),
             project_nodes,
         ));
     }
@@ -3332,6 +3326,78 @@ mod tests {
         app.tree_query = "api-1".into();
         app.refresh_tree();
         assert!(app.rows.iter().any(|r| r.title.starts_with("api-1")));
+    }
+
+    #[test]
+    fn grouped_workloads_preserve_sorted_groups_replica_order_and_missing_service_counts() {
+        let container = |name: &str,
+                         project: Option<&str>,
+                         service: Option<&str>,
+                         namespace: Option<&str>,
+                         state: &str| Container {
+            id: name.into(),
+            name: name.into(),
+            project: project.map(str::to_owned),
+            service: service.map(str::to_owned),
+            namespace: namespace.map(str::to_owned),
+            state: state.into(),
+            ..Default::default()
+        };
+        let snapshot = Snapshot {
+            containers: vec![
+                container("z-replica-2", Some("z"), Some("api"), None, "running"),
+                container("standalone", None, None, None, "exited"),
+                container("z-replica-1", Some("z"), Some("api"), None, "exited"),
+                container("a-missing", Some("a"), None, None, "running"),
+                container(
+                    "a-explicit",
+                    Some("a"),
+                    Some("Unassigned service"),
+                    None,
+                    "exited",
+                ),
+                container("foreign", Some("a"), Some("api"), Some("other"), "running"),
+                container("z-worker", Some("z"), Some("worker"), None, "running"),
+            ],
+            ..Default::default()
+        };
+        let nodes = workload_tree(0, &snapshot, None);
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["a [1/2 running]", "z [2/3 running]", "Standalone (1)"]
+        );
+        let a_services = &nodes[0].children[0];
+        assert_eq!(a_services.row.title, "Services (1)");
+        assert_eq!(
+            a_services.children[0].row.title,
+            "Unassigned service [1/2 running]"
+        );
+        assert_eq!(
+            a_services.children[0]
+                .children
+                .iter()
+                .map(|node| node.row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["a-missing", "a-explicit"]
+        );
+        let z_services = &nodes[1].children[0];
+        assert_eq!(z_services.row.title, "Services (2)");
+        assert_eq!(z_services.children[0].row.title, "api [1/2 running]");
+        assert_eq!(z_services.children[1].row.title, "worker [1/1 running]");
+        assert_eq!(
+            z_services.children[0]
+                .children
+                .iter()
+                .map(|node| node.row.title.as_str())
+                .collect::<Vec<_>>(),
+            ["z-replica-2", "z-replica-1"]
+        );
+        let other = workload_tree(0, &snapshot, Some(&"other".into()));
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].row.title, "a [1/1 running]");
     }
 
     #[test]

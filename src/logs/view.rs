@@ -36,6 +36,11 @@ struct EntryLayout {
     ranges: Vec<Range<usize>>,
 }
 
+struct SearchCount {
+    sequence: u64,
+    count: usize,
+}
+
 pub struct VisualRow {
     pub sequence: u64,
     pub range: Range<usize>,
@@ -57,6 +62,11 @@ pub struct LogView {
     layouts: VecDeque<EntryLayout>,
     layout_mode: Option<(usize, bool, super::filter::Filter)>,
     search_stamp: Option<(u64, u64, usize)>,
+    search_filter: Option<super::filter::Filter>,
+    search_counts: VecDeque<SearchCount>,
+    search_last: Option<u64>,
+    #[cfg(test)]
+    search_scans: usize,
 }
 
 impl LogView {
@@ -76,6 +86,11 @@ impl LogView {
             layouts: VecDeque::new(),
             layout_mode: None,
             search_stamp: None,
+            search_filter: None,
+            search_counts: VecDeque::new(),
+            search_last: None,
+            #[cfg(test)]
+            search_scans: 0,
         }
     }
 
@@ -88,7 +103,7 @@ impl LogView {
 
     pub fn reset_content(&mut self) {
         self.layouts.clear();
-        self.search_stamp = None;
+        self.reset_search_counts();
         self.anchor = None;
         self.active = None;
         self.match_count = 0;
@@ -107,7 +122,7 @@ impl LogView {
                 .ok()
         };
         self.active = None;
-        self.search_stamp = None;
+        self.reset_search_counts();
         self.sync(buffer, self.width, self.height);
         if self.regex.is_some() {
             self.next_match(buffer, false);
@@ -120,21 +135,76 @@ impl LogView {
             .iter()
             .filter(|entry| self.filter.matches(entry))
             .flat_map(move |entry| {
-                [
-                    (Field::Source, entry.source.as_str()),
-                    (Field::Payload, entry.text.as_str()),
-                ]
-                .into_iter()
-                .flat_map(move |(field, text)| {
-                    self.regex.iter().flat_map(move |regex| {
-                        regex.find_iter(text).map(move |found| SearchMatch {
-                            sequence: entry.sequence,
-                            field,
-                            range: found.range(),
-                        })
-                    })
-                })
+                self.regex
+                    .iter()
+                    .flat_map(move |regex| entry_matches(entry, regex))
             })
+    }
+
+    fn reset_search_counts(&mut self) {
+        self.search_counts.clear();
+        self.search_last = None;
+        self.search_stamp = None;
+        self.match_count = 0;
+    }
+
+    fn sync_search(&mut self, buffer: &LogBuffer, first: u64) {
+        if self.search_filter.as_ref() != Some(&self.filter) {
+            self.reset_search_counts();
+            self.search_filter = Some(self.filter.clone());
+        }
+        while self
+            .search_counts
+            .front()
+            .is_some_and(|cached| cached.sequence < first)
+        {
+            self.match_count -= self.search_counts.pop_front().unwrap().count;
+        }
+        if let Some(regex) = &self.regex {
+            let start = self.search_last.map_or(0, |last| {
+                buffer
+                    .entries
+                    .partition_point(|entry| entry.sequence <= last)
+            });
+            for entry in buffer.entries.range(start..) {
+                if !self.filter.matches(entry) {
+                    continue;
+                }
+                #[cfg(test)]
+                {
+                    self.search_scans += 1;
+                }
+                let count = entry_matches(entry, regex).count();
+                // Store counts, not occurrences: memory is bounded by retained entries,
+                // even when a short query matches every character in a long payload.
+                if count > 0 {
+                    self.search_counts.push_back(SearchCount {
+                        sequence: entry.sequence,
+                        count,
+                    });
+                    self.match_count += count;
+                }
+            }
+        }
+        self.search_last = buffer.entries.back().map(|entry| entry.sequence);
+        self.match_index = self.active.as_ref().and_then(|active| {
+            let entry = entry(buffer, active.sequence)?;
+            if !self.filter.matches(entry) {
+                return None;
+            }
+            let preceding: usize = self
+                .search_counts
+                .iter()
+                .take_while(|cached| cached.sequence < active.sequence)
+                .map(|cached| cached.count)
+                .sum();
+            entry_matches(entry, self.regex.as_ref()?)
+                .position(|found| &found == active)
+                .map(|index| preceding + index + 1)
+        });
+        if self.match_index.is_none() {
+            self.active = None;
+        }
     }
 
     pub fn sync(&mut self, buffer: &LogBuffer, width: usize, height: usize) {
@@ -171,19 +241,7 @@ impl LogView {
             .back()
             .map(|entry| (first, entry.sequence, buffer.entries.len()));
         if self.search_stamp != stamp {
-            let mut count = 0;
-            let mut index = None;
-            for found in self.matches(buffer) {
-                count += 1;
-                if self.active.as_ref() == Some(&found) {
-                    index = Some(count);
-                }
-            }
-            self.match_count = count;
-            self.match_index = index;
-            if index.is_none() {
-                self.active = None;
-            }
+            self.sync_search(buffer, first);
             self.search_stamp = stamp;
         }
     }
@@ -332,6 +390,21 @@ impl LogView {
     }
 }
 
+fn entry_matches<'a>(entry: &'a Entry, regex: &'a Regex) -> impl Iterator<Item = SearchMatch> + 'a {
+    [
+        (Field::Source, entry.source.as_str()),
+        (Field::Payload, entry.text.as_str()),
+    ]
+    .into_iter()
+    .flat_map(move |(field, text)| {
+        regex.find_iter(text).map(move |found| SearchMatch {
+            sequence: entry.sequence,
+            field,
+            range: found.range(),
+        })
+    })
+}
+
 pub fn entry(buffer: &LogBuffer, sequence: u64) -> Option<&Entry> {
     let first = buffer.entries.front()?.sequence;
     buffer.entries.get(sequence.checked_sub(first)? as usize)
@@ -350,6 +423,14 @@ pub fn byte_at_column(text: &str, column: usize) -> usize {
 
 pub fn wrap_ranges(text: &str, width: usize) -> Vec<Range<usize>> {
     let width = width.max(1);
+    // Printable ASCII has one byte, cell and grapheme per character. Controls
+    // (including CRLF), combining marks and wide characters use the Unicode path.
+    if !text.is_empty() && text.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+        return (0..text.len())
+            .step_by(width)
+            .map(|start| start..start.saturating_add(width).min(text.len()))
+            .collect();
+    }
     let mut rows = Vec::new();
     let mut start = 0;
     let mut columns = 0;
@@ -369,6 +450,143 @@ pub fn wrap_ranges(text: &str, width: usize) -> Vec<Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_search_matches_full_scan(view: &LogView, buffer: &LogBuffer) {
+        let matches: Vec<_> = view.matches(buffer).collect();
+        assert_eq!(view.match_count, matches.len());
+        assert_eq!(
+            view.match_index,
+            view.active
+                .as_ref()
+                .and_then(|active| matches.iter().position(|found| found == active))
+                .map(|index| index + 1)
+        );
+        assert!(view.search_counts.len() <= buffer.entries.len());
+    }
+
+    #[test]
+    fn search_counts_scan_only_new_entries_and_survive_navigation_resize_and_eviction() {
+        let mut buffer = LogBuffer::new(3);
+        for text in ["needle needle", "no match", "ÉRROR needle"] {
+            buffer.push("needle-api", text, false);
+        }
+        let mut view = LogView::new(true);
+        view.set_query("needle".into(), &mut buffer);
+        assert_eq!(view.search_scans, 3);
+        for backwards in [false, false, true, true] {
+            view.next_match(&mut buffer, backwards);
+            assert_search_matches_full_scan(&view, &buffer);
+        }
+        view.sync(&buffer, 3, 2);
+        view.toggle_wrap(&buffer);
+        assert_eq!(
+            view.search_scans, 3,
+            "Resizing/navigation must reuse counts"
+        );
+        for text in ["needle", "no match", "needle needle", "ÉRROR"] {
+            let scans = view.search_scans;
+            buffer.push("api", text, false);
+            view.sync(&buffer, 7, 2);
+            assert_eq!(view.search_scans, scans + 1);
+            assert_search_matches_full_scan(&view, &buffer);
+        }
+        // Several complete buffers may be evicted between frames.
+        for _ in 0..10 {
+            buffer.push("api", "needle", false);
+        }
+        let scans = view.search_scans;
+        view.sync(&buffer, 7, 2);
+        assert_eq!(view.search_scans, scans + 3);
+        assert_search_matches_full_scan(&view, &buffer);
+        assert!(view.active.is_none());
+    }
+
+    #[test]
+    fn search_counts_invalidate_for_query_filter_and_content_not_layout() {
+        let mut buffer = LogBuffer::new(4);
+        buffer.push("API", "ERROR needle needle", false);
+        buffer.push("worker", "INFO needle", false);
+        buffer.push("API", "ÉRROR érror", false);
+        let mut view = LogView::new(true);
+        view.set_query("needle".into(), &mut buffer);
+        for filter in [r#"{"source":"api"}"#, r#"{"level":"error"}"#, "{}"] {
+            view.filter = super::super::filter::Filter::parse(filter).unwrap();
+            view.sync(&buffer, 10, 3);
+            assert_search_matches_full_scan(&view, &buffer);
+            buffer.push("worker", "ERROR needle", false);
+            view.sync(&buffer, 10, 3);
+            assert_search_matches_full_scan(&view, &buffer);
+        }
+        view.set_query("érror".into(), &mut buffer);
+        assert_search_matches_full_scan(&view, &buffer);
+        view.set_query(String::new(), &mut buffer);
+        assert_eq!(view.match_count, 0);
+        assert!(view.search_counts.is_empty());
+        view.set_query("needle".into(), &mut buffer);
+        buffer = LogBuffer::new(4);
+        view.reset_content();
+        view.sync(&buffer, 10, 3);
+        assert_search_matches_full_scan(&view, &buffer);
+        buffer.push("api", "needle needle", false);
+        view.sync(&buffer, 10, 3);
+        assert_eq!(view.match_count, 2);
+        assert_search_matches_full_scan(&view, &buffer);
+    }
+
+    #[test]
+    fn search_rank_tracks_retained_matches_and_dense_queries_keep_one_count_per_entry() {
+        let mut buffer = LogBuffer::new(3);
+        buffer.push("a", "a", false);
+        buffer.push("a", "aaa", false);
+        buffer.push("b", "a", false);
+        let mut view = LogView::new(true);
+        view.set_query("a".into(), &mut buffer);
+        for _ in 0..3 {
+            view.next_match(&mut buffer, false);
+        }
+        assert_eq!(view.active.as_ref().unwrap().sequence, 1);
+        assert_eq!(view.match_index, Some(4));
+        buffer.push("b", "none", false);
+        view.sync(&buffer, 10, 3);
+        assert_eq!(view.match_index, Some(2), "Evicted matches shift the rank");
+        assert_search_matches_full_scan(&view, &buffer);
+        for _ in 0..3 {
+            buffer.push("a", &"a".repeat(16_000), false);
+        }
+        view.sync(&buffer, 10, 3);
+        assert_eq!(view.match_count, 48_003);
+        assert_eq!(view.search_counts.len(), 3);
+        assert_search_matches_full_scan(&view, &buffer);
+    }
+
+    #[test]
+    fn printable_ascii_fast_path_matches_grapheme_wrapping() {
+        for text in [
+            "",
+            " ",
+            "abcdef  ghij",
+            "a\tb",
+            "a\r\nb",
+            "ไทย 界 e\u{301} 👩‍💻",
+        ] {
+            for width in [0, 1, 2, 7, usize::MAX] {
+                let mut expected = Vec::new();
+                let mut start = 0;
+                let mut columns = 0;
+                for (index, grapheme) in text.grapheme_indices(true) {
+                    let size = grapheme.width();
+                    if columns + size > width.max(1) && index > start {
+                        expected.push(start..index);
+                        start = index;
+                        columns = 0;
+                    }
+                    columns += size;
+                }
+                expected.push(start..text.len());
+                assert_eq!(wrap_ranges(text, width), expected, "{text:?}, {width}");
+            }
+        }
+    }
 
     #[test]
     fn wrapping_keeps_unicode_and_whitespace_without_splitting_graphemes() {
