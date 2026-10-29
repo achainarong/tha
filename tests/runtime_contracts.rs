@@ -55,6 +55,18 @@ impl MockEngine {
                     }
                 }
                 let request = String::from_utf8_lossy(&bytes);
+                if request.contains("/history") {
+                    let body = serde_json::json!([
+                        {"Id":"<missing>","Created":2,"CreatedBy":"ENV MODE=production","Tags":[],"Size":0,"Comment":"metadata is not inferred from this zero"},
+                        {"Id":"<missing>","Created":1,"CreatedBy":"COPY app /app","Tags":[],"Size":4096,"Comment":"base step"}
+                    ]).to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    continue;
+                }
                 if request.contains("/images/json") {
                     let (status, body) = if network_failure {
                         (
@@ -78,7 +90,7 @@ impl MockEngine {
                 if request.contains("/images/") || request.contains("/containers/api123/json") {
                     let id = format!("sha256:{}", "a".repeat(64));
                     let body = if request.contains("/images/") {
-                        serde_json::json!({"Id":id,"Os":"linux","Architecture":"amd64"})
+                        serde_json::json!({"Id":id,"Os":"linux","Architecture":"amd64","RootFS":{"Type":"layers","Layers":["sha256:base-diff","sha256:top-diff"]}})
                     } else {
                         serde_json::json!({"Image":id})
                     }
@@ -189,6 +201,30 @@ async fn docker_inventory_preserves_ownership_and_attachments() {
     assert!(!snapshot.networks[0].external);
     assert_eq!(snapshot.images.as_ref().unwrap()[0].tags, ["shop:latest"]);
     assert_eq!(snapshot.images.as_ref().unwrap()[0].size, Some(1024));
+}
+
+#[tokio::test]
+async fn layers_use_resolved_metadata_and_do_not_guess_zero_byte_history_mappings() {
+    let engine = MockEngine::start(false);
+    let container = tha::model::Container {
+        id: "api123".into(),
+        image: "mutable:latest".into(),
+        ..Default::default()
+    };
+    let image = tha::layers::lookup(&engine.connection(), &container)
+        .await
+        .unwrap();
+    assert_eq!(image.id, format!("sha256:{}", "a".repeat(64)));
+    assert_eq!(image.filesystem, ["sha256:base-diff", "sha256:top-diff"]);
+    assert_eq!(image.history[0].instruction, "COPY app /app");
+    assert_eq!(image.history[1].size, Some(0));
+    assert_eq!(image.history[1].empty_layer, None);
+    assert!(
+        image
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("mapping is unavailable"))
+    );
 }
 
 #[tokio::test]

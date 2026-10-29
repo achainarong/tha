@@ -24,7 +24,32 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("reconnect-logs", "Reconnect the current log streams"),
     ("wrap", "Toggle log wrapping (w in logs)"),
     ("exec", "Open a shell in the selected container"),
+    (
+        "layers",
+        "Inspect resolved image filesystem layers and build history (5)",
+    ),
+    ("reload-layers", "Retry image layers lookup (read-only)"),
+    (
+        "actions",
+        "Show contextual actions and disabled reasons (a)",
+    ),
     ("close-exec", "Close the embedded shell (not the container)"),
+    (
+        "exec-sessions",
+        "Switch retained Exec sessions (F6 in navigation)",
+    ),
+    (
+        "filter-logs",
+        "Edit retained-log JSON/source/severity/time filters (F3)",
+    ),
+    (
+        "clear-log-filter",
+        "Clear retained-log filters without changing search",
+    ),
+    (
+        "export-logs",
+        "Export matching retained logs to a new private JSONL file",
+    ),
     ("performance", "Expand/collapse global performance (p)"),
     (
         "sort-contexts",
@@ -76,6 +101,7 @@ fn condition_style(app: &App, condition: Condition) -> Style {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.action_review_visible = false;
+    app.log_export_review_visible = false;
     let area = frame.area();
     if area.width < 32 || area.height < 10 {
         frame.render_widget(
@@ -143,12 +169,81 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.input_mode == InputMode::Command {
         draw_palette(frame, app, area);
     }
+    if matches!(app.input_mode, InputMode::LogFilter | InputMode::ExportLogs) {
+        draw_log_editor(frame, app, area);
+    }
     if app.picker.is_some() {
         draw_picker(frame, app, area);
     }
     if app.action_confirmation.is_some() || app.action_progress.is_some() {
         draw_action(frame, app, area);
     }
+}
+
+fn draw_log_editor(frame: &mut Frame, app: &mut App, area: Rect) {
+    let exporting = app.input_mode == InputMode::ExportLogs;
+    let review_visible = area.width >= 60 && area.height >= 18;
+    let area = centered(area, 100, 20);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered().title(if exporting {
+        " Export retained logs "
+    } else {
+        " Filter retained logs · JSON "
+    });
+    let inner = padded(block.inner(area));
+    frame.render_widget(block, area);
+    if !review_visible {
+        frame.render_widget(
+            Paragraph::new("Resize to review this dialog (at least 60 × 18). Esc cancels.")
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
+    app.log_export_review_visible = exporting;
+    let parts = Layout::vertical([
+        Constraint::Length(5),
+        Constraint::Min(1),
+        Constraint::Length(3),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+    let hint = if exporting {
+        let matched = app
+            .logs
+            .entries
+            .iter()
+            .filter(|entry| app.log_view.filter.matches(entry))
+            .count();
+        format!(
+            "{matched} matching / {} retained entries in the current scope.\nLogs may contain SECRETS. Choose an explicit destination filename.\nNew JSONL file only; mode 0600; existing files/symlinks refused.\nNo history fetch, no automatic redaction, no silent truncation.\nSnapshot limit: 16 MiB; destination directory must already exist.",
+            app.logs.entries.len()
+        )
+    } else {
+        "{} clears filters. Supported keys: source, level, min_level, fields, since, until.\nExample: {\"source\":\"api\",\"min_level\":\"warn\",\"fields\":{\"/http/status\":500}}\nTime bounds: RFC3339, e.g. \"since\":\"2026-10-29T10:00:00Z\".\nMissing required metadata does not match. Search remains separate.\nOnly retained entries are filtered; no older logs are fetched.".into()
+    };
+    frame.render_widget(Paragraph::new(hint).wrap(Wrap { trim: false }), parts[0]);
+    let input = Paragraph::new(format!("> {}▏", safe_text(&app.input))).wrap(Wrap { trim: false });
+    let scroll = input
+        .line_count(parts[1].width)
+        .saturating_sub(parts[1].height as usize)
+        .min(u16::MAX as usize);
+    frame.render_widget(input.scroll((scroll as u16, 0)), parts[1]);
+    frame.render_widget(
+        Paragraph::new(safe_text(&app.notice))
+            .wrap(Wrap { trim: false })
+            .style(accent(app, Color::Yellow)),
+        parts[2],
+    );
+    frame.render_widget(
+        Paragraph::new(if exporting {
+            "Enter Export snapshot · Esc Cancel · Ctrl-u Clear"
+        } else {
+            "Enter Apply · Esc Cancel · Ctrl-u Clear; paste appends JSON"
+        })
+        .wrap(Wrap { trim: false }),
+        parts[3],
+    );
 }
 
 fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -447,11 +542,18 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::Logs => "2 Logs",
         Tab::Networks => "3 Networks",
         Tab::Exec => "4 Exec",
+        Tab::Layers => "5 Layers",
     };
     let exec_context = if app.tab == Tab::Exec {
-        app.exec_session
-            .as_ref()
-            .map(|session| format!(" · {}", safe_text(&session.request.connection.name)))
+        app.sessions
+            .active()
+            .map(|session| {
+                format!(
+                    " #{} · {}",
+                    app.sessions.active_id().unwrap_or(0),
+                    safe_text(&session.request.connection.name)
+                )
+            })
             .unwrap_or_default()
     } else {
         String::new()
@@ -459,27 +561,28 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = pane(format!(" {label}{exec_context} "), app.detail_focus);
     let inner = padded(block.inner(area));
     frame.render_widget(block, area);
-    if inner.height < 3 || inner.width < 2 {
+    if inner.height < 3 || inner.width < 2 || app.tab == Tab::Exec && inner.height < 4 {
         return;
     }
     let sections = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(if app.tab == Tab::Exec { 2 } else { 1 }),
         Constraint::Min(1),
     ])
     .split(inner);
-    let names = if inner.width >= 50 {
-        vec!["1 Overview", "2 Logs", "3 Networks", "4 Exec"]
-    } else if inner.width >= 40 {
-        vec!["1 Info", "2 Logs", "3 Net", "4 Exec"]
+    let names = if inner.width >= 62 {
+        vec!["1 Overview", "2 Logs", "3 Networks", "4 Exec", "5 Layers"]
+    } else if inner.width >= 44 {
+        vec!["1 Info", "2 Logs", "3 Net", "4 Exec", "5 Layers"]
     } else {
-        vec!["1", "2", "3", "4"]
+        vec!["1", "2", "3", "4", "5"]
     };
     let active = match app.tab {
         Tab::Overview => 0,
         Tab::Logs => 1,
         Tab::Networks => 2,
         Tab::Exec => 3,
+        Tab::Layers => 4,
     };
     frame.render_widget(
         Tabs::new(names)
@@ -488,36 +591,36 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         sections[0],
     );
     let context = if app.tab == Tab::Exec {
-        app.exec_session
-            .as_ref()
+        app.sessions
+            .active()
             .map(|session| {
                 format!(
-                    "{}{} · {} · {}",
+                    "{}{}\n{} · {}",
                     session
                         .request
                         .container
                         .namespace
                         .as_ref()
-                        .map(|ns| format!("{ns}/"))
+                        .map(|ns| format!("{}/", safe_text(ns)))
                         .unwrap_or_default(),
-                    session.request.container.name,
-                    session.status(),
+                    safe_text(&session.request.container.name),
                     if app.exec_input {
-                        "SHELL INPUT · Ctrl-] navigation"
+                        "SHELL INPUT"
                     } else if session.running() {
-                        "NAVIGATION · Enter input"
+                        "NAVIGATION"
                     } else {
-                        "OUTPUT RETAINED · e new shell"
-                    }
+                        "OUTPUT RETAINED"
+                    },
+                    safe_text(&session.status()),
                 )
             })
-            .unwrap_or_else(|| "Exec · No session · Select a container and press e".into())
+            .unwrap_or_else(|| "No session\nNAVIGATION · Select a container and press e".into())
     } else {
         format!(
             "{} · {}",
             app.current()
-                .map(|row| row.title.as_str())
-                .unwrap_or("No selection"),
+                .map(|row| safe_text(&row.title))
+                .unwrap_or_else(|| "No selection".into()),
             if app.detail_focus {
                 "Focused"
             } else {
@@ -526,12 +629,18 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         )
     };
     frame.render_widget(
-        Paragraph::new(safe_text(&context)).style(muted()),
+        Paragraph::new(
+            context
+                .lines()
+                .map(|line| Line::from(safe_text(line)))
+                .collect::<Vec<_>>(),
+        )
+        .style(muted()),
         sections[1],
     );
     let body = sections[2];
     app.exec_dimensions = (body.height, body.width);
-    if let Some(session) = &mut app.exec_session
+    if let Some(session) = app.sessions.active_mut()
         && let Err(error) = session.resize(body.height, body.width)
     {
         app.notice = format!("Exec resize failed: {error:#}");
@@ -539,6 +648,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
     match app.tab {
         Tab::Logs => draw_logs(frame, app, body),
         Tab::Exec => draw_exec(frame, app, body),
+        Tab::Layers => draw_layers(frame, app, body),
         Tab::Overview | Tab::Networks => {
             let lines = if app.tab == Tab::Networks {
                 network_lines(app)
@@ -555,8 +665,159 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+fn draw_layers(frame: &mut Frame, app: &mut App, area: Rect) {
+    use crate::layers::State;
+    let image = match &app.layers.state {
+        State::Idle => {
+            frame.render_widget(Paragraph::new("Select one connected container or a one-container service.\nRead-only image metadata; no pulls, extraction, or builds.").wrap(Wrap { trim:false }), area);
+            return;
+        }
+        State::Loading => {
+            frame.render_widget(
+                Paragraph::new("Loading resolved image layers… (read-only)"),
+                area,
+            );
+            return;
+        }
+        State::Failed(error) => {
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Layers unavailable: {}\n:reload-layers retries; no image will be pulled.",
+                    safe_text(error)
+                ))
+                .wrap(Wrap { trim: false }),
+                area,
+            );
+            return;
+        }
+        State::Ready(image) => image,
+    };
+    let mut lines = vec![Line::from(format!("Resolved image: {}", image.id))];
+    let mut selected_line = 0;
+    if app.layers.expanded {
+        lines.push(Line::styled(
+            "Enter/Esc Back · j/k/PgUp/PgDn Scroll",
+            muted(),
+        ));
+        if let Some(id) = image.filesystem.get(app.layers.selected) {
+            lines.push(Line::from(format!("Filesystem diff ID: {id}")));
+            lines.push(Line::from(
+                "Uncompressed diff ID; size and build-step association are unavailable.",
+            ));
+        } else if let Some(step) = image
+            .history
+            .get(app.layers.selected.saturating_sub(image.filesystem.len()))
+        {
+            lines.push(Line::styled(
+                "Build history may contain secrets. Instructions are never executed.",
+                accent(app, Color::Yellow),
+            ));
+            lines.push(Line::from(match step.empty_layer {
+                Some(true) => "Explicit metadata-only step",
+                Some(false) => "Explicit filesystem-producing step",
+                None => "Filesystem association unavailable (not inferred from size)",
+            }));
+            lines.push(Line::from(format!(
+                "Reported history size: {}",
+                step.size
+                    .map(metrics::bytes)
+                    .unwrap_or_else(|| "unavailable".into())
+            )));
+            lines.push(Line::from(format!("Instruction: {}", step.instruction)));
+            if !step.comment.is_empty() {
+                lines.push(Line::from(format!("Comment: {}", step.comment)));
+            }
+        }
+    } else {
+        lines.push(Line::styled(
+            "j/k Select · Enter Details · :reload-layers Retry",
+            muted(),
+        ));
+        lines.push(Line::from(format!(
+            "Filesystem layers ({}) · base → top · sizes unavailable",
+            image.filesystem.len()
+        )));
+        for (index, id) in image.filesystem.iter().enumerate() {
+            if index == app.layers.selected {
+                selected_line = lines.len();
+            }
+            lines.push(Line::styled(
+                format!(
+                    "{} {}. {id}",
+                    if index == app.layers.selected {
+                        "▸"
+                    } else {
+                        " "
+                    },
+                    index + 1
+                ),
+                if index == app.layers.selected {
+                    selected()
+                } else {
+                    Style::default()
+                },
+            ));
+        }
+        lines.push(Line::from(format!(
+            "Build history ({}) · base → top · separate from diff IDs",
+            image.history.len()
+        )));
+        for (index, step) in image.history.iter().enumerate() {
+            let active = index + image.filesystem.len() == app.layers.selected;
+            if active {
+                selected_line = lines.len();
+            }
+            lines.push(Line::styled(
+                format!(
+                    "{} {}. {} · {}{}",
+                    if active { "▸" } else { " " },
+                    index + 1,
+                    step.size
+                        .map(metrics::bytes)
+                        .unwrap_or_else(|| "size unavailable".into()),
+                    "instruction hidden (Enter details)",
+                    if step.empty_layer == Some(true) {
+                        " [metadata-only]"
+                    } else {
+                        ""
+                    }
+                ),
+                if active { selected() } else { Style::default() },
+            ));
+        }
+        for warning in &image.warnings {
+            lines.push(Line::styled(warning.clone(), accent(app, Color::Yellow)));
+        }
+        lines.push(Line::styled(
+            "Build history may contain secrets; Enter reveals the selected step.",
+            muted(),
+        ));
+    }
+    if !app.layers.expanded && image.rows() > 0 {
+        let position = Paragraph::new(lines[..selected_line].to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(area.width);
+        if position < app.detail_scroll {
+            app.detail_scroll = position;
+        }
+        if position >= app.detail_scroll + area.height as usize {
+            app.detail_scroll = position.saturating_sub(area.height.saturating_sub(1) as usize);
+        }
+    }
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    app.detail_scroll = app
+        .detail_scroll
+        .min(
+            paragraph
+                .line_count(area.width)
+                .saturating_sub(area.height as usize),
+        )
+        .min(u16::MAX as usize);
+    frame.render_widget(paragraph.scroll((app.detail_scroll as u16, 0)), area);
+}
+
 fn draw_exec(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(session) = &app.exec_session else {
+    let Some(session) = app.sessions.active() else {
         frame.render_widget(Paragraph::new("Embedded container shell\n\nSelect a running container or service and press e.\nCtrl-] returns keyboard focus to Tha without closing the shell.\nThe session target stays fixed when you browse other containers.").wrap(Wrap { trim:false }), area);
         return;
     };
@@ -1172,16 +1433,31 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     let search = if app.log_view.query().is_empty() {
         format!(
-            "{} entries retained · {} evicted",
+            "{}/{} entries retained · Filter: {} · {} evicted",
+            app.logs
+                .entries
+                .iter()
+                .filter(|entry| app.log_view.filter.matches(entry))
+                .count(),
             app.logs.entries.len(),
+            if app.log_view.filter.active() {
+                "on"
+            } else {
+                "off"
+            },
             app.logs.evicted
         )
     } else {
         format!(
-            "{}/{} matches /{}",
+            "{}/{} matches /{} · Filter: {}",
             app.log_view.match_index.unwrap_or(0),
             app.log_view.match_count,
-            safe_text(app.log_view.query())
+            safe_text(app.log_view.query()),
+            if app.log_view.filter.active() {
+                "on"
+            } else {
+                "off"
+            },
         )
     };
     frame.render_widget(
@@ -1206,7 +1482,11 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
     let visible = app.log_view.visible(&app.logs);
     if visible.is_empty() {
         frame.render_widget(
-            Paragraph::new("Waiting for logs. Select a container, service, or project."),
+            Paragraph::new(if app.log_view.filter.active() {
+                "No matching retained logs. F3 edits; :clear-log-filter resets."
+            } else {
+                "Waiting for logs. Select a container, service, or project."
+            }),
             content,
         );
         return;
@@ -1306,7 +1586,12 @@ fn highlighted<'a>(
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let lines = if app.input_mode == InputMode::Search {
+    let lines = if matches!(app.input_mode, InputMode::LogFilter | InputMode::ExportLogs) {
+        vec![
+            Line::styled("Log dialog · Enter Apply/Export · Esc Cancel", muted()),
+            Line::from(safe_text(&app.notice)),
+        ]
+    } else if app.input_mode == InputMode::Search {
         vec![
             Line::from(format!("/{}▏", safe_text(&app.input))),
             Line::styled(
@@ -1316,13 +1601,15 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         ]
     } else {
         let hints = if app.exec_input && app.tab == Tab::Exec {
-            "Exec · SHELL INPUT · Keys go to the container · Ctrl-] returns to Tha navigation"
+            "Ctrl-] Navigate · SHELL INPUT · Keys go to the selected container session"
         } else if app.performance_focus {
             "Performance · ALL RUNTIMES · j/k Scroll  Enter Inspect  p Close  Tab Pane  ? Keys"
+        } else if app.detail_focus && app.tab == Tab::Exec {
+            "F6 Sessions · Enter Input · :close-exec Close slot · j/k Scroll · Tab Explorer · ? Keys"
         } else if app.detail_focus && app.tab == Tab::Logs {
-            "? Keys  w Wrap  / Search  n/N Match  j/k Scroll  f Follow  h/l Pan (unwrap)  Tab Explorer"
+            "? Keys  F3 Filter  :export-logs  w Wrap  / Search  n/N Match  j/k Scroll  f Follow  Tab Explorer"
         } else {
-            "? Keys  S/s/r/d Actions  p Performance  Space Toggle  Enter Open  e Exec  Tab Pane  1/2/3/4 Views  : Commands"
+            "? Keys  a Actions  p Performance  Space Toggle  Enter Open  e Exec  Tab Pane  1..5 Views  : Commands"
         };
         vec![
             Line::styled(hints, muted()),
@@ -1346,7 +1633,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     let area = centered(area, 80, 36);
     frame.render_widget(Clear, area);
-    let text = concat!(
+    let defaults = concat!(
         "Navigation\n",
         "j / k, arrows     Move in the focused pane\n",
         "h / l             Collapse/parent, expand/child (tree)\n",
@@ -1362,7 +1649,12 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         "                  Container or Compose rows only; confirmation required\n",
         "                  y confirms; Enter/Esc cancels; Delete: type name + Enter\n",
         "                  Delete stopped containers only; keep networks/volumes/images\n",
-        "1 / 2 / 3 / 4     Overview / Logs / Networks / Exec\n",
+        "1 / 2 / 3 / 4 / 5 Overview / Logs / Networks / Exec / Layers\n",
+        "a                 Contextual actions with disabled reasons (Explorer)\n",
+        "Enter in Layers   Expand details; Esc returns; no image pulls\n",
+        "F6 / :exec-sessions Switch retained shells (navigation mode only)\n",
+        "F3 in Logs        JSON/source/severity/time filters on retained entries\n",
+        ":export-logs      Explicit new private JSONL file; may contain secrets\n",
         "gg / G            First / last; G resumes log following\n",
         "Ctrl-u / Ctrl-d   Half-page up / down\n",
         "\nLogs (focus the log pane with Tab)\n",
@@ -1390,7 +1682,15 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         "Colors inherit your terminal's ANSI palette.\n",
         "Green circle: running/healthy; yellow: starting/paused/restarting.\n",
         "Red circle: unhealthy/failed; neutral: completed/stopped/unknown.\n",
-        "Exec can change container contents; no lifecycle actions exist."
+        "Exec and lifecycle actions can change workloads. Confirmations remain required."
+    );
+    let custom = app
+        .custom_bindings
+        .iter()
+        .map(|(key, action)| format!("{} → {}\n", safe_text(key), safe_text(action)))
+        .collect::<String>();
+    let text = format!(
+        "{defaults}\n\nCustom navigation bindings (override defaults only in navigation)\n{custom}"
     );
     let block = Block::bordered()
         .title(" Tha · Shortcuts / Cheatsheet ")
@@ -1436,17 +1736,36 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     let Some(picker) = &app.picker else {
         return;
     };
+    let actions = picker
+        .choices
+        .iter()
+        .any(|choice| matches!(choice, Choice::Action { .. }));
     let area = centered(
         area,
         86,
-        (picker.choices.len() as u16).saturating_add(3).min(24),
+        if actions {
+            18
+        } else {
+            (picker.choices.len() as u16).saturating_add(3).min(24)
+        },
     );
     frame.render_widget(Clear, area);
     let block = Block::bordered()
-        .title(format!(" {} ", picker.title))
+        .title(format!(" {} ", safe_text(&picker.title)))
         .title_bottom(" j/k Select · Enter Choose · Esc Cancel ");
-    let inner = padded(block.inner(area));
+    let mut inner = padded(block.inner(area));
     frame.render_widget(block, area);
+    if actions {
+        let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(4)]).split(inner);
+        inner = parts[0];
+        if let Some(Choice::Action { action, row }) = picker.choices.get(picker.selected) {
+            let explanation = app.action_availability(*action, row).map(|count| format!("{count} existing container(s). Enter opens confirmation; nothing is sent now.")).unwrap_or_else(|reason| format!("Disabled: {reason}"));
+            frame.render_widget(
+                Paragraph::new(safe_text(&explanation)).wrap(Wrap { trim: false }),
+                parts[1],
+            );
+        }
+    }
     let start = picker
         .selected
         .saturating_sub(inner.height.saturating_sub(1) as usize);
@@ -1458,6 +1777,32 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
         .take(inner.height as usize)
         .map(|(index, choice)| {
             let label = match choice {
+                Choice::Session(id) => app
+                    .sessions
+                    .iter()
+                    .find(|(candidate, _)| candidate == id)
+                    .map(|(_, session)| {
+                        format!(
+                            "{} #{} · {} / {} · {}",
+                            if app.sessions.active_id() == Some(*id) {
+                                "▸"
+                            } else {
+                                " "
+                            },
+                            id,
+                            session.request.connection.name,
+                            session.request.container.name,
+                            session.status()
+                        )
+                    })
+                    .unwrap_or_else(|| format!("#{id} · closed")),
+                Choice::Action { action, row } => format!(
+                    "{} · {}",
+                    action.label(),
+                    app.action_availability(*action, row)
+                        .map(|count| format!("{count} target(s)"))
+                        .unwrap_or_else(|_| "disabled".into())
+                ),
                 Choice::ContextSort(mode) => mode.label().into(),
                 Choice::Project(project) => format!(
                     "{} / {}{}",
@@ -2017,5 +2362,99 @@ mod tests {
                 .iter()
                 .all(|cell| cell.bg == Color::Reset)
         );
+    }
+
+    #[test]
+    fn contextual_actions_show_disabled_reasons_and_layers_show_separate_history() {
+        let mut app = App::new(crate::demo::connections(), 100, false, true);
+        crate::demo::populate(&mut app);
+        app.open_actions();
+        let mut terminal = Terminal::new(TestBackend::new(140, 35)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Actions"));
+        assert!(text.contains("Start · disabled"));
+        assert!(text.contains("Demo mode"));
+        app.picker = None;
+        app.tab = Tab::Layers;
+        app.detail_focus = true;
+        app.layers.state = crate::layers::State::Ready(crate::layers::Image {
+            id: "sha256:resolved".into(),
+            filesystem: vec!["sha256:base-diff".into()],
+            history: vec![crate::layers::History {
+                instruction: "ENV MODE=production".into(),
+                comment: "explicit OCI metadata".into(),
+                size: Some(0),
+                empty_layer: Some(true),
+            }],
+            warnings: vec![],
+        });
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("5 Layers"));
+        assert!(text.contains("Filesystem layers (1)"));
+        assert!(text.contains("Build history (1)"));
+        app.layers.selected = 1;
+        app.layers.expanded = true;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("may contain secrets"));
+        assert!(text.contains("Explicit metadata-only step"));
+        assert!(text.contains("ENV MODE=production"));
+    }
+
+    #[test]
+    fn log_dialogs_explain_filtering_and_require_visible_private_export_review() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.tab = Tab::Logs;
+        app.detail_focus = true;
+        app.input_mode = InputMode::LogFilter;
+        let mut terminal = Terminal::new(TestBackend::new(140, 35)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Filter retained logs"));
+        assert!(text.contains("JSON"));
+        assert!(text.contains("RFC3339"));
+        app.input_mode = InputMode::ExportLogs;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.log_export_review_visible);
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("SECRETS"));
+        assert!(text.contains("0600"));
+        assert!(text.contains("existing files/symlinks refused"));
+        let mut tiny = Terminal::new(TestBackend::new(50, 15)).unwrap();
+        tiny.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!app.log_export_review_visible);
     }
 }

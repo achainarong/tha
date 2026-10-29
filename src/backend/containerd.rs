@@ -5,10 +5,18 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
-use tokio::process::Command;
+use tokio::{io::AsyncReadExt, process::Command};
 
 pub fn command(connection: &Connection, namespace: Option<&str>) -> Command {
-    let mut command = Command::new("nerdctl");
+    command_at(std::path::Path::new("nerdctl"), connection, namespace)
+}
+
+fn command_at(
+    program: &std::path::Path,
+    connection: &Connection,
+    namespace: Option<&str>,
+) -> Command {
+    let mut command = Command::new(program);
     command.kill_on_drop(true).arg("--address").arg(
         connection
             .endpoint
@@ -22,17 +30,41 @@ pub fn command(connection: &Connection, namespace: Option<&str>) -> Command {
 }
 
 async fn output(mut command: Command) -> Result<String> {
-    let output = command
-        .output()
-        .await
+    use std::process::Stdio;
+    let mut child = command
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("Cannot run nerdctl. Install nerdctl and make sure it is on PATH")?;
-    if !output.status.success() {
+    let stdout = child.stdout.take().context("nerdctl stdout unavailable")?;
+    let stderr = child.stderr.take().context("nerdctl stderr unavailable")?;
+    let read = |pipe: Box<dyn tokio::io::AsyncRead + Unpin + Send>| async move {
+        let mut bytes = Vec::new();
+        pipe.take(4 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            bail!("nerdctl output exceeded 4 MiB");
+        }
+        Ok::<_, anyhow::Error>(bytes)
+    };
+    let (stdout, stderr, status) =
+        tokio::try_join!(read(Box::new(stdout)), read(Box::new(stderr)), async {
+            Ok::<_, anyhow::Error>(child.wait().await?)
+        })?;
+    if !status.success() {
         bail!(
             "nerdctl failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            String::from_utf8_lossy(&stderr)
+                .chars()
+                .take(4096)
+                .collect::<String>()
+                .trim()
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
 pub async fn platform(
@@ -73,6 +105,98 @@ pub fn parse_platform(value: &Value) -> Result<crate::platform::ImagePlatform> {
         .unwrap_or(value);
     let text = |key| row.get(key).and_then(Value::as_str).map(str::to_owned);
     crate::platform::ImagePlatform::new(text("Os"), text("Architecture"), text("Variant"))
+}
+
+pub async fn layers(
+    connection: &Connection,
+    container: &Container,
+) -> Result<crate::layers::Image> {
+    layers_at(std::path::Path::new("nerdctl"), connection, container).await
+}
+
+async fn layers_at(
+    program: &std::path::Path,
+    connection: &Connection,
+    container: &Container,
+) -> Result<crate::layers::Image> {
+    let namespace = container.namespace.as_deref();
+    let mut inspect = command_at(program, connection, namespace);
+    inspect.args(["inspect", "--", &container.id]);
+    let inspected: Value = serde_json::from_str(&output(inspect).await?)?;
+    let id = crate::platform::require_image_id(
+        inspected
+            .pointer("/0/Image")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    )?;
+    let mut inspect = command_at(program, connection, namespace);
+    inspect.args(["image", "inspect", "--", &id]);
+    let value: Value = serde_json::from_str(&output(inspect).await?)?;
+    let image = value.pointer("/0").unwrap_or(&value);
+    let mut history_command = command_at(program, connection, namespace);
+    history_command.args([
+        "image",
+        "history",
+        "--no-trunc",
+        "--format",
+        "{{json .}}",
+        "--",
+        &id,
+    ]);
+    let mut warnings = vec!["Filesystem sizes and filesystem/history mapping are unavailable. Only explicit empty_layer metadata identifies metadata-only steps.".into()];
+    let history = match output(history_command).await {
+        Ok(text) => {
+            let rows: Result<Vec<Value>, _> = text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(serde_json::from_str)
+                .collect();
+            match rows {
+                Ok(rows) => rows
+                    .into_iter()
+                    .rev()
+                    .map(|row| crate::layers::History {
+                        instruction: row
+                            .get("CreatedBy")
+                            .or_else(|| row.get("created_by"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("Instruction unavailable")
+                            .into(),
+                        comment: row
+                            .get("Comment")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .into(),
+                        size: row.get("Size").and_then(Value::as_u64),
+                        empty_layer: row.get("empty_layer").and_then(Value::as_bool),
+                    })
+                    .collect(),
+                Err(error) => {
+                    warnings.push(format!("Build history JSON unavailable: {error}"));
+                    Vec::new()
+                }
+            }
+        }
+        Err(error) => {
+            warnings.push(format!("Build history unavailable: {error:#}"));
+            Vec::new()
+        }
+    };
+    let filesystem = image.pointer("/RootFS/Layers").and_then(Value::as_array);
+    if filesystem.is_none() {
+        warnings.push("Filesystem layer metadata was not reported by nerdctl".into());
+    }
+    Ok(crate::layers::Image {
+        id,
+        filesystem: filesystem
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        history,
+        warnings,
+    })
 }
 
 pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
@@ -296,5 +420,42 @@ mod tests {
             "linux/arm64/v8 (ARM64)"
         );
         assert!(parse_platform(&serde_json::json!([{"Os":"linux"}])).is_err());
+    }
+
+    #[tokio::test]
+    async fn layer_commands_pin_the_namespace_and_resolved_image_without_shell_interpolation() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("tha-nerdctl-layers-{}", std::process::id()));
+        let id = format!("sha256:{}", "a".repeat(64));
+        let script = r##"#!/bin/sh
+image='$IMAGE'
+case "$*" in
+  '--address /fixture.sock --namespace dev inspect -- container-id') printf '[{"Image":"%s"}]' "$image";;
+  "--address /fixture.sock --namespace dev image inspect -- $image") printf '[{"RootFS":{"Layers":["base-diff","top-diff"]}}]';;
+  "--address /fixture.sock --namespace dev image history --no-trunc --format {{json .}} -- $image") printf '%s\n' '{"CreatedBy":"ENV MODE=production","Size":0,"empty_layer":true}' '{"CreatedBy":"COPY app /app","Size":"1 KiB"}';;
+  *) echo 'unexpected or mutating command' >&2; exit 33;;
+esac
+"##.replace("$IMAGE", &id);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let connection = Connection {
+            name: "fixture".into(),
+            kind: crate::config::BackendKind::Containerd,
+            endpoint: "unix:///fixture.sock".into(),
+        };
+        let container = Container {
+            id: "container-id".into(),
+            namespace: Some("dev".into()),
+            image: "mutable:latest".into(),
+            ..Default::default()
+        };
+        let result = layers_at(&path, &connection, &container).await;
+        std::fs::remove_file(&path).unwrap();
+        let image = result.unwrap();
+        assert_eq!(image.id, id);
+        assert_eq!(image.filesystem, ["base-diff", "top-diff"]);
+        assert_eq!(image.history[0].instruction, "COPY app /app");
+        assert_eq!(image.history[0].size, None);
+        assert_eq!(image.history[1].empty_layer, Some(true));
     }
 }

@@ -62,7 +62,7 @@ def main():
         config = directory / "config.toml"
         config.write_text("context_order = ['Podman / fixture']\nrefresh_seconds = 1\n")
         environment = {**os.environ, "HOME": temporary, "DOCKER_CONFIG": temporary,
-                       "XDG_CONFIG_HOME": temporary, "XDG_RUNTIME_DIR": temporary,
+                       "XDG_CONFIG_HOME": temporary, "XDG_RUNTIME_DIR": temporary, "XDG_STATE_HOME": temporary,
                        "PATH": str(binary_directory) + os.pathsep + os.environ["PATH"],
                        "TERM": "xterm-256color"}
         environment.pop("DOCKER_HOST", None)

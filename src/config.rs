@@ -31,6 +31,9 @@ pub struct Config {
     pub monochrome: bool,
     pub log_wrap: bool,
     pub exec_command: Vec<String>,
+    pub max_exec_sessions: usize,
+    pub save_preferences: bool,
+    pub bindings: std::collections::BTreeMap<String, String>,
     pub connections: Vec<Connection>,
     /// Exact displayed connection names, in preferred order. Unknown names are ignored.
     pub context_order: Vec<String>,
@@ -45,6 +48,9 @@ impl Default for Config {
             monochrome: false,
             log_wrap: true,
             exec_command: vec!["sh".into()],
+            max_exec_sessions: 4,
+            save_preferences: true,
+            bindings: Default::default(),
             connections: Vec::new(),
             context_order: Vec::new(),
         }
@@ -79,6 +85,9 @@ impl Config {
         if config.exec_command.is_empty() || config.exec_command[0].trim().is_empty() {
             bail!("exec_command must contain an executable, for example [\"sh\"]");
         }
+        if !(1..=8).contains(&config.max_exec_sessions) {
+            bail!("max_exec_sessions must be between 1 and 8");
+        }
         for connection in &config.connections {
             if connection.name.trim().is_empty() || connection.endpoint.trim().is_empty() {
                 bail!("Connection names and endpoints must not be empty");
@@ -93,6 +102,7 @@ impl Config {
                 bail!("Duplicate context_order name: {name}");
             }
         }
+        crate::keymap::Keymap::parse(&config.bindings)?;
         Ok(config)
     }
 }
@@ -127,6 +137,7 @@ mod tests {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.metrics_refresh_seconds, 1);
         assert_eq!(config.refresh_seconds, 5);
+        assert_eq!(config.max_exec_sessions, 4);
     }
 
     #[test]
@@ -161,6 +172,8 @@ mod tests {
         for input in [
             "context_order = ['']",
             "context_order = ['Colima', 'Colima']",
+            "max_exec_sessions = 0",
+            "max_exec_sessions = 9",
         ] {
             std::fs::write(&path, input).unwrap();
             assert!(Config::load(Some(&path)).is_err());

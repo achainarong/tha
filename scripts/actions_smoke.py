@@ -91,7 +91,7 @@ def main():
         config = directory / "config.toml"
         config.write_text("context_order = ['Mock lifecycle']\nrefresh_seconds = 1\n[[connections]]\nname = 'Mock lifecycle'\nkind = 'docker'\n" + f"endpoint = 'unix://{socket}'\n")
         environment = {**os.environ, "HOME": temporary, "DOCKER_CONFIG": temporary,
-                       "XDG_CONFIG_HOME": temporary, "XDG_RUNTIME_DIR": temporary, "TERM": "xterm-256color"}
+                       "XDG_CONFIG_HOME": temporary, "XDG_RUNTIME_DIR": temporary, "XDG_STATE_HOME": temporary, "TERM": "xterm-256color"}
         environment.pop("DOCKER_HOST", None)
         master, slave = pty.openpty()
         original = termios.tcgetattr(slave)

@@ -35,24 +35,66 @@ pub async fn platform(
         return Ok(platform.clone());
     }
     let docker = connect(connection)?.negotiate_version().await?;
-    let id = match container
-        .image_id
-        .clone()
-        .filter(|id| crate::platform::immutable_image_id(id))
-    {
-        Some(id) => id,
-        None => crate::platform::require_image_id(
-            docker
-                .inspect_container(
-                    &container.id,
-                    None::<bollard::query_parameters::InspectContainerOptions>,
-                )
-                .await?
-                .image,
-        )?,
-    };
+    let id = resolved_image(&docker, container).await?;
     let image = docker.inspect_image(&id).await?;
     crate::platform::ImagePlatform::new(image.os, image.architecture, image.variant)
+}
+
+async fn resolved_image(docker: &Docker, container: &Container) -> Result<String> {
+    Ok(
+        match container
+            .image_id
+            .clone()
+            .filter(|id| crate::platform::immutable_image_id(id))
+        {
+            Some(id) => id,
+            None => crate::platform::require_image_id(
+                docker
+                    .inspect_container(
+                        &container.id,
+                        None::<bollard::query_parameters::InspectContainerOptions>,
+                    )
+                    .await?
+                    .image,
+            )?,
+        },
+    )
+}
+
+pub async fn layers(
+    connection: &Connection,
+    container: &Container,
+) -> Result<crate::layers::Image> {
+    let docker = connect(connection)?.negotiate_version().await?;
+    let id = resolved_image(&docker, container).await?;
+    let inspected = docker.inspect_image(&id).await?;
+    let mut warnings = vec!["Docker-compatible history does not expose empty_layer; filesystem/history mapping is unavailable. Zero-byte steps are not assumed to be metadata-only.".into()];
+    let history = match docker.image_history(&id).await {
+        Ok(rows) => rows
+            .into_iter()
+            .rev()
+            .map(|row| crate::layers::History {
+                instruction: row.created_by,
+                comment: row.comment,
+                size: u64::try_from(row.size).ok(),
+                empty_layer: None,
+            })
+            .collect(),
+        Err(error) => {
+            warnings.push(format!("Build history unavailable: {error}"));
+            Vec::new()
+        }
+    };
+    let filesystem = inspected.root_fs.and_then(|root| root.layers);
+    if filesystem.is_none() {
+        warnings.push("Filesystem layer metadata was not reported by the runtime".into());
+    }
+    Ok(crate::layers::Image {
+        id: inspected.id.unwrap_or(id),
+        filesystem: filesystem.unwrap_or_default(),
+        history,
+        warnings,
+    })
 }
 
 pub async fn preflight_action(

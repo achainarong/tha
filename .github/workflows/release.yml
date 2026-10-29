@@ -115,6 +115,7 @@ jobs:
           cp LICENSE README.md "$stage/"
           mkdir -p dist
           COPYFILE_DISABLE=1 tar -czf "dist/$ASSET" -C "$stage" tha LICENSE README.md
+          python3 scripts/release_smoke.py --archive "dist/$ASSET"
       - uses: actions/upload-artifact@v4
         with:
           name: tha-release-${{ matrix.target }}

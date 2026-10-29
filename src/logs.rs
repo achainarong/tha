@@ -12,6 +12,8 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
+pub mod export;
+pub mod filter;
 pub mod view;
 
 const MAX_LINE_BYTES: usize = 16_384;
@@ -23,6 +25,7 @@ pub struct Entry {
     pub source: String,
     pub text: String,
     pub error: bool,
+    pub metadata: filter::Metadata,
 }
 
 pub struct LogBuffer {
@@ -58,11 +61,14 @@ impl LogBuffer {
             text = text.chars().take(MAX_LINE_BYTES / 4).collect();
             text.push_str(" … [truncated]");
         }
+        let text = safe_text(&text);
+        let metadata = filter::Metadata::parse(&text, error);
         self.entries.push_back(Entry {
             sequence: self.next_sequence,
             source: safe_text(source),
-            text: safe_text(&text),
+            text,
             error,
+            metadata,
         });
         self.next_sequence += 1;
     }

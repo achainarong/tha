@@ -43,6 +43,7 @@ pub struct VisualRow {
 }
 
 pub struct LogView {
+    pub filter: super::filter::Filter,
     pub wrap: bool,
     pub horizontal: usize,
     pub height: usize,
@@ -54,13 +55,14 @@ pub struct LogView {
     pub match_count: usize,
     pub match_index: Option<usize>,
     layouts: VecDeque<EntryLayout>,
-    layout_mode: Option<(usize, bool)>,
+    layout_mode: Option<(usize, bool, super::filter::Filter)>,
     search_stamp: Option<(u64, u64, usize)>,
 }
 
 impl LogView {
     pub fn new(wrap: bool) -> Self {
         Self {
+            filter: Default::default(),
             wrap,
             horizontal: 0,
             height: 1,
@@ -113,30 +115,35 @@ impl LogView {
     }
 
     fn matches<'a>(&'a self, buffer: &'a LogBuffer) -> impl Iterator<Item = SearchMatch> + 'a {
-        buffer.entries.iter().flat_map(move |entry| {
-            [
-                (Field::Source, entry.source.as_str()),
-                (Field::Payload, entry.text.as_str()),
-            ]
-            .into_iter()
-            .flat_map(move |(field, text)| {
-                self.regex.iter().flat_map(move |regex| {
-                    regex.find_iter(text).map(move |found| SearchMatch {
-                        sequence: entry.sequence,
-                        field,
-                        range: found.range(),
+        buffer
+            .entries
+            .iter()
+            .filter(|entry| self.filter.matches(entry))
+            .flat_map(move |entry| {
+                [
+                    (Field::Source, entry.source.as_str()),
+                    (Field::Payload, entry.text.as_str()),
+                ]
+                .into_iter()
+                .flat_map(move |(field, text)| {
+                    self.regex.iter().flat_map(move |regex| {
+                        regex.find_iter(text).map(move |found| SearchMatch {
+                            sequence: entry.sequence,
+                            field,
+                            range: found.range(),
+                        })
                     })
                 })
             })
-        })
     }
 
     pub fn sync(&mut self, buffer: &LogBuffer, width: usize, height: usize) {
         self.width = width.max(1);
         self.height = height.max(1);
-        if self.layout_mode != Some((self.width, self.wrap)) {
+        if self.layout_mode != Some((self.width, self.wrap, self.filter.clone())) {
             self.layouts.clear();
-            self.layout_mode = Some((self.width, self.wrap));
+            self.search_stamp = None;
+            self.layout_mode = Some((self.width, self.wrap, self.filter.clone()));
         }
         let first = buffer.entries.front().map(|e| e.sequence).unwrap_or(0);
         while self
@@ -147,11 +154,9 @@ impl LogView {
             self.layouts.pop_front();
         }
         let last = self.layouts.back().map(|layout| layout.sequence);
-        for entry in buffer
-            .entries
-            .iter()
-            .filter(|entry| last.is_none_or(|sequence| entry.sequence > sequence))
-        {
+        for entry in buffer.entries.iter().filter(|entry| {
+            last.is_none_or(|sequence| entry.sequence > sequence) && self.filter.matches(entry)
+        }) {
             self.layouts.push_back(EntryLayout {
                 sequence: entry.sequence,
                 ranges: if self.wrap {

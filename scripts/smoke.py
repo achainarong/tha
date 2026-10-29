@@ -71,7 +71,7 @@ def main():
         expect("Colima")
         keys(b"2\t", 1.0)
         expect("Following")
-        expect("INFO request completed")
+        expect("INFO request")  # The RFC3339 prefix can wrap the remainder onto another row.
         expect("Wrap: on")
         keys(b"w")
         expect("Wrap: off")
@@ -79,7 +79,7 @@ def main():
         expect("Wrap: on")
         keys(b"/upstream\r")
         expect("matches /upstream")
-        expect("INFO request completed")  # Search keeps surrounding entries.
+        expect("INFO request")  # Search keeps surrounding entries, even when wrapped.
         assert any(cell.reverse and cell.bold and cell.underscore for row in screen.buffer.values() for cell in row.values()), "No current-match highlight"
         keys(b"n")
         expect("matches /upstream")
@@ -91,7 +91,7 @@ def main():
         expect("Shortcuts")
         expect("Toggle wrapping on/off immediately")
         keys(b"G")
-        expect("Exec can change container contents")
+        expect("Exec and lifecycle actions can change workloads")
         keys(b"\x1b")
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 60, 0, 0))
         screen.resize(20, 60)

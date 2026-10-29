@@ -78,6 +78,7 @@ async fn start() -> Result<()> {
     }
     app.log_view.wrap = config.log_wrap;
     app.exec_command = config.exec_command;
+    app.sessions.set_limit(config.max_exec_sessions)?;
     app.metrics_refresh_seconds = config.metrics_refresh_seconds;
     app.context_pins = config.context_order;
     app.refresh_tree();
@@ -87,6 +88,21 @@ async fn start() -> Result<()> {
     if !cli.demo && !cli.overview {
         app.configure_startup(std::env::current_dir().context("Cannot read current directory")?);
         app.wait_for_machine_discovery();
+    }
+    app.keymap = tha::keymap::Keymap::parse(&config.bindings)?;
+    app.custom_bindings = config.bindings;
+    if config.save_preferences && !cli.demo {
+        app.preferences_path = tha::preferences::default_path();
+        if let Some(path) = &app.preferences_path {
+            match tha::preferences::load(path) {
+                Ok(Some(preferences)) => app.apply_preferences(preferences, !cli.overview),
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("tha: preferences ignored (existing file preserved): {error:#}");
+                    app.preferences_path = None;
+                }
+            }
+        }
     }
     run(app, config.refresh_seconds).await
 }
@@ -229,6 +245,10 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let (metrics_tx, mut metrics_rx) = mpsc::channel::<metrics::Event>(32);
     let (platform_tx, mut platform_rx) = mpsc::channel::<tha::platform::Event>(16);
     let mut platform_task: Option<(tha::platform::Key, AbortTask)> = None;
+    let (layers_tx, mut layers_rx) = mpsc::channel::<tha::layers::Event>(4);
+    let mut layers_task: Option<AbortTask> = None;
+    let (export_tx, mut export_rx) = mpsc::channel::<String>(4);
+    let mut export_task: Option<AbortTask> = None;
     let (action_tx, mut action_rx) = mpsc::channel(64);
     let mut action_task: Option<AbortTask> = None;
     let mut metric_targets = Vec::new();
@@ -281,6 +301,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                     if handle_key(&mut app, key, height, &refresh_tx) { break; }
                 },
                 Some(Ok(Event::Paste(text))) => {
+                    app.cancel_startup();
                     if let Some(confirmation) = &mut app.action_confirmation {
                         if confirmation.request.action == tha::actions::Action::Delete {
                             if text.chars().any(char::is_control) || confirmation.typed.len() + text.len() > 1024 {
@@ -288,14 +309,14 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                             } else { confirmation.typed.push_str(&text); }
                         }
                     } else if app.exec_input && app.tab == Tab::Exec {
-                        if let Some(session) = &mut app.exec_session && let Err(error) = session.paste(&text) { app.notice = format!("{error:#}"); }
+                        if let Some(session) = app.sessions.active_mut() && let Err(error) = session.paste(&text) { app.notice = format!("{error:#}"); }
                     } else if app.input_mode != InputMode::Normal {
                         let text = tha::model::safe_text(&text);
                         for ch in text.chars() { if app.input.len() + ch.len_utf8() > 1024 { break; } app.input.push(ch); }
                     }
                 },
                 Some(Err(error)) => return Err(error.into()),
-                Some(Ok(Event::Resize(_, _))) => app.action_review_visible = false,
+                Some(Ok(Event::Resize(_, _))) => { app.action_review_visible = false; app.log_export_review_visible = false; },
                 None => break,
                 _ => {}
             },
@@ -311,6 +332,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 publish_metric_targets(&mut app, &metric_targets);
             },
             Some(event) = metrics_rx.recv() => app.apply_metrics(event),
+            Some(result) = export_rx.recv() => { app.log_export_busy = false; app.notice = result; export_task = None; },
             Some(event) = action_rx.recv() => {
                 if let Some(progress) = &mut app.action_progress {
                     match event {
@@ -327,11 +349,15 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 }
             },
             Some(event) = platform_rx.recv() => app.platforms.insert(event.key, match event.result { Ok(platform) => tha::platform::State::Ready(platform), Err(error) => tha::platform::State::Unavailable(error) }),
+            Some(event) = layers_rx.recv() => {
+                app.layers.complete(event);
+            },
             _ = redraw.tick() => {
+                update_layers(&mut app, &mut layers_task, &layers_tx);
                 update_platform(&mut app, &mut platform_task, &platform_tx);
-                if let Some(session) = &mut app.exec_session && session.poll() {
-                    app.exec_input = false;
-                    app.notice = format!("Exec {} · container was not stopped. Press e to open another shell.", session.status());
+                for notice in app.sessions.poll() {
+                    if Some(notice.id) == app.sessions.active_id() { app.exec_input = false; }
+                    app.notice = format!("Exec #{} {} · container was not stopped. F6 switches retained sessions.", notice.id, notice.status);
                 }
                 update_logs(&mut app, &mut log_task, &log_tx, log_capacity);
                 // Batch log updates so a noisy container cannot trigger unlimited redraws.
@@ -351,12 +377,92 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 action_tx.clone(),
             ))));
         }
+        if let Some(request) = app.log_export_request.take() {
+            let sender = export_tx.clone();
+            export_task = Some(AbortTask(tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || request.write()).await;
+                let message = match result {
+                    Ok(Ok(message)) => message,
+                    Ok(Err(error)) => format!("Log export failed: {error:#}"),
+                    Err(error) => format!("Log export worker failed: {error}"),
+                };
+                let _ = sender.send(message).await;
+            })));
+        }
     }
     drop(log_task);
     drop(action_task);
+    drop(layers_task);
+    drop(export_task);
+    drop(terminal);
+    drop(_restore);
+    if let Some(path) = &app.preferences_path
+        && let Err(error) = tha::preferences::save(path, &app.preferences())
+    {
+        eprintln!("tha: could not save preferences: {error:#}");
+    }
     drop(discovery_task);
     drop(workers);
     Ok(())
+}
+
+fn update_layers(
+    app: &mut App,
+    task: &mut Option<AbortTask>,
+    tx: &mpsc::Sender<tha::layers::Event>,
+) {
+    let target = app.layers_target();
+    let key = target.as_ref().map(|(key, _, _)| key.clone());
+    if app.layers.key != key {
+        *task = None;
+        app.layers.select(key);
+        app.detail_scroll = 0;
+    }
+    let Some((key, connection, container)) = target else {
+        return;
+    };
+    if !matches!(app.layers.state, tha::layers::State::Loading) || task.is_some() {
+        return;
+    }
+    if app.demo {
+        app.layers.state = tha::layers::State::Ready(tha::layers::Image {
+            id: format!("{} [demo metadata]", container.image),
+            filesystem: vec![
+                "demo:base-diff-id".into(),
+                "demo:application-diff-id".into(),
+            ],
+            history: vec![
+                tha::layers::History {
+                    instruction: "COPY application /app".into(),
+                    comment: "Seeded demo instruction".into(),
+                    size: Some(4096),
+                    empty_layer: Some(false),
+                },
+                tha::layers::History {
+                    instruction: "ENV APP_MODE=production".into(),
+                    comment: "Explicit metadata-only demo step".into(),
+                    size: Some(0),
+                    empty_layer: Some(true),
+                },
+            ],
+            warnings: vec!["Demo data; not inspected from a real image".into()],
+        });
+        return;
+    }
+    let sender = tx.clone();
+    let generation = app.layers.generation;
+    *task = Some(AbortTask(tokio::spawn(async move {
+        let result = tha::layers::lookup(&connection, &container)
+            .await
+            .map_err(|error| tha::layers::text(&format!("{error:#}")));
+        let _ = sender
+            .send(tha::layers::Event {
+                key,
+                generation,
+                result,
+            })
+            .await;
+    })));
 }
 
 fn update_platform(
@@ -439,13 +545,7 @@ fn update_logs(
     };
     let containers = app.selected_containers();
     let engine = &app.engines[row.engine];
-    let scope = format!(
-        "{}:{:?}:{:?}:{:?}",
-        row.key,
-        engine.connection.endpoint,
-        engine.error,
-        containers.iter().map(|c| c.key()).collect::<Vec<_>>()
-    );
+    let scope = log_scope_key(&row, engine, &containers);
     if app.log_scope.as_deref() == Some(&scope) {
         return;
     }
@@ -475,12 +575,12 @@ fn update_logs(
                 let source = containers[n as usize % containers.len()].name.clone();
                 let text = if n % 7 == 0 {
                     format!(
-                        "14:32:{:02} {{\"level\":\"warn\",\"message\":\"upstream retry\",\"attempt\":2}}",
+                        "2026-10-29T14:32:{:02}Z {{\"level\":\"warn\",\"message\":\"upstream retry\",\"attempt\":2}}",
                         n % 60
                     )
                 } else {
                     format!(
-                        "14:32:{:02} INFO request completed method=GET path=/health duration=2ms",
+                        "2026-10-29T14:32:{:02}Z INFO request completed method=GET path=/health duration=2ms",
                         n % 60
                     )
                 };
@@ -511,6 +611,50 @@ fn update_logs(
     }
 }
 
+fn log_scope_key(
+    row: &tha::app::Row,
+    engine: &tha::app::Engine,
+    containers: &[tha::model::Container],
+) -> String {
+    format!(
+        "{}:{:?}:{:?}:{:?}",
+        row.key,
+        engine.connection.endpoint,
+        engine.error,
+        containers
+            .iter()
+            .map(|container| container.key())
+            .collect::<Vec<_>>()
+    )
+}
+
+fn queue_log_export(app: &mut App, path: &str) -> Result<()> {
+    if !app.log_export_review_visible {
+        bail!("Review the export dialog in a terminal at least 60 × 18 first");
+    }
+    if app.log_export_busy {
+        bail!("Another export is already running");
+    }
+    let row = app.current().context("Log selection disappeared")?;
+    let engine = &app.engines[row.engine];
+    let key = log_scope_key(row, engine, &app.selected_containers());
+    if app.tab != Tab::Logs
+        || engine.error.is_some()
+        || engine.alias.is_some()
+        || app.log_scope.as_ref() != Some(&key)
+        || app.log_export_scope.as_ref() != Some(&key)
+    {
+        bail!(
+            "Log target changed or is unavailable; cancel and reopen export after reviewing Logs"
+        );
+    }
+    let request =
+        logs::export::Request::snapshot(PathBuf::from(path), &app.logs, &app.log_view.filter)?;
+    app.log_export_request = Some(request);
+    app.log_export_busy = true;
+    Ok(())
+}
+
 fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Sender<u64>) -> bool {
     app.cancel_startup();
     if app.exec_input && app.detail_focus && app.tab == Tab::Exec {
@@ -522,7 +666,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             app.detail_focus = false;
             app.performance_focus = false;
             app.notice = "Exec is still connected · navigation mode · e refocuses the same container, or select 4 then Enter.".into();
-        } else if let Some(session) = &mut app.exec_session
+        } else if let Some(session) = app.sessions.active_mut()
             && let Err(error) = session.key(key)
         {
             app.notice = format!("{error:#}");
@@ -661,14 +805,37 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                 app.input.clear();
             }
             KeyCode::Enter => {
-                let input = app.input.trim().to_owned();
                 let mode = app.input_mode;
+                let input = if mode == InputMode::ExportLogs {
+                    app.input.clone()
+                } else {
+                    app.input.trim().to_owned()
+                };
                 app.input_mode = InputMode::Normal;
                 app.input.clear();
                 if mode == InputMode::Command {
                     return execute(app, &input, refresh);
                 }
-                if app.detail_focus && app.tab == Tab::Logs {
+                if mode == InputMode::LogFilter {
+                    match logs::filter::Filter::parse(&input) {
+                        Ok(filter) => {
+                            app.log_view.filter = filter;
+                            app.log_filter_text = input;
+                            app.notice = "Applied retained-log filter; entries without required metadata do not match. :clear-log-filter resets it.".into();
+                        }
+                        Err(error) => {
+                            app.notice = format!("Invalid log filter: {error:#}");
+                            app.input_mode = mode;
+                            app.input = input;
+                        }
+                    }
+                } else if mode == InputMode::ExportLogs {
+                    if let Err(error) = queue_log_export(app, &input) {
+                        app.notice = format!("{error:#}");
+                        app.input_mode = mode;
+                        app.input = input;
+                    }
+                } else if app.detail_focus && app.tab == Tab::Logs {
                     app.log_view.set_query(input, &mut app.logs);
                 } else {
                     app.tree_query = input;
@@ -686,8 +853,15 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             KeyCode::Backspace => {
                 app.input.pop();
             }
+            KeyCode::Char('u')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(app.input_mode, InputMode::LogFilter | InputMode::ExportLogs) =>
+            {
+                app.input.clear()
+            }
             KeyCode::Char(ch)
-                if !key.modifiers.contains(KeyModifiers::CONTROL) && app.input.len() < 1024 =>
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && app.input.len() + ch.len_utf8() <= 1024 =>
             {
                 app.input.push(ch);
             }
@@ -695,6 +869,8 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         }
         return false;
     }
+    // Only navigation reaches this point. Editors, confirmations and PTYs retain raw keys.
+    let key = app.keymap.translate(key);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let lifecycle_key = !app.detail_focus
         && !app.performance_focus
@@ -709,6 +885,10 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
     let pending_g = app.pending_g;
     app.pending_g = false;
     match key.code {
+        KeyCode::F(3) if app.tab == Tab::Logs && app.detail_focus => {
+            app.input_mode = InputMode::LogFilter;
+            app.input = app.log_filter_text.clone();
+        }
         KeyCode::Char('S') if lifecycle_key => app.request_action(tha::actions::Action::Start),
         KeyCode::Char('s') if lifecycle_key => app.request_action(tha::actions::Action::Stop),
         KeyCode::Char('r') if lifecycle_key => app.request_action(tha::actions::Action::Restart),
@@ -723,7 +903,10 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             }
         }
         KeyCode::Esc => {
-            if app.performance_focus {
+            if app.tab == Tab::Layers && app.detail_focus && app.layers.expanded {
+                app.layers.expanded = false;
+                app.detail_scroll = 0;
+            } else if app.performance_focus {
                 app.performance_focus = false;
             } else if app.detail_focus && app.tab == Tab::Logs && !app.log_view.query().is_empty() {
                 app.log_view.set_query(String::new(), &mut app.logs);
@@ -746,6 +929,8 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         KeyCode::Char('e') => app.request_exec(),
         KeyCode::Char('p') => app.toggle_performance(),
         KeyCode::Char('o') => app.pick_context_sort(),
+        KeyCode::F(6) => app.pick_sessions(),
+        KeyCode::Char('a') if lifecycle_key => app.open_actions(),
         KeyCode::Char(':') => {
             app.input_mode = InputMode::Command;
             app.input.clear();
@@ -773,6 +958,13 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             app.performance_focus = false;
             app.exec_input = false;
         }
+        KeyCode::Char('5') if !ctrl => {
+            app.tab = Tab::Layers;
+            app.detail_focus = true;
+            app.performance_focus = false;
+            app.layers.expanded = false;
+            app.detail_scroll = 0;
+        }
         KeyCode::Enter => {
             if app.performance_focus {
                 let engine_index = app.context_order.get(app.performance_scroll).copied();
@@ -792,13 +984,19 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                     .unwrap_or(0);
                 app.tab = Tab::Overview;
                 app.detail_focus = true;
+            } else if app.detail_focus && app.tab == Tab::Layers {
+                if matches!(&app.layers.state, tha::layers::State::Ready(image) if image.rows() > 0)
+                {
+                    app.layers.expanded = !app.layers.expanded;
+                    app.detail_scroll = 0;
+                }
             } else if app.detail_focus && app.tab == Tab::Exec {
-                if let Some(session) = &mut app.exec_session
+                if let Some(session) = app.sessions.active_mut()
                     && session.running()
                 {
                     session.follow();
                     app.exec_input = true;
-                } else if app.exec_session.is_none() {
+                } else if app.sessions.active().is_none() {
                     app.request_exec();
                 }
             } else if !app.detail_focus {
@@ -835,8 +1033,11 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                     app.selected = 0;
                 } else if app.tab == Tab::Logs {
                     app.log_view.first(&mut app.logs);
+                } else if app.tab == Tab::Layers && !app.layers.expanded {
+                    app.layers.selected = 0;
+                    app.detail_scroll = 0;
                 } else if app.tab == Tab::Exec {
-                    if let Some(session) = &mut app.exec_session {
+                    if let Some(session) = app.sessions.active_mut() {
                         session.scroll(500);
                     }
                 } else {
@@ -853,8 +1054,10 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                 app.selected = app.rows.len().saturating_sub(1);
             } else if app.tab == Tab::Logs {
                 app.logs.follow = true;
+            } else if app.tab == Tab::Layers && !app.layers.expanded {
+                app.layers.move_by(isize::MAX);
             } else if app.tab == Tab::Exec {
-                if let Some(session) = &mut app.exec_session {
+                if let Some(session) = app.sessions.active_mut() {
                     session.follow();
                 }
             } else {
@@ -895,8 +1098,10 @@ fn move_by(app: &mut App, amount: isize, _height: usize) {
         app.detail_scroll = 0;
     } else if app.tab == Tab::Logs {
         app.log_view.scroll(&mut app.logs, amount);
+    } else if app.tab == Tab::Layers && !app.layers.expanded {
+        app.layers.move_by(amount);
     } else if app.tab == Tab::Exec {
-        if let Some(session) = &mut app.exec_session {
+        if let Some(session) = app.sessions.active_mut() {
             session.scroll(-amount);
         }
     } else {
@@ -940,7 +1145,44 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
         }
         "wrap" => app.log_view.toggle_wrap(&app.logs),
         "exec" => app.request_exec(),
+        "layers" => {
+            app.tab = Tab::Layers;
+            app.detail_focus = true;
+            app.performance_focus = false;
+            app.detail_scroll = 0;
+        }
+        "reload-layers" => {
+            app.layers.select(None);
+            app.detail_scroll = 0;
+        }
+        "actions" => app.open_actions(),
+        "filter-logs" => {
+            app.tab = Tab::Logs;
+            app.detail_focus = true;
+            app.performance_focus = false;
+            app.input_mode = InputMode::LogFilter;
+            app.input = app.log_filter_text.clone();
+        }
+        "clear-log-filter" => {
+            app.log_view.filter = Default::default();
+            app.log_filter_text = "{}".into();
+        }
+        "export-logs" => {
+            if app.tab != Tab::Logs || app.log_scope.is_none() {
+                app.notice =
+                    "Open and review Logs for the desired workload before exporting".into();
+            } else if app.log_export_busy {
+                app.notice = "Another export is already running".into();
+            } else {
+                app.log_export_scope = app.log_scope.clone();
+                app.log_export_review_visible = false;
+                app.input_mode = InputMode::ExportLogs;
+                app.input.clear();
+                app.notice.clear();
+            }
+        }
         "close-exec" => app.close_exec(),
+        "exec-sessions" => app.pick_sessions(),
         "performance" => app.toggle_performance(),
         "sort-contexts" => app.pick_context_sort(),
         "back" => {
@@ -1243,6 +1485,7 @@ mod tests {
             KeyCode::Char('4'),
             KeyCode::Esc,
             KeyCode::Char('q'),
+            KeyCode::F(6),
         ] {
             assert!(!handle_key(
                 &mut app,
@@ -1586,5 +1829,198 @@ mod tests {
         assert_eq!(request.engine, 0);
         assert_eq!(request.containers.len(), 1);
         assert_eq!(request.containers[0].id, "fixture");
+    }
+
+    #[tokio::test]
+    async fn number_five_loads_demo_layers_and_enter_and_escape_toggle_read_only_details() {
+        let mut app = app();
+        let (tx, _) = watch::channel(0);
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, tha::app::Scope::Container(_)))
+            .unwrap();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert_eq!(app.tab, Tab::Layers);
+        assert!(app.detail_focus);
+        let (layers_tx, _) = mpsc::channel(4);
+        let mut task = None;
+        update_layers(&mut app, &mut task, &layers_tx);
+        assert!(matches!(app.layers.state, tha::layers::State::Ready(_)));
+        assert!(task.is_none());
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert!(app.layers.selected > 0);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert!(app.layers.expanded);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert!(!app.layers.expanded);
+        assert!(app.detail_focus);
+        assert!(app.action_request.is_none());
+    }
+
+    #[test]
+    fn action_menu_reuses_safety_checks_and_keeps_disabled_actions_open() {
+        let mut app = lifecycle_app("running");
+        let (tx, _) = watch::channel(0);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert!(app.picker.is_some());
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+            &tx,
+        ); // Start is disabled.
+        assert!(app.picker.is_some());
+        assert!(app.action_request.is_none());
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert!(app.picker.is_none());
+        assert!(app.action_confirmation.is_some());
+        assert!(app.action_request.is_none());
+    }
+
+    #[test]
+    fn custom_keys_are_navigation_only_and_never_change_editor_or_confirmation_input() {
+        let mut app = lifecycle_app("running");
+        let (tx, _) = watch::channel(0);
+        app.keymap = tha::keymap::Keymap::parse(&std::collections::BTreeMap::from([
+            ("x".into(), "logs".into()),
+            ("y".into(), "layers".into()),
+        ]))
+        .unwrap();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert_eq!(app.tab, Tab::Logs);
+        app.input_mode = InputMode::Search;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert_eq!(app.input, "x");
+        app.input_mode = InputMode::Normal;
+        app.tab = Tab::Overview;
+        app.request_action(tha::actions::Action::Stop);
+        app.action_review_visible = true;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert_eq!(app.tab, Tab::Overview);
+        assert!(app.action_request.is_some());
+    }
+
+    #[test]
+    fn log_filter_editor_validates_without_destroying_retained_logs_and_export_pins_scope() {
+        let (tx, _) = watch::channel(0);
+        let mut app = lifecycle_app("running");
+        app.tab = Tab::Logs;
+        app.detail_focus = true;
+        app.logs.push("api", "INFO before", false);
+        app.logs.push("api", "ERROR failed", false);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert_eq!(app.input_mode, InputMode::LogFilter);
+        app.input = "invalid".into();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert_eq!(app.input_mode, InputMode::LogFilter);
+        assert!(!app.log_view.filter.active());
+        app.input = r#"{"level":"error"}"#.into();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.log_view.filter.active());
+        assert_eq!(app.logs.entries.len(), 2);
+        let row = app.current().unwrap();
+        app.log_scope = Some(log_scope_key(
+            row,
+            &app.engines[row.engine],
+            &app.selected_containers(),
+        ));
+        execute(&mut app, "export-logs", &tx);
+        assert_eq!(app.input_mode, InputMode::ExportLogs);
+        app.input = "/never-written-by-this-test.jsonl".into();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert!(app.log_export_request.is_none());
+        app.log_export_review_visible = true;
+        app.selected = 0;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert!(app.log_export_request.is_none());
+        assert!(app.notice.contains("Log target changed"));
+        app.selected = 1;
+        app.log_export_review_visible = true;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert_eq!(app.log_export_request.as_ref().unwrap().entries.len(), 1);
+        assert!(app.log_export_busy);
     }
 }

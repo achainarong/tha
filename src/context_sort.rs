@@ -1,7 +1,8 @@
 //! Presentation ordering only. Engine IDs and backend worker indices never move.
 use std::cmp::Ordering;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ContextSort {
     #[default]
     ConnectedFirst,

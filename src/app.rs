@@ -86,12 +86,14 @@ fn node(engine: usize, scope: Scope, title: String, children: Vec<Node>) -> Node
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Tab {
     Overview,
     Logs,
     Networks,
     Exec,
+    Layers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +101,8 @@ pub enum InputMode {
     Normal,
     Search,
     Command,
+    LogFilter,
+    ExportLogs,
 }
 
 #[derive(Clone)]
@@ -114,6 +118,11 @@ struct NavigationState {
 }
 
 pub enum Choice {
+    Session(u64),
+    Action {
+        action: crate::actions::Action,
+        row: String,
+    },
     ContextSort(crate::context_sort::ContextSort),
     Project(Project),
     Exec {
@@ -133,6 +142,10 @@ pub struct App {
     pub context_order: Vec<usize>,
     pub context_pins: Vec<String>,
     pub context_sort: crate::context_sort::ContextSort,
+    pub keymap: crate::keymap::Keymap,
+    pub custom_bindings: std::collections::BTreeMap<String, String>,
+    pub preferences_path: Option<PathBuf>,
+    pending_preferences: Option<crate::preferences::Preferences>,
     /// Machine identity is provider + machine name, never its temporary socket path.
     podman_machines: BTreeMap<String, usize>,
     pub expanded: HashSet<String>,
@@ -145,6 +158,11 @@ pub struct App {
     pub performance_scroll: usize,
     pub detail_scroll: usize,
     pub log_view: LogView,
+    pub log_filter_text: String,
+    pub log_export_scope: Option<String>,
+    pub log_export_review_visible: bool,
+    pub log_export_request: Option<crate::logs::export::Request>,
+    pub log_export_busy: bool,
     pub tab: Tab,
     pub input_mode: InputMode,
     pub input: String,
@@ -164,10 +182,11 @@ pub struct App {
     pub picker: Option<Picker>,
     pub exec_request: Option<crate::exec::Request>,
     pub exec_command: Vec<String>,
-    pub exec_session: Option<crate::terminal::Session>,
+    pub sessions: crate::sessions::Sessions,
     pub exec_input: bool,
     pub exec_dimensions: (u16, u16),
     pub platforms: crate::platform::Cache,
+    pub layers: crate::layers::View,
     pub action_confirmation: Option<crate::actions::Confirmation>,
     pub action_request: Option<crate::actions::Request>,
     pub action_progress: Option<crate::actions::Progress>,
@@ -189,6 +208,10 @@ impl App {
             context_order,
             context_pins: Vec::new(),
             context_sort: Default::default(),
+            keymap: Default::default(),
+            custom_bindings: Default::default(),
+            preferences_path: None,
+            pending_preferences: None,
             podman_machines: BTreeMap::new(),
             engines: connections
                 .into_iter()
@@ -211,6 +234,11 @@ impl App {
             performance_scroll: 0,
             detail_scroll: 0,
             log_view: LogView::new(true),
+            log_filter_text: "{}".into(),
+            log_export_scope: None,
+            log_export_review_visible: false,
+            log_export_request: None,
+            log_export_busy: false,
             tab: Tab::Overview,
             input_mode: InputMode::Normal,
             input: String::new(),
@@ -230,10 +258,11 @@ impl App {
             picker: None,
             exec_request: None,
             exec_command: vec!["sh".into()],
-            exec_session: None,
+            sessions: Default::default(),
             exec_input: false,
             exec_dimensions: (24, 80),
             platforms: Default::default(),
+            layers: Default::default(),
             action_confirmation: None,
             action_request: None,
             action_progress: None,
@@ -307,7 +336,10 @@ impl App {
         {
             let projects = crate::workspace::directory_matches(&self.engines, &cwd);
             match projects.len() {
-                0 => self.notice.clear(),
+                0 => {
+                    self.notice.clear();
+                    self.restore_navigation();
+                }
                 1 => {
                     self.open_project(projects[0].clone());
                     self.notice = "Opened the Compose project matching this directory. Backspace returns to all runtimes.".into();
@@ -425,31 +457,7 @@ impl App {
         {
             return;
         }
-        let request = (|| {
-            if self.demo {
-                anyhow::bail!("Demo mode: lifecycle mutations are disabled");
-            }
-            let row = self
-                .current()
-                .ok_or_else(|| anyhow::anyhow!("Select a container or Compose workload"))?;
-            let engine = &self.engines[row.engine];
-            if engine.error.is_some() || engine.alias.is_some() {
-                anyhow::bail!(
-                    "Connection unavailable or aliased; select its connected primary context"
-                );
-            }
-            crate::actions::Request::build(
-                row.engine,
-                &engine.connection,
-                engine
-                    .snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.engine_id.as_deref()),
-                &row.scope,
-                self.selected_containers(),
-                action,
-            )
-        })();
+        let request = self.plan_action(action);
         match request {
             Ok(request) => {
                 self.action_review_visible = false;
@@ -462,6 +470,98 @@ impl App {
             }
             Err(error) => self.notice = format!("{error:#}"),
         }
+    }
+
+    fn plan_action(
+        &self,
+        action: crate::actions::Action,
+    ) -> anyhow::Result<crate::actions::Request> {
+        if self.demo {
+            anyhow::bail!("Demo mode: lifecycle mutations are disabled");
+        }
+        let row = self
+            .current()
+            .ok_or_else(|| anyhow::anyhow!("Select a container or Compose workload"))?;
+        let engine = &self.engines[row.engine];
+        if engine.error.is_some() || engine.alias.is_some() {
+            anyhow::bail!(
+                "Connection unavailable or aliased; select its connected primary context"
+            );
+        }
+        crate::actions::Request::build(
+            row.engine,
+            &engine.connection,
+            engine
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.engine_id.as_deref()),
+            &row.scope,
+            self.selected_containers(),
+            action,
+        )
+    }
+
+    pub fn action_availability(
+        &self,
+        action: crate::actions::Action,
+        row: &str,
+    ) -> Result<usize, String> {
+        if self.current().is_none_or(|current| current.key != row) {
+            return Err("Selection changed; reopen Actions".into());
+        }
+        self.plan_action(action)
+            .map(|request| request.containers.len())
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    pub fn open_actions(&mut self) {
+        let Some(row) = self.current() else {
+            return;
+        };
+        self.picker = Some(Picker {
+            title: format!("Actions · {}", row.title),
+            choices: [
+                crate::actions::Action::Start,
+                crate::actions::Action::Stop,
+                crate::actions::Action::Restart,
+                crate::actions::Action::Delete,
+            ]
+            .into_iter()
+            .map(|action| Choice::Action {
+                action,
+                row: row.key.clone(),
+            })
+            .collect(),
+            selected: 0,
+        });
+    }
+
+    pub fn layers_target(&self) -> Option<(crate::layers::Key, Connection, Container)> {
+        if self.tab != Tab::Layers {
+            return None;
+        }
+        let row = self.current()?;
+        if !matches!(row.scope, Scope::Container(_) | Scope::Service { .. }) {
+            return None;
+        }
+        let engine = &self.engines[row.engine];
+        if engine.error.is_some() || engine.alias.is_some() {
+            return None;
+        }
+        let containers = self.selected_containers();
+        if containers.len() != 1 {
+            return None;
+        }
+        let container = containers.into_iter().next()?;
+        let key = crate::layers::Key {
+            image: crate::platform::Key::new(
+                row.engine,
+                engine.snapshot.as_ref()?.engine_id.clone(),
+                &container,
+            ),
+            endpoint: engine.connection.key(),
+        };
+        Some((key, engine.connection.clone(), container))
     }
 
     pub fn confirm_action(&mut self) {
@@ -681,37 +781,9 @@ impl App {
     }
 
     pub fn start_exec(&mut self, request: crate::exec::Request) {
-        if let Some(session) = &mut self.exec_session
-            && session.running()
-        {
-            self.tab = Tab::Exec;
-            if session.same_target(&request) {
-                session.follow();
-                self.detail_focus = true;
-                self.performance_focus = false;
-                self.exec_input = true;
-            } else {
-                self.detail_focus = true;
-                self.performance_focus = false;
-                self.exec_input = false;
-                self.notice = format!(
-                    "An Exec session is already open for {}. Exit it or use :close-exec before opening another container.",
-                    session.request.container.name
-                );
-            }
-            return;
-        }
-        let result = crate::exec::prepare(&request).and_then(|command| {
-            crate::terminal::Session::start(
-                request,
-                command,
-                self.exec_dimensions.0,
-                self.exec_dimensions.1,
-            )
-        });
+        let result = self.sessions.open(request, self.exec_dimensions);
         match result {
-            Ok(session) => {
-                self.exec_session = Some(session);
+            Ok(_) => {
                 self.tab = Tab::Exec;
                 self.detail_focus = true;
                 self.performance_focus = false;
@@ -723,11 +795,34 @@ impl App {
     }
 
     pub fn close_exec(&mut self) {
-        if let Some(session) = &mut self.exec_session {
-            session.close();
-        }
+        self.sessions.close_active();
         self.exec_input = false;
         self.notice = "Exec closed; the container was not stopped.".into();
+    }
+
+    pub fn pick_sessions(&mut self) {
+        if self.sessions.is_empty() {
+            self.notice =
+                "No retained Exec sessions. Select a running container and press e.".into();
+            return;
+        }
+        self.picker = Some(Picker {
+            title: format!(
+                "Exec sessions · {}/{} retained",
+                self.sessions.len(),
+                self.sessions.limit()
+            ),
+            choices: self
+                .sessions
+                .iter()
+                .map(|(id, _)| Choice::Session(id))
+                .collect(),
+            selected: self
+                .sessions
+                .iter()
+                .position(|(id, _)| Some(id) == self.sessions.active_id())
+                .unwrap_or(0),
+        });
     }
 
     pub fn refresh_tree(&mut self) {
@@ -877,9 +972,126 @@ impl App {
     }
 
     pub fn cancel_startup(&mut self) {
+        self.pending_preferences = None;
         if self.startup_cwd.take().is_some() {
             self.notice.clear();
         }
+    }
+
+    pub fn apply_preferences(
+        &mut self,
+        preferences: crate::preferences::Preferences,
+        restore_navigation: bool,
+    ) {
+        self.performance_open = preferences.performance_open;
+        self.log_view.wrap = preferences.log_wrap;
+        self.context_sort = preferences.context_sort;
+        // Never restore a shell tab, input focus, an editor, or a mutation dialog.
+        self.tab = if preferences.tab == Tab::Exec {
+            Tab::Overview
+        } else {
+            preferences.tab
+        };
+        self.reorder_contexts();
+        self.refresh_tree();
+        if restore_navigation {
+            self.pending_preferences = Some(preferences);
+        }
+    }
+
+    fn preference_connection(&self, engine: usize) -> String {
+        let connection = &self.engines[engine].connection;
+        // Display names and backend only: no endpoints, TLS data, or credentials on disk.
+        format!("{:?}/{}", connection.kind, connection.name)
+    }
+
+    pub fn preferences(&self) -> crate::preferences::Preferences {
+        let row = |engine, scope| crate::preferences::Row {
+            connection: self.preference_connection(engine),
+            scope,
+        };
+        let mut expanded: Vec<_> = self
+            .expanded
+            .iter()
+            .filter_map(|key| {
+                let (engine, scope) = key.split_once('/')?;
+                let engine: usize = engine.parse().ok()?;
+                (engine < self.engines.len()).then(|| row(engine, scope.to_owned()))
+            })
+            .collect();
+        expanded.sort_by(|left, right| {
+            (&left.connection, &left.scope).cmp(&(&right.connection, &right.scope))
+        });
+        expanded.truncate(1024);
+        crate::preferences::Preferences {
+            version: 1,
+            performance_open: self.performance_open,
+            log_wrap: self.log_view.wrap,
+            context_sort: self.context_sort,
+            tab: if self.tab == Tab::Exec {
+                Tab::Overview
+            } else {
+                self.tab
+            },
+            expanded,
+            selected: self
+                .current()
+                .map(|current| row(current.engine, format!("{:?}", current.scope))),
+            project: self.project.as_ref().map(|project| {
+                row(
+                    project.engine,
+                    format!(
+                        "{:?}",
+                        Scope::Project {
+                            namespace: project.namespace.clone(),
+                            project: project.name.clone()
+                        }
+                    ),
+                )
+            }),
+        }
+    }
+
+    fn restore_navigation(&mut self) {
+        let Some(preferences) = self.pending_preferences.take() else {
+            return;
+        };
+        let resolve = |saved: &crate::preferences::Row| {
+            let engines: Vec<_> = (0..self.engines.len())
+                .filter(|&engine| self.preference_connection(engine) == saved.connection)
+                .collect();
+            if engines.len() == 1 {
+                Some(format!("{}/{scope}", engines[0], scope = saved.scope))
+            } else {
+                None
+            }
+        };
+        self.expanded = preferences.expanded.iter().filter_map(resolve).collect();
+        self.refresh_tree();
+        if let Some(saved) = &preferences.project
+            && let Some(key) = resolve_preference_key(self, saved)
+            && let Some(current) = self.rows.iter().find(|row| row.key == key)
+            && let Scope::Project { namespace, project } = &current.scope
+        {
+            self.open_project(Project {
+                engine: current.engine,
+                namespace: namespace.clone(),
+                name: project.clone(),
+            });
+        }
+        if let Some(saved) = &preferences.selected
+            && let Some(key) = resolve_preference_key(self, saved)
+            && let Some(index) = self.rows.iter().position(|row| row.key == key)
+        {
+            self.selected = index;
+        }
+        self.tab = if preferences.tab == Tab::Exec {
+            Tab::Overview
+        } else {
+            preferences.tab
+        };
+        self.detail_focus = false;
+        self.exec_input = false;
     }
 
     pub fn open_selected(&mut self) {
@@ -996,6 +1208,15 @@ impl App {
     }
 
     pub fn choose(&mut self) {
+        if let Some(Choice::Action { action, row }) = self
+            .picker
+            .as_ref()
+            .and_then(|picker| picker.choices.get(picker.selected))
+            && let Err(reason) = self.action_availability(*action, row)
+        {
+            self.notice = reason;
+            return;
+        }
         let Some(mut picker) = self.picker.take() else {
             return;
         };
@@ -1003,6 +1224,21 @@ impl App {
             return;
         }
         match picker.choices.remove(picker.selected) {
+            Choice::Session(id) => {
+                if self.sessions.select(id) {
+                    self.tab = Tab::Exec;
+                    self.detail_focus = true;
+                    self.performance_focus = false;
+                    self.exec_input = false;
+                    self.notice =
+                        format!("Selected Exec session #{id}; Enter resumes input if connected");
+                }
+            }
+            Choice::Action { action, row } => {
+                if self.current().is_some_and(|current| current.key == row) {
+                    self.request_action(action);
+                }
+            }
             Choice::ContextSort(mode) => {
                 self.context_sort = mode;
                 self.reorder_contexts();
@@ -1072,6 +1308,13 @@ impl App {
                 .unwrap_or(0);
         }
     }
+}
+
+fn resolve_preference_key(app: &App, saved: &crate::preferences::Row) -> Option<String> {
+    let engines: Vec<_> = (0..app.engines.len())
+        .filter(|&engine| app.preference_connection(engine) == saved.connection)
+        .collect();
+    (engines.len() == 1).then(|| format!("{}/{scope}", engines[0], scope = saved.scope))
 }
 
 fn find_project<'a>(node: &'a Node, project: &Project) -> Option<&'a Node> {
@@ -1367,6 +1610,40 @@ fn flatten(
 mod tests {
     use super::*;
     use crate::config::BackendKind;
+
+    #[test]
+    fn preferences_restore_navigation_without_restoring_shells_or_input_and_cancel_on_interaction()
+    {
+        let mut original = app();
+        original.open_project(Project {
+            engine: 0,
+            namespace: None,
+            name: "shop".into(),
+        });
+        original.tab = Tab::Layers;
+        original.performance_open = true;
+        original.log_view.wrap = false;
+        let preferences = original.preferences();
+        let serialized = toml::to_string(&preferences).unwrap();
+        assert!(!serialized.contains("unix:///test"));
+        assert!(!serialized.contains("exec_command"));
+        let mut restored = app();
+        restored.apply_preferences(preferences.clone(), true);
+        restored.restore_navigation();
+        assert_eq!(restored.project.as_ref().unwrap().name, "shop");
+        assert_eq!(restored.tab, Tab::Layers);
+        assert!(restored.performance_open);
+        assert!(!restored.log_view.wrap);
+        assert!(!restored.exec_input);
+        assert!(restored.sessions.is_empty());
+        let mut canceled = app();
+        canceled.apply_preferences(preferences, true);
+        canceled.cancel_startup();
+        canceled.restore_navigation();
+        assert!(canceled.project.is_none());
+        original.tab = Tab::Exec;
+        assert_eq!(original.preferences().tab, Tab::Overview);
+    }
 
     fn app() -> App {
         let mut app = App::new(

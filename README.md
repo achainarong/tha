@@ -213,7 +213,11 @@ your navigation. Demo mode never auto-opens a project.
 | `p` / `:performance` | Expand/collapse bottom-left global Performance |
 | `o` / `:sort-contexts` | Choose connected-first, name, CPU, or memory context order |
 | `S` / `s` / `r` / `d` in Explorer | Start / Stop / Restart / Delete selected container or Compose workload |
-| `1` / `2` / `3` / `4` | Overview / Logs / Networks / Exec on the right |
+| `1` / `2` / `3` / `4` / `5` | Overview / Logs / Networks / Exec / Layers on the right |
+| `a` / `:actions` | Contextual lifecycle menu with eligibility counts and disabled reasons |
+| `F3` in Logs / `:filter-logs` | Edit structured retained-log filters |
+| `:clear-log-filter` | Clear filters without clearing highlighted search |
+| `:export-logs` | Export matching retained entries to an explicitly chosen new JSONL file |
 | `/` | Search tree or highlight log matches when the log pane is focused |
 | `n` / `N` | Next / previous match; logs navigate individual occurrences |
 | `f` | Toggle follow in the focused log pane |
@@ -222,6 +226,7 @@ your navigation. Demo mode never auto-opens a project.
 | `Enter` in Exec | Focus the existing shell, or start one if no session exists |
 | `Ctrl-]` in Exec | Return keyboard focus to Tha without closing the shell |
 | `:close-exec` | Close the PTY/CLI session, not the container |
+| `F6` / `:exec-sessions` in navigation | Choose a retained shell; Enter resumes its input |
 | `:` | Command palette; `Tab` completes a command |
 | `?` / `F1` / `:help` | Open the shortcut cheatsheet; `j`/`k` scroll it |
 | `Esc` | Cancel input, clear search, return to explorer, or go back |
@@ -343,12 +348,24 @@ terminals encode it identically to Ctrl-5). Then `?` opens Tha's cheatsheet.
 Use `4` then `Enter` to resume. In navigation, `j`/`k`, paging, `gg`/`G` scroll
 the retained shell screen; typing resumes at the live prompt.
 
-One shell session is retained. Browsing other containers or tabs does **not**
-redirect it or change its target. Starting another target is refused until the
-existing shell exits or you explicitly run `:close-exec`. Exited output stays
-visible, including normal nonzero exit codes; exit 130 is shown as interrupted,
-not automatically blamed on a missing shell. Closing Tha closes its local
-PTY/CLI process; it does not stop the container and cannot guarantee termination
+Up to **four retained shell sessions** are available by default. `e` opens the
+selected container or refocuses its existing running session. Each session has a
+stable ID shown in the Exec pane title, its own target, state, input queues,
+emulator, and scrollback. **Browsing never redirects a session.** Background
+sessions continue to drain output without stealing keyboard focus.
+
+Use **Ctrl-]**, then **F6** (or `:exec-sessions`) to select a session. Selection
+shows its output in navigation mode; **Enter explicitly resumes input**. While
+shell input is active, F6 goes to the shell like other function keys. Exited output
+is retained and counts toward the limit. `:close-exec` closes/removes only the
+active slot; another retained session is selected in navigation mode, never with
+automatic input focus. No session is evicted when the limit is reached. Set
+`max_exec_sessions = 4` (range 1–8) in configuration to change the resource cap.
+Sessions are never serialized or automatically reopened on startup.
+
+Normal nonzero exits remain visible; exit 130 is shown as interrupted rather
+than automatically blamed on a missing shell. Closing Tha closes all its local
+PTY/CLI processes; it does not stop containers and cannot guarantee termination
 of every background command started inside it. Exit the shell cleanly when needed.
 
 Viewport resizing is forwarded through the PTY, with bounded output queues,
@@ -361,9 +378,120 @@ or another argv array in the config for images without `sh`. If the runtime CLI
 is missing or exits unsuccessfully, Tha shows the error in its existing view.
 Exec may modify container contents; it is intentionally **not read-only**.
 
+## Saved preferences and navigation keys
+
+On a normal exit Tha atomically saves UI preferences to
+`$XDG_STATE_HOME/tha/preferences.toml` (default `~/.local/state/tha/preferences.toml`).
+This includes Performance visibility, wrapping, context sorting, the non-Exec tab,
+expanded branches, selection, and Compose workspace. The first launch still starts
+with Performance collapsed. Set `save_preferences = false` to disable loading and
+saving; demo and connection-listing modes never write preferences. Invalid or
+unknown-version state is reported and preserved rather than overwritten.
+
+Directory-based Compose matching takes priority over saved navigation; `--overview`
+skips navigation restoration. Any key press cancels pending navigation restoration,
+so late inventory cannot take over your selection. Restored names must identify a
+unique connection; missing/ambiguous targets fall back safely. No logs, filters,
+search text, shell contents, endpoints, credentials, or sessions are persisted.
+Restoration never grants shell input or opens a mutation dialog. To reset, move
+the preferences file aside while Tha is closed.
+
+Add navigation-only aliases using crokey key syntax in `config.toml`:
+
+```toml
+[bindings]
+"alt-j" = "down"
+"alt-k" = "up"
+"F7" = "exec-sessions"
+```
+
+Actions: `up`, `down`, `left`, `right`, `page-up`, `page-down`, `first`, `last`,
+`overview`, `logs`, `networks`, `exec`, `layers`, `open-exec`, `exec-sessions`,
+`actions`, `performance`, `sort-contexts`, `wrap`, `follow`, `filter-logs`, `help`.
+Bindings override matching defaults **only in navigation**; editors, pickers,
+confirmations, and embedded shells receive the original keys. Esc, Enter, Tab,
+BackTab, `/`, `:`, Ctrl-c and Ctrl-] (including Ctrl-5) are reserved. Invalid,
+duplicate-normalized, and unsupported multi-key bindings fail configuration loading.
+Configured aliases are listed in `?` help. Lifecycle confirmations are not remappable.
+
+## Structured log filters and export
+
+Press **F3 in Logs** or run `:filter-logs` to edit a JSON filter. Ctrl-u clears the
+editor, Enter applies valid JSON, and Esc cancels. Invalid filters leave the
+previous filter intact. Examples:
+
+```json
+{"source":"api","min_level":"warn"}
+```
+
+```json
+{"fields":{"/http/status":500},"since":"2026-10-29T10:00:00Z","until":"2026-10-29T11:00:00Z"}
+```
+
+Supported keys are `source` (case-insensitive substring), `level` (exact severity),
+`min_level` (minimum severity), `fields` (typed equality at JSON pointers), and
+inclusive RFC3339 `since`/`until` bounds. Severities are trace/debug/info/warn/error/
+fatal; warning and critical are accepted aliases. JSON numeric `500` differs from
+the string `"500"`. Pointer escapes use `~0` and `~1`.
+
+Structured records recognize `level`, `severity`, `log.level`, or `log.level` nested
+as an object. Timestamps come from a runtime RFC3339 prefix, or JSON `timestamp`,
+`time`, or `ts` strings. Plain-text severity is recognized only as the first token
+after a recognized timestamp (or at the start of a line), not arbitrary words
+inside messages. Numeric/ambiguous timestamps are not guessed. Entries lacking
+required metadata do not match the corresponding filter.
+
+Filtering never deletes retained entries or fetches older history. Counts show
+matching/retained entries; wrapping, scrolling, highlighted search, and match
+navigation operate on matching entries. `:clear-log-filter` (or `{}` in the editor)
+restores all retained entries without clearing search. Filters remain visible and
+active when browsing another scope until explicitly cleared; they are not written
+to disk.
+
+With the desired **Logs view open and reviewed**, run `:export-logs`. The dialog
+warns that logs may contain secrets and requires an explicit filename in an
+existing directory. Enter exports a frozen snapshot of matching retained entries
+as JSONL (`sequence`, `source`, `text`, `level`, `timestamp`). Scope changes require
+canceling and reopening the dialog. A terminal of at least 60 × 18 is required.
+
+New files use mode **0600** (or stricter under your umask). Existing files and
+symlinks are refused atomically; no overwrite option or automatic redaction is
+provided. Empty or oversized snapshots are refused before file creation; the
+snapshot limit is 16 MiB and never silently truncates. File writes run off the UI
+thread. Wait for the completion notice; an I/O failure or interruption can leave
+a partial **new** export file, never a truncated existing file.
+
+## Image layers
+
+Press **`5`** (or `:layers`) with one container selected, including a one-container
+service. Tha asynchronously inspects the container's resolved image, never a mutable
+tag. The view separates **uncompressed filesystem diff IDs** (base → top) from
+**build history** (base → top). `j`/`k`, paging, and `gg`/`G` select rows; Enter opens
+details, where `j`/`k` scroll and Enter/Esc returns. `:reload-layers` retries a failed
+lookup. Switching selection/endpoints cancels the previous lookup and discards late
+results. Demo mode uses explicit seeded metadata without contacting an engine.
+
+Filesystem sizes and history-to-filesystem mappings are shown as unavailable when
+the runtime does not provide them. A zero-byte history step is **not** assumed to
+be metadata-only; only explicit OCI `empty_layer` metadata gets that label.
+Docker-compatible history does not expose that flag. History sizes are labelled
+as reported history sizes, not compressed registry blob sizes. Native containerd
+uses explicit-endpoint, namespace-pinned nerdctl inspect/history commands and
+reports unsupported formats without hiding the available filesystem metadata.
+
+Build instructions can contain secrets. They stay hidden in the list until Enter
+opens their bounded, sanitized details with a warning. Tha never executes instructions, pulls/builds images,
+extracts layers, or exports history automatically.
+
 ## Container and Compose lifecycle actions
 
 With **Explorer focused**, select a container, Compose service, or Compose project:
+
+Press **`a`** to see all four lifecycle actions, eligible target counts, and the
+reason an action is disabled. Selecting an enabled action opens the same safety
+confirmation as its shortcut; the menu never sends a mutation itself. Availability
+is rechecked against current inventory, and a disappearing selection cannot silently
+retarget the menu.
 
 - **`S`** starts existing `created`/`exited` containers.
 - **`s`** stops running containers.
@@ -468,7 +596,15 @@ match the package version in `Cargo.toml`, for example `v0.1.0` for `0.1.0`.
 Prerelease versions such as `0.2.0-rc.1` become GitHub prereleases and are not
 selected by the quick-install `latest` URL.
 
-The workflow reuses the full macOS/Linux CI checks, including all four terminal
+The offline `scripts/release_smoke.py` suite executes the actual README installer
+and workflow shell steps against isolated fake download/GitHub commands. It checks
+the supported installer matrix, failed-download/checksum preservation, cleanup,
+tag/version and prerelease rules, exact assets, moved tags, existing releases,
+upload failures, and publish failures. It never contacts GitHub or reads credentials.
+Every native release build also validates its archive's exact regular-file contents
+before upload; links, duplicate/hidden members, and non-executable binaries are rejected.
+
+The workflow reuses the full macOS/Linux CI checks, including all five terminal
 smoke tests, then tests/builds each release target on a matching native runner:
 
 | Asset | Rust target | Runner |
@@ -520,6 +656,8 @@ uv run --with pyte python scripts/smoke.py
 uv run --with pyte python scripts/exec_smoke.py
 uv run --with pyte python scripts/podman_smoke.py
 uv run --with pyte python scripts/actions_smoke.py
+uv run --with pyte python scripts/features_smoke.py
+uv run --with pyyaml python scripts/release_smoke.py
 ```
 
 The exec smoke test uses a fake runtime CLI and mock engine; it never executes
@@ -598,4 +736,4 @@ secrets—Tha cannot infer or redact every application-specific secret.
 
 This is an early MVP, not a claim of tested parity across every runtime. Next:
 broader Podman/containerd compatibility testing, native containerd transport,
-structured log exploration, configurable bindings, and image-layer exploration.
+secure remote transports, explicitly associated Compose orchestration, and release-contract automation.
