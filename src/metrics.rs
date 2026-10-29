@@ -78,6 +78,7 @@ pub struct Sample {
 #[derive(Debug)]
 struct Frame {
     values: HashMap<String, Usage>,
+    sampled_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -87,7 +88,46 @@ pub struct Store {
     history: VecDeque<Frame>,
 }
 
+#[derive(Debug)]
+pub struct TimedUsage {
+    pub sampled_at: Instant,
+    pub cpu: Option<u64>,
+    pub memory: Option<u64>,
+}
+
 impl Store {
+    pub fn has_history(&self) -> bool {
+        !self.history.is_empty()
+    }
+
+    /// Snapshot all retained readings for these exact IDs, including stopped
+    /// containers. Selection never changes which containers are collected.
+    pub fn timed_history<'a>(
+        &self,
+        containers: impl IntoIterator<Item = &'a Container>,
+    ) -> Vec<TimedUsage> {
+        let keys: Vec<_> = containers.into_iter().map(Container::key).collect();
+        self.history
+            .iter()
+            .map(|frame| {
+                let cpu = keys.iter().try_fold(0.0, |sum, key| {
+                    let value = frame.values.get(key)?.cpu_percent?;
+                    (value.is_finite() && value >= 0.0).then_some(sum + value)
+                });
+                let memory = keys.iter().try_fold(0u64, |sum, key| {
+                    Some(sum.saturating_add(frame.values.get(key)?.memory_bytes?))
+                });
+                TimedUsage {
+                    sampled_at: frame.sampled_at,
+                    cpu: cpu
+                        .filter(|_| !keys.is_empty())
+                        .map(|value| (value * 100.0).round() as u64),
+                    memory: memory.filter(|_| !keys.is_empty()),
+                }
+            })
+            .collect()
+    }
+
     pub fn reconcile(&mut self, containers: &[Container]) {
         let running: HashSet<_> = containers
             .iter()
@@ -106,6 +146,11 @@ impl Store {
             .map(Container::key)
             .collect();
         let mut values = HashMap::new();
+        let sampled_at = batch
+            .values()
+            .filter_map(|result| result.as_ref().ok().map(|reading| reading.sampled_at))
+            .max()
+            .unwrap_or_else(Instant::now);
         for (key, result) in batch {
             if !running.contains(&key) {
                 continue;
@@ -130,7 +175,7 @@ impl Store {
         if self.history.len() == HISTORY_LENGTH {
             self.history.pop_front();
         }
-        self.history.push_back(Frame { values });
+        self.history.push_back(Frame { values, sampled_at });
     }
 
     pub fn summary<'a>(
@@ -213,6 +258,51 @@ impl Store {
                 Some((total * 100.0).round() as u64)
             })
             .collect()
+    }
+
+    /// Complete-workload totals only; missing members are gaps, never invented zeroes.
+    /// A stale tail is marked without advancing history on UI redraws.
+    pub fn performance_history(
+        &self,
+        containers: &[Container],
+        now: Instant,
+        stale_after: Duration,
+    ) -> (Vec<Option<u64>>, Vec<Option<u64>>) {
+        let keys: Vec<_> = containers
+            .iter()
+            .filter(|c| c.running())
+            .map(Container::key)
+            .collect();
+        let mut cpu = Vec::new();
+        let mut memory = Vec::new();
+        let mut previous: Option<Instant> = None;
+        for frame in &self.history {
+            if previous
+                .is_some_and(|at| frame.sampled_at.saturating_duration_since(at) > stale_after)
+            {
+                cpu.push(None);
+                memory.push(None);
+            }
+            previous = Some(frame.sampled_at);
+            let total = keys.iter().try_fold(0u64, |sum, key| {
+                Some(sum.saturating_add(frame.values.get(key)?.memory_bytes?))
+            });
+            memory.push(total.filter(|_| !keys.is_empty()));
+            let total = keys.iter().try_fold(0.0, |sum, key| {
+                let value = frame.values.get(key)?.cpu_percent?;
+                (value.is_finite() && value >= 0.0).then_some(sum + value)
+            });
+            cpu.push(
+                total
+                    .filter(|_| !keys.is_empty())
+                    .map(|value| (value * 100.0).round() as u64),
+            );
+        }
+        if previous.is_some_and(|at| now.saturating_duration_since(at) > stale_after) {
+            cpu.push(None);
+            memory.push(None);
+        }
+        (cpu, memory)
     }
 }
 
@@ -387,6 +477,101 @@ mod tests {
             counters: None,
             sampled_at: at,
         }
+    }
+
+    #[test]
+    fn timestamped_history_is_per_container_bounded_and_retains_stopped_readings() {
+        let mut store = Store::default();
+        let mut containers = vec![container("one"), container("two")];
+        let start = Instant::now();
+        for tick in 0..HISTORY_LENGTH + 5 {
+            let at = start + Duration::from_secs(tick as u64 * 2);
+            store.apply(
+                &containers,
+                [
+                    ("/one".into(), Ok(reading(Some(10.0), Some(100), at))),
+                    ("/two".into(), Ok(reading(Some(20.0), Some(200), at))),
+                ]
+                .into(),
+            );
+        }
+        let first = store.timed_history(&containers[..1]);
+        let second = store.timed_history(&containers[1..]);
+        assert_eq!(first.len(), HISTORY_LENGTH);
+        assert_eq!(first[0].sampled_at, start + Duration::from_secs(10));
+        assert!(
+            first
+                .iter()
+                .all(|point| point.cpu == Some(1000) && point.memory == Some(100))
+        );
+        assert!(
+            second
+                .iter()
+                .all(|point| point.cpu == Some(2000) && point.memory == Some(200))
+        );
+        containers[0].state = "exited".into();
+        store.reconcile(&containers);
+        assert_eq!(store.timed_history(&containers[..1])[0].memory, Some(100));
+        let missing = store.timed_history(&[container("replacement")]);
+        assert!(
+            missing
+                .iter()
+                .all(|point| point.cpu.is_none() && point.memory.is_none())
+        );
+    }
+
+    #[test]
+    fn performance_history_tracks_memory_and_real_samples_with_gaps() {
+        let mut store = Store::default();
+        let containers = vec![container("one"), container("two")];
+        let now = Instant::now();
+        let stale = Duration::from_secs(3);
+        store.apply(
+            &containers,
+            [
+                ("/one".into(), Ok(reading(Some(120.0), Some(100), now))),
+                ("/two".into(), Ok(reading(Some(80.0), Some(200), now))),
+            ]
+            .into(),
+        );
+        assert_eq!(
+            store.performance_history(&containers, now, stale),
+            (vec![Some(20_000)], vec![Some(300)])
+        );
+        store.apply(
+            &containers,
+            [
+                (
+                    "/one".into(),
+                    Ok(reading(Some(0.0), Some(0), now + Duration::from_secs(1))),
+                ),
+                ("/two".into(), Err("missing".into())),
+            ]
+            .into(),
+        );
+        assert_eq!(
+            store.performance_history(&containers, now + Duration::from_secs(1), stale),
+            (vec![Some(20_000), None], vec![Some(300), None])
+        );
+        let after = now + Duration::from_secs(6);
+        let first = store.performance_history(&containers, after, stale);
+        assert_eq!(first.0, vec![Some(20_000), None, None]);
+        assert_eq!(
+            store.performance_history(&containers, after, stale),
+            first,
+            "Idle rendering must not append frames"
+        );
+        store.apply(
+            &containers,
+            [
+                ("/one".into(), Ok(reading(Some(0.0), Some(0), after))),
+                ("/two".into(), Ok(reading(Some(0.0), Some(0), after))),
+            ]
+            .into(),
+        );
+        let (cpu, memory) = store.performance_history(&containers, after, stale);
+        assert_eq!(cpu, vec![Some(20_000), None, None, Some(0)]);
+        assert_eq!(memory, vec![Some(300), None, None, Some(0)]);
     }
 
     #[test]

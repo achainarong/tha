@@ -2,6 +2,93 @@ use std::collections::BTreeMap;
 
 pub type Labels = BTreeMap<String, String>;
 
+#[derive(Debug, Clone)]
+pub struct PortBinding {
+    pub host_ip: Option<String>,
+    pub host_port: Option<u16>,
+    pub container_port: u16,
+    pub protocol: String,
+}
+
+impl PortBinding {
+    pub fn overview(&self) -> String {
+        let destination = format!("{}/{}", self.container_port, self.protocol);
+        let Some(port) = self.host_port else {
+            return format!("{destination} — exposed, no host port");
+        };
+        let Some(ip) = self.host_ip.as_deref().filter(|ip| !ip.is_empty()) else {
+            return format!("host port {port} → {destination} (host address not reported)");
+        };
+        match ip.parse::<std::net::IpAddr>() {
+            Ok(address) if address.is_loopback() => {
+                let local = if address.is_ipv6() {
+                    format!("[::1]:{port}")
+                } else if ip == "127.0.0.1" {
+                    format!("localhost:{port}")
+                } else {
+                    format!("{ip}:{port}")
+                };
+                format!("{local} → {destination} (loopback only · {ip})")
+            }
+            Ok(address) if address.is_unspecified() => {
+                let host = if address.is_ipv6() {
+                    format!("[{ip}]:{port}")
+                } else {
+                    format!("{ip}:{port}")
+                };
+                format!("{host} → {destination} (all interfaces; not localhost-only)")
+            }
+            _ => {
+                let host = if ip.contains(':') {
+                    format!("[{ip}]:{port}")
+                } else {
+                    format!("{ip}:{port}")
+                };
+                format!("{host} → {destination} (specific host address)")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::*;
+    #[test]
+    fn ports_distinguish_loopback_wildcards_specific_addresses_and_unpublished_ports() {
+        let mut binding = PortBinding {
+            host_ip: Some("127.0.0.1".into()),
+            host_port: Some(8080),
+            container_port: 80,
+            protocol: "tcp".into(),
+        };
+        assert_eq!(
+            binding.overview(),
+            "localhost:8080 → 80/tcp (loopback only · 127.0.0.1)"
+        );
+        binding.host_ip = Some("::1".into());
+        assert!(binding.overview().contains("[::1]:8080"));
+        for ip in ["0.0.0.0", "::"] {
+            binding.host_ip = Some(ip.into());
+            assert!(
+                binding
+                    .overview()
+                    .contains("all interfaces; not localhost-only")
+            );
+        }
+        binding.host_ip = Some("192.0.2.1".into());
+        binding.protocol = "udp".into();
+        assert!(
+            binding
+                .overview()
+                .contains("192.0.2.1:8080 → 80/udp (specific host address)")
+        );
+        binding.host_ip = None;
+        assert!(binding.overview().contains("host address not reported"));
+        binding.host_port = None;
+        assert_eq!(binding.overview(), "80/udp — exposed, no host port");
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Container {
     pub id: String,
@@ -20,6 +107,7 @@ pub struct Container {
     pub service: Option<String>,
     pub compose_working_dir: Option<std::path::PathBuf>,
     pub ports: Vec<String>,
+    pub port_bindings: Vec<PortBinding>,
     pub networks: Vec<String>,
     pub volumes: Vec<String>,
     pub managed: bool,

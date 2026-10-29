@@ -27,6 +27,43 @@ pub fn connect(connection: &Connection) -> Result<Docker> {
     Ok(Docker::connect_with_unix(path, 10, API_DEFAULT_VERSION)?)
 }
 
+/// Podman's Docker-compatible /info.ID is generated anew on each request.
+/// Use API provider metadata plus the local socket identity instead. This is
+/// deliberately not a claim to identify a backend behind an unchanged proxy.
+pub async fn runtime_identity(
+    docker: &Docker,
+    connection: &Connection,
+    info: &bollard::models::SystemInfo,
+) -> Result<Option<String>> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let version = docker.version().await?;
+    let podman = version.components.as_ref().is_some_and(|components| {
+        components
+            .iter()
+            .any(|component| component.name == "Podman Engine")
+    });
+    if !podman {
+        return Ok(info.id.clone().filter(|id| !id.is_empty()));
+    }
+    let path = connection
+        .endpoint
+        .strip_prefix("unix://")
+        .unwrap_or(&connection.endpoint);
+    let path = std::fs::canonicalize(path).context("Cannot resolve Podman socket identity")?;
+    let metadata = std::fs::metadata(&path).context("Cannot inspect Podman socket identity")?;
+    if !metadata.file_type().is_socket() {
+        bail!("Podman endpoint is not a Unix socket");
+    }
+    Ok(Some(format!(
+        "podman:{}:{}:{}:{}:{}",
+        path.display(),
+        metadata.dev(),
+        metadata.ino(),
+        metadata.ctime(),
+        metadata.ctime_nsec()
+    )))
+}
+
 pub async fn platform(
     connection: &Connection,
     container: &Container,
@@ -103,7 +140,12 @@ pub async fn preflight_action(
     expected: &Container,
 ) -> Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        if docker.info().await?.id.as_deref() != Some(request.identity.as_str()) {
+        let info = docker.info().await?;
+        if runtime_identity(docker, &request.connection, &info)
+            .await?
+            .as_deref()
+            != Some(request.identity.as_str())
+        {
             bail!("Runtime identity changed; cancel and reconnect before changing containers");
         }
         let inspected = docker
@@ -216,8 +258,9 @@ pub async fn apply_action(
 pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
     let docker = connect(connection)?.negotiate_version().await?;
     let info = docker.info().await?;
+    let engine_id = runtime_identity(&docker, connection, &info).await?;
     let mut result = Snapshot {
-        engine_id: info.id.filter(|id| !id.is_empty()),
+        engine_id,
         version: info.server_version.unwrap_or_default(),
         memory_capacity_bytes: info
             .mem_total
@@ -244,9 +287,21 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
             .unwrap_or_default()
             .trim_start_matches('/')
             .to_owned();
-        let ports = item
-            .ports
-            .unwrap_or_default()
+        let reported_ports = item.ports.unwrap_or_default();
+        let port_bindings = reported_ports
+            .iter()
+            .map(|port| model::PortBinding {
+                host_ip: port.ip.clone(),
+                host_port: port.public_port,
+                container_port: port.private_port,
+                protocol: port
+                    .typ
+                    .as_ref()
+                    .map(|protocol| protocol.to_string())
+                    .unwrap_or_else(|| "tcp".into()),
+            })
+            .collect();
+        let ports = reported_ports
             .into_iter()
             .map(|port| {
                 let protocol = port
@@ -311,6 +366,7 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
             compose_working_dir: model::compose_working_dir(&labels),
             managed: labels.keys().any(|key| key.starts_with("io.kubernetes.")),
             ports,
+            port_bindings,
             networks,
             volumes,
             namespace: None,

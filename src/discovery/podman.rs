@@ -39,6 +39,12 @@ fn parse_list(value: Value) -> Result<Vec<ListedMachine>> {
     {
         bail!("Podman returned an invalid machine name");
     }
+    for machine in &machines {
+        crate::runtime::Target::Podman {
+            machine: machine.name.clone(),
+        }
+        .validate()?;
+    }
     machines.sort_by(|a, b| a.name.cmp(&b.name));
     machines.dedup_by(|a, b| a.name == b.name);
     Ok(machines)
@@ -137,7 +143,7 @@ pub async fn discover_with(program: &Path) -> Discovery {
     let machines = stream::iter(machines)
         .map(|machine| async move {
             let endpoint = if !machine.running {
-                Err("Podman machine is stopped; start it separately, then refresh".into())
+                Err("Podman machine is stopped; use Start on its runtime row".into())
             } else {
                 match bounded_json(program, &["machine", "inspect", &machine.name]).await {
                     Ok(value) => parse_socket(&value).map_err(|error| format!("{error:#}")),

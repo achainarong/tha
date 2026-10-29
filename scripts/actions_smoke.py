@@ -8,10 +8,12 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import socketserver
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import threading
@@ -34,7 +36,9 @@ class Engine(socketserver.BaseRequestHandler):
         code = 200
         with self.server.lock:
             states = self.server.states
-            if url.path.endswith("/version"):
+            if self.server.offline.exists():
+                code, data = 503, {"message": "fixture runtime is stopped"}
+            elif url.path.endswith("/version"):
                 data = {"ApiVersion": "1.44", "MinAPIVersion": "1.24", "Version": "fixture"}
             elif url.path.endswith("/info"):
                 data = {"ID": "lifecycle-fixture", "NCPU": 2, "MemTotal": 1024 * 1024 * 1024}
@@ -82,15 +86,47 @@ def main():
     root = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="tha-act-") as temporary:
         directory = Path(temporary)
-        socket = directory / "api.sock"
+        socket = directory / ".colima/fixture/docker.sock"
+        socket.parent.mkdir(parents=True)
+        binaries = directory / "bin"
+        binaries.mkdir()
+        offline = binaries / "runtime.offline"
+        runtime_log = binaries / "runtime.log"
+        fake_colima = binaries / "colima"
+        fake_colima.write_text(f"#!{sys.executable}\n" + '''import json, sys, time
+from pathlib import Path
+root = Path(__file__).parent
+if sys.argv[1:] == ["list", "--json"]:
+    print(json.dumps({"name": "fixture"}))
+    sys.exit(0)
+assert sys.argv[1:3] == ["--profile", "fixture"], sys.argv
+assert len(sys.argv) == 4 and sys.argv[3] in ["start", "stop", "restart"], sys.argv
+with (root / "runtime.log").open("a") as log:
+    log.write(sys.argv[3] + "\\n")
+if sys.argv[3] == "stop":
+    if (root / "hold-stop").exists():
+        (root / "stop-started").touch()
+        while not (root / "release-stop").exists():
+            time.sleep(0.025)
+    (root / "runtime.offline").touch()
+else:
+    (root / "runtime.offline").unlink(missing_ok=True)
+''')
+        fake_colima.chmod(0o700)
+        # Keep optional machine discovery isolated too.
+        fake_podman = binaries / "podman"
+        fake_podman.write_text(f"#!{sys.executable}\nprint('[]')\n")
+        fake_podman.chmod(0o700)
         server = socketserver.UnixStreamServer(str(socket), Engine)
         server.lock = threading.Lock()
         server.states = {"a": "running", "b": "running"}
         server.writes = []
+        server.offline = offline
         threading.Thread(target=server.serve_forever, daemon=True).start()
         config = directory / "config.toml"
         config.write_text("context_order = ['Mock lifecycle']\nrefresh_seconds = 1\n[[connections]]\nname = 'Mock lifecycle'\nkind = 'docker'\n" + f"endpoint = 'unix://{socket}'\n")
         environment = {**os.environ, "HOME": temporary, "DOCKER_CONFIG": temporary,
+                       "PATH": str(binaries) + os.pathsep + os.environ.get("PATH", ""),
                        "XDG_CONFIG_HOME": temporary, "XDG_RUNTIME_DIR": temporary, "XDG_STATE_HOME": temporary, "TERM": "xterm-256color"}
         environment.pop("DOCKER_HOST", None)
         master, slave = pty.openpty()
@@ -122,14 +158,14 @@ def main():
             os.write(master, value)
             drain()
 
-        def confirmed(key, action):
+        def confirmed(key, action, confirm=b"y"):
             keys(key)
-            expect("Confirm " + action)
+            expect(action + " fixture-project?")
             expect("Runtime: Mock lifecycle")  # Never confirm an action on any host runtime.
             expect("2 target(s)")
-            keys(b"y")
+            keys(confirm)
             expect(":action-results")
-            assert "Confirm " not in "\n".join(screen.display)
+            assert action + " fixture-project?" not in "\n".join(screen.display)
             assert "Please wait" not in "\n".join(screen.display)
             keys(b":action-results\r")
             expect(action + " \u00b7 Results")
@@ -140,30 +176,30 @@ def main():
             expect("fixture-project")
             keys(b"/Mock lifecycle\rggj")
             keys(b"s")
-            expect("Confirm Stop")
+            expect("Stop fixture-project?")
             expect("Runtime: Mock lifecycle")
             assert not server.writes
             keys(b"n")
-            assert "Confirm Stop" not in "\n".join(screen.display)
+            assert "Stop fixture-project?" not in "\n".join(screen.display)
             assert not server.writes
             keys(b"s")
-            expect("Confirm Stop")
-            keys(b"\r")  # Enter cancels by default.
+            expect("Stop fixture-project?")
+            keys(b"\x1b")
             assert not server.writes
-            confirmed(b"s", "Stop")
+            confirmed(b"s", "Stop", confirm=b"\r")
             expect("fixture-project [0/2 running]")
             confirmed(b"S", "Start")
             expect("fixture-project [2/2 running]")
-            confirmed(b"r", "Restart")
+            confirmed(b"r", "Restart", confirm=b"\r")
             keys(b"d")
             expect("Stop all selected containers before deleting")
             assert len(server.writes) == 6
             confirmed(b"s", "Stop")
             expect("fixture-project [0/2 running]")
             keys(b"d")
-            expect("Confirm Delete")
+            expect("Delete fixture-project?")
             expect("Runtime: Mock lifecycle")
-            expect("ALL volumes and images stay")
+            expect("all volumes/images stay")
             keys(b"\r")
             expect("Name does not match")
             assert len(server.writes) == 8
@@ -175,11 +211,75 @@ def main():
             assert len(server.writes) == 10
             assert not server.states
             keys(b"\r")
+
+            # Runtime rows must invoke the provider, never container mutations.
+            keys(b"ggs")
+            expect("Stop Colima profile fixture?")
+            expect("all workloads")
+            expect("Runtime: Mock lifecycle")
+            keys(b"n")
+            assert not runtime_log.exists()
+            keys(b"s")
+            expect("Stop Colima profile fixture?")
+            (binaries / "hold-stop").touch()
+            keys(b"\r")
+            expect("Stopping…")
+            first_spinner = set("\n".join(screen.display)) & set("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+            assert first_spinner, "No visible pending-action spinner"
+            drain(0.25)
+            next_spinner = set("\n".join(screen.display)) & set("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+            assert next_spinner and next_spinner != first_spinner, "Pending-action spinner did not animate"
+            drain(1)
+            assert re.search(r"Stopping… [1-9][0-9]*s", "\n".join(screen.display)), "No elapsed-time feedback"
+            keys(b"?")
+            expect("Shortcuts")  # Navigation must remain usable during a slow provider command.
+            keys(b"\x1b")
+            expect("Stopping…")
+            assert not offline.exists(), "UI must not pretend the still-running runtime is stopped"
+            (binaries / "release-stop").touch()
+            expect("Stop \u00b7 finished")
+            expect("(offline)")
+            assert "Stop Colima profile fixture?" not in "\n".join(screen.display)
+            assert runtime_log.read_text() == "stop\n"
+            assert len(server.writes) == 10
             keys(b"\x03")
             process.wait(timeout=5)
             assert process.returncode == 0
             assert termios.tcgetattr(slave) == original
-            print("PASS: S/s/r/d, frozen Compose targets, cancel by default, typed deletion, API results, automatic refresh, volume-preserving flags, terminal restoration; mock mutations only")
+
+            # Relaunch while offline, then explicitly start and restart the same runtime.
+            drain(0.1)
+            screen = pyte.Screen(120, 35)
+            stream = pyte.Stream(screen)
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            process = subprocess.Popen([str(root / "target/debug/tha"), "--overview", "--config", str(config)],
+                                       stdin=slave, stdout=slave, stderr=slave, env=environment, start_new_session=True)
+            drain(1)
+            expect("(offline)")
+            keys(b"/Mock lifecycle\rggS")
+            expect("Start Colima profile fixture?")
+            keys(b"\r")
+            expect("Start \u00b7 finished")
+            for _ in range(20):
+                if "(offline)" not in "\n".join(screen.display):
+                    break
+                drain(0.2)
+            assert "Mock lifecycle (offline)" not in "\n".join(screen.display)
+            keys(b"r")
+            expect("Restart Colima profile fixture?")
+            keys(b"y")
+            expect("Restart \u00b7 finished")
+            keys(b":action-results\r")
+            expect("Restart \u00b7 Results")
+            expect("Succeeded")
+            keys(b"\r")
+            assert runtime_log.read_text() == "stop\nstart\nrestart\n"
+            assert len(server.writes) == 10
+            keys(b"\x03")
+            process.wait(timeout=5)
+            assert process.returncode == 0
+            assert termios.tcgetattr(slave) == original
+            print("PASS: container safeguards, runtime Stop/offline/relaunch/Start/Restart, animated slow-action feedback/elapsed time, navigation while pending, truthful runtime state, background results, terminal restoration; mock mutations only")
         finally:
             if process.poll() is None:
                 process.kill()

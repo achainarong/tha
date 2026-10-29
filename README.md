@@ -138,7 +138,7 @@ privileged helper. Multiple machines are supported. Missing Podman and empty
 machine lists are optional-provider states, not application failures.
 
 Discovery refreshes with inventory and `:refresh`. Stopped/disappeared machines
-remain visible as unavailable with last-known data; Tha does not connect to a
+remain visible as `(offline)` with last-known data; Tha does not connect to a
 stopped machine. Restarting or changing a forwarded socket replaces that machine's
 inventory/stats workers without changing its navigation identity. Old worker
 responses are rejected, logs resubscribe to the new socket, and an existing Exec
@@ -153,8 +153,9 @@ sizes at the bottom of runtime Overview (Tab into details and scroll). Image
 listing failures do not hide containers. Compose grouping recognizes both
 `com.docker.compose.*` and `io.podman.compose.*` labels.
 
-Tha never starts machines, changes rootless/rootful settings, installs helpers,
-or changes the default Docker/Podman connection. Live compatibility is version-
+Tha starts/stops/restarts machines only after explicit runtime confirmation. It
+never changes rootless/rootful settings, installs helpers, or changes the default
+Docker/Podman connection. Live compatibility is version-
 specific; the fixture checks below cover the installed macOS Podman machine,
 not every Podman version or remote transport.
 
@@ -211,6 +212,9 @@ your navigation. Demo mode never auto-opens a project.
 | `Ctrl-u` / `Ctrl-d` | Half-page up / down |
 | `Tab` / `Shift-Tab` | Cycle Explorer / Performance (when open) / Details |
 | `p` / `:performance` | Expand/collapse bottom-left global Performance |
+| `P` (Shift-p) | Switch Runtime / Selected container Performance; open panel |
+| `z` (Performance focused) | Toggle compact / full-width bottom Performance |
+| `Esc` (Performance expanded) | Restore compact view first |
 | `o` / `:sort-contexts` | Choose connected-first, name, CPU, or memory context order |
 | `S` / `s` / `r` / `d` in Explorer | Start / Stop / Restart / Delete selected container or Compose workload |
 | `1` / `2` / `3` / `4` / `5` | Overview / Logs / Networks / Exec / Layers on the right |
@@ -279,11 +283,27 @@ semantic multiline grouping, and export are follow-up work.
 The explorer shows aligned CPU/Mem columns for runtimes, namespaces, Compose
 projects, services, and containers. Press **`p`** to expand the **bottom-left
 Performance panel**: per-runtime CPU sparklines, memory bars, and sample coverage.
-It starts collapsed to one header row and **always covers all runtimes**, even
-inside a Compose workspace. Tab into it and use `j`/`k` to scroll runtimes;
-`Enter` opens the highlighted runtime's Overview. Alias connections are labelled
-without duplicate measurements. The right pane keeps its full height for the
-active tab; selected-container metrics remain compact numeric fields there.
+It starts collapsed to one header row and shows **connected, non-alias runtimes**
+across all projects, even inside a Compose workspace. Offline/stopped, connecting,
+and alias contexts are omitted from Performance; offline rows remain in Explorer
+so you can start them again. Tab into Performance and use `j`/`k`, paging, `gg`/`G`
+to navigate; `Enter` opens the highlighted runtime's Overview. Selection follows
+the same runtime across sorting and refreshes while it stays connected. An empty
+panel says **No connected runtimes**. The right pane keeps its full height for the
+active tab in compact mode. Press **`P` (Shift-p)** to switch to the selected
+container's own CPU and RAM history (and open the panel if closed). Container
+mode follows Explorer selection; groups, networks and volumes say **Select a
+container** rather than reusing another target's readings. In container mode,
+`j`/`k` moves Explorer selection and `Enter` inspects that container.
+
+With Performance focused, **`z`** toggles a larger **full-width bottom panel**,
+keeping Explorer and details above it. **Esc** restores compact mode first;
+closing with `p` also resets zoom. Tiny terminals fall back to compact rendering.
+CPU/RAM graphs share a timestamp-based axis ending at **latest**; the sample-age
+label tells you how long ago that was, rather than implying stale data is live.
+History is session-only, bounded to 60 sampling batches, and collected for all
+running containers regardless of which one is selected. Missing readings remain
+gaps, not zeros. Container memory bars use its reported limit, not VM capacity.
 Small terminals keep metrics in Overview even without explorer columns.
 
 **Sampling targets one update per second**, independently of the five-second
@@ -396,6 +416,13 @@ search text, shell contents, endpoints, credentials, or sessions are persisted.
 Restoration never grants shell input or opens a mutation dialog. To reset, move
 the preferences file aside while Tha is closed.
 
+Known local runtime provider/profile/machine names are also retained (not socket
+endpoints, commands, or credentials), so offline runtimes remain selectable after
+a normal exit and relaunch. This retention requires `save_preferences = true`.
+Existing configuration and Docker context metadata are never removed by Stop.
+Older Tha versions may reject the new optional runtime metadata; move the
+preferences file aside when downgrading rather than deleting runtime configuration.
+
 Add navigation-only aliases using crokey key syntax in `config.toml`:
 
 ```toml
@@ -486,7 +513,8 @@ extracts layers, or exports history automatically.
 ## Container and Compose lifecycle actions
 
 With **Explorer focused**, select a container, Compose service/project, **Services**
-group, **Standalone** group, or connected runtime parent:
+group, or **Standalone** group. Runtime rows have separate runtime-wide behavior
+described below.
 
 Press **`a`** to see all four lifecycle actions, eligible target counts, and the
 reason an action is disabled. Selecting an enabled action opens the same safety
@@ -502,10 +530,15 @@ retarget the menu.
 
 These work through the Docker-compatible API for **Docker and Podman**. Services
 groups target their project's existing containers; Standalone groups target only
-non-Compose containers; runtime parents target existing workloads in that connected
-runtime (and the current project focus, if active). Parent operations do not stop or
-restart the runtime daemon/VM itself. **Delete remains disabled on these three parent
-types**; select a container, service, or project for deletion.
+non-Compose containers. **Delete remains disabled on these grouping rows**; select
+a container, service, or project for deletion.
+
+Podman is identified from API component metadata, never a displayed connection
+name. Its Docker-compatible `/info.ID` can change on every request, so inventory
+and lifecycle preflight instead use the canonical local socket path and filesystem
+identity. Socket replacement refuses a pending container action. This does not
+identify a backend swapped behind an unchanged forwarding socket; full container
+IDs, names, Compose labels, states, and management metadata remain checked.
 
 Network/volume rows, namespaces, unavailable/aliased connections, Kubernetes-managed
 workloads, demo mode, and native containerd cannot be mutated. A parent selection
@@ -514,11 +547,14 @@ even if that member would otherwise be skipped by the requested action.
 While Exec owns input, all these keys go to the shell. `Ctrl-d` remains half-page
 navigation in Tha and EOF inside Exec; it is never a delete shortcut.
 
-Every action opens a scrollable confirmation listing the exact runtime, endpoint,
-container names/IDs, target count, and skipped count. **`y` confirms Start/Stop/
-Restart; n, Enter or Esc cancels by default.** Delete requires typing the selected
+Every action opens a compact confirmation showing the runtime, target, essential
+warning, and (for container actions) target names/count and skipped count. Longer
+target lists scroll with ↑/↓ or PgUp/PgDn. Socket paths, IDs, and commands stay in
+the explicit results view, not the confirmation. **`y` or Enter confirms Start/Stop/
+Restart; `n` or Esc cancels.** Delete requires typing the selected
 container/service/project name exactly, then Enter. Esc cancels deletion. A
-terminal of at least 60 × 18 is required to review and confirm actions.
+terminal of at least 44 × 10 is required to review and confirm actions (long delete
+names may need more space). Enter outside a confirmation keeps its normal navigation behavior.
 
 **Delete loses the container's writable data. Networks, images, and all volumes
 (including anonymous volumes) are retained.** Force deletion is disabled. There
@@ -537,15 +573,60 @@ sequentially off the UI thread, with per-container outcomes and a refresh when
 each container finishes and when the operation completes. Confirming closes the
 dialog immediately: navigation, logs, and Exec remain available while the action
 runs in the background. The footer shows progress and a retained completion/error
-summary; `:action-results` opens the per-container details. Enter/Esc closes those
-details even while an action is running, without canceling it. Only one lifecycle
-operation can run at a time. Results remain available until the next confirmed
-operation; they are not saved across restarts.
+summary; `:action-results` opens details or a runtime chooser when several runtimes
+have results. Enter/Esc closes details even while an action is running, without
+canceling it. **Independent runtimes can run lifecycle actions concurrently.**
+Only actions on the same runtime (including aliases) are serialized. The latest
+confirmed operation/results are retained per runtime until its next confirmed
+operation; they are not saved across restarts. Every worker's results are tagged
+with its operation ID, so completion on one runtime cannot overwrite another.
 Bulk operations are **not atomic** and have no automatic rollback.
 Normal API rejections are reported per member; ambiguous failures/timeouts are
 shown as **outcome unknown**, stop remaining mutations, and are never retried
 automatically. Inspect current state before explicitly confirming another action.
 Quitting cannot undo a request already received by the runtime.
+
+### Runtime/context Start, Stop, and Restart
+
+On a **runtime row**, `S` / `s` / `r` control the runtime itself, **not a bulk
+container selection**. The compact confirmation names the provider target and
+warns that it affects **all workloads**. Runtime shutdown affects all workloads,
+including other projects and any provider-managed Kubernetes workloads; OrbStack
+shutdown also stops its Linux machines. Runtime Delete is disabled.
+
+| Provider | Commands |
+| --- | --- |
+| Colima | `colima --profile PROFILE start/stop/restart` |
+| Podman machine | `podman machine start/stop/restart MACHINE` |
+| Docker Desktop | `docker desktop start/stop/restart` |
+| OrbStack | `orbctl start/stop`; restart is stop followed by start |
+
+Provider control requires a recognized local socket location or a natively
+discovered Podman machine, not a display-name match. Generic Docker sockets,
+remote contexts, native containerd, and aliases cannot control a daemon. There is
+no fallback to stopping containers, no sudo/system-service management, no machine
+initialization, and no context switching. Colima/Podman commands verify the named
+instance still exists before proceeding. The corresponding CLI must be installed.
+
+Stopped/unreachable contexts stay visible as **`(offline)`**. Select the runtime
+and press `S` to start it; Stop/Restart require a connected runtime. API refresh
+determines when it is actually available again. Runtime control stays in the
+background with `:action-results` details, a 120-second deadline per command and
+bounded output. Failures after invoking a lifecycle command are outcome unknown,
+never automatically retried; an OrbStack restart does not proceed to Start if
+Stop fails. Quitting Tha cannot undo a command already sent to the provider.
+
+### Ports in Container Overview
+
+Overview shows reported host-to-container mappings, for example
+`localhost:8080 → 80/tcp (loopback only · 127.0.0.1)`. IPv6 addresses use brackets.
+Wildcard bindings such as `0.0.0.0:8080` / `[::]:8080` are labelled **all interfaces,
+not localhost-only**. Specific host addresses and TCP/UDP protocols are preserved.
+An exposed port without a host publication says **exposed, no host port**; missing
+binding addresses are not guessed. Offline bindings are marked last-known and
+stopped containers are not presented as listening. These are runtime-reported
+bindings, not an active connectivity test: VM/remote forwarding, firewalls, and
+whether the application is listening can affect localhost access.
 
 ## Context ordering
 
@@ -686,7 +767,7 @@ checks machine discovery, images, metrics, stopped machines, socket replacement,
 invalid-JSON recovery, and terminal restoration without starting a real VM.
 
 The lifecycle smoke test uses a separate mock API for every mutation. It checks
-`S/s/r/d`, cancel-by-default confirmation, exact-name deletion, automatic refresh,
+`S/s/r/d`, `y`/Enter confirmation, `n`/Esc cancellation, exact-name deletion, automatic refresh,
 per-container results, and volume-preserving delete flags. `tests/actions.rs`
 also covers stale identities/states/labels, partial failures, lost responses,
 and no automatic retries against mock Docker 1.53 / Podman-compatible 1.44 APIs.

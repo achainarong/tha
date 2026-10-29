@@ -87,8 +87,31 @@ def main():
         keys(b":networks\r")
         expect("Network membership")
         expect("shop_default")
+        keys(b"p\t\t")  # Details -> Explorer -> Performance.
+        expect("Performance \u00b7 Connected runtimes")
+        keys(b"G")
+        performance_start = next(index for index, row in enumerate(screen.display) if "\u25be Performance" in row[:60])
+        performance_text = "\n".join(row[:60] for row in screen.display[performance_start:-2])
+        assert "Podman" not in performance_text, "Offline runtime leaked into Performance"
+        assert "Unavailable" not in performance_text
+        keys(b"gg\r")
+        right = "\n".join(row[60:] for row in screen.display)
+        assert "Colima / development" in right, "Enter did not inspect the first connected runtime"
+        keys(b"pq/shop-api-1\rG")
+        keys(b"P")
+        expect("Performance · Selected container")
+        expect("Container · shop-api-1")
+        keys(b"z")
+        expect("latest")
+        border = next(row for row in screen.display if "· Selected container" in row)
+        assert border[-1] == "┐", "Expanded Performance did not span terminal width"
+        keys(b"\x1b")
+        border = next(row for row in screen.display if "· Selected container" in row)
+        assert border[59] == "┐", "Esc did not restore the compact panel"
+        keys(b"p:networks\r")
         keys(b"?")
         expect("Shortcuts")
+        keys(b"jjj")
         expect("Toggle wrapping on/off immediately")
         keys(b"G")
         expect("Exec and lifecycle actions can change workloads")
@@ -103,7 +126,7 @@ def main():
         keys(b"q")
         assert process.wait(timeout=3) == 0
         assert termios.tcgetattr(slave) == original, "Terminal settings were not restored"
-        print("PASS: tree, Space, counts, Compose workspace/back, wrap shortcut, highlighted search/context, palette, scrollable cheatsheet, resize, quit, terminal restoration")
+        print("PASS: tree, Space, counts, Compose workspace/back, wrap/search, connected-only Performance navigation/Enter, palette, cheatsheet, resize, quit, terminal restoration")
     finally:
         if process.poll() is None:
             process.kill()

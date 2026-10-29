@@ -249,8 +249,8 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let mut layers_task: Option<AbortTask> = None;
     let (export_tx, mut export_rx) = mpsc::channel::<String>(4);
     let mut export_task: Option<AbortTask> = None;
-    let (action_tx, mut action_rx) = mpsc::channel(64);
-    let mut action_task: Option<AbortTask> = None;
+    let (action_tx, mut action_rx) = mpsc::channel::<tha::actions::Update>(64);
+    let mut action_tasks = std::collections::BTreeMap::<u64, AbortTask>::new();
     let mut metric_targets = Vec::new();
     let mut workers = Vec::new();
     let channels = WorkerChannels {
@@ -290,17 +290,22 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let log_capacity = app.logs.capacity();
     let mut redraw = tokio::time::interval(Duration::from_millis(70));
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let frame_started = std::time::Instant::now();
     terminal.draw(|frame| ui::draw(frame, &mut app))?;
+    let mut visual_deadline = app.next_visual_deadline(frame_started);
     loop {
+        let mut redraw_now = false;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = terminate.recv() => break,
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
-                    let height = terminal.size()?.height.saturating_sub(7) as usize;
+                    let height = terminal.size()?.height.saturating_sub(5 + ui::footer_height(&app)) as usize;
                     if handle_key(&mut app, key, height, &refresh_tx) { break; }
+                    redraw_now = true;
                 },
                 Some(Ok(Event::Paste(text))) => {
+                    redraw_now = true;
                     app.cancel_startup();
                     if let Some(confirmation) = &mut app.action_confirmation {
                         if confirmation.request.action == tha::actions::Action::Delete {
@@ -316,7 +321,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                     }
                 },
                 Some(Err(error)) => return Err(error.into()),
-                Some(Ok(Event::Resize(_, _))) => { app.action_review_visible = false; app.log_export_review_visible = false; },
+                Some(Ok(Event::Resize(_, _))) => { app.action_review_visible = false; app.log_export_review_visible = false; redraw_now = true; },
                 None => break,
                 _ => {}
             },
@@ -324,58 +329,60 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 if !workers.get(event.engine).is_some_and(|slot| slot.accepts(event.generation)) { continue; }
                 app.update_engine(event.engine, event.result);
                 publish_metric_targets(&mut app, &metric_targets);
+                redraw_now = true;
             },
             Some(discovery) = discovery_rx.recv() => {
                 if let Some(warning) = &discovery.warning { app.notice = warning.clone(); }
                 let availability = app.reconcile_podman(&discovery);
                 sync_workers(&mut app, &availability, &mut workers, &mut metric_targets, &channels, refresh_seconds);
                 publish_metric_targets(&mut app, &metric_targets);
+                redraw_now = true;
             },
-            Some(event) = metrics_rx.recv() => app.apply_metrics(event),
-            Some(result) = export_rx.recv() => { app.log_export_busy = false; app.notice = result; export_task = None; },
-            Some(event) = action_rx.recv() => {
-                if let Some(progress) = &mut app.action_progress {
-                    match event {
-                        tha::actions::Event::Result { index, status } => {
-                            if let Some(result) = progress.results.get_mut(index) { *result = Some(status); }
-                            refresh_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
-                        }
-                        tha::actions::Event::Finished => {
-                            progress.finished = true;
-                            action_task = None;
-                            refresh_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
-                        }
-                    }
+            Some(event) = metrics_rx.recv() => { app.apply_metrics(event); redraw_now = true; },
+            Some(result) = export_rx.recv() => { app.log_export_busy = false; app.notice = result; export_task = None; redraw_now = true; },
+            Some(update) = action_rx.recv() => {
+                let operation = update.operation;
+                let finished = matches!(&update.event, tha::actions::Event::Finished);
+                if app.apply_action_update(update) {
+                    redraw_now = true;
+                    if finished { action_tasks.remove(&operation); }
+                    refresh_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
                 }
             },
-            Some(event) = platform_rx.recv() => app.platforms.insert(event.key, match event.result { Ok(platform) => tha::platform::State::Ready(platform), Err(error) => tha::platform::State::Unavailable(error) }),
+            Some(event) = platform_rx.recv() => { app.platforms.insert(event.key, match event.result { Ok(platform) => tha::platform::State::Ready(platform), Err(error) => tha::platform::State::Unavailable(error) }); redraw_now = true; },
             Some(event) = layers_rx.recv() => {
                 app.layers.complete(event);
+                redraw_now = true;
             },
             _ = redraw.tick() => {
-                update_layers(&mut app, &mut layers_task, &layers_tx);
-                update_platform(&mut app, &mut platform_task, &platform_tx);
+                redraw_now = visual_deadline.is_some_and(|at| std::time::Instant::now() >= at)
+                    || app.tab == Tab::Exec && app.sessions.active().is_some();
                 for notice in app.sessions.poll() {
+                    redraw_now = true;
                     if Some(notice.id) == app.sessions.active_id() { app.exec_input = false; }
                     app.notice = format!("Exec #{} {} · container was not stopped. F6 switches retained sessions.", notice.id, notice.status);
                 }
-                update_logs(&mut app, &mut log_task, &log_tx, log_capacity);
                 // Batch log updates so a noisy container cannot trigger unlimited redraws.
                 for _ in 0..512 {
                     let Ok(event) = log_rx.try_recv() else { break; };
-                    if event.generation == app.log_generation { app.logs.push(&event.source, &event.text, event.error); }
+                    if event.generation == app.log_generation {
+                        app.logs.push(&event.source, &event.text, event.error);
+                        redraw_now |= app.tab == Tab::Logs;
+                    }
                 }
-                terminal.draw(|frame| ui::draw(frame, &mut app))?;
             }
         }
         if let Some(request) = app.exec_request.take() {
             app.start_exec(request);
         }
         if let Some(request) = app.action_request.take() {
-            action_task = Some(AbortTask(tokio::spawn(tha::actions::run(
-                request,
-                action_tx.clone(),
-            ))));
+            action_tasks.insert(
+                request.operation,
+                AbortTask(tokio::spawn(tha::actions::run_tracked(
+                    request,
+                    action_tx.clone(),
+                ))),
+            );
         }
         if let Some(request) = app.log_export_request.take() {
             let sender = export_tx.clone();
@@ -389,9 +396,19 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 let _ = sender.send(message).await;
             })));
         }
+        if redraw_now {
+            // Input/operation feedback is not delayed until the next animation tick.
+            // Resolve view targets first so navigation never paints the previous target's layers.
+            update_layers(&mut app, &mut layers_task, &layers_tx);
+            update_platform(&mut app, &mut platform_task, &platform_tx);
+            update_logs(&mut app, &mut log_task, &log_tx, log_capacity);
+            let frame_started = std::time::Instant::now();
+            terminal.draw(|frame| ui::draw(frame, &mut app))?;
+            visual_deadline = app.next_visual_deadline(frame_started);
+        }
     }
     drop(log_task);
-    drop(action_task);
+    drop(action_tasks);
     drop(layers_task);
     drop(export_task);
     drop(terminal);
@@ -411,8 +428,12 @@ fn update_layers(
     task: &mut Option<AbortTask>,
     tx: &mpsc::Sender<tha::layers::Event>,
 ) {
+    app.reconcile_detail_tab();
     let target = app.layers_target();
     let key = target.as_ref().map(|(key, _, _)| key.clone());
+    if key.is_none() {
+        *task = None;
+    }
     if app.layers.key != key {
         *task = None;
         app.layers.select(key);
@@ -682,7 +703,14 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         match key.code {
             KeyCode::Esc => app.action_confirmation = None,
             KeyCode::Enter if deleting => app.confirm_action(),
-            KeyCode::Enter => app.action_confirmation = None, // Cancel is the default.
+            KeyCode::Enter
+                if key.kind == KeyEventKind::Press
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                app.confirm_action()
+            }
             KeyCode::Char('n') if !deleting => app.action_confirmation = None,
             KeyCode::Char('y')
                 if !deleting
@@ -733,7 +761,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         return false;
     }
     if app.action_results_visible {
-        let Some(progress) = &mut app.action_progress else {
+        let Some(progress) = app.action_progress_mut() else {
             app.action_results_visible = false;
             return false;
         };
@@ -908,7 +936,9 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             }
         }
         KeyCode::Esc => {
-            if app.tab == Tab::Layers && app.detail_focus && app.layers.expanded {
+            if app.performance_open && app.performance_expanded {
+                app.performance_expanded = false;
+            } else if app.tab == Tab::Layers && app.detail_focus && app.layers.expanded {
                 app.layers.expanded = false;
                 app.detail_scroll = 0;
             } else if app.performance_focus {
@@ -933,6 +963,14 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         }
         KeyCode::Char('e') => app.request_exec(),
         KeyCode::Char('p') => app.toggle_performance(),
+        KeyCode::Char('P') if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+            app.switch_performance_scope()
+        }
+        KeyCode::Char('z')
+            if app.performance_focus && !ctrl && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            app.performance_expanded = !app.performance_expanded;
+        }
         KeyCode::Char('o') => app.pick_context_sort(),
         KeyCode::F(6) => app.pick_sessions(),
         KeyCode::Char('a') if lifecycle_key => app.open_actions(),
@@ -964,6 +1002,9 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             app.exec_input = false;
         }
         KeyCode::Char('5') if !ctrl => {
+            if !app.layers_available() {
+                return false;
+            }
             app.tab = Tab::Layers;
             app.detail_focus = true;
             app.performance_focus = false;
@@ -971,8 +1012,16 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             app.detail_scroll = 0;
         }
         KeyCode::Enter => {
-            if app.performance_focus {
-                let engine_index = app.context_order.get(app.performance_scroll).copied();
+            if app.performance_focus
+                && app.performance_scope == tha::app::PerformanceScope::Container
+            {
+                if app.performance_container().is_some() {
+                    app.performance_focus = false;
+                    app.detail_focus = true;
+                    app.tab = Tab::Overview;
+                }
+            } else if app.performance_focus {
+                let engine_index = app.performance_engine();
                 let Some(engine_index) = engine_index else {
                     return false;
                 };
@@ -1033,7 +1082,11 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         KeyCode::Char('g') => {
             if pending_g {
                 if app.performance_focus {
-                    app.performance_scroll = 0;
+                    if app.performance_scope == tha::app::PerformanceScope::Container {
+                        app.selected = 0;
+                    } else {
+                        app.performance_scroll = 0;
+                    }
                 } else if !app.detail_focus {
                     app.selected = 0;
                 } else if app.tab == Tab::Logs {
@@ -1054,7 +1107,11 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         }
         KeyCode::Char('G') => {
             if app.performance_focus {
-                app.performance_scroll = app.engines.len().saturating_sub(1);
+                if app.performance_scope == tha::app::PerformanceScope::Container {
+                    app.selected = app.rows.len().saturating_sub(1);
+                } else {
+                    app.performance_scroll = app.performance_engines().len().saturating_sub(1);
+                }
             } else if !app.detail_focus {
                 app.selected = app.rows.len().saturating_sub(1);
             } else if app.tab == Tab::Logs {
@@ -1093,11 +1150,13 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
 }
 
 fn move_by(app: &mut App, amount: isize, _height: usize) {
-    if app.performance_focus {
+    if app.performance_focus && app.performance_scope == tha::app::PerformanceScope::Container {
+        app.move_selection(amount);
+    } else if app.performance_focus {
         app.performance_scroll = app
             .performance_scroll
             .saturating_add_signed(amount)
-            .min(app.engines.len().saturating_sub(1));
+            .min(app.performance_engines().len().saturating_sub(1));
     } else if !app.detail_focus {
         app.move_selection(amount);
         app.detail_scroll = 0;
@@ -1151,6 +1210,10 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
         "wrap" => app.log_view.toggle_wrap(&app.logs),
         "exec" => app.request_exec(),
         "layers" => {
+            if !app.layers_available() {
+                app.notice = "Layers requires a container or single-container service".into();
+                return false;
+            }
             app.tab = Tab::Layers;
             app.detail_focus = true;
             app.performance_focus = false;
@@ -1161,13 +1224,7 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
             app.detail_scroll = 0;
         }
         "actions" => app.open_actions(),
-        "action-results" => {
-            if app.action_progress.is_some() {
-                app.action_results_visible = true;
-            } else {
-                app.notice = "No lifecycle action results yet".into();
-            }
-        }
+        "action-results" => app.open_action_results(),
         "filter-logs" => {
             app.tab = Tab::Logs;
             app.detail_focus = true;
@@ -1409,6 +1466,38 @@ mod tests {
     }
 
     #[test]
+    fn performance_navigation_and_enter_use_only_connected_non_alias_runtimes() {
+        let mut app = app();
+        let (tx, _) = watch::channel(0);
+        app.engines[2].alias = Some("OrbStack".into());
+        app.context_order = vec![3, 1, 0, 2];
+        app.performance_open = true;
+        app.performance_focus = true;
+        app.detail_focus = false;
+        assert_eq!(app.performance_engines(), [1, 0]);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('G')), 20, &tx);
+        assert_eq!(app.performance_engine(), Some(0));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('k')), 20, &tx);
+        assert_eq!(app.performance_engine(), Some(1));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+        assert_eq!(app.current().unwrap().engine, 1);
+        assert!(app.detail_focus);
+        assert_eq!(app.tab, Tab::Overview);
+
+        app.performance_focus = true;
+        app.detail_focus = false;
+        for engine in &mut app.engines {
+            engine.error = Some("offline".into());
+        }
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('G')), 20, &tx);
+        assert_eq!(app.performance_scroll, 0);
+        let selected = app.selected;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+        assert_eq!(app.selected, selected);
+        assert!(app.performance_focus);
+    }
+
+    #[test]
     fn performance_panel_defaults_closed_and_is_part_of_focus_cycle_when_open() {
         let mut app = app();
         let (tx, _) = watch::channel(0);
@@ -1474,7 +1563,7 @@ mod tests {
         app.performance_open = true;
         app.performance_focus = true;
         app.performance_scroll = 0;
-        let expected = app.context_order[0];
+        let expected = app.performance_engines()[0];
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -1712,8 +1801,8 @@ mod tests {
         assert!(app.action_results_visible);
         handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 20, &tx);
         assert!(!app.action_results_visible);
-        assert!(!app.action_progress.as_ref().unwrap().finished);
-        let progress = app.action_progress.as_mut().unwrap();
+        assert!(!app.action_progress().unwrap().finished);
+        let progress = app.action_progress_mut().unwrap();
         progress.results[0] = Some(Status::Unknown("lost response".into()));
         progress.finished = true;
         assert!(app.action_status().unwrap().contains("1 unknown"));
@@ -1721,7 +1810,7 @@ mod tests {
         handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
         assert!(!app.action_results_visible);
         assert!(matches!(
-            app.action_progress.as_ref().unwrap().results[0],
+            app.action_progress().unwrap().results[0],
             Some(Status::Unknown(_))
         ));
 
@@ -1737,10 +1826,6 @@ mod tests {
         use tha::{actions::Action, app::Scope};
         let (tx, _) = watch::channel(0);
         for (scope, expected) in [
-            (
-                Scope::Engine,
-                vec!["fixture", "worker", "other", "standalone"],
-            ),
             (
                 Scope::Services {
                     namespace: None,
@@ -1821,7 +1906,7 @@ mod tests {
                     .collect::<String>();
                 assert!(rendered.contains(&name));
                 assert!(rendered.contains(&format!("{} target(s)", expected.len())));
-                assert!(rendered.contains("Enter/Esc Cancel"));
+                assert!(rendered.contains("n / Esc Cancel"));
                 // A refresh and changed selection must not add targets to this review.
                 let mut updated = app.engines[0].snapshot.clone().unwrap();
                 let mut replica = original;
@@ -1850,7 +1935,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_shortcuts_require_confirmation_and_enter_defaults_to_cancel() {
+    fn lifecycle_shortcuts_require_confirmation_and_n_cancels() {
         let (tx, _) = watch::channel(0);
         for (key, state, action) in [
             ('S', "exited", tha::actions::Action::Start),
@@ -1873,7 +1958,7 @@ mod tests {
             if key != 'd' {
                 handle_key(
                     &mut app,
-                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
                     20,
                     &tx,
                 );
@@ -1896,7 +1981,7 @@ mod tests {
             &tx,
         );
         assert!(app.action_request.is_some());
-        assert!(app.action_progress.is_some());
+        assert!(app.action_progress().is_some());
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
@@ -1904,6 +1989,55 @@ mod tests {
             &tx,
         );
         assert!(app.action_confirmation.is_none());
+    }
+
+    #[test]
+    fn enter_and_y_confirm_start_stop_restart_only_after_visible_review() {
+        use tha::actions::Action;
+        let (tx, _) = watch::channel(0);
+        for (shortcut, state, action) in [
+            ('S', "exited", Action::Start),
+            ('s', "running", Action::Stop),
+            ('r', "running", Action::Restart),
+        ] {
+            for confirm in [KeyCode::Enter, KeyCode::Char('y')] {
+                let mut app = lifecycle_app(state);
+                handle_key(&mut app, KeyEvent::from(KeyCode::Char(shortcut)), 20, &tx);
+                handle_key(&mut app, KeyEvent::from(confirm), 20, &tx);
+                assert!(app.action_request.is_none());
+                assert!(app.action_confirmation.is_some());
+                app.action_review_visible = true;
+                for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                    handle_key(&mut app, KeyEvent::new(KeyCode::Enter, modifiers), 20, &tx);
+                    assert!(app.action_request.is_none());
+                }
+                let mut repeat = KeyEvent::from(KeyCode::Enter);
+                repeat.kind = KeyEventKind::Repeat;
+                handle_key(&mut app, repeat, 20, &tx);
+                assert!(app.action_request.is_none());
+                handle_key(&mut app, KeyEvent::from(confirm), 20, &tx);
+                assert_eq!(app.action_request.as_ref().unwrap().action, action);
+                assert!(app.action_confirmation.is_none());
+                assert!(!app.action_results_visible);
+            }
+            for cancel in [KeyCode::Char('n'), KeyCode::Esc] {
+                let mut app = lifecycle_app(state);
+                handle_key(&mut app, KeyEvent::from(KeyCode::Char(shortcut)), 20, &tx);
+                handle_key(&mut app, KeyEvent::from(cancel), 20, &tx);
+                assert!(app.action_confirmation.is_none());
+                assert!(app.action_request.is_none());
+            }
+        }
+        let mut app = lifecycle_app("running");
+        app.selected = 0;
+        app.engines[0].runtime = Some(tha::runtime::Target::Colima {
+            profile: "fixture".into(),
+        });
+        app.engines[0].error = Some("offline".into());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('S')), 20, &tx);
+        app.action_review_visible = true;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+        assert!(app.action_request.as_ref().unwrap().runtime.is_some());
     }
 
     #[test]
@@ -2017,6 +2151,71 @@ mod tests {
         assert_eq!(request.engine, 0);
         assert_eq!(request.containers.len(), 1);
         assert_eq!(request.containers[0].id, "fixture");
+    }
+
+    #[tokio::test]
+    async fn performance_scope_zoom_escape_and_container_inspection_are_navigation_only() {
+        use tha::app::PerformanceScope;
+        let mut app = app();
+        let (tx, _) = watch::channel(0);
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, tha::app::Scope::Container(_)))
+            .unwrap();
+        let selected = app.current().unwrap().key.clone();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT),
+            20,
+            &tx,
+        );
+        assert_eq!(app.performance_scope, PerformanceScope::Container);
+        assert!(app.performance_open && app.performance_focus);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('z')), 20, &tx);
+        assert!(app.performance_expanded);
+        app.tree_query = "preserve this search".into();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 20, &tx);
+        assert!(!app.performance_expanded);
+        assert!(app.performance_focus && app.performance_open);
+        assert_eq!(app.tree_query, "preserve this search");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+        assert!(app.detail_focus && !app.performance_focus);
+        assert_eq!(app.current().unwrap().key, selected);
+        assert_eq!(app.tab, Tab::Overview);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('z')), 20, &tx);
+        assert!(!app.performance_expanded, "Zoom is Performance-focus-only");
+        app.input_mode = InputMode::Search;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('P')), 20, &tx);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('z')), 20, &tx);
+        assert_eq!(app.input, "Pz");
+        assert_eq!(app.performance_scope, PerformanceScope::Container);
+        app.input_mode = InputMode::Normal;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('P')), 20, &tx);
+        assert_eq!(app.performance_scope, PerformanceScope::Runtime);
+        assert!(app.action_request.is_none());
+    }
+
+    #[tokio::test]
+    async fn unsupported_layers_shortcuts_are_blocked_and_pending_lookup_is_cancelled() {
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.selected = 0;
+        assert!(!app.layers_available());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('5')), 20, &refresh);
+        assert_eq!(app.tab, Tab::Overview);
+        execute(&mut app, "layers", &refresh);
+        assert_eq!(app.tab, Tab::Overview);
+        let pending = tokio::spawn(std::future::pending::<()>());
+        let abort = pending.abort_handle();
+        let mut task = Some(AbortTask(pending));
+        let (sender, _) = mpsc::channel(4);
+        app.tab = Tab::Layers;
+        update_layers(&mut app, &mut task, &sender);
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished());
+        assert!(task.is_none());
+        assert_eq!(app.tab, Tab::Overview);
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@ pub mod metrics;
 pub mod model;
 pub mod platform;
 pub mod preferences;
+pub mod runtime;
 pub mod sessions;
 pub mod terminal;
 pub mod ui;

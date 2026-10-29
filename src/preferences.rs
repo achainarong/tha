@@ -26,6 +26,7 @@ pub struct Preferences {
     pub expanded: Vec<Row>,
     pub selected: Option<Row>,
     pub project: Option<Row>,
+    pub runtimes: Vec<crate::runtime::Saved>,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -38,6 +39,7 @@ impl Default for Preferences {
             expanded: Vec::new(),
             selected: None,
             project: None,
+            runtimes: Vec::new(),
         }
     }
 }
@@ -72,6 +74,18 @@ pub fn load(path: &Path) -> Result<Option<Preferences>> {
     let preferences: Preferences = toml::from_str(&text).context("Invalid preferences")?;
     if preferences.version != 1 || preferences.expanded.len() > 1024 {
         bail!("Unsupported preferences version or too many expanded branches");
+    }
+    if preferences.runtimes.len() > 128 {
+        bail!("Too many saved runtimes");
+    }
+    for saved in &preferences.runtimes {
+        saved.target.validate()?;
+        if saved.name.is_empty()
+            || saved.name.len() > 1024
+            || crate::model::safe_text(&saved.name) != saved.name
+        {
+            bail!("Invalid saved runtime name");
+        }
     }
     Ok(Some(preferences))
 }
@@ -129,6 +143,10 @@ mod tests {
         fs::write(&path, "version = 99").unwrap();
         assert!(load(&path).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "version = 99");
+        let unsafe_runtime = "version = 1\n[[runtimes]]\nname = 'fixture'\n[runtimes.target]\nprovider = 'colima'\nprofile = '../unsafe'\n";
+        fs::write(&path, unsafe_runtime).unwrap();
+        assert!(load(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), unsafe_runtime);
         fs::write(&path, "x".repeat(LIMIT as usize + 1)).unwrap();
         assert!(load(&path).is_err());
         let link = directory.join("link");

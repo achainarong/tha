@@ -27,6 +27,8 @@ struct State {
     errors: BTreeMap<String, u16>,
     lose_response: bool,
     replace_engine: bool,
+    podman_random_id: bool,
+    mutation_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 struct Engine {
     path: PathBuf,
@@ -70,6 +72,8 @@ impl Engine {
             errors: BTreeMap::new(),
             lose_response: false,
             replace_engine: false,
+            podman_random_id: false,
+            mutation_gate: None,
         }));
         let server_state = state.clone();
         let task = tokio::spawn(async move {
@@ -101,11 +105,20 @@ impl Engine {
                     if route.ends_with("/version") {
                         (
                             200,
-                            serde_json::json!({"ApiVersion":version,"MinAPIVersion":"1.24","Version":"fixture"}),
+                            if state.podman_random_id {
+                                serde_json::json!({"ApiVersion":version,"MinAPIVersion":"1.24","Version":"6.1.4", "Components":[{"Name":"Podman Engine", "Version":"6.1.4"}]})
+                            } else {
+                                serde_json::json!({"ApiVersion":version,"MinAPIVersion":"1.24","Version":"fixture"})
+                            },
                             false,
                         )
                     } else if route.ends_with("/info") {
-                        (200, serde_json::json!({"ID":state.identity}), false)
+                        let identity = if state.podman_random_id {
+                            format!("random-{}", state.requests.len())
+                        } else {
+                            state.identity.clone()
+                        };
+                        (200, serde_json::json!({"ID":identity}), false)
                     } else if let Some((_, target)) = route.split_once("/containers/") {
                         let (id, operation) = target.split_once('/').unwrap_or((target, ""));
                         if method == "GET" && operation == "json" {
@@ -175,6 +188,13 @@ impl Engine {
                         )
                     }
                 };
+                let gate = server_state.lock().unwrap().mutation_gate.clone();
+                if (method == "POST" || method == "DELETE")
+                    && let Some((started, release)) = gate
+                {
+                    started.notify_one();
+                    release.notified().await;
+                }
                 if lose {
                     continue;
                 }
@@ -287,6 +307,141 @@ async fn docker_and_podman_use_exact_container_ids_for_all_four_actions() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn tracked_operations_on_independent_engines_finish_without_waiting_for_each_other() {
+    let slow = Engine::start(vec![container("slow", "running")], "1.53");
+    let fast = Engine::start(vec![container("fast", "running")], "1.53");
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    slow.state.lock().unwrap().mutation_gate = Some((started.clone(), release.clone()));
+    let mut first = slow.request(Action::Stop, "Slow runtime");
+    first.operation = 101;
+    let mut second = fast.request(Action::Restart, "Fast runtime");
+    second.operation = 102;
+    let (tx, mut rx) = mpsc::channel(32);
+    let slow_task = tokio::spawn(actions::run_tracked(first, tx.clone()));
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    let fast_task = tokio::spawn(actions::run_tracked(second, tx));
+    loop {
+        let update = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            update.operation, 102,
+            "The first runtime must still be waiting"
+        );
+        match update.event {
+            Event::Result { status, .. } => assert_eq!(status, Status::Succeeded),
+            Event::Finished => break,
+        }
+    }
+    assert!(!slow_task.is_finished());
+    release.notify_one();
+    loop {
+        let update = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.operation, 101);
+        match update.event {
+            Event::Result { status, .. } => assert_eq!(status, Status::Succeeded),
+            Event::Finished => break,
+        }
+    }
+    slow_task.await.unwrap();
+    fast_task.await.unwrap();
+    assert_eq!(slow.writes().len(), 1);
+    assert_eq!(fast.writes().len(), 1);
+}
+
+#[tokio::test]
+async fn tracked_worker_exits_when_its_results_receiver_is_closed() {
+    let engine = Engine::start(
+        (0..32)
+            .map(|n| container(&format!("member{n}"), "exited"))
+            .collect(),
+        "1.53",
+    );
+    let mut request = engine.request(Action::Start, "fixture");
+    request.operation = 1;
+    let (tx, rx) = mpsc::channel(1);
+    drop(rx);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        actions::run_tracked(request, tx),
+    )
+    .await
+    .unwrap();
+}
+
+async fn podman_request(engine: &Engine, action: Action) -> Request {
+    engine.state.lock().unwrap().podman_random_id = true;
+    let mut request = engine.request(action, "arbitrary name (not provider detection)");
+    let client = tha::backend::docker::connect(&request.connection)
+        .unwrap()
+        .negotiate_version()
+        .await
+        .unwrap();
+    let info = client.info().await.unwrap();
+    request.identity = tha::backend::docker::runtime_identity(&client, &request.connection, &info)
+        .await
+        .unwrap()
+        .unwrap();
+    request
+}
+
+#[tokio::test]
+async fn real_podman_metadata_with_random_ids_allows_all_container_lifecycle_actions() {
+    for action in [Action::Start, Action::Stop, Action::Restart, Action::Delete] {
+        let state = if matches!(action, Action::Start | Action::Delete) {
+            "exited"
+        } else {
+            "running"
+        };
+        let engine = Engine::start(vec![container("a", state)], "1.44");
+        let request = podman_request(&engine, action).await;
+        assert_eq!(execute(request).await, [Status::Succeeded]);
+        assert_eq!(engine.writes().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn changed_podman_ownership_and_replaced_socket_still_refuse_mutations() {
+    let engine = Engine::start(vec![container("a", "running")], "1.44");
+    let request = podman_request(&engine, Action::Stop).await;
+    engine
+        .state
+        .lock()
+        .unwrap()
+        .containers
+        .get_mut("a")
+        .unwrap()
+        .managed = true;
+    assert!(matches!(execute(request).await[0], Status::Failed(_)));
+    assert!(engine.writes().is_empty());
+
+    engine
+        .state
+        .lock()
+        .unwrap()
+        .containers
+        .get_mut("a")
+        .unwrap()
+        .managed = false;
+    let request = podman_request(&engine, Action::Stop).await;
+    let replacement = Engine::start(vec![container("a", "running")], "1.44");
+    replacement.state.lock().unwrap().podman_random_id = true;
+    let old_socket = engine.path.with_extension("old.sock");
+    std::fs::rename(&engine.path, &old_socket).unwrap();
+    std::fs::rename(&replacement.path, &engine.path).unwrap();
+    assert!(matches!(execute(request).await[0], Status::Failed(_)));
+    assert!(replacement.writes().is_empty());
+    std::fs::remove_file(old_socket).unwrap();
 }
 
 #[tokio::test]

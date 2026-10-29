@@ -30,6 +30,10 @@ impl MockEngine {
     }
 
     fn start_with_manifest(network_failure: bool, manifest: bool) -> Self {
+        Self::start_with_provider(network_failure, manifest, false)
+    }
+
+    fn start_with_provider(network_failure: bool, manifest: bool, podman: bool) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "tha-{}-{}.sock",
@@ -39,6 +43,7 @@ impl MockEngine {
         let listener = UnixListener::bind(&path).unwrap();
         let task = tokio::spawn(async move {
             let mut samples = 0u64;
+            let mut info_reads = 0u64;
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
@@ -59,6 +64,20 @@ impl MockEngine {
                     }
                 }
                 let request = String::from_utf8_lossy(&bytes);
+                if podman && (request.contains("/version ") || request.contains("/info ")) {
+                    let body = if request.contains("/version ") {
+                        serde_json::json!({"ApiVersion":"1.44", "Version":"6.1.4", "Components":[{"Name":"Podman Engine", "Version":"6.1.4"}]})
+                    } else {
+                        info_reads += 1;
+                        serde_json::json!({"ID":format!("random-{info_reads}"), "ServerVersion":"6.1.4"})
+                    }.to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    continue;
+                }
                 if manifest && request.contains("/containers/json") {
                     let body = serde_json::json!([{
                         "Id":"api123", "Names":["/shop-api-1"], "Image":"mutable:latest",
@@ -229,11 +248,32 @@ async fn docker_inventory_preserves_ownership_and_attachments() {
         Some(std::path::Path::new("/projects/shop"))
     );
     assert_eq!(snapshot.containers[0].ports, ["127.0.0.1:8080 → 3000/tcp"]);
+    assert_eq!(
+        snapshot.containers[0].port_bindings[0].overview(),
+        "localhost:8080 → 3000/tcp (loopback only · 127.0.0.1)"
+    );
     assert_eq!(snapshot.networks[0].containers, ["shop-api-1"]);
     assert_eq!(snapshot.volumes[0].containers, ["shop-api-1"]);
     assert!(!snapshot.networks[0].external);
     assert_eq!(snapshot.images.as_ref().unwrap()[0].tags, ["shop:latest"]);
     assert_eq!(snapshot.images.as_ref().unwrap()[0].size, Some(1024));
+}
+
+#[tokio::test]
+async fn podman_snapshots_have_stable_socket_identity_despite_random_info_ids() {
+    let engine = MockEngine::start_with_provider(false, false, true);
+    let first = backend::snapshot(&engine.connection()).await.unwrap();
+    let second = backend::snapshot(&engine.connection()).await.unwrap();
+    assert_eq!(first.engine_id, second.engine_id);
+    assert!(first.engine_id.as_deref().unwrap().starts_with("podman:"));
+    let other = MockEngine::start_with_provider(false, false, true);
+    assert_ne!(
+        first.engine_id,
+        backend::snapshot(&other.connection())
+            .await
+            .unwrap()
+            .engine_id
+    );
 }
 
 #[tokio::test]
@@ -560,6 +600,11 @@ async fn live_podman_inventory_platform_metrics_and_logs() {
     };
     let snapshot = backend::snapshot(&connection).await.unwrap();
     assert!(snapshot.warnings.is_empty(), "{:?}", snapshot.warnings);
+    let refreshed = backend::snapshot(&connection).await.unwrap();
+    assert_eq!(
+        snapshot.engine_id, refreshed.engine_id,
+        "Podman identity must survive inventory refresh"
+    );
     let compose = snapshot
         .containers
         .iter()
@@ -567,6 +612,29 @@ async fn live_podman_inventory_platform_metrics_and_logs() {
         .expect("Existing Compose fixture is required");
     assert_eq!(compose.project.as_deref(), Some("hello-podman"));
     assert_eq!(compose.service.as_deref(), Some("hello"));
+    // Exercise the real lifecycle safety path, without sending any mutation.
+    let request = tha::actions::Request::build(
+        0,
+        &connection,
+        snapshot.engine_id.as_deref(),
+        &tha::app::Scope::Container(compose.key()),
+        vec![compose.clone()],
+        tha::actions::Action::Stop,
+    )
+    .unwrap();
+    let client = backend::docker::connect(&connection)
+        .unwrap()
+        .negotiate_version()
+        .await
+        .unwrap();
+    backend::docker::preflight_action(&client, &request, compose)
+        .await
+        .unwrap();
+    assert!(
+        compose.port_bindings.iter().any(
+            |port| port.host_port == Some(8080) && port.host_ip.as_deref() == Some("127.0.0.1")
+        )
+    );
     assert!(snapshot.containers.iter().any(|container| container.name
         == "hello-podman-standalone"
         && container.project.is_none()));

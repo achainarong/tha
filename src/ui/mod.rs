@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, Choice, InputMode, ResourceKind, Scope, Tab},
+    app::{App, Choice, InputMode, PerformanceScope, ResourceKind, Scope, Tab},
     config::BackendKind,
     logs::view::{self as log_view, Field},
     metrics,
@@ -11,7 +11,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Cell, Clear, LineGauge, Paragraph, Row as TableRow, Scrollbar,
+        Block, Borders, Cell, Clear, Gauge, LineGauge, Paragraph, Row as TableRow, Scrollbar,
         ScrollbarOrientation, ScrollbarState, Sparkline, Table, Tabs, Wrap,
     },
 };
@@ -106,6 +106,7 @@ fn condition_style(app: &App, condition: Condition) -> Style {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.reconcile_detail_tab();
     app.action_review_visible = false;
     app.log_export_review_visible = false;
     let area = frame.area();
@@ -121,7 +122,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let layout = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
-        Constraint::Length(2),
+        Constraint::Length(footer_height(app)),
     ])
     .split(area);
     let connected = app
@@ -157,16 +158,36 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Paragraph::new(vec![header, Line::styled(breadcrumb, muted())]),
         layout[0],
     );
+    let expanded = app.performance_open && app.performance_expanded && layout[1].height >= 20;
+    let body = if expanded {
+        let parts = Layout::vertical([
+            Constraint::Min(8),
+            Constraint::Length((layout[1].height / 2).max(12)),
+        ])
+        .split(layout[1]);
+        draw_performance_panel(frame, app, parts[1]);
+        parts[0]
+    } else {
+        layout[1]
+    };
     if area.width >= 110 {
         let tree_width = (area.width / 2).clamp(52, 72);
-        let panes = Layout::horizontal([Constraint::Length(tree_width), Constraint::Min(1)])
-            .split(layout[1]);
-        draw_sidebar(frame, app, panes[0]);
+        let panes =
+            Layout::horizontal([Constraint::Length(tree_width), Constraint::Min(1)]).split(body);
+        if expanded {
+            draw_tree(frame, app, panes[0]);
+        } else {
+            draw_sidebar(frame, app, panes[0]);
+        }
         draw_details(frame, app, panes[1]);
     } else if app.detail_focus {
-        draw_details(frame, app, layout[1]);
+        draw_details(frame, app, body);
     } else {
-        draw_sidebar(frame, app, layout[1]);
+        if expanded {
+            draw_tree(frame, app, body);
+        } else {
+            draw_sidebar(frame, app, body);
+        }
     }
     draw_footer(frame, app, layout[2]);
     if app.help {
@@ -253,6 +274,10 @@ fn draw_log_editor(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
+    if app.action_confirmation.is_some() {
+        draw_action_confirmation(frame, app, area);
+        return;
+    }
     use crate::actions::{Action, Status};
     let dialog = centered(area, 100, area.height.saturating_sub(2).min(28));
     frame.render_widget(Clear, dialog);
@@ -260,18 +285,20 @@ fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new("Resize to at least 60 × 18 to review lifecycle targets.\nEsc cancels confirmation; running actions continue.").wrap(Wrap { trim: false }).block(Block::bordered().title(" Lifecycle ")), dialog);
         return;
     }
-    let (request, scroll, finished) = if let Some(confirmation) = &app.action_confirmation {
-        (&confirmation.request, confirmation.scroll, None)
-    } else if let Some(progress) = &app.action_progress {
-        (&progress.request, progress.scroll, Some(progress.finished))
-    } else {
+    let Some(progress) = app.action_progress() else {
         return;
     };
-    let title = match finished {
-        None => format!(" Confirm {} ", request.action.label()),
-        Some(false) => format!(" {} · Running ", request.action.label()),
-        Some(true) => format!(" {} · Results ", request.action.label()),
-    };
+    let request = &progress.request;
+    let scroll = progress.scroll;
+    let title = format!(
+        " {} · {} ",
+        request.action.label(),
+        if progress.finished {
+            "Results"
+        } else {
+            "Running"
+        }
+    );
     let block = Block::bordered()
         .title(title)
         .title_bottom(" ↑/↓ PgUp/PgDn Review targets ");
@@ -286,33 +313,71 @@ fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(format!("Runtime: {}", safe_text(&request.connection.name))),
-            Line::from(format!(
-                "{}: {} · {} target(s), {} skipped",
-                request.action.label(),
-                safe_text(&request.name),
-                request.containers.len(),
-                request.skipped
-            )),
+            Line::from(if request.runtime.is_some() {
+                format!("{} RUNTIME · ALL workloads", request.action.label())
+            } else {
+                format!(
+                    "{}: {} · {} target(s), {} skipped",
+                    request.action.label(),
+                    safe_text(&request.name),
+                    request.target_count(),
+                    request.skipped
+                )
+            }),
         ]),
         parts[0],
     );
     let mut lines = vec![
         Line::from(format!(
             "Endpoint: {}",
-            safe_text(&request.connection.endpoint)
+            if request.connection.endpoint.is_empty() {
+                "not currently available".into()
+            } else {
+                safe_text(&request.connection.endpoint)
+            }
         )),
-        Line::from(format!("Runtime ID: {}", safe_text(&request.identity))),
-        Line::styled(
+        Line::from(format!(
+            "{}: {}",
+            if request.runtime.is_some() {
+                "Provider target"
+            } else {
+                "Runtime ID"
+            },
+            safe_text(&request.identity)
+        )),
+    ];
+    if let Some(target) = &request.runtime {
+        lines.push(Line::styled(
+            "RUNTIME-WIDE: affects ALL workloads, including outside the focused project.",
+            accent(app, Color::Yellow),
+        ));
+        if let Ok(commands) = target.commands(request.action) {
+            for (program, args) in commands {
+                lines.push(Line::from(format!("Command: {program} {}", args.join(" "))));
+            }
+        }
+        lines.push(Line::from(
+            "Runtime configuration is retained; stopped runtimes remain (offline).",
+        ));
+        lines.push(Line::from(safe_text(
+            &progress.results[0]
+                .as_ref()
+                .map(Status::text)
+                .unwrap_or_else(|| "Pending / checking runtime".into()),
+        )));
+    } else {
+        lines.push(Line::styled(
             "Existing containers only; no Compose dependency orchestration.",
             muted(),
-        ),
-    ];
+        ));
+    }
     if request.action == Action::Delete {
         lines.push(Line::styled(
             "Container writable data is lost. Networks, ALL volumes and images stay.",
             accent(app, Color::Yellow),
         ));
-    } else if matches!(request.action, Action::Stop | Action::Restart) {
+    } else if request.runtime.is_none() && matches!(request.action, Action::Stop | Action::Restart)
+    {
         lines.push(Line::styled(
             "10s stop grace period, then runtime may kill the process.",
             accent(app, Color::Yellow),
@@ -328,15 +393,13 @@ fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
             format!("  ID: {}", safe_text(&container.id)),
             muted(),
         ));
-        if let Some(progress) = app.action_progress.as_ref().filter(|_| finished.is_some()) {
-            let (text, style) = match &progress.results[index] {
-                Some(Status::Succeeded) => ("Succeeded".into(), accent(app, Color::Green)),
-                Some(status @ Status::Failed(_)) => (status.text(), accent(app, Color::Red)),
-                Some(status) => (status.text(), accent(app, Color::Yellow)),
-                None => ("Pending / checking safety".into(), muted()),
-            };
-            lines.push(Line::styled(safe_text(&text), style));
-        }
+        let (text, style) = match &progress.results[index] {
+            Some(Status::Succeeded) => ("Succeeded".into(), accent(app, Color::Green)),
+            Some(status @ Status::Failed(_)) => (status.text(), accent(app, Color::Red)),
+            Some(status) => (status.text(), accent(app, Color::Yellow)),
+            None => ("Pending / checking safety".into(), muted()),
+        };
+        lines.push(Line::styled(safe_text(&text), style));
         lines.push(Line::from(""));
     }
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -345,51 +408,152 @@ fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
         .saturating_sub(parts[1].height as usize);
     let scroll = scroll.min(max_scroll).min(u16::MAX as usize);
     frame.render_widget(paragraph.scroll((scroll as u16, 0)), parts[1]);
-    let deleting = request.action == Action::Delete;
-    let confirmation_name = safe_text(&request.name);
-    let prompt = if let Some(confirmation) = &mut app.action_confirmation {
-        confirmation.scroll = scroll;
-        app.action_review_visible = true;
-        let hint = if deleting {
-            format!(
-                "Type {} then Enter to DELETE\n> {} · Esc Cancel",
-                confirmation_name,
-                safe_text(&confirmation.typed)
-            )
-        } else {
-            "y Confirm · n Cancel · Enter/Esc Cancel (default)".into()
-        };
-        format!(
-            "{hint}\n{}",
-            confirmation
-                .error
-                .as_deref()
-                .map(safe_text)
-                .unwrap_or_default()
-        )
+    let prompt = if progress.finished {
+        "Enter/Esc Close · Inventory refresh requested\nNo automatic retry or rollback; inspect unknown outcomes."
     } else {
-        let progress = app.action_progress.as_mut().unwrap();
-        progress.scroll = scroll;
-        if progress.finished {
-            "Enter/Esc Close · Inventory refresh requested\nNo automatic retry or rollback; inspect unknown outcomes.".into()
-        } else {
-            "Enter/Esc Close · Actions continue in the background.\nQuitting cannot undo a request already sent to the runtime.".into()
-        }
+        "Enter/Esc Close · Actions continue in the background.\nQuitting cannot undo a request already sent to the runtime."
     };
     frame.render_widget(Paragraph::new(prompt).wrap(Wrap { trim: false }), parts[2]);
+    app.action_progress_mut().unwrap().scroll = scroll;
+}
+
+fn draw_action_confirmation(frame: &mut Frame, app: &mut App, area: Rect) {
+    use crate::actions::Action;
+    if area.width < 44 || area.height < 10 {
+        let dialog = centered(area, 56, 5);
+        frame.render_widget(Clear, dialog);
+        frame.render_widget(
+            Paragraph::new("Resize to at least 44 × 10 to confirm.\nEsc Cancel")
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title(" Confirm action ")),
+            dialog,
+        );
+        return;
+    }
+    let confirmation = app.action_confirmation.as_ref().unwrap();
+    let request = &confirmation.request;
+    let runtime_name = Line::from(format!("Runtime: {}", safe_text(&request.connection.name)));
+    let mut lines = Vec::new();
+    if request.runtime.is_some() {
+        lines.push(Line::styled(
+            match request.action {
+                Action::Start => "Starts this runtime; workloads may auto-start.",
+                Action::Stop => "Stops this runtime and all workloads.",
+                _ => "Restarts this runtime and all workloads.",
+            },
+            accent(app, Color::Yellow),
+        ));
+        if matches!(request.runtime, Some(crate::runtime::Target::OrbStack)) {
+            lines.push(Line::from("Includes all OrbStack Linux machines."));
+        }
+        lines.push(runtime_name);
+    } else {
+        if request.action == Action::Delete {
+            lines.push(Line::styled(
+                "Writable data is lost; all volumes/images stay.",
+                accent(app, Color::Yellow),
+            ));
+        }
+        lines.push(runtime_name);
+        lines.push(Line::from(format!(
+            "{} target(s), {} skipped",
+            request.target_count(),
+            request.skipped
+        )));
+        for container in &request.containers {
+            lines.push(Line::from(format!("• {}", safe_text(&container.name))));
+        }
+    }
+    let title = format!(" {} {}? ", request.action.label(), safe_text(&request.name));
+    let hint = if request.action == Action::Delete {
+        format!(
+            "Type {} then Enter to DELETE\n> {} · Esc Cancel",
+            safe_text(&request.name),
+            safe_text(&confirmation.typed)
+        )
+    } else {
+        "y / Enter Confirm    n / Esc Cancel".into()
+    };
+    let mut prompt = hint;
+    if let Some(error) = &confirmation.error {
+        prompt.push_str(&format!("\n{}", safe_text(error)));
+    }
+    let width = area.width.saturating_sub(2).min(56);
+    let content_width = width.saturating_sub(4);
+    if UnicodeWidthStr::width(title.as_str()) > width.saturating_sub(2) as usize {
+        lines.push(Line::from(format!("Target: {}", safe_text(&request.name))));
+    }
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let footer = Paragraph::new(prompt).wrap(Wrap { trim: false });
+    let footer_height = footer.line_count(content_width).min(4) as u16;
+    let desired = (body.line_count(content_width).min(9) as u16)
+        .saturating_add(footer_height)
+        .saturating_add(3);
+    let dialog = centered(
+        area,
+        width,
+        desired.min(12).min(area.height.saturating_sub(2)),
+    );
+    let block = Block::bordered().title(ellipsize_line(
+        Line::from(title),
+        dialog.width.saturating_sub(2) as usize,
+    ));
+    let inner = block
+        .inner(dialog)
+        .inner(ratatui::layout::Margin::new(1, 0));
+    frame.render_widget(Clear, dialog);
+    frame.render_widget(block, dialog);
+    let parts = Layout::vertical([
+        Constraint::Min(2),
+        Constraint::Length(1),
+        Constraint::Length(footer_height),
+    ])
+    .split(inner);
+    let max_scroll = body
+        .line_count(parts[0].width)
+        .saturating_sub(parts[0].height as usize);
+    let scroll = confirmation.scroll.min(max_scroll).min(u16::MAX as usize);
+    frame.render_widget(body.scroll((scroll as u16, 0)), parts[0]);
+    if max_scroll > 0 {
+        frame.render_widget(
+            Paragraph::new("↑/↓ Review targets").style(muted()),
+            parts[1],
+        );
+    }
+    frame.render_widget(footer, parts[2]);
+    let confirmation = app.action_confirmation.as_mut().unwrap();
+    confirmation.scroll = scroll;
+    app.action_review_visible = parts[0].height >= 2 && parts[2].height == footer_height;
+}
+
+fn performance_height(app: &App, available: u16) -> u16 {
+    if app.performance_open && available >= 12 {
+        let count = if app.performance_scope == PerformanceScope::Container {
+            1
+        } else {
+            app.performance_engines().len().min(3) as u16
+        };
+        if count == 0 {
+            return 6;
+        }
+        (count + 13).max(6).min((available / 2).clamp(6, 18))
+    } else {
+        1
+    }
 }
 
 fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
-    let height = if app.performance_open && area.height >= 12 {
-        (area.height / 2).clamp(6, 18)
-    } else {
-        1
-    };
+    let height = performance_height(app, area.height);
     let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(height)]).split(area);
     draw_tree(frame, app, parts[0]);
     if height == 1 {
         frame.render_widget(
-            Paragraph::new(" ▸ Performance · All runtimes (p)").style(if app.performance_focus {
+            Paragraph::new(if app.performance_scope == PerformanceScope::Container {
+                " ▸ Performance · Selected container (p/P)"
+            } else {
+                " ▸ Performance · Connected runtimes (p/P)"
+            })
+            .style(if app.performance_focus {
                 selected()
             } else {
                 muted()
@@ -398,23 +562,109 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         );
         return;
     }
+    draw_performance_panel(frame, app, parts[1]);
+}
+
+fn draw_performance_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = pane(
-        " ▾ Performance · All runtimes · p ".into(),
+        if app.performance_scope == PerformanceScope::Container {
+            " ▾ Performance · Selected container · P Runtime ".into()
+        } else {
+            " ▾ Performance · Connected runtimes · P Container ".into()
+        },
         app.performance_focus,
     )
-    .title_bottom(" j/k Scroll · Tab Pane ");
-    let inner = padded(block.inner(parts[1]));
-    frame.render_widget(block, parts[1]);
-    app.performance_scroll = app
-        .performance_scroll
-        .min(app.engines.len().saturating_sub(1));
+    .title_bottom(" j/k Select · Enter Inspect · z Zoom · p Close ");
+    let inner = padded(block.inner(area));
+    frame.render_widget(block, area);
+    if app.performance_scope == PerformanceScope::Container {
+        if let Some((index, _)) = app.performance_container() {
+            draw_performance_history(frame, app, index, inner);
+        } else {
+            frame.render_widget(
+                Paragraph::new("Select a container in Explorer · P Runtime")
+                    .style(muted())
+                    .wrap(Wrap { trim: false }),
+                inner,
+            );
+        }
+        return;
+    }
+    let engines = app.performance_engines();
+    app.performance_scroll = app.performance_scroll.min(engines.len().saturating_sub(1));
+    if engines.is_empty() {
+        app.performance_offset = 0;
+        frame.render_widget(
+            Paragraph::new("No connected runtimes")
+                .style(muted())
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
+    if inner.height >= 9 && inner.width >= 26 {
+        let index = engines[app.performance_scroll];
+        let graph_height = inner
+            .height
+            .saturating_sub(engines.len().saturating_sub(1).min(2) as u16);
+        draw_performance_history(
+            frame,
+            app,
+            index,
+            Rect::new(inner.x, inner.y, inner.width, graph_height),
+        );
+        let others: Vec<_> = engines
+            .iter()
+            .copied()
+            .filter(|&other| other != index)
+            .collect();
+        let capacity = inner.height.saturating_sub(graph_height) as usize;
+        app.performance_offset = app.performance_scroll.saturating_sub(capacity);
+        for (offset, &other) in others
+            .iter()
+            .skip(
+                app.performance_offset
+                    .min(others.len().saturating_sub(capacity)),
+            )
+            .take(capacity)
+            .enumerate()
+        {
+            draw_usage(
+                frame,
+                app,
+                other,
+                Rect::new(
+                    inner.x,
+                    inner.y + graph_height + offset as u16,
+                    inner.width,
+                    1,
+                ),
+            );
+        }
+        return;
+    }
+    let item_height = if inner.height >= 4 { 4 } else { 1 };
+    let capacity = (inner.height / item_height).max(1) as usize;
+    app.performance_offset = app
+        .performance_offset
+        .min(engines.len().saturating_sub(capacity));
+    if app.performance_scroll < app.performance_offset {
+        app.performance_offset = app.performance_scroll;
+    } else if app.performance_scroll >= app.performance_offset + capacity {
+        app.performance_offset = app.performance_scroll + 1 - capacity;
+    }
     let mut y = inner.y;
-    for &index in app.context_order.iter().skip(app.performance_scroll) {
-        if y + 3 >= inner.bottom() {
+    for &index in engines.iter().skip(app.performance_offset).take(capacity) {
+        if y + item_height > inner.bottom() {
             break;
         }
-        draw_usage(frame, app, index, Rect::new(inner.x, y, inner.width, 4));
-        y += 4;
+        draw_usage(
+            frame,
+            app,
+            index,
+            Rect::new(inner.x, y, inner.width, item_height),
+        );
+        y += item_height;
     }
 }
 
@@ -478,12 +728,14 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
         inner.width
     };
     let height = inner.height.saturating_sub(u16::from(show_metrics)) as usize;
+    let now = std::time::Instant::now();
     if app.selected < app.tree_offset {
         app.tree_offset = app.selected;
     }
     if app.selected >= app.tree_offset + height {
         app.tree_offset = app.selected.saturating_sub(height.saturating_sub(1));
     }
+    app.prepare_row_presentations(app.tree_offset, height, now, show_metrics);
     let rows: Vec<_> = app
         .rows
         .iter()
@@ -500,7 +752,12 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 "  "
             };
-            let condition = app.condition_for(row);
+            let presentation = app.row_presentation(&row.key);
+            let condition = presentation.condition;
+            let feedback = app.row_action_feedback(row, now);
+            let feedback_style = feedback
+                .as_ref()
+                .map(|feedback| condition_style(app, Condition::new(feedback.tone, "")));
             let style = if i == app.selected {
                 selected()
             } else if row.running == Some(false)
@@ -511,7 +768,12 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default()
             };
             let mut name = vec![Span::raw(format!("{}{}", "  ".repeat(row.depth), arrow))];
-            if let Some(condition) = condition {
+            if let Some(feedback) = feedback.as_ref().filter(|feedback| feedback.active) {
+                name.push(Span::styled(
+                    format!("{} ", feedback.symbol),
+                    feedback_style.unwrap(),
+                ));
+            } else if let Some(condition) = condition {
                 name.push(Span::styled(
                     format!("{} ", condition.symbol()),
                     condition_style(app, condition).remove_modifier(Modifier::REVERSED),
@@ -530,20 +792,28 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                     condition_style(app, condition),
                 ));
             }
-            let mut cells = vec![Cell::from(ellipsize_line(
-                Line::from(name),
-                workload_width as usize,
-            ))];
-            if show_metrics {
-                let (cpu, memory) =
-                    if matches!(row.scope, Scope::Resource { .. } | Scope::Resources { .. }) {
-                        (String::new(), String::new())
-                    } else if app.engines[row.engine].alias.is_some() {
-                        ("↪".into(), "alias".into())
+            let width = workload_width as usize;
+            let label = if let Some(feedback) = feedback {
+                let suffix = Line::from(Span::styled(
+                    if feedback.active {
+                        format!(" · {}", feedback.label)
                     } else {
-                        let usage = app.metrics_for(row);
-                        (usage.cpu_label(), usage.memory_label())
-                    };
+                        format!(" · {} {}", feedback.symbol, feedback.label)
+                    },
+                    feedback_style.unwrap(),
+                ));
+                // Reserve room for the action even when the workload name is long.
+                let name_width = width.saturating_sub(suffix.width()).max(width.min(8));
+                let mut label = ellipsize_line(Line::from(name), name_width);
+                let suffix = ellipsize_line(suffix, width.saturating_sub(label.width()));
+                label.spans.extend(suffix.spans);
+                label
+            } else {
+                ellipsize_line(Line::from(name), width)
+            };
+            let mut cells = vec![Cell::from(label)];
+            if show_metrics {
+                let (cpu, memory) = (presentation.cpu.clone(), presentation.memory.clone());
                 cells.push(Cell::from(Line::from(cpu).alignment(Alignment::Right)));
                 cells.push(Cell::from(Line::from(memory).alignment(Alignment::Right)));
             }
@@ -616,13 +886,16 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Min(1),
     ])
     .split(inner);
-    let names = if inner.width >= 62 {
+    let mut names = if inner.width >= 62 {
         vec!["1 Overview", "2 Logs", "3 Networks", "4 Exec", "5 Layers"]
     } else if inner.width >= 44 {
         vec!["1 Info", "2 Logs", "3 Net", "4 Exec", "5 Layers"]
     } else {
         vec!["1", "2", "3", "4", "5"]
     };
+    if !app.layers_available() {
+        names.pop();
+    }
     let active = match app.tab {
         Tab::Overview => 0,
         Tab::Logs => 1,
@@ -895,7 +1168,249 @@ fn draw_exec(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn draw_performance_history(frame: &mut Frame, app: &App, index: usize, area: Rect) {
+    let engine = &app.engines[index];
+    let Some(snapshot) = &engine.snapshot else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let container = if app.performance_scope == PerformanceScope::Container {
+        app.performance_container().map(|(_, container)| container)
+    } else {
+        None
+    };
+    let containers = container
+        .as_ref()
+        .map(std::slice::from_ref)
+        .unwrap_or(&snapshot.containers);
+    let summary = if container.is_some() {
+        engine.metrics.summary(
+            containers,
+            now,
+            app.metrics_stale_after(),
+            engine.error.is_none() && engine.alias.is_none(),
+        )
+    } else {
+        app.engine_metrics(index)
+    };
+    let title = if let Some(container) = &container {
+        format!(
+            "Container · {} · {}",
+            safe_text(&container.name),
+            safe_text(&engine.connection.name)
+        )
+    } else {
+        safe_text(&engine.connection.name)
+    };
+    let capacity = if container.is_some() {
+        summary.memory_limit_bytes
+    } else {
+        snapshot.memory_capacity_bytes
+    }
+    .filter(|&limit| limit > 0);
+    let points = if container.is_some() {
+        engine.metrics.timed_history(containers)
+    } else {
+        engine.metrics.timed_history(
+            snapshot
+                .containers
+                .iter()
+                .filter(|container| container.running()),
+        )
+    };
+    let end = points.last().map(|point| point.sampled_at).unwrap_or(now);
+    let span = points
+        .first()
+        .map(|point| end.saturating_duration_since(point.sampled_at))
+        .unwrap_or_default()
+        .max(std::time::Duration::from_secs(
+            app.metrics_refresh_seconds
+                .max(1)
+                .saturating_mul((metrics::HISTORY_LENGTH - 1) as u64),
+        ));
+    let (cpu, memory) = history_columns(&points, area.width as usize, span);
+    if area.height < 8 {
+        let lines = vec![
+            Line::from(title),
+            Line::from(format!(
+                "CPU {} · RAM {}",
+                summary.cpu_label(),
+                summary.memory_label()
+            )),
+            Line::styled("z Zoom · more room for history", muted()),
+        ];
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+    let parts = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    frame.render_widget(
+        Paragraph::new(format!("{} · CPU {}", title, summary.cpu_label())).style(
+            if app.performance_focus {
+                selected()
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            },
+        ),
+        parts[0],
+    );
+    let cpu_max = cpu.iter().flatten().copied().max().unwrap_or(0).max(10_000);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "CPU {} · scale {:.0}%",
+            summary.cpu_label(),
+            cpu_max as f64 / 100.0
+        ))
+        .style(accent(app, Color::Cyan)),
+        parts[1],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Memory {}{}",
+            summary.memory_label(),
+            capacity
+                .map(|limit| format!(" / {}", metrics::bytes(limit)))
+                .unwrap_or_default()
+        ))
+        .style(accent(app, Color::Green)),
+        parts[3],
+    );
+    if let Some((used, limit)) = summary.memory_bytes.zip(capacity) {
+        frame.render_widget(
+            Gauge::default()
+                .ratio((used as f64 / limit as f64).clamp(0.0, 1.0))
+                .label(if container.is_some() {
+                    "Container usage / memory limit"
+                } else {
+                    "Container usage / runtime capacity"
+                })
+                .gauge_style(accent(app, Color::Green)),
+            parts[4],
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new("Capacity or live usage unavailable").style(muted()),
+            parts[4],
+        );
+    }
+    for (values, maximum, color, graph) in [
+        (&cpu, cpu_max, Color::Cyan, parts[2]),
+        (
+            &memory,
+            capacity
+                .unwrap_or(0)
+                .max(memory.iter().flatten().copied().max().unwrap_or(1))
+                .max(1),
+            Color::Green,
+            parts[5],
+        ),
+    ] {
+        frame.render_widget(
+            Sparkline::default()
+                .data(values)
+                .max(maximum)
+                .style(accent(app, color))
+                .absent_value_style(muted())
+                .absent_value_symbol("·"),
+            graph,
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(history_axis(area.width as usize, span)).style(muted()),
+        parts[6],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{} · {}s target · latest {}s ago · · gap{}",
+            if container.is_some() {
+                "Container"
+            } else {
+                "Container totals"
+            },
+            app.metrics_refresh_seconds,
+            now.saturating_duration_since(end).as_secs(),
+            if engine.error.is_some() {
+                " · offline"
+            } else {
+                ""
+            }
+        ))
+        .style(muted()),
+        parts[7],
+    );
+}
+
+/// Plot by elapsed time, not by frame index. Empty buckets stay gaps.
+fn history_columns(
+    points: &[metrics::TimedUsage],
+    width: usize,
+    span: std::time::Duration,
+) -> (Vec<Option<u64>>, Vec<Option<u64>>) {
+    let mut cpu = vec![None; width];
+    let mut memory = vec![None; width];
+    let Some(end) = points
+        .last()
+        .map(|point| point.sampled_at)
+        .filter(|_| width > 0)
+    else {
+        return (cpu, memory);
+    };
+    for point in points {
+        let age = end
+            .saturating_duration_since(point.sampled_at)
+            .as_secs_f64();
+        let position = ((1.0 - age / span.as_secs_f64().max(1.0)).clamp(0.0, 1.0)
+            * width.saturating_sub(1) as f64)
+            .round() as usize;
+        cpu[position] = point.cpu;
+        memory[position] = point.memory;
+    }
+    (cpu, memory)
+}
+
+fn history_axis(width: usize, span: std::time::Duration) -> String {
+    let mut cells = vec!['─'; width];
+    let seconds = span.as_secs();
+    let ticks = if width >= 48 { 4 } else { 2 };
+    for tick in 0..=ticks {
+        let label = if tick == ticks {
+            "latest".into()
+        } else {
+            format!("−{}s", seconds * (ticks - tick) / ticks)
+        };
+        let length = label.chars().count();
+        if length > width {
+            continue;
+        }
+        let start = (width.saturating_sub(1) * tick as usize / ticks as usize)
+            .saturating_sub(if tick == ticks {
+                length - 1
+            } else if tick == 0 {
+                0
+            } else {
+                length / 2
+            })
+            .min(width - length);
+        for (offset, ch) in label.chars().enumerate() {
+            cells[start + offset] = ch;
+        }
+    }
+    cells.into_iter().collect()
+}
+
 fn draw_usage(frame: &mut Frame, app: &App, index: usize, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let engine = &app.engines[index];
     let line = |offset| Rect::new(area.x, area.y + offset, area.width, 1);
     let condition = if engine.error.is_some() {
@@ -914,14 +1429,19 @@ fn draw_usage(frame: &mut Frame, app: &App, index: usize, area: Rect) {
             condition_style(app, condition),
         ),
         Span::raw(format!(
-            "{} · CPU {}",
+            "{} · CPU {}{}",
             safe_text(&engine.connection.name),
-            summary.cpu_label()
+            summary.cpu_label(),
+            if area.height < 4 {
+                format!(" · Mem {}", summary.memory_label())
+            } else {
+                String::new()
+            }
         )),
     ]);
     frame.render_widget(
         Paragraph::new(header).style(
-            if app.performance_focus && app.performance_scroll == index {
+            if app.performance_focus && app.performance_engine() == Some(index) {
                 selected()
             } else {
                 Style::default()
@@ -929,6 +1449,9 @@ fn draw_usage(frame: &mut Frame, app: &App, index: usize, area: Rect) {
         ),
         line(0),
     );
+    if area.height < 4 {
+        return;
+    }
     if let Some(alias) = &engine.alias {
         frame.render_widget(
             Paragraph::new(format!("Alias of {} · not counted twice", safe_text(alias)))
@@ -1047,6 +1570,24 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
             lines.push(Line::styled(
                 "Showing stale, last-known data below.",
                 accent(app, Color::Yellow),
+            ));
+        }
+        lines.push(Line::from(""));
+    }
+    if row.scope == Scope::Engine {
+        if let Some(target) = &engine.runtime {
+            lines.push(Line::from(format!(
+                "Runtime control: {}",
+                safe_text(&target.label())
+            )));
+            lines.push(Line::styled(
+                "S Start runtime · s Stop runtime · r Restart runtime (ALL workloads)",
+                muted(),
+            ));
+        } else {
+            lines.push(Line::styled(
+                "Runtime control unsupported; select a workload for container actions.",
+                muted(),
             ));
         }
         lines.push(Line::from(""));
@@ -1248,8 +1789,35 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
                     lines.push(Line::from(format!("  Service    {}", safe_text(service))));
                 }
             }
-            for port in &container.ports {
-                lines.push(Line::from(format!("  Port       {}", safe_text(port))));
+            if !container.port_bindings.is_empty() {
+                for port in &container.port_bindings {
+                    lines.push(Line::from(format!(
+                        "  Port       {}",
+                        safe_text(&port.overview())
+                    )));
+                }
+                lines.push(Line::styled(
+                    if engine.error.is_some() {
+                        "  Last-known bindings (offline); localhost reachability not verified."
+                    } else if !container.running() {
+                        "  Container is stopped; published ports are not active."
+                    } else {
+                        "  Reported bindings; localhost/VM forwarding reachability not verified."
+                    },
+                    muted(),
+                ));
+            } else if container.ports.is_empty() {
+                lines.push(Line::styled(
+                    "  Ports      No port mappings reported",
+                    muted(),
+                ));
+            } else {
+                for port in &container.ports {
+                    lines.push(Line::from(format!(
+                        "  Port       {} (reported)",
+                        safe_text(port)
+                    )));
+                }
             }
             for network in &container.networks {
                 lines.push(Line::from(format!("  Network    {}", safe_text(network))));
@@ -1631,16 +2199,16 @@ fn highlighted<'a>(
     Line::from(spans)
 }
 
+pub fn footer_height(app: &App) -> u16 {
+    if app.action_jobs.is_empty() { 2 } else { 3 }
+}
+
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let notice = match app.action_status() {
-        Some(status) if !app.notice.is_empty() => format!("{} · {status}", app.notice),
-        Some(status) => status,
-        None => app.notice.clone(),
-    };
-    let lines = if matches!(app.input_mode, InputMode::LogFilter | InputMode::ExportLogs) {
+    let notice = &app.notice;
+    let mut lines = if matches!(app.input_mode, InputMode::LogFilter | InputMode::ExportLogs) {
         vec![
             Line::styled("Log dialog · Enter Apply/Export · Esc Cancel", muted()),
-            Line::from(safe_text(&notice)),
+            Line::from(safe_text(notice)),
         ]
     } else if app.input_mode == InputMode::Search {
         vec![
@@ -1654,7 +2222,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         let hints = if app.exec_input && app.tab == Tab::Exec {
             "Ctrl-] Navigate · SHELL INPUT · Keys go to the selected container session"
         } else if app.performance_focus {
-            "Performance · ALL RUNTIMES · j/k Scroll  Enter Inspect  p Close  Tab Pane  ? Keys"
+            "Performance · P Scope  z Zoom  j/k Select  Enter Inspect  p Close  Tab Pane  ? Keys"
         } else if app.detail_focus && app.tab == Tab::Exec {
             "F6 Sessions · Enter Input · :close-exec Close slot · j/k Scroll · Tab Explorer · ? Keys"
         } else if app.detail_focus && app.tab == Tab::Logs {
@@ -1662,8 +2230,33 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             "? Keys  a Actions  p Performance  Space Toggle  Enter Open  e Exec  Tab Pane  1..5 Views  : Commands"
         };
-        vec![Line::styled(hints, muted()), Line::from(safe_text(&notice))]
+        vec![Line::styled(hints, muted()), Line::from(safe_text(notice))]
     };
+    if let Some(status) = app.action_status() {
+        let style = if app
+            .action_jobs
+            .values()
+            .flat_map(|job| job.results.iter().flatten())
+            .any(|status| matches!(status, crate::actions::Status::Unknown(_)))
+        {
+            accent(app, Color::Yellow)
+        } else if app
+            .action_jobs
+            .values()
+            .flat_map(|job| job.results.iter().flatten())
+            .any(|status| matches!(status, crate::actions::Status::Failed(_)))
+        {
+            accent(app, Color::Red)
+        } else if app.has_active_actions() {
+            accent(app, Color::Cyan)
+        } else {
+            muted()
+        };
+        lines.insert(
+            0,
+            Line::styled(safe_text(&format!("Activity · {status}")), style),
+        );
+    }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -1691,11 +2284,14 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         "Esc               Clear search, return to explorer, then go back\n",
         "q                 Back through panes/workspaces; quit from home\n",
         "Tab / Shift-Tab   Cycle Explorer / Performance (open) / Details\n",
-        "p                 Expand/collapse bottom-left Performance\n",
+        "p                 Open/close Performance (compact by default)\n",
+        "P (Shift-p)       Switch Runtime / Selected container; open Performance\n",
+        "z                 Zoom focused Performance to full-width bottom panel\n",
+        "Esc               Restore compact Performance before other navigation\n",
         "o                 Sort contexts (pins first; usage is a snapshot)\n",
         "S / s / r / d     Start / Stop / Restart / Delete in Explorer\n",
         "                  Container or Compose rows only; confirmation required\n",
-        "                  y confirms; Enter/Esc cancels; Delete: type name + Enter\n",
+        "                  y/Enter confirms; n/Esc cancels; Delete: type name + Enter\n",
         "                  Delete stopped containers only; keep networks/volumes/images\n",
         "1 / 2 / 3 / 4 / 5 Overview / Logs / Networks / Exec / Layers\n",
         "a                 Contextual actions with disabled reasons (Explorer)\n",
@@ -1825,6 +2421,18 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
         .take(inner.height as usize)
         .map(|(index, choice)| {
             let label = match choice {
+                Choice::ActionResult(operation) => app
+                    .action_jobs
+                    .get(operation)
+                    .map(|job| {
+                        format!(
+                            "{} · {} · {}",
+                            job.request.connection.name,
+                            job.request.action.label(),
+                            job.summary()
+                        )
+                    })
+                    .unwrap_or_else(|| "Result no longer available".into()),
                 Choice::Session(id) => app
                     .sessions
                     .iter()
@@ -1889,6 +2497,372 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_axis_uses_elapsed_time_and_keeps_missing_samples_absent() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let points = vec![
+            metrics::TimedUsage {
+                sampled_at: start,
+                cpu: Some(10),
+                memory: Some(100),
+            },
+            metrics::TimedUsage {
+                sampled_at: start + Duration::from_secs(2),
+                cpu: None,
+                memory: None,
+            },
+            metrics::TimedUsage {
+                sampled_at: start + Duration::from_secs(10),
+                cpu: Some(20),
+                memory: Some(200),
+            },
+        ];
+        let (cpu, memory) = history_columns(&points, 11, Duration::from_secs(10));
+        assert_eq!(cpu[0], Some(10));
+        assert_eq!(cpu[2], None);
+        assert_eq!(cpu[10], Some(20));
+        assert_eq!(memory[10], Some(200));
+        assert!(cpu[3..10].iter().all(Option::is_none));
+        let axis = history_axis(60, Duration::from_secs(120));
+        assert!(axis.starts_with("−120s"));
+        assert!(axis.contains("−60s"));
+        assert!(axis.ends_with("latest"));
+        assert_eq!(history_axis(2, Duration::from_secs(60)).chars().count(), 2);
+    }
+
+    #[test]
+    fn full_width_performance_and_container_empty_state_survive_resize() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.switch_performance_scope();
+        app.performance_expanded = true;
+        for (width, height) in [(140, 40), (60, 20), (32, 10), (140, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            if width == 140 {
+                let buffer = terminal.backend().buffer();
+                let header = (0..height)
+                    .find(|&y| {
+                        let row: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+                        row.contains("Performance · Selected container")
+                    })
+                    .unwrap();
+                assert_eq!(buffer[(width - 1, header)].symbol(), "┐");
+                let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                assert!(text.contains("Select a container"));
+            }
+        }
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, Scope::Container(_)))
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Container ·"));
+        assert!(text.contains("latest"));
+        assert!(text.contains("memory limit"));
+    }
+
+    #[test]
+    fn expanded_performance_has_multirow_graphs_and_idle_frames_are_stable() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(60, 13)).unwrap();
+        terminal
+            .draw(|frame| draw_performance_history(frame, &app, 1, frame.area()))
+            .unwrap();
+        let before = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..13)
+            .map(|y| (0..60).map(|x| before[(x, y)].symbol()).collect())
+            .collect();
+        assert!(rows.iter().any(|row| row.contains("Memory")));
+        assert!(rows.iter().any(|row| row.contains("runtime capacity")));
+        assert!(
+            rows.iter()
+                .filter(|row| row.chars().any(|ch| "▁▂▃▄▅▆▇█".contains(ch)))
+                .count()
+                >= 3
+        );
+        terminal
+            .draw(|frame| draw_performance_history(frame, &app, 1, frame.area()))
+            .unwrap();
+        assert_eq!(
+            &before,
+            terminal.backend().buffer(),
+            "Rendering alone must not animate fake samples"
+        );
+    }
+
+    #[test]
+    fn layers_tab_is_hidden_and_dismissed_for_non_workload_selections() {
+        let mut app = App::new(crate::demo::connections(), 100, false, true);
+        crate::demo::populate(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(140, 35)).unwrap();
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, Scope::Container(_)))
+            .unwrap();
+        assert!(app.layers_available());
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("5 Layers"));
+        let unsupported: Vec<_> = app
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| !matches!(row.scope, Scope::Container(_) | Scope::Service { .. }))
+            .map(|(index, _)| index)
+            .collect();
+        assert!(!unsupported.is_empty());
+        for index in unsupported {
+            app.selected = index;
+            app.tab = Tab::Layers;
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            assert_eq!(app.tab, Tab::Overview);
+            assert!(app.layers.key.is_none());
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(!text.contains("5 Layers"));
+        }
+    }
+
+    #[test]
+    fn performance_shrinks_to_fit_connected_runtimes() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.performance_open = true;
+        assert_eq!(performance_height(&app, 40), 16);
+        app.update_engine(0, Err("stopped".into()));
+        app.update_engine(2, Err("stopped".into()));
+        assert_eq!(performance_height(&app, 40), 14);
+        app.update_engine(1, Err("stopped".into()));
+        assert_eq!(performance_height(&app, 40), 6);
+        app.performance_open = false;
+        assert_eq!(performance_height(&app, 40), 1);
+    }
+
+    #[test]
+    fn activity_and_error_notices_have_separate_footer_rows() {
+        let mut app = App::new(
+            vec![crate::config::Connection {
+                name: "fixture".into(),
+                kind: BackendKind::Docker,
+                endpoint: "unix:///fixture.sock".into(),
+            }],
+            100,
+            true,
+            false,
+        );
+        app.engines[0].runtime = Some(crate::runtime::Target::Colima {
+            profile: "fixture".into(),
+        });
+        app.request_action(crate::actions::Action::Start);
+        app.action_review_visible = true;
+        app.confirm_action();
+        app.notice = "Permission denied: this notice must not compete with activity".into();
+        assert_eq!(footer_height(&app), 3);
+        let mut terminal = Terminal::new(TestBackend::new(100, 3)).unwrap();
+        terminal
+            .draw(|frame| draw_footer(frame, &app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let activity: String = (0..100).map(|x| buffer[(x, 0)].symbol()).collect();
+        let notice: String = (0..100).map(|x| buffer[(x, 2)].symbol()).collect();
+        assert!(activity.contains("Activity ·"));
+        assert!(activity.contains("Starting…"));
+        assert!(!activity.contains("Permission denied"));
+        assert!(notice.contains(&app.notice));
+        assert!(!notice.contains("Starting…"));
+    }
+
+    #[test]
+    fn pending_actions_stay_visible_on_long_explorer_labels_without_displacing_metrics() {
+        let mut app = App::new(
+            vec![crate::config::Connection {
+                name: "a-very-long-runtime-name-".repeat(5),
+                kind: BackendKind::Docker,
+                endpoint: "unix:///fixture.sock".into(),
+            }],
+            100,
+            true,
+            false,
+        );
+        app.engines[0].runtime = Some(crate::runtime::Target::Colima {
+            profile: "fixture".into(),
+        });
+        app.update_engine(0, Ok(crate::model::Snapshot::default()));
+        app.request_action(crate::actions::Action::Stop);
+        app.action_review_visible = true;
+        app.confirm_action();
+        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
+        terminal
+            .draw(|frame| draw_tree(frame, &mut app, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Stopping…"));
+        assert!(text.chars().any(|ch| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(ch)));
+        assert!(text.contains("0.0%"));
+        assert!(text.contains("0 B"));
+        assert!(!app.action_results_visible);
+        assert!(app.engines[0].error.is_none());
+    }
+
+    #[test]
+    fn container_overview_shows_host_ports_and_does_not_claim_reachability() {
+        let mut app = App::new(
+            vec![crate::config::Connection {
+                name: "fixture".into(),
+                kind: crate::config::BackendKind::Docker,
+                endpoint: "unix:///fixture.sock".into(),
+            }],
+            100,
+            false,
+            true,
+        );
+        app.update_engine(
+            0,
+            Ok(crate::model::Snapshot {
+                containers: vec![crate::model::Container {
+                    id: "fixture".into(),
+                    name: "api".into(),
+                    state: "running".into(),
+                    port_bindings: vec![
+                        crate::model::PortBinding {
+                            host_ip: Some("127.0.0.1".into()),
+                            host_port: Some(8080),
+                            container_port: 80,
+                            protocol: "tcp".into(),
+                        },
+                        crate::model::PortBinding {
+                            host_ip: Some("0.0.0.0".into()),
+                            host_port: Some(5353),
+                            container_port: 53,
+                            protocol: "udp".into(),
+                        },
+                        crate::model::PortBinding {
+                            host_ip: None,
+                            host_port: None,
+                            container_port: 443,
+                            protocol: "tcp".into(),
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        );
+        let text: String = overview_lines(&app)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(text.contains("localhost:8080 → 80/tcp (loopback only"));
+        assert!(text.contains("0.0.0.0:5353 → 53/udp (all interfaces"));
+        assert!(text.contains("443/tcp — exposed, no host port"));
+        assert!(text.contains("reachability not verified"));
+        app.update_engine(0, Err("fixture offline".into()));
+        let text: String = overview_lines(&app)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(text.contains("Last-known bindings (offline)"));
+    }
+
+    #[test]
+    fn runtime_confirmation_warns_about_all_workloads_and_returns_to_navigation() {
+        use crate::{actions::Action, runtime::Target};
+        let mut app = App::new(
+            vec![crate::config::Connection {
+                name: "fixture".into(),
+                kind: crate::config::BackendKind::Docker,
+                endpoint: "unix:///fixture.sock".into(),
+            }],
+            100,
+            false,
+            false,
+        );
+        app.engines[0].runtime = Some(Target::Colima {
+            profile: "fixture".into(),
+        });
+        app.update_engine(0, Ok(crate::model::Snapshot::default()));
+        app.request_action(Action::Stop);
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal
+            .draw(|frame| draw_action(frame, &mut app, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Stop Colima profile fixture?"));
+        assert!(text.contains("all workloads"));
+        assert!(text.contains("y / Enter Confirm    n / Esc Cancel"));
+        assert!(!text.contains("colima --profile fixture stop"));
+        assert!(!text.contains("Endpoint:"));
+        assert!(!text.contains("Existing containers only"));
+        let occupied: Vec<_> = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| !cell.symbol().trim().is_empty())
+            .map(|(index, _)| (index % 120, index / 120))
+            .collect();
+        assert!(
+            occupied.iter().map(|(x, _)| x).max().unwrap()
+                - occupied.iter().map(|(x, _)| x).min().unwrap()
+                < 56
+        );
+        assert!(
+            occupied.iter().map(|(_, y)| y).max().unwrap()
+                - occupied.iter().map(|(_, y)| y).min().unwrap()
+                < 10
+        );
+        app.confirm_action();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!app.action_results_visible);
+        app.action_results_visible = true;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Pending / checking runtime"));
+    }
     use ratatui::{Terminal, backend::TestBackend};
 
     fn render(width: u16, height: u16, detail: bool) -> String {
@@ -2027,7 +3001,7 @@ mod tests {
         let mut app = App::new(crate::demo::connections(), 100, true, true);
         crate::demo::populate(&mut app);
         app.help = true;
-        app.help_scroll = 14;
+        app.help_scroll = 17;
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let text: String = terminal
@@ -2040,6 +3014,96 @@ mod tests {
         assert!(text.contains("Cheatsheet"));
         assert!(text.contains("Toggle wrapping on/off immediately"));
         assert!(text.contains("Scroll"));
+    }
+
+    #[test]
+    fn performance_hides_offline_and_alias_contexts_and_recovers_from_stale_scroll() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.update_engine(0, Err("stopped".into()));
+        app.engines[2].alias = Some("Colima / development".into());
+        app.performance_open = true;
+        app.performance_focus = true;
+        app.performance_scroll = usize::MAX;
+        app.performance_offset = usize::MAX;
+        let mut terminal = Terminal::new(TestBackend::new(90, 35)).unwrap();
+        terminal
+            .draw(|frame| draw_sidebar(frame, &mut app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let performance_start = 35 - performance_height(&app, 35);
+        let text: String = (performance_start..35)
+            .flat_map(|y| (0..90).map(move |x| buffer[(x, y)].symbol()))
+            .collect();
+        assert!(text.contains("Performance · Connected runtimes"));
+        assert!(text.contains("Colima / development · CPU 59.0%"));
+        assert!(!text.contains("OrbStack"));
+        assert!(!text.contains("containerd"));
+        assert!(!text.contains("Unavailable"));
+        assert_eq!(app.performance_scroll, 0);
+        assert_eq!(app.performance_offset, 0);
+        let header_y = (performance_start..35)
+            .find(|&y| {
+                let line: String = (0..90).map(|x| buffer[(x, y)].symbol()).collect();
+                line.contains("Colima / development · CPU")
+            })
+            .unwrap();
+        assert!((0..90).any(|x| buffer[(x, header_y)].modifier.contains(Modifier::REVERSED)));
+
+        app.update_engine(1, Err("stopped".into()));
+        app.update_engine(2, Err("stopped".into()));
+        terminal
+            .draw(|frame| draw_sidebar(frame, &mut app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let performance_start = 35 - performance_height(&app, 35);
+        let text: String = (performance_start..35)
+            .flat_map(|y| (0..90).map(move |x| buffer[(x, y)].symbol()))
+            .collect();
+        assert!(text.contains("No connected runtimes"));
+        assert!(app.rows.iter().any(|row| row.title.contains("(offline)")));
+    }
+
+    #[test]
+    fn performance_viewport_keeps_the_last_selection_visible_without_blank_tail_space() {
+        let mut app = App::new(
+            (0..5)
+                .map(|index| crate::config::Connection {
+                    name: format!("Runtime{index}"),
+                    kind: BackendKind::Docker,
+                    endpoint: format!("unix:///runtime{index}.sock"),
+                })
+                .collect(),
+            100,
+            true,
+            true,
+        );
+        for index in 0..5 {
+            app.update_engine(
+                index,
+                Ok(crate::model::Snapshot {
+                    engine_id: Some(format!("engine{index}")),
+                    ..Default::default()
+                }),
+            );
+        }
+        app.performance_open = true;
+        app.performance_scroll = 4;
+        let mut terminal = Terminal::new(TestBackend::new(90, 35)).unwrap();
+        terminal
+            .draw(|frame| draw_sidebar(frame, &mut app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let performance_start = 35 - performance_height(&app, 35);
+        let text: String = (performance_start..35)
+            .flat_map(|y| (0..90).map(move |x| buffer[(x, y)].symbol()))
+            .collect();
+        for name in ["Runtime2", "Runtime3", "Runtime4"] {
+            assert!(text.contains(name));
+        }
+        assert!(!text.contains("Runtime0"));
+        assert!(!text.contains("Runtime1"));
+        assert_eq!(app.performance_offset, 2);
     }
 
     #[test]
@@ -2089,7 +3153,7 @@ mod tests {
         assert!(!text.contains("Colima / development"));
         app.performance_open = true;
         app.performance_scroll = app
-            .context_order
+            .performance_engines()
             .iter()
             .position(|&index| index == 1)
             .unwrap();
@@ -2210,7 +3274,7 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
-        assert!(text.contains("Colima [unavailable]"));
+        assert!(text.contains("Colima (offline)"));
         assert!(text.contains("Connection unavailable"));
         assert!(text.contains(diagnostic));
         assert!(buffer.content.iter().any(|cell| cell.fg == Color::Yellow));
@@ -2375,17 +3439,16 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         for expected in [
-            "Confirm Stop",
+            "Stop shop?",
             "Runtime: OrbStack",
             "3 target(s)",
             "shop-api-1",
-            "ID: api-1",
-            "y Confirm",
-            "Enter/Esc Cancel",
+            "y / Enter Confirm",
+            "n / Esc Cancel",
         ] {
             assert!(text.contains(expected), "{expected}");
         }
-        let mut tiny = Terminal::new(TestBackend::new(50, 15)).unwrap();
+        let mut tiny = Terminal::new(TestBackend::new(35, 8)).unwrap();
         tiny.draw(|frame| draw(frame, &mut app)).unwrap();
         assert!(!app.action_review_visible);
         app.confirm_action();
@@ -2393,8 +3456,8 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         app.confirm_action();
         assert!(app.action_request.is_some());
-        app.action_progress.as_mut().unwrap().finished = true;
-        app.action_progress.as_mut().unwrap().results[0] =
+        app.action_progress_mut().unwrap().finished = true;
+        app.action_progress_mut().unwrap().results[0] =
             Some(crate::actions::Status::Unknown("lost response".into()));
         app.action_results_visible = true;
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -2435,6 +3498,11 @@ mod tests {
         assert!(text.contains("Start · disabled"));
         assert!(text.contains("Demo mode"));
         app.picker = None;
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, Scope::Container(_)))
+            .unwrap();
         app.tab = Tab::Layers;
         app.detail_focus = true;
         app.layers.state = crate::layers::State::Ready(crate::layers::Image {

@@ -104,7 +104,7 @@ def main():
             expect("3.0 KiB")
             update(running=False)
             keys(b":refresh\r")
-            expect("[unavailable]")
+            expect("(offline)")
             expect("machine is stopped")
             old_samples = servers[0].samples
             update(socket="two.sock")

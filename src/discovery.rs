@@ -40,7 +40,17 @@ pub fn discover(
             ),
         ];
         for (name, path) in candidates {
-            add_socket(&mut found, name, BackendKind::Docker, &path);
+            if (name == "OrbStack" && home.join(".orbstack").is_dir())
+                || (name == "Docker Desktop" && home.join(".docker/desktop").is_dir())
+            {
+                found.push(Connection {
+                    name: name.into(),
+                    kind: BackendKind::Docker,
+                    endpoint: format!("unix://{}", path.display()),
+                });
+            } else {
+                add_socket(&mut found, name, BackendKind::Docker, &path);
+            }
         }
         let mut profiles: Vec<_> = std::fs::read_dir(home.join(".colima"))
             .into_iter()

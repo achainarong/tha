@@ -36,6 +36,7 @@ impl Action {
 
 #[derive(Debug, Clone)]
 pub struct Request {
+    pub operation: u64,
     pub engine: usize,
     pub connection: Connection,
     pub identity: String,
@@ -43,6 +44,9 @@ pub struct Request {
     pub name: String,
     pub containers: Vec<Container>,
     pub skipped: usize,
+    pub runtime: Option<crate::runtime::Target>,
+    pub owner: Option<crate::runtime::Target>,
+    pub owner_endpoint: String,
 }
 
 impl Request {
@@ -57,11 +61,13 @@ impl Request {
         if connection.kind != BackendKind::Docker {
             bail!("Lifecycle actions support Docker and Podman API connections only");
         }
+        if *scope == Scope::Engine {
+            bail!(
+                "Runtime rows control the runtime itself; runtime control is unsupported for this endpoint"
+            );
+        }
         if action == Action::Delete
-            && matches!(
-                scope,
-                Scope::Engine | Scope::Services { .. } | Scope::Standalone(_)
-            )
+            && matches!(scope, Scope::Services { .. } | Scope::Standalone(_))
         {
             bail!(
                 "Delete is disabled on runtime and grouping rows; select a container, Compose service, or Compose project"
@@ -74,14 +80,13 @@ impl Request {
                 .unwrap_or_default(),
             Scope::Project { project, .. } => project.clone(),
             Scope::Service { service, .. } => service.clone(),
-            Scope::Engine => format!("{} / workloads", connection.name),
             Scope::Services {
                 namespace: None,
                 project,
             } => format!("{project} / Services"),
             Scope::Standalone(None) => "Standalone containers".into(),
             _ => bail!(
-                "Select a container, Compose workload, Services group, Standalone group, or connected runtime; namespace and resource actions are disabled"
+                "Select a container, Compose workload, Services group, or Standalone group; namespace and resource actions are disabled"
             ),
         };
         let Some(identity) = identity.filter(|identity| !identity.is_empty()) else {
@@ -129,6 +134,7 @@ impl Request {
         }
         let skipped = total - containers.len();
         Ok(Self {
+            operation: 0,
             engine,
             connection: connection.clone(),
             identity: identity.into(),
@@ -136,7 +142,55 @@ impl Request {
             name,
             containers,
             skipped,
+            runtime: None,
+            owner: None,
+            owner_endpoint: crate::discovery::endpoint_key(connection),
         })
+    }
+
+    pub fn runtime(
+        engine: usize,
+        connection: &Connection,
+        target: crate::runtime::Target,
+        action: Action,
+    ) -> Result<Self> {
+        target.validate()?;
+        target.commands(action)?;
+        Ok(Self {
+            operation: 0,
+            engine,
+            connection: connection.clone(),
+            identity: target.label(),
+            action,
+            name: target.label(),
+            containers: Vec::new(),
+            skipped: 0,
+            runtime: Some(target.clone()),
+            owner: Some(target),
+            owner_endpoint: crate::discovery::endpoint_key(connection),
+        })
+    }
+
+    /// Connections and aliases to the same runtime share one mutation lock.
+    pub fn conflicts(&self, other: &Self) -> bool {
+        self.engine == other.engine
+            || self
+                .owner
+                .as_ref()
+                .zip(other.owner.as_ref())
+                .is_some_and(|(a, b)| a == b)
+            || (!self.connection.endpoint.is_empty()
+                && !other.connection.endpoint.is_empty()
+                && self.owner_endpoint == other.owner_endpoint)
+            || (!self.identity.is_empty() && self.identity == other.identity)
+    }
+
+    pub fn target_count(&self) -> usize {
+        if self.runtime.is_some() {
+            1
+        } else {
+            self.containers.len()
+        }
     }
 
     pub fn validate_container(&self, expected: &Container, current: &Container) -> Result<()> {
@@ -191,13 +245,63 @@ pub struct Progress {
     pub finished: bool,
     pub scroll: usize,
 }
+impl Progress {
+    pub fn summary(&self) -> String {
+        if !self.finished {
+            return format!(
+                "{}/{} completed",
+                self.results.iter().flatten().count(),
+                self.results.len()
+            );
+        }
+        let count = |predicate: fn(&Status) -> bool| {
+            self.results
+                .iter()
+                .flatten()
+                .filter(|status| predicate(status))
+                .count()
+        };
+        format!(
+            "finished · {} succeeded, {} failed, {} unknown, {} skipped",
+            count(|status| matches!(status, Status::Succeeded)),
+            count(|status| matches!(status, Status::Failed(_))),
+            count(|status| matches!(status, Status::Unknown(_))),
+            count(|status| matches!(status, Status::Skipped(_)))
+        )
+    }
+}
 pub enum Event {
     Result { index: usize, status: Status },
     Finished,
 }
 
+pub struct Update {
+    pub operation: u64,
+    pub event: Event,
+}
+
+/// Tag every worker event so concurrent operations cannot overwrite each other.
+/// Both futures are owned by this task, so cancellation never detaches a worker.
+pub async fn run_tracked(request: Request, tx: mpsc::Sender<Update>) {
+    let operation = request.operation;
+    let (events, mut rx) = mpsc::channel(16);
+    tokio::join!(run(request, events), async move {
+        while let Some(event) = rx.recv().await {
+            if tx.send(Update { operation, event }).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
 /// Sequential, bounded operations; never retry a mutation or roll back a partial result.
 pub async fn run(request: Request, tx: mpsc::Sender<Event>) {
+    if let Some(target) = &request.runtime {
+        let status = target.run(request.action).await;
+        let _ = tx.send(Event::Result { index: 0, status }).await;
+        let _ = tx.send(Event::Finished).await;
+        return;
+    }
     let client = tokio::time::timeout(Duration::from_secs(5), async {
         crate::backend::docker::connect(&request.connection)?
             .with_timeout(Duration::from_secs(25))
@@ -349,7 +453,6 @@ mod tests {
     #[test]
     fn workload_parents_allow_lifecycle_but_never_delete() {
         for (scope, label) in [
-            (Scope::Engine, "Podman / fixture / workloads"),
             (
                 Scope::Services {
                     namespace: None,
@@ -390,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn broad_runtime_operations_fail_closed_when_any_member_is_managed() {
+    fn broad_group_operations_fail_closed_when_any_member_is_managed() {
         for scoped in [false, true] {
             let mut protected = container("exited");
             if scoped {
@@ -403,7 +506,10 @@ mod tests {
                     0,
                     &connection(),
                     Some("engine"),
-                    &Scope::Engine,
+                    &Scope::Services {
+                        namespace: None,
+                        project: "fixture".into()
+                    },
                     vec![container("running"), protected],
                     Action::Stop
                 )

@@ -11,6 +11,7 @@ use std::path::PathBuf;
 #[derive(Debug)]
 pub struct Engine {
     pub connection: Connection,
+    pub runtime: Option<crate::runtime::Target>,
     pub snapshot: Option<Snapshot>,
     pub error: Option<String>,
     pub alias: Option<String>,
@@ -118,6 +119,7 @@ struct NavigationState {
 }
 
 pub enum Choice {
+    ActionResult(u64),
     Session(u64),
     Action {
         action: crate::actions::Action,
@@ -137,7 +139,74 @@ pub struct Picker {
     pub selected: usize,
 }
 
+/// UI-only timing/selection metadata; never changes observed workload state.
+struct ActionFeedback {
+    started_at: std::time::Instant,
+    finished_at: Option<std::time::Instant>,
+    row_key: Option<String>,
+    result_at: Vec<Option<std::time::Instant>>,
+}
+
+pub struct RowActionFeedback {
+    pub symbol: &'static str,
+    pub label: String,
+    pub tone: Tone,
+    pub active: bool,
+}
+
+pub struct RowPresentation {
+    pub condition: Option<Condition>,
+    pub cpu: String,
+    pub memory: String,
+    metrics_ready: bool,
+}
+
+#[derive(PartialEq, Eq)]
+struct PresentationContext {
+    project: Option<Project>,
+    demo: bool,
+    stale_after: std::time::Duration,
+    availability: Vec<(bool, bool, bool)>,
+}
+
+#[derive(Default)]
+struct PresentationCache {
+    rows: BTreeMap<String, RowPresentation>,
+    context: Option<PresentationContext>,
+    expires_at: Option<std::time::Instant>,
+    #[cfg(test)]
+    builds: usize,
+}
+
+impl ActionFeedback {
+    fn active(&self, action: crate::actions::Action, now: std::time::Instant) -> RowActionFeedback {
+        use crate::actions::Action;
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let elapsed = now.saturating_duration_since(self.started_at);
+        let verb = match action {
+            Action::Start => "Starting",
+            Action::Stop => "Stopping",
+            Action::Restart => "Restarting",
+            Action::Delete => "Deleting",
+        };
+        RowActionFeedback {
+            symbol: FRAMES[((elapsed.as_millis() / 100) % FRAMES.len() as u128) as usize],
+            label: format!("{verb}… {}s", elapsed.as_secs()),
+            tone: Tone::Warning,
+            active: true,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PerformanceScope {
+    #[default]
+    Runtime,
+    Container,
+}
+
 pub struct App {
+    presentations: PresentationCache,
     pub engines: Vec<Engine>,
     pub context_order: Vec<usize>,
     pub context_pins: Vec<String>,
@@ -154,8 +223,12 @@ pub struct App {
     pub tree_offset: usize,
     pub detail_focus: bool,
     pub performance_open: bool,
+    pub performance_scope: PerformanceScope,
+    pub performance_expanded: bool,
     pub performance_focus: bool,
+    /// Selected position in the connected, non-alias performance list.
     pub performance_scroll: usize,
+    pub performance_offset: usize,
     pub detail_scroll: usize,
     pub log_view: LogView,
     pub log_filter_text: String,
@@ -189,7 +262,11 @@ pub struct App {
     pub layers: crate::layers::View,
     pub action_confirmation: Option<crate::actions::Confirmation>,
     pub action_request: Option<crate::actions::Request>,
-    pub action_progress: Option<crate::actions::Progress>,
+    pub action_jobs: BTreeMap<u64, crate::actions::Progress>,
+    action_feedback: BTreeMap<u64, ActionFeedback>,
+    action_confirmation_row: Option<String>,
+    pub action_selected: Option<u64>,
+    next_action_id: u64,
     pub action_results_visible: bool,
     pub action_review_visible: bool,
     startup_cwd: Option<PathBuf>,
@@ -206,6 +283,7 @@ impl App {
     ) -> Self {
         let context_order = (0..connections.len()).collect();
         let mut app = Self {
+            presentations: Default::default(),
             context_order,
             context_pins: Vec::new(),
             context_sort: Default::default(),
@@ -217,6 +295,12 @@ impl App {
             engines: connections
                 .into_iter()
                 .map(|connection| Engine {
+                    runtime: std::env::var_os("HOME").and_then(|home| {
+                        crate::runtime::Target::from_connection(
+                            &connection,
+                            std::path::Path::new(&home),
+                        )
+                    }),
                     connection,
                     snapshot: None,
                     error: None,
@@ -231,8 +315,11 @@ impl App {
             tree_offset: 0,
             detail_focus: false,
             performance_open: false,
+            performance_scope: PerformanceScope::Runtime,
+            performance_expanded: false,
             performance_focus: false,
             performance_scroll: 0,
+            performance_offset: 0,
             detail_scroll: 0,
             log_view: LogView::new(true),
             log_filter_text: "{}".into(),
@@ -266,7 +353,11 @@ impl App {
             layers: Default::default(),
             action_confirmation: None,
             action_request: None,
-            action_progress: None,
+            action_jobs: BTreeMap::new(),
+            action_feedback: BTreeMap::new(),
+            action_confirmation_row: None,
+            action_selected: None,
+            next_action_id: 0,
             action_results_visible: false,
             action_review_visible: false,
             startup_cwd: None,
@@ -281,6 +372,8 @@ impl App {
     }
 
     pub fn update_engine(&mut self, index: usize, result: Result<Snapshot, String>) {
+        self.invalidate_presentations();
+        let performance_engine = self.performance_engine();
         match result {
             Ok(snapshot) => {
                 let previous_identity = self.engines[index]
@@ -327,6 +420,7 @@ impl App {
             });
         }
         self.refresh_tree();
+        self.restore_performance_focus(performance_engine);
         self.startup_pending.remove(&index);
         self.complete_startup();
     }
@@ -365,10 +459,15 @@ impl App {
         &mut self,
         discovery: &crate::discovery::podman::Discovery,
     ) -> Vec<(usize, bool)> {
+        self.invalidate_presentations();
+        let performance_engine = self.performance_engine();
         for machine in &discovery.machines {
             if !self.podman_machines.contains_key(&machine.name) {
                 let index = self.engines.len();
                 self.engines.push(Engine {
+                    runtime: Some(crate::runtime::Target::Podman {
+                        machine: machine.name.clone(),
+                    }),
                     connection: Connection {
                         name: format!("Podman / {}", machine.name),
                         kind: crate::config::BackendKind::Docker,
@@ -391,9 +490,6 @@ impl App {
                     .iter()
                     .position(|&engine| pin_rank(index) < pin_rank(engine))
                     .unwrap_or(self.context_order.len());
-                if !self.context_order.is_empty() && position <= self.performance_scroll {
-                    self.performance_scroll += 1;
-                }
                 self.context_order.insert(position, index);
                 self.expanded.insert(format!("{index}/{:?}", Scope::Engine));
                 self.podman_machines.insert(machine.name.clone(), index);
@@ -423,6 +519,18 @@ impl App {
                             engine.error =
                                 Some("Podman socket changed; refreshing inventory".into());
                         }
+                        // A Docker context may be the primary row for this same socket.
+                        // Give it the verified machine target too, without trusting its name.
+                        let key = crate::discovery::endpoint_key(&self.engines[index].connection);
+                        for engine in &mut self.engines {
+                            if engine.runtime.is_none()
+                                && crate::discovery::endpoint_key(&engine.connection) == key
+                            {
+                                engine.runtime = Some(crate::runtime::Target::Podman {
+                                    machine: name.clone(),
+                                });
+                            }
+                        }
                         availability.push((index, true));
                         None
                     }
@@ -439,6 +547,7 @@ impl App {
             }
         }
         self.refresh_tree();
+        self.restore_performance_focus(performance_engine);
         self.startup_discovery_pending = false;
         self.complete_startup();
         availability
@@ -453,20 +562,13 @@ impl App {
     }
 
     pub fn request_action(&mut self, action: crate::actions::Action) {
-        if self
-            .action_progress
-            .as_ref()
-            .is_some_and(|progress| !progress.finished)
-            || self.action_request.is_some()
-            || self.action_confirmation.is_some()
-        {
-            self.notice =
-                "A lifecycle action is already active; :action-results shows progress".into();
+        if self.action_confirmation.is_some() {
             return;
         }
         let request = self.plan_action(action);
         match request {
             Ok(request) => {
+                self.action_confirmation_row = self.current().map(|row| row.key.clone());
                 self.action_review_visible = false;
                 self.action_confirmation = Some(crate::actions::Confirmation {
                     request,
@@ -483,14 +585,6 @@ impl App {
         &self,
         action: crate::actions::Action,
     ) -> anyhow::Result<crate::actions::Request> {
-        if self
-            .action_progress
-            .as_ref()
-            .is_some_and(|progress| !progress.finished)
-            || self.action_request.is_some()
-        {
-            anyhow::bail!("A lifecycle action is already active; :action-results shows progress");
-        }
         if self.demo {
             anyhow::bail!("Demo mode: lifecycle mutations are disabled");
         }
@@ -498,12 +592,27 @@ impl App {
             .current()
             .ok_or_else(|| anyhow::anyhow!("Select a container or Compose workload"))?;
         let engine = &self.engines[row.engine];
+        if row.scope == Scope::Engine {
+            if engine.alias.is_some() {
+                anyhow::bail!("Select the primary runtime, not an alias");
+            }
+            let target = engine.runtime.clone().ok_or_else(|| anyhow::anyhow!("Runtime control unsupported for this endpoint; select a workload for container actions"))?;
+            if action != crate::actions::Action::Start
+                && (engine.error.is_some() || engine.snapshot.is_none())
+            {
+                anyhow::bail!("Runtime is offline; use Start to bring it online");
+            }
+            let request =
+                crate::actions::Request::runtime(row.engine, &engine.connection, target, action)?;
+            self.check_action_conflicts(&request)?;
+            return Ok(request);
+        }
         if engine.error.is_some() || engine.alias.is_some() {
             anyhow::bail!(
                 "Connection unavailable or aliased; select its connected primary context"
             );
         }
-        crate::actions::Request::build(
+        let mut request = crate::actions::Request::build(
             row.engine,
             &engine.connection,
             engine
@@ -513,7 +622,31 @@ impl App {
             &row.scope,
             self.selected_containers(),
             action,
-        )
+        )?;
+        request.owner = engine.runtime.clone();
+        self.check_action_conflicts(&request)?;
+        Ok(request)
+    }
+
+    fn check_action_conflicts(&self, request: &crate::actions::Request) -> anyhow::Result<()> {
+        if self.action_jobs.values().any(|job| {
+            let current_owners_match = self
+                .engines
+                .get(job.request.engine)
+                .and_then(|engine| engine.runtime.as_ref())
+                .zip(
+                    self.engines
+                        .get(request.engine)
+                        .and_then(|engine| engine.runtime.as_ref()),
+                )
+                .is_some_and(|(a, b)| a == b);
+            !job.finished && (job.request.conflicts(request) || current_owners_match)
+        }) {
+            anyhow::bail!(
+                "An action is already active on this runtime; other runtimes remain available. :action-results shows progress"
+            );
+        }
+        Ok(())
     }
 
     pub fn action_availability(
@@ -525,7 +658,7 @@ impl App {
             return Err("Selection changed; reopen Actions".into());
         }
         self.plan_action(action)
-            .map(|request| request.containers.len())
+            .map(|request| request.target_count())
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -555,6 +688,22 @@ impl App {
         if self.tab != Tab::Layers {
             return None;
         }
+        self.available_layers_target()
+    }
+
+    pub fn layers_available(&self) -> bool {
+        self.available_layers_target().is_some()
+    }
+
+    pub fn reconcile_detail_tab(&mut self) {
+        if self.tab == Tab::Layers && !self.layers_available() {
+            self.tab = Tab::Overview;
+            self.detail_scroll = 0;
+            self.layers.select(None);
+        }
+    }
+
+    fn available_layers_target(&self) -> Option<(crate::layers::Key, Connection, Container)> {
         let row = self.current()?;
         if !matches!(row.scope, Scope::Container(_) | Scope::Service { .. }) {
             return None;
@@ -582,8 +731,9 @@ impl App {
     pub fn confirm_action(&mut self) {
         if !self.action_review_visible {
             if let Some(confirmation) = &mut self.action_confirmation {
-                confirmation.error =
-                    Some("Review targets in a terminal at least 60 × 18 before confirming".into());
+                confirmation.error = Some(
+                    "Resize the terminal to review this confirmation before confirming".into(),
+                );
             }
             return;
         }
@@ -597,17 +747,28 @@ impl App {
             self.action_confirmation = Some(confirmation);
             return;
         }
-        let request = confirmation.request;
+        let mut request = confirmation.request;
         let validation = (|| {
+            self.check_action_conflicts(&request)?;
             let engine = self
                 .engines
                 .get(request.engine)
                 .ok_or_else(|| anyhow::anyhow!("Runtime no longer exists"))?;
-            if self.demo
-                || engine.error.is_some()
-                || engine.alias.is_some()
-                || engine.connection != request.connection
-            {
+            if self.demo || engine.alias.is_some() || engine.connection != request.connection {
+                anyhow::bail!("Connection changed or is unavailable; select and confirm again");
+            }
+            if let Some(target) = &request.runtime {
+                if engine.runtime.as_ref() != Some(target) {
+                    anyhow::bail!("Runtime provider changed; select and confirm again");
+                }
+                if request.action != crate::actions::Action::Start
+                    && (engine.error.is_some() || engine.snapshot.is_none())
+                {
+                    anyhow::bail!("Runtime is offline; use Start instead");
+                }
+                return Ok(());
+            }
+            if engine.error.is_some() {
                 anyhow::bail!("Connection changed or is unavailable; select and confirm again");
             }
             let snapshot = engine
@@ -633,44 +794,271 @@ impl App {
             self.notice = format!("{error:#}");
             return;
         }
-        self.action_progress = Some(crate::actions::Progress {
-            results: vec![None; request.containers.len()],
-            request: request.clone(),
-            finished: false,
-            scroll: 0,
-        });
+        let Some(operation) = self.next_action_id.checked_add(1) else {
+            self.notice = "Operation IDs exhausted; restart Tha before another action".into();
+            return;
+        };
+        self.next_action_id = operation;
+        request.operation = operation;
+        // Keep the last confirmed result for each runtime; never evict active work.
+        self.action_jobs
+            .retain(|_, job| !job.finished || !job.request.conflicts(&request));
+        self.action_feedback
+            .retain(|id, _| self.action_jobs.contains_key(id));
+        self.action_feedback.insert(
+            operation,
+            ActionFeedback {
+                started_at: std::time::Instant::now(),
+                finished_at: None,
+                row_key: self.action_confirmation_row.take(),
+                result_at: vec![None; request.target_count()],
+            },
+        );
+        self.action_selected = Some(operation);
+        self.action_jobs.insert(
+            operation,
+            crate::actions::Progress {
+                results: vec![None; request.target_count()],
+                request: request.clone(),
+                finished: false,
+                scroll: 0,
+            },
+        );
         self.action_results_visible = false;
         self.notice.clear();
         self.action_request = Some(request);
     }
 
     pub fn action_status(&self) -> Option<String> {
-        use crate::actions::Status;
-        let progress = self.action_progress.as_ref()?;
-        let completed = progress.results.iter().flatten().count();
-        let count = |predicate: fn(&Status) -> bool| {
-            progress
-                .results
-                .iter()
-                .flatten()
-                .filter(|status| predicate(status))
-                .count()
-        };
-        let summary = if progress.finished {
-            format!(
-                "finished · {} succeeded, {} failed, {} unknown, {} skipped",
-                count(|status| matches!(status, Status::Succeeded)),
-                count(|status| matches!(status, Status::Failed(_))),
-                count(|status| matches!(status, Status::Unknown(_))),
-                count(|status| matches!(status, Status::Skipped(_))),
-            )
+        let now = std::time::Instant::now();
+        let active: Vec<_> = self
+            .action_jobs
+            .values()
+            .filter(|job| !job.finished)
+            .collect();
+        let (failed, unknown) = self
+            .action_jobs
+            .values()
+            .flat_map(|job| job.results.iter().flatten())
+            .fold((0, 0), |(failed, unknown), status| {
+                (
+                    failed + usize::from(matches!(status, crate::actions::Status::Failed(_))),
+                    unknown + usize::from(matches!(status, crate::actions::Status::Unknown(_))),
+                )
+            });
+        let issues = if failed + unknown > 0 {
+            format!(" · {failed} failed, {unknown} unknown")
         } else {
-            format!("{completed}/{} completed", progress.results.len())
+            String::new()
         };
+        if self.action_jobs.len() > 1 && !active.is_empty() {
+            let summary = active
+                .iter()
+                .take(2)
+                .map(|job| {
+                    format!(
+                        "{}: {} {}",
+                        job.request.connection.name,
+                        self.active_action_label(job, now),
+                        job.summary()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            return Some(format!(
+                "{} running{issues} · {summary} · :action-results",
+                active.len()
+            ));
+        }
+        if self.action_jobs.len() > 1 {
+            return Some(format!(
+                "{} runtimes finished{issues} · :action-results",
+                self.action_jobs.len()
+            ));
+        }
+        let progress = self.action_progress()?;
+        if !progress.finished {
+            return Some(format!(
+                "{} · {} · :action-results",
+                self.active_action_label(progress, now),
+                progress.summary()
+            ));
+        }
         Some(format!(
-            "{} · {summary} · :action-results",
-            progress.request.action.label()
+            "{} · {} · :action-results",
+            progress.request.action.label(),
+            progress.summary()
         ))
+    }
+
+    pub fn has_active_actions(&self) -> bool {
+        self.action_jobs.values().any(|job| !job.finished)
+    }
+
+    fn active_action_label(
+        &self,
+        job: &crate::actions::Progress,
+        now: std::time::Instant,
+    ) -> String {
+        self.action_feedback
+            .get(&job.request.operation)
+            .map(|feedback| {
+                let active = feedback.active(job.request.action, now);
+                format!("{} {}", active.symbol, active.label)
+            })
+            .unwrap_or_else(|| job.request.action.label().into())
+    }
+
+    pub fn row_action_feedback(
+        &self,
+        row: &Row,
+        now: std::time::Instant,
+    ) -> Option<RowActionFeedback> {
+        use crate::actions::Status;
+        for (&id, job) in self.action_jobs.iter().rev() {
+            let Some(feedback) = self.action_feedback.get(&id) else {
+                continue;
+            };
+            let same_runtime = job.request.engine == row.engine;
+            let container_index = if same_runtime && job.request.runtime.is_none() {
+                if let Scope::Container(key) = &row.scope {
+                    job.request
+                        .containers
+                        .iter()
+                        .position(|container| container.key() == *key)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let selected_row =
+                same_runtime && feedback.row_key.as_deref() == Some(row.key.as_str());
+            let runtime_row =
+                same_runtime && job.request.runtime.is_some() && row.scope == Scope::Engine;
+            if !selected_row && !runtime_row && container_index.is_none() {
+                continue;
+            }
+            let (result, completed_at) = if let Some(index) = container_index {
+                (job.results[index].as_ref(), feedback.result_at[index])
+            } else if job.finished {
+                let result = job
+                    .results
+                    .iter()
+                    .flatten()
+                    .find(|status| matches!(status, Status::Unknown(_)))
+                    .or_else(|| {
+                        job.results
+                            .iter()
+                            .flatten()
+                            .find(|status| matches!(status, Status::Failed(_)))
+                    })
+                    .or_else(|| {
+                        job.results
+                            .iter()
+                            .flatten()
+                            .find(|status| matches!(status, Status::Skipped(_)))
+                    })
+                    .or_else(|| job.results.iter().flatten().next());
+                (result, feedback.finished_at)
+            } else {
+                (None, None)
+            };
+            let Some(result) = result else {
+                return (!job.finished).then(|| feedback.active(job.request.action, now));
+            };
+            let (symbol, label, tone) = match result {
+                Status::Succeeded => {
+                    if completed_at.is_none_or(|at| {
+                        now.saturating_duration_since(at) >= std::time::Duration::from_secs(5)
+                    }) {
+                        return None;
+                    }
+                    let label = if job.request.runtime.is_some() {
+                        "command completed"
+                    } else {
+                        "completed"
+                    };
+                    (
+                        "✓",
+                        format!("{} {label}", job.request.action.label()),
+                        Tone::Good,
+                    )
+                }
+                Status::Failed(_) => (
+                    "×",
+                    format!("{} failed", job.request.action.label()),
+                    Tone::Error,
+                ),
+                Status::Unknown(_) => ("?", "Outcome unknown".into(), Tone::Warning),
+                Status::Skipped(_) => ("–", "Not attempted".into(), Tone::Warning),
+            };
+            return Some(RowActionFeedback {
+                symbol,
+                label,
+                tone,
+                active: false,
+            });
+        }
+        None
+    }
+
+    pub fn action_progress(&self) -> Option<&crate::actions::Progress> {
+        self.action_jobs.get(&self.action_selected?)
+    }
+
+    pub fn action_progress_mut(&mut self) -> Option<&mut crate::actions::Progress> {
+        self.action_jobs.get_mut(&self.action_selected?)
+    }
+
+    pub fn apply_action_update(&mut self, update: crate::actions::Update) -> bool {
+        let Some(progress) = self.action_jobs.get_mut(&update.operation) else {
+            return false;
+        };
+        if progress.finished {
+            return false;
+        }
+        match update.event {
+            crate::actions::Event::Result { index, status } => {
+                let Some(result) = progress.results.get_mut(index) else {
+                    return false;
+                };
+                *result = Some(status);
+                if let Some(feedback) = self.action_feedback.get_mut(&update.operation) {
+                    feedback.result_at[index] = Some(std::time::Instant::now());
+                }
+            }
+            crate::actions::Event::Finished => {
+                progress.finished = true;
+                if let Some(feedback) = self.action_feedback.get_mut(&update.operation) {
+                    feedback.finished_at = Some(std::time::Instant::now());
+                }
+            }
+        }
+        true
+    }
+
+    pub fn open_action_results(&mut self) {
+        match self.action_jobs.len() {
+            0 => self.notice = "No lifecycle action results yet".into(),
+            1 => {
+                self.action_selected = self.action_jobs.keys().next().copied();
+                self.action_results_visible = true;
+            }
+            _ => {
+                self.picker = Some(Picker {
+                    title: "Action results · Choose a runtime".into(),
+                    choices: self
+                        .action_jobs
+                        .keys()
+                        .rev()
+                        .copied()
+                        .map(Choice::ActionResult)
+                        .collect(),
+                    selected: 0,
+                })
+            }
+        }
     }
 
     pub fn apply_metrics(&mut self, event: crate::metrics::Event) {
@@ -684,9 +1072,14 @@ impl App {
         if let Some(snapshot) = &engine.snapshot {
             engine.metrics.apply(&snapshot.containers, event.batch);
         }
+        self.invalidate_presentations();
     }
 
     pub fn metrics_for(&self, row: &Row) -> crate::metrics::Summary {
+        self.metrics_for_at(row, std::time::Instant::now())
+    }
+
+    fn metrics_for_at(&self, row: &Row, now: std::time::Instant) -> crate::metrics::Summary {
         let engine = &self.engines[row.engine];
         let Some(snapshot) = &engine.snapshot else {
             return Default::default();
@@ -700,7 +1093,7 @@ impl App {
                         .as_ref()
                         .is_none_or(|project| project.contains(c))
             }),
-            std::time::Instant::now(),
+            now,
             self.metrics_stale_after(),
             available,
         );
@@ -718,6 +1111,135 @@ impl App {
             return std::time::Duration::MAX;
         }
         std::time::Duration::from_secs(self.metrics_refresh_seconds.saturating_mul(3).max(3))
+    }
+
+    fn invalidate_presentations(&mut self) {
+        self.presentations.rows.clear();
+        self.presentations.context = None;
+        self.presentations.expires_at = None;
+    }
+
+    fn next_metrics_expiry(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        let stale_after = self.metrics_stale_after();
+        self.engines
+            .iter()
+            .flat_map(|engine| engine.metrics.samples.values())
+            .filter_map(|sample| {
+                // Summary considers the boundary itself fresh; redraw just after it.
+                sample
+                    .sampled_at
+                    .checked_add(stale_after)?
+                    .checked_add(std::time::Duration::from_nanos(1))
+            })
+            .filter(|&at| at > now)
+            .min()
+    }
+
+    pub fn prepare_row_presentations(
+        &mut self,
+        start: usize,
+        count: usize,
+        now: std::time::Instant,
+        include_metrics: bool,
+    ) {
+        let context = PresentationContext {
+            project: self.project.clone(),
+            demo: self.demo,
+            stale_after: self.metrics_stale_after(),
+            availability: self
+                .engines
+                .iter()
+                .map(|engine| {
+                    (
+                        engine.snapshot.is_some(),
+                        engine.error.is_some(),
+                        engine.alias.is_some(),
+                    )
+                })
+                .collect(),
+        };
+        if self.presentations.context.as_ref() != Some(&context)
+            || self.presentations.expires_at.is_some_and(|at| now >= at)
+        {
+            self.presentations.rows.clear();
+            self.presentations.context = Some(context);
+            self.presentations.expires_at = self.next_metrics_expiry(now);
+        }
+        for index in start..start.saturating_add(count).min(self.rows.len()) {
+            let row = &self.rows[index];
+            if self
+                .presentations
+                .rows
+                .get(&row.key)
+                .is_some_and(|value| !include_metrics || value.metrics_ready)
+            {
+                continue;
+            }
+            let condition = self.condition_for(row);
+            let (cpu, memory) = if !include_metrics
+                || matches!(row.scope, Scope::Resource { .. } | Scope::Resources { .. })
+            {
+                (String::new(), String::new())
+            } else if self.engines[row.engine].alias.is_some() {
+                ("↪".into(), "alias".into())
+            } else {
+                let usage = self.metrics_for_at(row, now);
+                (usage.cpu_label(), usage.memory_label())
+            };
+            self.presentations.rows.insert(
+                row.key.clone(),
+                RowPresentation {
+                    condition,
+                    cpu,
+                    memory,
+                    metrics_ready: include_metrics,
+                },
+            );
+            #[cfg(test)]
+            {
+                self.presentations.builds += 1;
+            }
+        }
+    }
+
+    pub fn row_presentation(&self, key: &str) -> &RowPresentation {
+        &self.presentations.rows[key]
+    }
+
+    /// Only time-dependent visuals schedule an otherwise unchanged frame.
+    pub fn next_visual_deadline(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        let mut deadline = self.next_metrics_expiry(now);
+        let mut consider = |at: Option<std::time::Instant>| {
+            if let Some(at) = at {
+                deadline = Some(deadline.map_or(at, |old| old.min(at)));
+            }
+        };
+        if self.has_active_actions() {
+            consider(now.checked_add(std::time::Duration::from_millis(100)));
+        }
+        for feedback in self.action_feedback.values() {
+            for at in feedback
+                .finished_at
+                .iter()
+                .chain(feedback.result_at.iter().flatten())
+            {
+                consider(
+                    at.checked_add(std::time::Duration::from_secs(5))
+                        .filter(|&at| at > now),
+                );
+            }
+        }
+        // Keep visible sample-age diagnostics accurate without redrawing all idle views.
+        if !self.demo
+            && (self.tab == Tab::Overview || self.performance_open)
+            && self.engines.iter().any(|engine| {
+                !engine.metrics.samples.is_empty()
+                    || self.performance_open && engine.metrics.has_history()
+            })
+        {
+            consider(now.checked_add(std::time::Duration::from_secs(1)));
+        }
+        deadline
     }
 
     pub fn engine_metrics(&self, index: usize) -> crate::metrics::Summary {
@@ -795,10 +1317,67 @@ impl App {
         Some((key, engine.connection.clone(), container))
     }
 
+    /// One ordering/filter shared by rendering, movement, Enter, and focus restoration.
+    pub fn performance_engines(&self) -> Vec<usize> {
+        self.context_order
+            .iter()
+            .copied()
+            .filter(|&index| {
+                let engine = &self.engines[index];
+                engine.snapshot.is_some() && engine.error.is_none() && engine.alias.is_none()
+            })
+            .collect()
+    }
+
+    pub fn performance_engine(&self) -> Option<usize> {
+        let engines = self.performance_engines();
+        engines
+            .get(self.performance_scroll.min(engines.len().saturating_sub(1)))
+            .copied()
+    }
+
+    /// Only actual container rows are eligible, never an implicit group member.
+    pub fn performance_container(&self) -> Option<(usize, Container)> {
+        let row = self.current()?;
+        let Scope::Container(key) = &row.scope else {
+            return None;
+        };
+        let engine = &self.engines[row.engine];
+        if engine.alias.is_some() {
+            return None;
+        }
+        let container = engine
+            .snapshot
+            .as_ref()?
+            .containers
+            .iter()
+            .find(|container| container.key() == *key)?
+            .clone();
+        Some((row.engine, container))
+    }
+
+    pub fn switch_performance_scope(&mut self) {
+        self.performance_scope = match self.performance_scope {
+            PerformanceScope::Runtime => PerformanceScope::Container,
+            PerformanceScope::Container => PerformanceScope::Runtime,
+        };
+        self.performance_open = true;
+        self.performance_focus = true;
+        self.detail_focus = false;
+    }
+
+    fn restore_performance_focus(&mut self, engine: Option<usize>) {
+        let engines = self.performance_engines();
+        self.performance_scroll = engine
+            .and_then(|index| engines.iter().position(|&candidate| candidate == index))
+            .unwrap_or(self.performance_scroll.min(engines.len().saturating_sub(1)));
+    }
+
     pub fn toggle_performance(&mut self) {
         self.performance_open = !self.performance_open;
         if !self.performance_open {
             self.performance_focus = false;
+            self.performance_expanded = false;
         }
     }
 
@@ -1029,6 +1608,41 @@ impl App {
         preferences: crate::preferences::Preferences,
         restore_navigation: bool,
     ) {
+        // Only validated provider/name metadata is retained; no endpoints or commands.
+        if let Some(home) = std::env::var_os("HOME") {
+            for saved in &preferences.runtimes {
+                if saved.target.validate().is_err()
+                    || self
+                        .engines
+                        .iter()
+                        .any(|engine| engine.runtime.as_ref() == Some(&saved.target))
+                {
+                    continue;
+                }
+                let index = self.engines.len();
+                self.engines.push(Engine {
+                    connection: Connection {
+                        name: saved.name.clone(),
+                        kind: crate::config::BackendKind::Docker,
+                        endpoint: saved.target.endpoint(std::path::Path::new(&home)),
+                    },
+                    runtime: Some(saved.target.clone()),
+                    snapshot: None,
+                    error: Some("Offline · waiting for runtime discovery".into()),
+                    alias: None,
+                    metrics: Default::default(),
+                    metrics_revision: 0,
+                });
+                if let crate::runtime::Target::Podman { machine } = &saved.target {
+                    self.podman_machines.insert(machine.clone(), index);
+                }
+                self.context_order.push(index);
+                self.expanded.insert(format!("{index}/{:?}", Scope::Engine));
+                if self.startup_cwd.is_some() {
+                    self.startup_pending.insert(index);
+                }
+            }
+        }
         self.performance_open = preferences.performance_open;
         self.log_view.wrap = preferences.log_wrap;
         self.context_sort = preferences.context_sort;
@@ -1071,6 +1685,17 @@ impl App {
         expanded.truncate(1024);
         crate::preferences::Preferences {
             version: 1,
+            runtimes: self
+                .engines
+                .iter()
+                .filter_map(|engine| {
+                    engine.runtime.clone().map(|target| crate::runtime::Saved {
+                        name: engine.connection.name.clone(),
+                        target,
+                    })
+                })
+                .take(128)
+                .collect(),
             performance_open: self.performance_open,
             log_wrap: self.log_view.wrap,
             context_sort: self.context_sort,
@@ -1270,6 +1895,12 @@ impl App {
             return;
         }
         match picker.choices.remove(picker.selected) {
+            Choice::ActionResult(operation) => {
+                if self.action_jobs.contains_key(&operation) {
+                    self.action_selected = Some(operation);
+                    self.action_results_visible = true;
+                }
+            }
             Choice::Session(id) => {
                 if self.sessions.select(id) {
                     self.tab = Tab::Exec;
@@ -1323,7 +1954,7 @@ impl App {
     }
 
     fn reorder_contexts(&mut self) {
-        let focused_engine = self.context_order.get(self.performance_scroll).copied();
+        let focused_engine = self.performance_engine();
         let contexts: Vec<_> = self
             .engines
             .iter()
@@ -1346,13 +1977,7 @@ impl App {
             .collect();
         self.context_order =
             crate::context_sort::order(&contexts, &self.context_pins, self.context_sort);
-        if let Some(index) = focused_engine {
-            self.performance_scroll = self
-                .context_order
-                .iter()
-                .position(|&engine| engine == index)
-                .unwrap_or(0);
-        }
+        self.restore_performance_focus(focused_engine);
     }
 }
 
@@ -1430,7 +2055,7 @@ fn engine_tree(index: usize, engine: &Engine) -> Node {
     let status = if engine.alias.is_some() {
         " [alias]"
     } else if engine.error.is_some() {
-        " [unavailable]"
+        " (offline)"
     } else if engine.snapshot.is_some() {
         ""
     } else {
@@ -1658,6 +2283,692 @@ mod tests {
     use crate::config::BackendKind;
 
     #[test]
+    fn container_performance_tracks_only_the_current_container_and_keeps_zoom_transient() {
+        let mut app = app();
+        assert_eq!(app.performance_scope, PerformanceScope::Runtime);
+        assert!(!app.performance_expanded);
+        app.switch_performance_scope();
+        assert!(app.performance_open && app.performance_focus);
+        assert!(app.performance_container().is_none());
+        app.tree_query = "api-1".into();
+        app.refresh_tree();
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, Scope::Container(_)))
+            .unwrap();
+        let (index, container) = app.performance_container().unwrap();
+        assert_eq!(container.key(), app.selected_containers()[0].key());
+        app.engines[index].error = Some("offline".into());
+        assert!(
+            app.performance_container().is_some(),
+            "Offline history remains inspectable"
+        );
+        app.selected = 0;
+        assert!(
+            app.performance_container().is_none(),
+            "Never fall back to the previous container"
+        );
+        app.performance_expanded = true;
+        app.toggle_performance();
+        assert!(!app.performance_open && !app.performance_expanded);
+        app.toggle_performance();
+        assert!(!app.performance_expanded);
+    }
+
+    #[test]
+    fn narrow_row_cache_defers_metrics_until_columns_become_visible() {
+        let mut app = app();
+        let now = std::time::Instant::now();
+        let key = app.rows[0].key.clone();
+        app.prepare_row_presentations(0, 1, now, false);
+        assert!(app.row_presentation(&key).cpu.is_empty());
+        let builds = app.presentations.builds;
+        app.prepare_row_presentations(0, 1, now, true);
+        assert_eq!(app.row_presentation(&key).cpu, "0.0%");
+        assert_eq!(app.presentations.builds, builds + 1);
+        app.prepare_row_presentations(0, 1, now, false);
+        assert_eq!(app.presentations.builds, builds + 1);
+    }
+
+    #[test]
+    fn row_presentations_reuse_work_and_expire_without_new_metric_events() {
+        use crate::metrics::{Event, Reading, Usage};
+        use std::time::{Duration, Instant};
+        let mut app = app();
+        app.demo = false;
+        app.tab = Tab::Logs; // No Overview age clock; test the freshness deadline itself.
+        app.engines[0].snapshot.as_mut().unwrap().containers[0].state = "running".into();
+        let now = Instant::now();
+        let reading = |value, at| Reading {
+            usage: Usage {
+                cpu_percent: Some(value),
+                memory_bytes: Some(1024),
+                ..Default::default()
+            },
+            counters: None,
+            sampled_at: at,
+        };
+        app.apply_metrics(Event {
+            engine: 0,
+            revision: 0,
+            batch: [("/one".into(), Ok(reading(50.0, now)))].into(),
+        });
+        app.prepare_row_presentations(0, 1, now, true);
+        let key = app.rows[0].key.clone();
+        let builds = app.presentations.builds;
+        assert_eq!(app.row_presentation(&key).cpu, "50.0%");
+        for _ in 0..50 {
+            app.prepare_row_presentations(0, 1, now + Duration::from_secs(1), true);
+        }
+        assert_eq!(
+            app.presentations.builds, builds,
+            "Unchanged frames must not rescan workloads"
+        );
+        assert_eq!(
+            app.next_visual_deadline(now),
+            Some(now + Duration::from_secs(3) + Duration::from_nanos(1))
+        );
+        app.prepare_row_presentations(0, 1, now + Duration::from_secs(4), true);
+        assert_eq!(app.row_presentation(&key).cpu, "stale");
+        assert_eq!(app.presentations.builds, builds + 1);
+        app.apply_metrics(Event {
+            engine: 0,
+            revision: 0,
+            batch: [(
+                "/one".into(),
+                Ok(reading(25.0, now + Duration::from_secs(4))),
+            )]
+            .into(),
+        });
+        app.prepare_row_presentations(0, 1, now + Duration::from_secs(4), true);
+        assert_eq!(app.row_presentation(&key).cpu, "25.0%");
+        app.update_engine(0, Err("offline".into()));
+        app.prepare_row_presentations(0, 1, now + Duration::from_secs(4), true);
+        assert_eq!(
+            app.row_presentation(&key).condition.unwrap().label,
+            "unavailable"
+        );
+        assert_ne!(app.row_presentation(&key).cpu, "25.0%");
+    }
+
+    #[test]
+    fn row_cache_invalidates_for_workspace_changes_and_is_lazy_on_large_inventories() {
+        use crate::metrics::{Event, Reading, Usage};
+        use std::time::Instant;
+        let mut app = app();
+        let now = Instant::now();
+        let containers: Vec<_> = (0..1000)
+            .map(|index| Container {
+                id: format!("member-{index}"),
+                name: format!("member-{index}"),
+                state: "running".into(),
+                project: Some(if index == 0 { "alpha" } else { "beta" }.into()),
+                ..Default::default()
+            })
+            .collect();
+        app.update_engine(
+            0,
+            Ok(Snapshot {
+                containers,
+                ..Default::default()
+            }),
+        );
+        let reading = |cpu| Reading {
+            usage: Usage {
+                cpu_percent: Some(cpu),
+                ..Default::default()
+            },
+            counters: None,
+            sampled_at: now,
+        };
+        app.apply_metrics(Event {
+            engine: 0,
+            revision: 0,
+            batch: [
+                ("/member-0".into(), Ok(reading(10.0))),
+                ("/member-1".into(), Ok(reading(20.0))),
+            ]
+            .into(),
+        });
+        app.prepare_row_presentations(0, 1, now, true);
+        let key = app.rows[0].key.clone();
+        let initial = app.row_presentation(&key).cpu.clone();
+        let builds = app.presentations.builds;
+        for _ in 0..100 {
+            app.prepare_row_presentations(0, 1, now, true);
+        }
+        assert_eq!(app.presentations.builds, builds);
+        assert_eq!(
+            app.presentations.rows.len(),
+            1,
+            "Only visible rows should be calculated"
+        );
+        app.project = Some(Project {
+            engine: 0,
+            namespace: None,
+            name: "alpha".into(),
+        });
+        app.prepare_row_presentations(0, 1, now, true);
+        assert_eq!(app.row_presentation(&key).cpu, "10.0%");
+        assert_ne!(initial, app.row_presentation(&key).cpu);
+        assert_eq!(app.presentations.builds, builds + 1);
+        app.project = None;
+        app.prepare_row_presentations(0, 1, now, true);
+        assert_eq!(app.row_presentation(&key).cpu, initial);
+    }
+
+    #[test]
+    fn idle_views_have_no_redraw_deadline_but_actions_and_badge_expiry_do() {
+        use crate::{
+            actions::{Action, Event, Status, Update},
+            runtime::Target,
+        };
+        use std::time::{Duration, Instant};
+        let mut app = app();
+        assert!(app.next_visual_deadline(Instant::now()).is_none());
+        app.demo = false;
+        app.engines[0].runtime = Some(Target::Colima {
+            profile: "fixture".into(),
+        });
+        app.selected = 0;
+        app.request_action(Action::Start);
+        app.action_review_visible = true;
+        app.confirm_action();
+        let operation = app.action_request.take().unwrap().operation;
+        let now = Instant::now();
+        assert_eq!(
+            app.next_visual_deadline(now),
+            Some(now + Duration::from_millis(100))
+        );
+        app.apply_action_update(Update {
+            operation,
+            event: Event::Result {
+                index: 0,
+                status: Status::Succeeded,
+            },
+        });
+        app.apply_action_update(Update {
+            operation,
+            event: Event::Finished,
+        });
+        assert!(app.next_visual_deadline(Instant::now()).is_some());
+        assert!(
+            app.next_visual_deadline(Instant::now() + Duration::from_secs(6))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn action_feedback_animates_frozen_targets_and_tracks_member_completion() {
+        use crate::actions::{Action, Event, Status, Update};
+        use std::time::{Duration, Instant};
+        let mut app = app();
+        app.demo = false;
+        app.engines[0].snapshot.as_mut().unwrap().engine_id = Some("fixture".into());
+        app.engines[0].snapshot.as_mut().unwrap().containers[0].state = "running".into();
+        app.tree_query = "api-1".into();
+        app.refresh_tree();
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, Scope::Project { .. }))
+            .unwrap();
+        let project = app.current().unwrap().clone();
+        let container = app
+            .rows
+            .iter()
+            .find(|row| matches!(row.scope, Scope::Container(_)))
+            .unwrap()
+            .clone();
+        app.request_action(Action::Restart);
+        app.selected = 0; // Changing selection must not retarget the feedback.
+        app.action_review_visible = true;
+        app.confirm_action();
+        let operation = app.action_request.take().unwrap().operation;
+        let started = app.action_feedback[&operation].started_at;
+        let initial = app.row_action_feedback(&project, started).unwrap();
+        assert_eq!(initial.label, "Restarting… 0s");
+        assert!(initial.active);
+        assert_ne!(
+            initial.symbol,
+            app.row_action_feedback(&project, started + Duration::from_millis(100))
+                .unwrap()
+                .symbol
+        );
+        assert_eq!(
+            app.row_action_feedback(&container, started + Duration::from_secs(3))
+                .unwrap()
+                .label,
+            "Restarting… 3s"
+        );
+
+        let mut refreshed = app.engines[0].snapshot.clone().unwrap();
+        let mut late = refreshed.containers[0].clone();
+        late.id = "new-replica".into();
+        late.name = "new-replica".into();
+        refreshed.containers.push(late);
+        app.update_engine(0, Ok(refreshed));
+        app.tree_query = "new-replica".into();
+        app.refresh_tree();
+        let late_row = app
+            .rows
+            .iter()
+            .find(|row| matches!(&row.scope, Scope::Container(key) if key == "/new-replica"))
+            .unwrap();
+        assert!(app.row_action_feedback(late_row, Instant::now()).is_none());
+        assert!(
+            app.row_action_feedback(&app.rows[0], Instant::now())
+                .is_none()
+        );
+
+        app.apply_action_update(Update {
+            operation,
+            event: Event::Result {
+                index: 0,
+                status: Status::Succeeded,
+            },
+        });
+        assert!(
+            !app.row_action_feedback(&container, Instant::now())
+                .unwrap()
+                .active
+        );
+        assert!(
+            app.row_action_feedback(&project, Instant::now())
+                .unwrap()
+                .active
+        );
+        app.apply_action_update(Update {
+            operation,
+            event: Event::Finished,
+        });
+        assert_eq!(
+            app.row_action_feedback(&project, Instant::now())
+                .unwrap()
+                .label,
+            "Restart completed"
+        );
+        assert!(
+            app.row_action_feedback(&project, Instant::now() + Duration::from_secs(6))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_feedback_never_claims_readiness_and_errors_do_not_disappear() {
+        use crate::{
+            actions::{Action, Event, Status, Update},
+            runtime::Target,
+        };
+        use std::time::{Duration, Instant};
+        let mut app = App::new(
+            vec![Connection {
+                name: "fixture".into(),
+                kind: BackendKind::Docker,
+                endpoint: "unix:///fixture.sock".into(),
+            }],
+            100,
+            false,
+            false,
+        );
+        app.engines[0].runtime = Some(Target::Colima {
+            profile: "fixture".into(),
+        });
+        app.update_engine(0, Err("offline".into()));
+        let row = app.current().unwrap().clone();
+        for (status, expected) in [
+            (Status::Succeeded, "Start command completed"),
+            (Status::Failed("denied".into()), "Start failed"),
+            (Status::Unknown("timeout".into()), "Outcome unknown"),
+            (
+                Status::Skipped("previous outcome unknown".into()),
+                "Not attempted",
+            ),
+        ] {
+            app.request_action(Action::Start);
+            app.action_review_visible = true;
+            app.confirm_action();
+            let operation = app.action_request.take().unwrap().operation;
+            assert_eq!(
+                app.action_feedback.len(),
+                1,
+                "Old animation metadata must be evicted with old results"
+            );
+            assert_eq!(
+                app.row_action_feedback(&row, Instant::now()).unwrap().label,
+                "Starting… 0s"
+            );
+            app.apply_action_update(Update {
+                operation,
+                event: Event::Result {
+                    index: 0,
+                    status: status.clone(),
+                },
+            });
+            app.apply_action_update(Update {
+                operation,
+                event: Event::Finished,
+            });
+            let feedback = app.row_action_feedback(&row, Instant::now()).unwrap();
+            assert_eq!(feedback.label, expected);
+            assert!(!feedback.active);
+            if status != Status::Succeeded {
+                assert!(
+                    app.row_action_feedback(&row, Instant::now() + Duration::from_secs(3600))
+                        .is_some()
+                );
+            }
+            assert!(app.engines[0].error.is_some());
+            assert!(app.engines[0].snapshot.is_none());
+            assert!(app.current().unwrap().title.contains("(offline)"));
+            assert!(!app.action_results_visible);
+        }
+    }
+
+    #[test]
+    fn performance_lists_only_connected_primary_runtimes_including_idle_ones() {
+        let mut app = App::new(
+            (0..4)
+                .map(|index| Connection {
+                    name: format!("runtime-{index}"),
+                    kind: BackendKind::Docker,
+                    endpoint: format!("unix:///runtime-{index}.sock"),
+                })
+                .collect(),
+            100,
+            false,
+            true,
+        );
+        app.update_engine(
+            0,
+            Ok(Snapshot {
+                engine_id: Some("offline".into()),
+                ..Default::default()
+            }),
+        );
+        app.update_engine(0, Err("stopped".into()));
+        for index in [1, 2] {
+            app.update_engine(
+                index,
+                Ok(Snapshot {
+                    engine_id: Some("shared".into()),
+                    ..Default::default()
+                }),
+            );
+        }
+        assert!(app.engines[2].alias.is_some());
+        assert!(app.engines[3].snapshot.is_none());
+        assert_eq!(app.performance_engines(), [1]);
+        assert_eq!(app.engine_metrics(1).cpu_percent, Some(0.0));
+        assert!(
+            app.rows
+                .iter()
+                .any(|row| row.engine == 0 && row.title.contains("(offline)"))
+        );
+    }
+
+    #[test]
+    fn performance_focus_survives_sorting_new_connections_and_availability_changes() {
+        let mut app = App::new(
+            ["Zeta", "Beta", "Alpha"]
+                .into_iter()
+                .map(|name| Connection {
+                    name: name.into(),
+                    kind: BackendKind::Docker,
+                    endpoint: format!("unix:///{name}.sock"),
+                })
+                .collect(),
+            100,
+            false,
+            true,
+        );
+        let snapshot = |index| Snapshot {
+            engine_id: Some(format!("runtime-{index}")),
+            ..Default::default()
+        };
+        app.update_engine(0, Ok(snapshot(0)));
+        app.update_engine(1, Ok(snapshot(1)));
+        assert_eq!(app.performance_engine(), Some(0));
+        app.performance_scroll = app
+            .performance_engines()
+            .iter()
+            .position(|&index| index == 1)
+            .unwrap();
+        app.update_engine(2, Ok(snapshot(2)));
+        assert_eq!(app.performance_engine(), Some(1));
+        app.context_sort = crate::context_sort::ContextSort::Name;
+        app.context_pins = vec!["Zeta".into()];
+        app.refresh_tree();
+        assert_eq!(app.performance_engine(), Some(1));
+        app.update_engine(0, Err("stopped".into()));
+        assert_eq!(app.performance_engine(), Some(1));
+        app.update_engine(1, Err("stopped".into()));
+        assert_eq!(app.performance_engine(), Some(2));
+        app.update_engine(1, Ok(snapshot(1)));
+        assert_eq!(app.performance_engine(), Some(2));
+        app.update_engine(1, Err("stopped".into()));
+        app.update_engine(2, Err("stopped".into()));
+        assert!(app.performance_engines().is_empty());
+        assert_eq!(app.performance_scroll, 0);
+        assert!(app.performance_engine().is_none());
+    }
+
+    #[test]
+    fn independent_runtimes_run_concurrently_with_isolated_results_and_alias_locks() {
+        use crate::{
+            actions::{Action, Event, Status, Update},
+            runtime::Target,
+        };
+        let mut app = App::new(
+            vec![
+                Connection {
+                    name: "First".into(),
+                    kind: BackendKind::Docker,
+                    endpoint: "unix:///one.sock".into(),
+                },
+                Connection {
+                    name: "Second".into(),
+                    kind: BackendKind::Docker,
+                    endpoint: "unix:///two.sock".into(),
+                },
+            ],
+            100,
+            false,
+            false,
+        );
+        let first_target = Target::Colima {
+            profile: "first".into(),
+        };
+        let second_target = Target::Colima {
+            profile: "second".into(),
+        };
+        app.engines[0].runtime = Some(first_target.clone());
+        app.engines[1].runtime = Some(second_target.clone());
+        app.update_engine(
+            1,
+            Ok(Snapshot {
+                engine_id: Some("second".into()),
+                ..Default::default()
+            }),
+        );
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| row.engine == 0 && row.scope == Scope::Engine)
+            .unwrap();
+        app.request_action(Action::Start);
+        app.action_review_visible = true;
+        app.confirm_action();
+        let first = app.action_request.take().unwrap().operation;
+        assert!(
+            app.plan_action(Action::Start)
+                .unwrap_err()
+                .to_string()
+                .contains("already active")
+        );
+
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| row.engine == 1 && row.scope == Scope::Engine)
+            .unwrap();
+        app.engines[1].runtime = Some(first_target);
+        assert!(
+            app.plan_action(Action::Restart)
+                .unwrap_err()
+                .to_string()
+                .contains("already active")
+        );
+        app.engines[1].runtime = Some(second_target);
+        app.request_action(Action::Restart);
+        assert!(app.action_confirmation.is_some());
+        app.action_review_visible = true;
+        app.confirm_action();
+        let second = app.action_request.take().unwrap().operation;
+        assert_ne!(first, second);
+        assert_eq!(app.action_jobs.len(), 2);
+        assert!(app.action_status().unwrap().contains("2 running"));
+
+        assert!(app.apply_action_update(Update {
+            operation: second,
+            event: Event::Result {
+                index: 0,
+                status: Status::Failed("fixture denied".into())
+            }
+        }));
+        assert!(app.apply_action_update(Update {
+            operation: second,
+            event: Event::Finished
+        }));
+        assert!(!app.action_jobs[&first].finished);
+        assert!(app.action_jobs[&first].results[0].is_none());
+        assert!(matches!(
+            app.action_jobs[&second].results[0],
+            Some(Status::Failed(_))
+        ));
+        app.open_action_results();
+        assert_eq!(app.picker.as_ref().unwrap().choices.len(), 2);
+        app.picker.as_mut().unwrap().selected = 1;
+        app.choose();
+        assert_eq!(app.action_selected, Some(first));
+        assert!(app.action_results_visible);
+        app.action_results_visible = false;
+
+        app.apply_action_update(Update {
+            operation: first,
+            event: Event::Result {
+                index: 0,
+                status: Status::Succeeded,
+            },
+        });
+        app.apply_action_update(Update {
+            operation: first,
+            event: Event::Finished,
+        });
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| row.engine == 0 && row.scope == Scope::Engine)
+            .unwrap();
+        app.request_action(Action::Start);
+        app.action_review_visible = true;
+        app.confirm_action();
+        let next = app.action_request.take().unwrap().operation;
+        assert!(!app.action_jobs.contains_key(&first));
+        assert!(!app.apply_action_update(Update {
+            operation: first,
+            event: Event::Result {
+                index: 0,
+                status: Status::Unknown("late".into())
+            }
+        }));
+        assert!(app.action_jobs[&next].results[0].is_none());
+        assert!(app.action_jobs[&second].finished);
+    }
+
+    #[test]
+    fn runtime_rows_target_the_provider_not_workloads_and_offline_start_is_allowed() {
+        use crate::{actions::Action, runtime::Target};
+        let mut app = app();
+        app.demo = false;
+        app.engines[0].runtime = Some(Target::Colima {
+            profile: "fixture".into(),
+        });
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| row.scope == Scope::Engine)
+            .unwrap();
+        for action in [Action::Start, Action::Stop, Action::Restart] {
+            let request = app.plan_action(action).unwrap();
+            assert!(request.runtime.is_some());
+            assert!(request.containers.is_empty());
+            assert_eq!(request.target_count(), 1);
+        }
+        assert!(app.plan_action(Action::Delete).is_err());
+        app.update_engine(0, Err("Runtime stopped".into()));
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| row.scope == Scope::Engine)
+            .unwrap();
+        assert!(app.current().unwrap().title.contains("(offline)"));
+        assert!(app.plan_action(Action::Stop).is_err());
+        assert!(app.plan_action(Action::Restart).is_err());
+        app.request_action(Action::Start);
+        app.action_review_visible = true;
+        app.confirm_action();
+        assert!(app.action_confirmation.is_none());
+        assert!(app.action_request.as_ref().unwrap().runtime.is_some());
+        assert_eq!(app.action_progress().unwrap().results.len(), 1);
+        assert!(!app.action_results_visible);
+    }
+
+    #[test]
+    fn saved_runtime_rows_survive_relaunch_without_sockets_and_rejoin_native_discovery() {
+        use crate::runtime::Target;
+        let mut original = app();
+        original.engines[0].runtime = Some(Target::Podman {
+            machine: "fixture".into(),
+        });
+        let text = toml::to_string(&original.preferences()).unwrap();
+        assert!(!text.contains("unix:///test"));
+        let preferences = toml::from_str(&text).unwrap();
+        let mut restored = App::new(vec![], 100, false, false);
+        restored.apply_preferences(preferences, false);
+        assert_eq!(restored.engines.len(), 1);
+        assert!(restored.rows[0].title.contains("(offline)"));
+        assert!(restored.engines[0].connection.endpoint.is_empty());
+        restored.reconcile_podman(&crate::discovery::podman::Discovery {
+            machines: vec![crate::discovery::podman::Machine {
+                name: "fixture".into(),
+                endpoint: Ok("unix:///new-forwarded.sock".into()),
+            }],
+            warning: None,
+        });
+        assert_eq!(restored.engines.len(), 1);
+        assert_eq!(
+            restored.engines[0].connection.endpoint,
+            "unix:///new-forwarded.sock"
+        );
+        restored.update_engine(0, Ok(Snapshot::default()));
+        assert!(!restored.rows[0].title.contains("(offline)"));
+    }
+
+    #[test]
+    fn generic_context_never_falls_back_to_bulk_container_actions() {
+        let mut app = app();
+        app.demo = false;
+        app.selected = 0;
+        let error = app
+            .plan_action(crate::actions::Action::Stop)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported"));
+    }
+
+    #[test]
     fn preferences_restore_navigation_without_restoring_shells_or_input_and_cancel_on_interaction()
     {
         let mut original = app();
@@ -1757,6 +3068,7 @@ mod tests {
         connection.name = "alias".into();
         app.engines.push(Engine {
             connection,
+            runtime: None,
             snapshot: None,
             error: None,
             alias: None,
@@ -1777,7 +3089,7 @@ mod tests {
         let mut app = app();
         app.update_engine(0, Err("offline".into()));
         assert!(app.engines[0].snapshot.is_some());
-        assert!(app.rows[0].title.contains("unavailable"));
+        assert!(app.rows[0].title.contains("(offline)"));
     }
 
     #[test]
@@ -2055,7 +3367,7 @@ mod tests {
             warning: None,
         });
         assert_eq!(app.context_order[0], app.podman_machines["preferred"]);
-        assert_eq!(app.context_order[app.performance_scroll], 0);
+        assert_eq!(app.performance_engine(), Some(0));
         assert_eq!(app.current().unwrap().key, selected);
     }
 
@@ -2073,7 +3385,7 @@ mod tests {
         let expanded = app.expanded.clone();
         app.log_scope = Some("fixed-log-target".into());
         app.performance_scroll = app
-            .context_order
+            .performance_engines()
             .iter()
             .position(|&engine| engine == 0)
             .unwrap();
@@ -2084,7 +3396,7 @@ mod tests {
         assert_eq!(app.current().unwrap().key, selection);
         assert_eq!(app.expanded, expanded);
         assert_eq!(app.log_scope.as_deref(), Some("fixed-log-target"));
-        assert_eq!(app.context_order[app.performance_scroll], 0);
+        assert_eq!(app.performance_engine(), Some(0));
         assert_eq!(
             app.engines
                 .iter()
