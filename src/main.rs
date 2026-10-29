@@ -906,7 +906,6 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
     let key = app.keymap.translate(key);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let lifecycle_key = !app.detail_focus
-        && !app.performance_focus
         && !key.modifiers.intersects(
             KeyModifiers::CONTROL
                 | KeyModifiers::ALT
@@ -1082,11 +1081,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         KeyCode::Char('g') => {
             if pending_g {
                 if app.performance_focus {
-                    if app.performance_scope == tha::app::PerformanceScope::Container {
-                        app.selected = 0;
-                    } else {
-                        app.performance_scroll = 0;
-                    }
+                    app.move_performance_selection(isize::MIN);
                 } else if !app.detail_focus {
                     app.selected = 0;
                 } else if app.tab == Tab::Logs {
@@ -1107,11 +1102,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         }
         KeyCode::Char('G') => {
             if app.performance_focus {
-                if app.performance_scope == tha::app::PerformanceScope::Container {
-                    app.selected = app.rows.len().saturating_sub(1);
-                } else {
-                    app.performance_scroll = app.performance_engines().len().saturating_sub(1);
-                }
+                app.move_performance_selection(isize::MAX);
             } else if !app.detail_focus {
                 app.selected = app.rows.len().saturating_sub(1);
             } else if app.tab == Tab::Logs {
@@ -1150,13 +1141,8 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
 }
 
 fn move_by(app: &mut App, amount: isize, _height: usize) {
-    if app.performance_focus && app.performance_scope == tha::app::PerformanceScope::Container {
-        app.move_selection(amount);
-    } else if app.performance_focus {
-        app.performance_scroll = app
-            .performance_scroll
-            .saturating_add_signed(amount)
-            .min(app.performance_engines().len().saturating_sub(1));
+    if app.performance_focus {
+        app.move_performance_selection(amount);
     } else if !app.detail_focus {
         app.move_selection(amount);
         app.detail_scroll = 0;
@@ -2101,15 +2087,7 @@ mod tests {
     fn lifecycle_keys_do_not_fire_in_details_shell_search_or_with_control_modifiers() {
         let (tx, _) = watch::channel(0);
         for mode in [
-            "details",
-            "shell",
-            "search",
-            "performance",
-            "control",
-            "repeat",
-            "demo",
-            "offline",
-            "alias",
+            "details", "shell", "search", "control", "repeat", "demo", "offline", "alias",
         ] {
             let mut app = lifecycle_app("running");
             let mut key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
@@ -2121,7 +2099,6 @@ mod tests {
                     app.exec_input = true;
                 }
                 "search" => app.input_mode = InputMode::Search,
-                "performance" => app.performance_focus = true,
                 "control" => key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
                 "repeat" => key.kind = KeyEventKind::Repeat,
                 "demo" => app.demo = true,
@@ -2132,6 +2109,221 @@ mod tests {
             assert!(app.action_confirmation.is_none(), "{mode}");
             assert!(app.action_request.is_none());
         }
+    }
+
+    #[test]
+    fn performance_actions_target_the_displayed_runtime_or_container_and_keep_confirmations() {
+        use tha::{
+            actions::Action,
+            app::{PerformanceScope, Scope},
+            runtime::Target,
+        };
+        let (tx, _) = watch::channel(0);
+        for (key, state, action) in [
+            ('S', "exited", Action::Start),
+            ('s', "running", Action::Stop),
+            ('r', "running", Action::Restart),
+        ] {
+            for scope in [PerformanceScope::Runtime, PerformanceScope::Container] {
+                let mut app = lifecycle_app(state);
+                app.engines[0].runtime = Some(Target::Colima {
+                    profile: "fixture".into(),
+                });
+                app.tree_query = "fixture-api".into();
+                app.refresh_tree();
+                let container_index = app
+                    .rows
+                    .iter()
+                    .position(|row| matches!(row.scope, Scope::Container(_)))
+                    .unwrap();
+                app.selected = if scope == PerformanceScope::Container {
+                    container_index
+                } else {
+                    1
+                };
+                app.performance_scope = scope;
+                app.performance_open = true;
+                app.performance_focus = true;
+                app.performance_expanded = true;
+                handle_key(&mut app, KeyEvent::from(KeyCode::Char(key)), 20, &tx);
+                let request = &app.action_confirmation.as_ref().unwrap().request;
+                assert_eq!(request.action, action);
+                assert_eq!(
+                    request.runtime.is_some(),
+                    scope == PerformanceScope::Runtime
+                );
+                if scope == PerformanceScope::Container {
+                    assert_eq!(request.containers[0].id, "fixture");
+                    assert_eq!(request.containers.len(), 1);
+                }
+                assert!(
+                    app.action_request.is_none(),
+                    "Opening the panel never bypasses confirmation"
+                );
+                handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+                assert!(
+                    app.action_request.is_none(),
+                    "Review must actually be rendered"
+                );
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+                terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+                assert!(app.action_review_visible);
+                handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+                assert_eq!(app.action_request.as_ref().unwrap().action, action);
+                assert!(app.performance_focus && app.performance_expanded);
+                handle_key(&mut app, KeyEvent::from(KeyCode::Char(key)), 20, &tx);
+                assert!(
+                    app.action_confirmation.is_none(),
+                    "Conflicting work is still blocked"
+                );
+            }
+        }
+        // A focused container view must never turn a group selection into a bulk action.
+        let mut app = lifecycle_app("running");
+        app.performance_scope = PerformanceScope::Container;
+        app.performance_focus = true;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('r')), 20, &tx);
+        assert!(app.action_confirmation.is_none());
+        assert!(app.action_request.is_none());
+        assert!(app.notice.contains("Select a target"));
+    }
+
+    #[test]
+    fn performance_container_actions_keep_delete_and_input_safeguards() {
+        use tha::app::{PerformanceScope, Scope};
+        let (tx, _) = watch::channel(0);
+        for mode in [
+            "delete", "offline", "alias", "demo", "control", "repeat", "search",
+        ] {
+            let mut app = lifecycle_app("exited");
+            app.tree_query = "fixture-api".into();
+            app.refresh_tree();
+            app.selected = app
+                .rows
+                .iter()
+                .position(|row| matches!(row.scope, Scope::Container(_)))
+                .unwrap();
+            app.performance_open = true;
+            app.performance_focus = true;
+            app.performance_scope = PerformanceScope::Container;
+            let mut key = KeyEvent::from(KeyCode::Char('d'));
+            match mode {
+                "offline" => app.engines[0].error = Some("offline".into()),
+                "alias" => app.engines[0].alias = Some("primary".into()),
+                "demo" => app.demo = true,
+                "control" => key.modifiers = KeyModifiers::CONTROL,
+                "repeat" => key.kind = KeyEventKind::Repeat,
+                "search" => app.input_mode = InputMode::Search,
+                _ => {}
+            }
+            handle_key(&mut app, key, 20, &tx);
+            assert!(app.action_request.is_none(), "{mode}");
+            if mode == "delete" {
+                assert!(app.action_confirmation.is_some());
+                app.action_review_visible = true;
+                handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+                assert!(app.action_request.is_none());
+                let confirmation = app.action_confirmation.as_mut().unwrap();
+                confirmation.typed = confirmation.request.name.clone();
+                handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+                assert_eq!(
+                    app.action_request.as_ref().unwrap().containers[0].id,
+                    "fixture"
+                );
+            } else {
+                assert!(app.action_confirmation.is_none(), "{mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_performance_actions_do_not_follow_an_unrelated_explorer_selection() {
+        use tha::{actions::Action, app::PerformanceScope, runtime::Target};
+        let (tx, _) = watch::channel(0);
+        let mut app = lifecycle_app("running");
+        app.engines[0].runtime = Some(Target::Colima {
+            profile: "fixture".into(),
+        });
+        let mut other = tha::app::Engine {
+            connection: app.engines[0].connection.clone(),
+            runtime: None,
+            snapshot: app.engines[0].snapshot.clone(),
+            error: None,
+            alias: None,
+            metrics: Default::default(),
+            metrics_revision: 0,
+        };
+        other.connection.name = "other runtime".into();
+        other.connection.endpoint = "unix:///other-fixture".into();
+        other.runtime = Some(Target::Colima {
+            profile: "other".into(),
+        });
+        other.snapshot.as_mut().unwrap().engine_id = Some("other-engine".into());
+        app.engines.push(other);
+        app.context_order.push(1);
+        app.refresh_tree();
+        app.performance_scope = PerformanceScope::Runtime;
+        app.performance_open = true;
+        app.performance_focus = true;
+        app.performance_scroll = 1;
+        assert_eq!(app.current().unwrap().engine, 0);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('r')), 20, &tx);
+        let request = &app.action_confirmation.as_ref().unwrap().request;
+        assert_eq!(request.engine, 1);
+        assert_eq!(request.runtime.as_ref(), app.engines[1].runtime.as_ref());
+        assert_eq!(request.action, Action::Restart);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('n')), 20, &tx);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')), 20, &tx);
+        assert!(app.picker.as_ref().unwrap().title.contains("other runtime"));
+        app.choose();
+        assert_eq!(app.action_confirmation.as_ref().unwrap().request.engine, 1);
+    }
+
+    #[test]
+    fn focused_container_navigation_skips_groups_and_inspects_the_shown_container() {
+        use tha::app::{PerformanceScope, Scope};
+        let (tx, _) = watch::channel(0);
+        let mut app = app();
+        app.tree_query = "-".into();
+        app.refresh_tree();
+        app.performance_open = true;
+        app.performance_focus = true;
+        app.performance_scope = PerformanceScope::Container;
+        let indices: Vec<_> = app
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                matches!(row.scope, Scope::Container(_)) && app.engines[row.engine].alias.is_none()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert!(indices.len() >= 3);
+        for expanded in [false, true] {
+            app.performance_expanded = expanded;
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char('g')), 20, &tx);
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char('g')), 20, &tx);
+            assert_eq!(app.selected, indices[0]);
+            handle_key(&mut app, KeyEvent::from(KeyCode::Down), 20, &tx);
+            assert_eq!(app.selected, indices[1]);
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')), 20, &tx);
+            assert_eq!(app.selected, indices[2]);
+            handle_key(&mut app, KeyEvent::from(KeyCode::Up), 20, &tx);
+            assert_eq!(app.selected, indices[1]);
+            handle_key(&mut app, KeyEvent::from(KeyCode::PageDown), 2, &tx);
+            assert_eq!(app.selected, indices[3.min(indices.len() - 1)]);
+            handle_key(&mut app, KeyEvent::from(KeyCode::PageUp), 2, &tx);
+            assert_eq!(app.selected, indices[1]);
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char('G')), 20, &tx);
+            assert_eq!(app.selected, *indices.last().unwrap());
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')), 20, &tx);
+            assert_eq!(app.selected, *indices.last().unwrap());
+        }
+        let key = app.current().unwrap().key.clone();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+        assert!(app.detail_focus && !app.performance_focus);
+        assert_eq!(app.current().unwrap().key, key);
     }
 
     #[test]

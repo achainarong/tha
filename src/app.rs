@@ -568,7 +568,7 @@ impl App {
         let request = self.plan_action(action);
         match request {
             Ok(request) => {
-                self.action_confirmation_row = self.current().map(|row| row.key.clone());
+                self.action_confirmation_row = self.action_row().map(|row| row.key);
                 self.action_review_visible = false;
                 self.action_confirmation = Some(crate::actions::Confirmation {
                     request,
@@ -581,6 +581,32 @@ impl App {
         }
     }
 
+    /// Performance actions use the displayed target, not the Explorer row that
+    /// happened to be selected before focus moved into the dock.
+    fn action_row(&self) -> Option<Row> {
+        if self.performance_focus {
+            return match self.performance_scope {
+                PerformanceScope::Runtime => {
+                    let index = self.performance_engine()?;
+                    Some(
+                        node(
+                            index,
+                            Scope::Engine,
+                            self.engines[index].connection.name.clone(),
+                            vec![],
+                        )
+                        .row,
+                    )
+                }
+                PerformanceScope::Container => {
+                    self.performance_container()?;
+                    self.current().cloned()
+                }
+            };
+        }
+        self.current().cloned()
+    }
+
     fn plan_action(
         &self,
         action: crate::actions::Action,
@@ -588,9 +614,13 @@ impl App {
         if self.demo {
             anyhow::bail!("Demo mode: lifecycle mutations are disabled");
         }
-        let row = self
-            .current()
-            .ok_or_else(|| anyhow::anyhow!("Select a container or Compose workload"))?;
+        let row = self.action_row().ok_or_else(|| {
+            anyhow::anyhow!(if self.performance_focus {
+                "Select a target in Performance before requesting an action"
+            } else {
+                "Select a container or Compose workload"
+            })
+        })?;
         let engine = &self.engines[row.engine];
         if row.scope == Scope::Engine {
             if engine.alias.is_some() {
@@ -620,7 +650,7 @@ impl App {
                 .as_ref()
                 .and_then(|snapshot| snapshot.engine_id.as_deref()),
             &row.scope,
-            self.selected_containers(),
+            self.containers_for(&row),
             action,
         )?;
         request.owner = engine.runtime.clone();
@@ -654,7 +684,7 @@ impl App {
         action: crate::actions::Action,
         row: &str,
     ) -> Result<usize, String> {
-        if self.current().is_none_or(|current| current.key != row) {
+        if self.action_row().is_none_or(|current| current.key != row) {
             return Err("Selection changed; reopen Actions".into());
         }
         self.plan_action(action)
@@ -663,7 +693,7 @@ impl App {
     }
 
     pub fn open_actions(&mut self) {
-        let Some(row) = self.current() else {
+        let Some(row) = self.action_row() else {
             return;
         };
         self.picker = Some(Picker {
@@ -1356,6 +1386,71 @@ impl App {
         Some((row.engine, container))
     }
 
+    /// Move within the active Performance scope, respecting workspace/search
+    /// filters but revealing collapsed ancestors of the chosen container.
+    pub fn move_performance_selection(&mut self, amount: isize) {
+        if self.performance_scope == PerformanceScope::Runtime {
+            let last = self.performance_engines().len().saturating_sub(1);
+            self.performance_scroll = self
+                .performance_scroll
+                .min(last)
+                .saturating_add_signed(amount)
+                .min(last);
+            return;
+        }
+        let mut rows = Vec::new();
+        let query = self.tree_query.to_lowercase();
+        for &index in &self.context_order {
+            let Some(tree) = self.explorer_tree(index) else {
+                continue;
+            };
+            let mut expanded = HashSet::new();
+            let mut pending = vec![&tree];
+            while let Some(node) = pending.pop() {
+                expanded.insert(node.row.key.clone());
+                pending.extend(&node.children);
+            }
+            flatten(&tree, 0, &expanded, &query, &mut rows);
+        }
+        let selected = self
+            .current()
+            .and_then(|current| rows.iter().position(|row| row.key == current.key))
+            .unwrap_or(0);
+        let indices: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                matches!(row.scope, Scope::Container(_)) && self.engines[row.engine].alias.is_none()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if indices.is_empty() {
+            self.notice =
+                "No containers in the current Explorer scope; adjust workspace or search".into();
+            return;
+        }
+        let position = match indices.binary_search(&selected) {
+            Ok(position) => position.saturating_add_signed(amount),
+            Err(position) if amount > 0 => position.saturating_add(amount as usize - 1),
+            Err(position) if amount < 0 => position.saturating_sub(amount.unsigned_abs()),
+            Err(_) => return,
+        }
+        .min(indices.len() - 1);
+        let target = &rows[indices[position]];
+        let mut depth = target.depth;
+        for ancestor in rows[..indices[position]].iter().rev() {
+            if ancestor.depth < depth {
+                self.expanded.insert(ancestor.key.clone());
+                depth = ancestor.depth;
+            }
+        }
+        self.refresh_tree();
+        if let Some(index) = self.rows.iter().position(|row| row.key == target.key) {
+            self.selected = index;
+        }
+        self.detail_scroll = 0;
+    }
+
     pub fn switch_performance_scope(&mut self) {
         self.performance_scope = match self.performance_scope {
             PerformanceScope::Runtime => PerformanceScope::Container,
@@ -1450,6 +1545,32 @@ impl App {
         });
     }
 
+    fn explorer_tree(&self, index: usize) -> Option<Node> {
+        if self
+            .project
+            .as_ref()
+            .is_some_and(|project| project.engine != index)
+        {
+            return None;
+        }
+        let tree = engine_tree(index, &self.engines[index]);
+        Some(if let Some(project) = &self.project {
+            find_project(&tree, project).cloned().unwrap_or_else(|| {
+                node(
+                    index,
+                    Scope::Project {
+                        namespace: project.namespace.clone(),
+                        project: project.name.clone(),
+                    },
+                    format!("{} [not in latest inventory]", project.name),
+                    vec![],
+                )
+            })
+        } else {
+            tree
+        })
+    }
+
     pub fn refresh_tree(&mut self) {
         let previous = self.current().map(|r| r.key.clone());
         if matches!(
@@ -1461,30 +1582,11 @@ impl App {
         }
         let mut rows = Vec::new();
         for &i in &self.context_order {
-            let engine = &self.engines[i];
-            let tree = engine_tree(i, engine);
-            let focused;
-            let tree = if let Some(project) = &self.project {
-                if project.engine != i {
-                    continue;
-                }
-                focused = find_project(&tree, project).cloned().unwrap_or_else(|| {
-                    node(
-                        i,
-                        Scope::Project {
-                            namespace: project.namespace.clone(),
-                            project: project.name.clone(),
-                        },
-                        format!("{} [not in latest inventory]", project.name),
-                        vec![],
-                    )
-                });
-                &focused
-            } else {
-                &tree
+            let Some(tree) = self.explorer_tree(i) else {
+                continue;
             };
             flatten(
-                tree,
+                &tree,
                 0,
                 &self.expanded,
                 &self.tree_query.to_lowercase(),
@@ -1573,6 +1675,10 @@ impl App {
         let Some(row) = self.current() else {
             return vec![];
         };
+        self.containers_for(row)
+    }
+
+    fn containers_for(&self, row: &Row) -> Vec<Container> {
         let Some(snapshot) = &self.engines[row.engine].snapshot else {
             return vec![];
         };
@@ -1912,7 +2018,7 @@ impl App {
                 }
             }
             Choice::Action { action, row } => {
-                if self.current().is_some_and(|current| current.key == row) {
+                if self.action_row().is_some_and(|current| current.key == row) {
                     self.request_action(action);
                 }
             }
@@ -2281,6 +2387,82 @@ fn flatten(
 mod tests {
     use super::*;
     use crate::config::BackendKind;
+
+    #[test]
+    fn performance_container_navigation_stays_inside_workspace_and_search_when_branches_are_collapsed()
+     {
+        let mut app = App::new(crate::demo::connections(), 100, false, true);
+        crate::demo::populate(&mut app);
+        app.performance_scope = PerformanceScope::Container;
+        app.project = Some(Project {
+            engine: 0,
+            namespace: None,
+            name: "shop".into(),
+        });
+        app.expanded.clear();
+        app.refresh_tree();
+        assert!(app.performance_container().is_none());
+        for amount in [1, isize::MAX, isize::MIN, -1] {
+            app.move_performance_selection(amount);
+            let (index, container) = app.performance_container().unwrap();
+            assert_eq!(index, 0);
+            assert_eq!(container.project.as_deref(), Some("shop"));
+        }
+        app.tree_query = "shop-api-1".into();
+        app.refresh_tree();
+        for amount in [isize::MAX, isize::MIN, 1] {
+            app.move_performance_selection(amount);
+            assert_eq!(app.performance_container().unwrap().1.name, "shop-api-1");
+        }
+        app.performance_scope = PerformanceScope::Runtime;
+        app.performance_scroll = usize::MAX;
+        app.move_performance_selection(isize::MIN);
+        assert_eq!(app.performance_scroll, 0);
+    }
+
+    #[test]
+    fn performance_container_navigation_handles_group_positions_empty_lists_and_aliases() {
+        let mut app = app();
+        app.performance_scope = PerformanceScope::Container;
+        assert!(
+            !app.rows
+                .iter()
+                .any(|row| matches!(row.scope, Scope::Container(_)))
+        );
+        app.move_performance_selection(1);
+        assert!(
+            app.performance_container().is_some(),
+            "Collapsed ancestors are revealed automatically"
+        );
+        app.tree_query = "no-matching-container".into();
+        app.refresh_tree();
+        let selected = app.selected;
+        app.move_performance_selection(1);
+        assert_eq!(app.selected, selected);
+        assert!(app.notice.contains("No containers"));
+        app.tree_query = "api-1".into();
+        app.refresh_tree();
+        let container = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, Scope::Container(_)))
+            .unwrap();
+        app.selected = 0;
+        app.move_performance_selection(1);
+        assert_eq!(app.selected, container);
+        app.move_performance_selection(-1);
+        assert_eq!(app.selected, container);
+        app.move_performance_selection(isize::MAX);
+        app.move_performance_selection(isize::MIN);
+        assert_eq!(app.selected, container);
+        app.engines[0].alias = Some("primary".into());
+        app.selected = 0;
+        app.move_performance_selection(1);
+        assert_eq!(
+            app.selected, 0,
+            "An alias cannot become the Performance target"
+        );
+    }
 
     #[test]
     fn container_performance_tracks_only_the_current_container_and_keeps_zoom_transient() {
