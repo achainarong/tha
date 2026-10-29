@@ -776,14 +776,39 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 vec!["Name", "Status"]
             };
+            let available_name_width = table_area.width.saturating_sub(if wide {
+                68
+            } else if table_area.width >= 50 {
+                36
+            } else {
+                17
+            }) as usize;
+            let name_width = if wide && !images {
+                rows.iter()
+                    .map(|row| row.name.width().saturating_add(4))
+                    .max()
+                    .unwrap_or(18)
+                    .clamp(18, 64)
+                    .min(available_name_width)
+            } else {
+                available_name_width
+            };
             let constraints = if wide {
                 vec![
-                    Constraint::Min(18),
+                    if images {
+                        Constraint::Min(18)
+                    } else {
+                        Constraint::Length(name_width as u16)
+                    },
                     Constraint::Length(14),
                     Constraint::Length(10),
                     Constraint::Length(13),
                     Constraint::Length(5),
-                    Constraint::Length(14),
+                    if images {
+                        Constraint::Length(14)
+                    } else {
+                        Constraint::Min(14)
+                    },
                 ]
             } else if table_area.width >= 50 {
                 vec![
@@ -810,13 +835,6 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     row.name.clone()
                 };
-                let name_width = table_area.width.saturating_sub(if wide {
-                    68
-                } else if table_area.width >= 50 {
-                    36
-                } else {
-                    17
-                }) as usize;
                 let mark = if view.marked.contains(&row.key) {
                     "[x] "
                 } else if row.status == "unreferenced" {
@@ -1277,5 +1295,55 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(text.contains("Inventory unavailable"));
+    }
+
+    #[test]
+    fn volume_names_are_content_sized_capped_and_leave_room_for_projects() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.overview_mode = OverviewMode::Volumes;
+        let project = "project_with_more_than_fourteen_cells";
+        for name in ["zam_database".to_owned(), "x".repeat(100), "界".repeat(40)] {
+            let snapshot = app.engines[0].snapshot.as_mut().unwrap();
+            snapshot.volumes = vec![crate::model::Resource {
+                name: name.clone(),
+                project: Some(project.into()),
+                details: "driver: local".into(),
+                ..Default::default()
+            }];
+            snapshot.volumes_available = true;
+            for width in [150, 220] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+                terminal
+                    .draw(|frame| draw(frame, &mut app, frame.area()))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let lines: Vec<String> = (0..20)
+                    .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+                    .collect();
+                let header = lines
+                    .iter()
+                    .find(|line| line.contains("Volume / source"))
+                    .unwrap();
+                let driver = header.find("Driver").unwrap();
+                let volume = header.find("Volume / source").unwrap();
+                let expected_width = (name.width() + 4).clamp(18, 64);
+                assert_eq!(driver - volume, expected_width + 2);
+                let visible_project = if width >= 220 {
+                    project
+                } else {
+                    &project[..24]
+                };
+                assert!(
+                    lines.iter().any(|line| line.contains(visible_project)),
+                    "{lines:#?}"
+                );
+                if name.width() + 4 > 64 {
+                    assert!(lines.iter().any(|line| line.contains('…')));
+                } else {
+                    assert!(lines.iter().any(|line| line.contains(&name)));
+                }
+            }
+        }
     }
 }

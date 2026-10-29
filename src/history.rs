@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, config::DbConfig, params};
 use std::{
     fs::{self, File, OpenOptions as FsOptions},
     io::{Read, Seek, SeekFrom, Write},
@@ -80,6 +80,75 @@ fn regular(path: &Path) -> Result<()> {
 fn lock_path(path: &Path) -> PathBuf {
     path.with_extension("lock")
 }
+
+fn private_file(path: &Path) -> Result<()> {
+    regular(path)?;
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && metadata.permissions().mode() & 0o077 != 0
+    {
+        bail!(
+            "History file must be private (mode 0600): {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn harden(db: &Connection) -> Result<()> {
+    db.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    db.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
+    db.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)?;
+    db.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW, false)?;
+    Ok(())
+}
+
+fn sqlite_path(path: &Path) -> Result<PathBuf> {
+    // SQLITE_OPEN_NOFOLLOW rejects symlinks in *any* path component, including
+    // macOS's system /var -> /private/var alias. Resolve only the directory;
+    // leave the database leaf untouched so SQLite still refuses a leaf symlink.
+    Ok(path
+        .parent()
+        .context("History path has no directory")?
+        .canonicalize()?
+        .join(path.file_name().context("History path has no filename")?))
+}
+
+/// Schema markers identify our format, not its authenticity. Refuse executable
+/// schema objects and unexpected tables before querying or writing history data.
+fn validate_schema(db: &Connection) -> Result<()> {
+    let mut objects =
+        db.prepare("SELECT type,name,tbl_name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'")?;
+    let mut tables = std::collections::HashSet::new();
+    for object in objects.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (kind, name, table) = object?;
+        match (kind.as_str(), name.as_str(), table.as_str()) {
+            ("table", "containers" | "samples" | "health", _) => {
+                tables.insert(name);
+            }
+            ("index", "samples_expiry", "samples") => {}
+            _ => bail!("Unexpected history schema object; database preserved"),
+        }
+    }
+    if tables.len() != 3 {
+        bail!("History schema is missing required tables; database preserved");
+    }
+    let mut table_list = db.prepare("PRAGMA main.table_list")?;
+    for table in table_list.query_map([], |row| {
+        Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    })? {
+        let (name, kind) = table?;
+        if tables.contains(&name) && kind != "table" {
+            bail!("History requires ordinary tables; database preserved");
+        }
+    }
+    Ok(())
+}
 fn lock_file(path: &Path) -> Result<File> {
     regular(path)?;
     FsOptions::new()
@@ -125,11 +194,20 @@ pub fn collector_running(path: &Path) -> Result<bool> {
     }
 }
 pub fn reader(path: &Path) -> Result<Connection> {
-    regular(path)?;
+    for candidate in [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        private_file(&candidate)?;
+    }
     let db = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        sqlite_path(path)?,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
+    harden(&db)?;
     db.busy_timeout(Duration::from_millis(150))?;
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version != 1 {
@@ -139,6 +217,7 @@ pub fn reader(path: &Path) -> Result<Connection> {
     if application != APPLICATION_ID {
         bail!("Not a Tha history database; database preserved");
     }
+    validate_schema(&db)?;
     Ok(db)
 }
 
@@ -211,7 +290,7 @@ impl Store {
             PathBuf::from(format!("{}-wal", path.display())),
             PathBuf::from(format!("{}-shm", path.display())),
         ] {
-            regular(&candidate)?;
+            private_file(&candidate)?;
         }
         if let Ok(metadata) = fs::metadata(path)
             && metadata.len() > 0
@@ -229,7 +308,13 @@ impl Store {
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        let db = Connection::open(path)?;
+        let db = Connection::open_with_flags(
+            sqlite_path(path)?,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        harden(&db)?;
         db.busy_timeout(Duration::from_millis(250))?;
         let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version > 1 {
@@ -239,9 +324,12 @@ impl Store {
         if (version == 1 && application != APPLICATION_ID) || (version == 0 && application != 0) {
             bail!("Not a Tha history database; existing database preserved");
         }
+        if version == 1 {
+            validate_schema(&db)?;
+        }
         if version == 0 {
             let tables: i64 = db.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
                 [],
                 |row| row.get(0),
             )?;
@@ -993,6 +1081,131 @@ pub(crate) mod tests {
             .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn readers_and_writers_reject_nonprivate_databases_and_sidecars() {
+        let fixture = Fixture::new();
+        let path = fixture.database();
+        drop(Store::open(&path, 16 * 1024 * 1024).unwrap());
+        for mode in [0o644, 0o660, 0o666] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(reader(&path).is_err());
+            assert!(Store::open(&path, 16 * 1024 * 1024).is_err());
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(reader(&path).is_ok());
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{suffix}", path.display()));
+            fs::write(&sidecar, b"untrusted sidecar").unwrap();
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(reader(&path).is_err());
+            assert!(Store::open(&path, 16 * 1024 * 1024).is_err());
+            assert_eq!(fs::read(&sidecar).unwrap(), b"untrusted sidecar");
+            fs::remove_file(sidecar).unwrap();
+        }
+    }
+
+    #[test]
+    fn unexpected_views_triggers_and_virtual_tables_are_rejected_without_mutation() {
+        for ddl in [
+            "CREATE VIEW injected AS SELECT randomblob(100) AS payload",
+            "CREATE TRIGGER sqliteX_injected AFTER INSERT ON samples BEGIN DELETE FROM containers; END",
+            "DROP TABLE health; CREATE VIEW health AS SELECT 0 AS heartbeat,0 AS dropped,'forged' AS warning",
+            "CREATE VIRTUAL TABLE injected USING fts5(payload)",
+        ] {
+            let fixture = Fixture::new();
+            let path = fixture.database();
+            drop(Store::open(&path, 16 * 1024 * 1024).unwrap());
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(ddl).unwrap();
+            let before: String = db
+                .query_row(
+                    "SELECT group_concat(sql,';') FROM sqlite_schema",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(reader(&path).is_err(), "{ddl}");
+            assert!(Store::open(&path, 16 * 1024 * 1024).is_err(), "{ddl}");
+            let after: String = db
+                .query_row(
+                    "SELECT group_concat(sql,';') FROM sqlite_schema",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(before, after);
+        }
+    }
+
+    #[test]
+    fn sqlite_connections_are_hardened_and_sql_looking_values_remain_data() {
+        let fixture = Fixture::new();
+        let path = fixture.database();
+        let mut store = Store::open(&path, 16 * 1024 * 1024).unwrap();
+        let mut value = sample(now_ms(), 42.0);
+        value.key = "'); DROP TABLE samples; --".into();
+        value.name = "\"; DELETE FROM containers; --".into();
+        let runtime = "runtime' OR 1=1 --";
+        store.append(runtime, std::slice::from_ref(&value)).unwrap();
+        let db = reader(&path).unwrap();
+        for db in [&store.db, &db] {
+            assert!(db.db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE).unwrap());
+            assert!(
+                !db.db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA)
+                    .unwrap()
+            );
+            assert!(
+                !db.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER)
+                    .unwrap()
+            );
+            assert!(!db.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW).unwrap());
+        }
+        let stored_name: String = db
+            .query_row(
+                "SELECT name FROM containers WHERE runtime=?1 AND key=?2",
+                params![runtime, value.key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_name, value.name);
+        assert_eq!(
+            latest(&path, runtime, &[value.key.clone()]).unwrap()[&value.key]
+                .as_ref()
+                .unwrap()
+                .usage
+                .cpu_percent,
+            Some(42.0)
+        );
+        assert!(db.execute("DELETE FROM samples", []).is_err());
+    }
+
+    #[test]
+    fn database_leaf_symlinks_are_rejected_but_directory_aliases_work() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
+        let real_directory = fixture.0.join("real");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&real_directory)
+            .unwrap();
+        let alias = fixture.0.join("alias");
+        symlink(&real_directory, &alias).unwrap();
+        // An ancestor alias is fine; the immediate database directory remains private.
+        let child = alias.join("private");
+        fs::DirBuilder::new().mode(0o700).create(&child).unwrap();
+        let path = child.join("metrics.sqlite");
+        drop(Store::open(&path, 16 * 1024 * 1024).unwrap());
+        assert!(reader(&path).is_ok());
+        let link = child.join("linked.sqlite");
+        symlink(&path, &link).unwrap();
+        assert!(reader(&link).is_err());
+        assert!(Store::open(&link, 16 * 1024 * 1024).is_err());
     }
 
     #[test]

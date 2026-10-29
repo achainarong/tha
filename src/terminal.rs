@@ -9,6 +9,143 @@ use std::{
 
 const MAX_INPUT: usize = 65_536;
 const SCROLLBACK: usize = 500;
+const MAX_OSC_BYTES: usize = 4096;
+const MAX_CSI_BYTES: usize = 1024;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+enum OutputState {
+    #[default]
+    Ground,
+    Escape,
+    Csi,
+    DiscardCsi,
+    Osc(usize),
+    DiscardOsc,
+}
+
+/// vte's std-enabled OSC buffer is unbounded, even when callbacks ignore OSC.
+/// Limit bytes before they reach the parser, retaining only state across reads.
+#[derive(Default)]
+struct OutputGuard {
+    state: OutputState,
+    csi: Vec<u8>,
+}
+
+impl OutputGuard {
+    fn process<CB: vt100::Callbacks>(&mut self, parser: &mut vt100::Parser<CB>, bytes: &[u8]) {
+        let mut start = 0;
+        for (index, &byte) in bytes.iter().enumerate() {
+            if matches!(self.state, OutputState::Csi | OutputState::DiscardCsi) {
+                start = index + 1;
+                match byte {
+                    0x1b => {
+                        parser.process(b"\x18\x1b");
+                        self.csi.clear();
+                        self.state = OutputState::Escape;
+                    }
+                    0x18 | 0x1a => {
+                        parser.process(&[byte]);
+                        self.csi.clear();
+                        self.state = OutputState::Ground;
+                    }
+                    0x00..=0x1f => parser.process(&[byte]),
+                    0x40..=0x7e => {
+                        if self.state == OutputState::Csi {
+                            self.finish_csi(parser, byte);
+                        }
+                        self.csi.clear();
+                        self.state = OutputState::Ground;
+                    }
+                    0x20..=0x3f if self.state == OutputState::Csi => {
+                        if self.csi.len() == MAX_CSI_BYTES {
+                            parser.process(b"\x18");
+                            self.csi.clear();
+                            self.state = OutputState::DiscardCsi;
+                        } else {
+                            self.csi.push(byte);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            self.state = match self.state {
+                OutputState::Ground if byte == 0x1b => OutputState::Escape,
+                OutputState::Escape => match byte {
+                    b']' => OutputState::Osc(0),
+                    b'[' => {
+                        parser.process(&bytes[start..=index]);
+                        start = index + 1;
+                        OutputState::Csi
+                    }
+                    // vte stays in Escape across these controls/ignored bytes.
+                    0x00..=0x17 | 0x19 | 0x1b..=0x1f | 0x7f..=0xff => OutputState::Escape,
+                    _ => OutputState::Ground,
+                },
+                OutputState::Osc(_) if byte == 0x1b => OutputState::Escape,
+                OutputState::Osc(_) if matches!(byte, 0x07 | 0x18 | 0x1a) => OutputState::Ground,
+                OutputState::Osc(count) if count < MAX_OSC_BYTES => OutputState::Osc(count + 1),
+                OutputState::Osc(_) => {
+                    parser.process(&bytes[start..index]);
+                    // CAN ends the current OSC and releases its contents. Do not
+                    // reset the screen or interpret the discarded tail as text.
+                    parser.process(b"\x18");
+                    start = index + 1;
+                    OutputState::DiscardOsc
+                }
+                OutputState::DiscardOsc => {
+                    start = index + 1;
+                    match byte {
+                        // Like vte, any ESC ends OSC and begins a new escape;
+                        // preserve it, including when ESC and '\\' span reads.
+                        0x1b => {
+                            start = index;
+                            OutputState::Escape
+                        }
+                        0x07 | 0x18 | 0x1a => OutputState::Ground,
+                        _ => OutputState::DiscardOsc,
+                    }
+                }
+                OutputState::Ground => OutputState::Ground,
+                OutputState::Csi | OutputState::DiscardCsi => unreachable!(),
+            };
+        }
+        parser.process(&bytes[start..]);
+    }
+
+    fn finish_csi<CB: vt100::Callbacks>(&self, parser: &mut vt100::Parser<CB>, code: u8) {
+        // Only plain ICH/IL/SD reach vt100's costly insertion loops. Private
+        // and intermediate CSI forms have different meanings and stay intact.
+        if matches!(code, b'@' | b'L' | b'T')
+            && self
+                .csi
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b';' | b':'))
+        {
+            let count = self
+                .csi
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .fold(0u16, |count, byte| {
+                    count
+                        .saturating_mul(10)
+                        .saturating_add(u16::from(byte - b'0'))
+                })
+                .max(1);
+            let (rows, cols) = parser.screen().size();
+            let limit = if code == b'@' {
+                cols.saturating_sub(parser.screen().cursor_position().1)
+                    .max(1)
+            } else {
+                rows
+            };
+            parser.process(count.min(limit).to_string().as_bytes());
+        } else {
+            parser.process(&self.csi);
+        }
+        parser.process(&[code]);
+    }
+}
 
 pub enum State {
     Running,
@@ -70,6 +207,7 @@ pub struct Session {
     pub request: crate::exec::Request,
     pub state: State,
     parser: vt100::Parser<Replies>,
+    output_guard: OutputGuard,
     master: Box<dyn MasterPty + Send>,
     child: Option<Box<dyn Child + Send + Sync>>,
     input: Option<SyncSender<Vec<u8>>>,
@@ -164,6 +302,7 @@ impl Session {
                 Replies::default(),
             ),
             master: pair.master,
+            output_guard: OutputGuard::default(),
             child: Some(child),
             input: Some(input),
             output,
@@ -262,7 +401,7 @@ impl Session {
         let mut eof = false;
         for _ in 0..64 {
             match self.output.try_recv() {
-                Ok(Output::Data(bytes)) => self.parser.process(&bytes),
+                Ok(Output::Data(bytes)) => self.output_guard.process(&mut self.parser, &bytes),
                 Ok(Output::Eof) => eof = true,
                 Ok(Output::Error(error)) => {
                     if self.running() {
@@ -423,10 +562,190 @@ mod tests {
     #[test]
     fn emulation_contains_cursor_controls_and_ignores_host_clipboard_and_titles() {
         let mut parser = vt100::Parser::new_with_callbacks(3, 20, 10, Replies::default());
-        parser
-            .process(b"hello\r\nworld\x1b[1;1HOK\x1b]52;c;secret\x07\x1b]2;host-title\x07\x1b[6n");
+        OutputGuard::default().process(
+            &mut parser,
+            b"hello\r\nworld\x1b[1;1HOK\x1b]52;c;secret\x07\x1b]2;host-title\x07\x1b[6n",
+        );
         assert!(parser.screen().contents().starts_with("OKllo"));
         assert!(!parser.screen().contents().contains("secret"));
         assert_eq!(parser.callbacks().pending, [b"\x1b[1;3R".to_vec()]);
+    }
+
+    #[derive(Default)]
+    struct OscLengths {
+        count: usize,
+        max: usize,
+    }
+
+    impl vt100::Callbacks for OscLengths {
+        fn unhandled_osc(&mut self, _screen: &mut vt100::Screen, params: &[&[u8]]) {
+            self.count += 1;
+            self.max = self.max.max(params.iter().map(|param| param.len()).sum());
+        }
+    }
+
+    #[test]
+    fn oversized_unterminated_osc_is_bounded_across_reads_and_recovers() {
+        let mut parser = vt100::Parser::new_with_callbacks(3, 20, 10, OscLengths::default());
+        let mut guard = OutputGuard::default();
+        guard.process(&mut parser, b"before\x1b");
+        guard.process(&mut parser, b"]999;");
+        // Eight MiB in small, reused chunks; no large test allocation or PTY.
+        for _ in 0..1024 {
+            guard.process(&mut parser, &[b'x'; 8192]);
+            assert!(parser.callbacks().max <= MAX_OSC_BYTES);
+        }
+        assert_eq!(guard.state, OutputState::DiscardOsc);
+        assert_eq!(parser.callbacks().count, 1);
+        assert_eq!(parser.screen().contents(), "before");
+        guard.process(&mut parser, b"\x1b");
+        guard.process(&mut parser, b"\\after");
+        assert_eq!(guard.state, OutputState::Ground);
+        assert_eq!(parser.screen().contents(), "beforeafter");
+        assert_eq!(parser.callbacks().count, 1);
+    }
+
+    #[test]
+    fn osc_limit_handles_exact_boundary_and_all_parser_terminators() {
+        for terminator in [b"\x07".as_slice(), b"\x18", b"\x1a", b"\x1b\\", b"\x1b[0m"] {
+            for length in [MAX_OSC_BYTES - 1, MAX_OSC_BYTES, MAX_OSC_BYTES + 1] {
+                let mut parser =
+                    vt100::Parser::new_with_callbacks(3, 20, 10, OscLengths::default());
+                let mut guard = OutputGuard::default();
+                guard.process(&mut parser, b"\x1b]999;");
+                guard.process(&mut parser, &vec![b'x'; length - 4]);
+                for byte in terminator {
+                    guard.process(&mut parser, &[*byte]);
+                }
+                guard.process(&mut parser, b"ok\x1b]999;next\x07");
+                assert_eq!(guard.state, OutputState::Ground);
+                assert_eq!(parser.screen().contents(), "ok");
+                assert_eq!(parser.callbacks().count, 2);
+                assert_eq!(parser.callbacks().max, length.min(MAX_OSC_BYTES) - 1);
+            }
+        }
+    }
+
+    #[test]
+    fn osc_guard_preserves_normal_emulation_across_chunk_boundaries() {
+        let bytes = concat!(
+            "hello\r\n世界\x1b[1;1HOK\x1b[31mred\x1b[0m",
+            "\x1b]52;c;secret\x07\x1b]2;title\x1b\\",
+            "\x1b\x00\x7f]999;ignored\x07",
+            "\x1b ]not-an-osc\x1b[?2004h\x1b[6n"
+        )
+        .as_bytes();
+        let mut expected = vt100::Parser::new_with_callbacks(5, 80, 10, Replies::default());
+        expected.process(bytes);
+        for chunk_size in [1, 2, 3, 7, bytes.len()] {
+            let mut parser = vt100::Parser::new_with_callbacks(5, 80, 10, Replies::default());
+            let mut guard = OutputGuard::default();
+            for chunk in bytes.chunks(chunk_size) {
+                guard.process(&mut parser, chunk);
+            }
+            assert_eq!(
+                parser.screen().contents_formatted(),
+                expected.screen().contents_formatted()
+            );
+            assert_eq!(
+                parser.screen().cursor_position(),
+                expected.screen().cursor_position()
+            );
+            assert_eq!(
+                parser.screen().bracketed_paste(),
+                expected.screen().bracketed_paste()
+            );
+            assert_eq!(parser.callbacks().pending, expected.callbacks().pending);
+        }
+    }
+
+    #[test]
+    fn repeated_oversized_osc_sequences_in_one_read_remain_bounded() {
+        let mut bytes = Vec::new();
+        for _ in 0..3 {
+            // Repeated ESC and ignored controls must not hide an OSC opener.
+            bytes.extend_from_slice(b"\x1b\x1b\x00\x7f]999;");
+            bytes.extend(std::iter::repeat_n(b'x', MAX_OSC_BYTES * 2));
+            bytes.extend_from_slice(b"\x07ok");
+        }
+        let mut parser = vt100::Parser::new_with_callbacks(3, 20, 10, OscLengths::default());
+        let mut guard = OutputGuard::default();
+        guard.process(&mut parser, &bytes);
+        assert_eq!(guard.state, OutputState::Ground);
+        assert_eq!(parser.callbacks().count, 3);
+        assert!(parser.callbacks().max <= MAX_OSC_BYTES);
+        assert_eq!(parser.screen().contents(), "okokok");
+    }
+
+    #[test]
+    fn costly_csi_counts_are_clamped_to_screen_dimensions_across_reads() {
+        for code in [b'@', b'L', b'T'] {
+            for parameter in ["65535", "999999999999999999999999", "65535;2", "65535:2"] {
+                let input = format!(
+                    "abcdef\r\nsecond\x1b[1;1H\x1b[{parameter}{}ok",
+                    char::from(code)
+                );
+                let mut expected = vt100::Parser::new(3, 20, 10);
+                let count = if code == b'@' { 20 } else { 3 };
+                expected.process(
+                    format!(
+                        "abcdef\r\nsecond\x1b[1;1H\x1b[{count}{}ok",
+                        char::from(code)
+                    )
+                    .as_bytes(),
+                );
+                for chunk_size in [1, 2, 7, input.len()] {
+                    let mut parser = vt100::Parser::new(3, 20, 10);
+                    let mut guard = OutputGuard::default();
+                    for chunk in input.as_bytes().chunks(chunk_size) {
+                        guard.process(&mut parser, chunk);
+                    }
+                    assert_eq!(
+                        parser.screen().contents_formatted(),
+                        expected.screen().contents_formatted()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn csi_guard_preserves_controls_defaults_and_interrupted_sequences() {
+        for bytes in [
+            b"hello\x1b[2D\x1b[@!".as_slice(),
+            b"hello\x1b[0@!",
+            b"hello\x1b[2\r@!",
+            b"hello\x1b[?2h\x1b[2 q!",
+            b"hello\x1b[65535\x18!",
+            b"hello\x1b[65535\x1b]999;ignored\x07!",
+        ] {
+            let mut expected = vt100::Parser::new(3, 20, 10);
+            expected.process(bytes);
+            let mut parser = vt100::Parser::new(3, 20, 10);
+            let mut guard = OutputGuard::default();
+            for byte in bytes {
+                guard.process(&mut parser, &[*byte]);
+            }
+            assert_eq!(
+                parser.screen().contents_formatted(),
+                expected.screen().contents_formatted()
+            );
+        }
+    }
+
+    #[test]
+    fn unterminated_csi_storage_is_bounded_and_recovers_without_rendering_its_tail() {
+        let mut parser = vt100::Parser::new(3, 20, 10);
+        let mut guard = OutputGuard::default();
+        guard.process(&mut parser, b"before\x1b[");
+        for _ in 0..1024 {
+            guard.process(&mut parser, &[b'9'; 8192]);
+            assert!(guard.csi.len() <= MAX_CSI_BYTES);
+            assert!(guard.csi.capacity() <= MAX_CSI_BYTES);
+        }
+        assert_eq!(guard.state, OutputState::DiscardCsi);
+        guard.process(&mut parser, b"@after\x1b[2D!");
+        assert_eq!(guard.state, OutputState::Ground);
+        assert_eq!(parser.screen().contents(), "beforeaft!r");
     }
 }
