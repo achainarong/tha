@@ -2356,7 +2356,27 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Line::styled(safe_text(&format!("Activity · {status}")), style),
         );
     }
+    const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+    let version_width = VERSION.width() as u16;
+    let version_area =
+        (area.height > 0 && area.width >= version_width.saturating_add(2)).then(|| {
+            if let Some(last) = lines.get_mut(usize::from(area.height - 1)) {
+                *last = ellipsize_line(
+                    std::mem::take(last),
+                    usize::from(area.width - version_width - 1),
+                );
+            }
+            Rect::new(
+                area.right() - version_width,
+                area.bottom() - 1,
+                version_width,
+                1,
+            )
+        });
     frame.render_widget(Paragraph::new(lines), area);
+    if let Some(version_area) = version_area {
+        frame.render_widget(Paragraph::new(VERSION).style(muted()), version_area);
+    }
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -2795,6 +2815,60 @@ mod tests {
         assert!(!activity.contains("Permission denied"));
         assert!(notice.contains(&app.notice));
         assert!(!notice.contains("Starting…"));
+        assert!(notice.ends_with(concat!("v", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[test]
+    fn footer_version_is_bottom_right_without_overwriting_status_text() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
+        for width in [32, 100] {
+            for mode in [
+                InputMode::Normal,
+                InputMode::Search,
+                InputMode::InventorySearch,
+            ] {
+                app.input_mode = mode;
+                app.notice = "Status: ".to_owned() + &"x".repeat(200);
+                let mut terminal = Terminal::new(TestBackend::new(width, 2)).unwrap();
+                terminal
+                    .draw(|frame| draw_footer(frame, &app, frame.area()))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let last: String = (0..width).map(|x| buffer[(x, 1)].symbol()).collect();
+                assert!(last.ends_with(version));
+                if width == 32 || mode == InputMode::Normal {
+                    assert!(last.contains('…'));
+                }
+                assert_eq!(buffer[(width - version.len() as u16 - 1, 1)].symbol(), " ");
+                if mode == InputMode::Normal {
+                    assert!(last.starts_with("Status: "));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn footer_version_handles_offsets_and_tiny_areas() {
+        let app = App::new(crate::demo::connections(), 100, true, true);
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
+        let mut terminal = Terminal::new(TestBackend::new(120, 6)).unwrap();
+        let area = Rect::new(3, 2, 100, 2);
+        terminal
+            .draw(|frame| draw_footer(frame, &app, area))
+            .unwrap();
+        let last: String = (area.x..area.right())
+            .map(|x| terminal.backend().buffer()[(x, area.bottom() - 1)].symbol())
+            .collect();
+        assert!(last.ends_with(version));
+        for width in [0, 1, version.len() as u16] {
+            terminal
+                .draw(|frame| draw_footer(frame, &app, Rect::new(0, 0, width, 2)))
+                .unwrap();
+        }
+        terminal
+            .draw(|frame| draw_footer(frame, &app, Rect::new(0, 0, 100, 0)))
+            .unwrap();
     }
 
     #[test]
