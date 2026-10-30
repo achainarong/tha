@@ -134,6 +134,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let scale = app.history_view.chart_scale(runtime, container.key());
     let view = &app.history_view;
     let block = pane(
+        app,
         format!(" Metrics · {} ", safe_text(&container.name)),
         app.detail_focus,
     );

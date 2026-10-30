@@ -692,8 +692,9 @@ fn draw_overview_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: 
         parts[0],
     );
     let block = pane(
+        app,
         if scan_only {
-            " Security images · m/M Check · Enter Findings ".into()
+            " Security images · m/M Check · Enter/Tab Findings ".into()
         } else if app.overview_mode == OverviewMode::Images {
             " Images overview ".into()
         } else {

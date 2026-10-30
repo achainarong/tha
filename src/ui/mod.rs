@@ -64,11 +64,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "scan-image",
-        "Scan the selected image with containerized Grype",
+        "Scan checked images, or the selected image when none are checked",
     ),
     (
         "scan-images",
-        "Scan checked images sequentially; stop on first error",
+        "Scan checked images sequentially; continue after image errors",
     ),
     (
         "cancel-scan",
@@ -76,7 +76,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "update-security-db",
-        "Refresh scanner/database and rescan the selected image",
+        "Refresh scanner/database and rescan checked or selected images",
     ),
     (
         "actions",
@@ -680,6 +680,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_performance_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = pane(
+        app,
         if app.performance_scope == PerformanceScope::Container {
             " ▾ Performance · Selected container · P Runtime ".into()
         } else {
@@ -781,15 +782,22 @@ fn draw_performance_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn pane(title: String, focused: bool) -> Block<'static> {
+fn pane(app: &App, title: String, focused: bool) -> Block<'static> {
+    let style = if focused {
+        accent(app, Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        muted()
+    };
     Block::default()
         .borders(Borders::ALL)
-        .title(title)
-        .border_style(if focused {
-            Style::default().add_modifier(Modifier::BOLD)
+        .border_type(if focused {
+            ratatui::widgets::BorderType::Thick
         } else {
-            Style::default().add_modifier(Modifier::DIM)
+            ratatui::widgets::BorderType::Plain
         })
+        .title(title)
+        .title_style(style)
+        .border_style(style)
 }
 
 /// Truncate styled text by terminal cells, without splitting a grapheme cluster.
@@ -824,6 +832,7 @@ fn ellipsize_line(mut line: Line<'_>, width: usize) -> Line<'_> {
 
 fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = pane(
+        app,
         if app.tree_query.is_empty() {
             " Explorer ".into()
         } else {
@@ -989,7 +998,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         String::new()
     };
-    let block = pane(format!(" {label}{exec_context} "), app.detail_focus);
+    let block = pane(app, format!(" {label}{exec_context} "), app.detail_focus);
     let inner = padded(block.inner(area));
     frame.render_widget(block, area);
     if inner.height < 3 || inner.width < 2 || app.tab == Tab::Exec && inner.height < 4 {
@@ -2722,7 +2731,7 @@ mod tests {
                         row.contains("Performance · Selected container")
                     })
                     .unwrap();
-                assert_eq!(buffer[(width - 1, header)].symbol(), "┐");
+                assert_eq!(buffer[(width - 1, header)].symbol(), "┓");
                 let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
                 assert!(text.contains("Select a container"));
             }

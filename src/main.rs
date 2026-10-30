@@ -516,7 +516,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
             },
             Some(event) = security_rx.recv() => {
                 if let tha::security::Outcome::Finished(Err(error)) = &event.result {
-                    app.notice = format!("Security stopped on {}: {}", tha::model::safe_text(&event.target.label), tha::model::safe_text(error));
+                    app.notice = format!("Security scan failed for {}: {}", tha::model::safe_text(&event.target.label), tha::model::safe_text(error));
                 }
                 app.security.complete(event);
                 redraw_now = true;
@@ -687,16 +687,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                     if targets.is_empty() {
                         targets.push(target);
                     }
-                    app.security.batch =
-                        format!("{} image(s) queued; stops on first error", targets.len());
-                    app.security.busy = true;
-                    app.security.generation = app.security.generation.wrapping_add(1);
-                    app.security.state =
-                        tha::security::State::Running("Starting security queue…".into());
-                    app.security.expanded = false;
-                    app.security.selected = 0;
-                    app.security.offset = 0;
-                    app.detail_scroll = 0;
+                    app.security.start(targets.len());
                     let (cancel_tx, cancel_rx) = watch::channel(false);
                     security_cancel = Some(cancel_tx);
                     security_task = Some(tokio::spawn(tha::security::submit(
@@ -2271,6 +2262,86 @@ mod tests {
         handle_key(&mut app, w, 20, &tx);
         assert!(app.log_view.wrap);
         assert_eq!(app.input, "w");
+    }
+
+    #[test]
+    fn scanning_checked_images_preserves_focus_and_navigation() {
+        use tha::app::OverviewMode;
+        for shortcut in ['s', 'S'] {
+            let mut app = app();
+            app.demo = false;
+            app.security.enabled = true;
+            app.overview_mode = OverviewMode::Images;
+            app.detail_focus = false;
+            let snapshot = app.engines[0].snapshot.as_mut().unwrap();
+            snapshot.engine_id = Some("fixture-engine".into());
+            snapshot.images = Some(
+                ['a', 'b', 'c']
+                    .into_iter()
+                    .map(|ch| tha::model::Image {
+                        id: format!("sha256:{}", ch.to_string().repeat(64)),
+                        tags: vec![format!("image-{ch}:latest")],
+                        size: None,
+                    })
+                    .collect(),
+            );
+            ui::inventory::navigate(&mut app, KeyCode::Char('M'), 25);
+            app.overview_mode = OverviewMode::Security;
+            app.inventory_views
+                .get_mut(&(0, OverviewMode::Images))
+                .unwrap()
+                .query = "image-b".into();
+            let (tx, _) = watch::channel(0);
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char(shortcut)), 25, &tx);
+            assert!(app.security.request);
+            assert_eq!(
+                app.security.target.as_ref().unwrap().image,
+                format!("sha256:{}", "b".repeat(64))
+            );
+            assert_eq!(
+                app.security.queue.len(),
+                3,
+                "Hidden checks must be scanned too"
+            );
+            assert!(!app.detail_focus);
+            app.security.busy = true;
+            let generation = app.security.generation;
+            handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 25, &tx);
+            assert!(app.detail_focus);
+            assert_eq!(app.security.generation, generation);
+            handle_key(&mut app, KeyEvent::from(KeyCode::Tab), 25, &tx);
+            assert!(!app.detail_focus);
+            app.inventory_views
+                .get_mut(&(0, OverviewMode::Images))
+                .unwrap()
+                .query
+                .clear();
+            let before = app.inventory_views[&(0, OverviewMode::Images)].index;
+            handle_key(&mut app, KeyEvent::from(KeyCode::Down), 25, &tx);
+            assert_ne!(
+                app.inventory_views[&(0, OverviewMode::Images)].index,
+                before
+            );
+            assert_eq!(app.security.generation, generation);
+        }
+    }
+
+    #[test]
+    fn scanning_without_checks_preserves_findings_focus() {
+        use tha::app::OverviewMode;
+        let mut app = app();
+        app.demo = false;
+        app.security.enabled = true;
+        app.overview_mode = OverviewMode::Security;
+        app.detail_focus = true;
+        app.engines[0].snapshot.as_mut().unwrap().engine_id = Some("fixture-engine".into());
+        let target = ui::inventory::security_targets(&app, false).remove(0);
+        app.security.select(Some(target.clone()));
+        app.request_security_scan(false);
+        assert!(app.security.request);
+        assert!(app.detail_focus);
+        assert_eq!(app.security.target, Some(target));
+        assert!(app.security.queue.is_empty());
     }
 
     #[test]

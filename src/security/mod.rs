@@ -43,10 +43,8 @@ pub struct Report {
 pub enum State {
     #[default]
     Idle,
-    Running(String),
     Ready(Report),
     Failed(String),
-    Cancelled,
 }
 
 #[derive(Default)]
@@ -65,14 +63,39 @@ pub struct View {
     pub update: bool,
     pub cancel: bool,
     pub busy: bool,
+    pub completed: usize,
+    pub failed: usize,
+    pub progress: String,
+    pub scan_target: Option<Target>,
+    pub started: Option<std::time::Instant>,
+    pub queue_cancelled: bool,
 }
 
 impl View {
+    pub fn start(&mut self, total: usize) {
+        self.batch = format!("{total} image(s) queued; continues after image errors");
+        self.completed = 0;
+        self.failed = 0;
+        self.busy = true;
+        self.generation = self.generation.wrapping_add(1);
+        self.progress = "Starting security queue…".into();
+        self.scan_target = None;
+        self.started = Some(std::time::Instant::now());
+        self.queue_cancelled = false;
+    }
+
     pub fn select(&mut self, target: Option<Target>) {
         if self.target == target {
             return;
         }
-        self.generation = self.generation.wrapping_add(1);
+        // The generation belongs to the queue, not to the image being browsed.
+        if !self.busy {
+            self.generation = self.generation.wrapping_add(1);
+            self.queue.clear();
+            self.request = false;
+            self.update = false;
+            self.cancel = false;
+        }
         self.state = match target.as_ref().map(store::load).transpose() {
             Ok(Some(Some(report))) => State::Ready(report),
             Err(error) => State::Failed(format!("Cannot load saved report: {error:#}")),
@@ -82,11 +105,6 @@ impl View {
         self.selected = 0;
         self.offset = 0;
         self.expanded = false;
-        self.queue.clear();
-        self.batch.clear();
-        self.request = false;
-        self.update = false;
-        self.cancel = false;
     }
 
     pub fn complete(&mut self, event: Event) {
@@ -95,32 +113,44 @@ impl View {
         }
         if matches!(&event.result, Outcome::QueueDone) {
             self.busy = false;
-            self.batch = match &self.state {
-                State::Failed(_) => {
-                    "Queue stopped on error; completed images saved to SQLite".into()
-                }
-                State::Cancelled => "Queue cancelled; completed images saved to SQLite".into(),
-                _ => "Queue complete; reports saved to SQLite".into(),
+            let status = if self.queue_cancelled {
+                "Queue cancelled"
+            } else {
+                "Queue complete"
             };
+            self.batch = format!(
+                "{status} · {} completed · {} failed · completed reports saved to SQLite",
+                self.completed, self.failed
+            );
             return;
         }
-        if self.target.as_ref() != Some(&event.target) {
-            self.selected = 0;
-            self.offset = 0;
-            self.expanded = false;
-        }
-        self.target = Some(event.target);
-        self.state = match event.result {
-            Outcome::Progress(text) => State::Running(text),
+        let selected = self.target.as_ref().is_some_and(|target| {
+            target.connection.endpoint == event.target.connection.endpoint
+                && target.runtime == event.target.runtime
+                && target.image == event.target.image
+        });
+        self.scan_target = Some(event.target);
+        match event.result {
+            Outcome::Progress(text) => self.progress = text,
             Outcome::Finished(Ok(report)) => {
-                self.selected = self.selected.min(report.findings.len().saturating_sub(1));
-                self.offset = self.offset.min(self.selected);
-                State::Ready(report)
+                self.completed += 1;
+                if selected {
+                    self.selected = self.selected.min(report.findings.len().saturating_sub(1));
+                    self.offset = self.offset.min(self.selected);
+                    self.state = State::Ready(report);
+                }
             }
-            Outcome::Finished(Err(error)) => State::Failed(error),
-            Outcome::Cancelled => State::Cancelled,
-            Outcome::QueueDone => return,
-        };
+            Outcome::Finished(Err(error)) => {
+                self.failed += 1;
+                self.progress = format!("Image scan failed: {error}");
+                // A failed rescan must not erase a previously completed report.
+                if selected && !matches!(self.state, State::Ready(_)) {
+                    self.state = State::Failed(error);
+                }
+            }
+            Outcome::Cancelled => self.queue_cancelled = true,
+            Outcome::QueueDone => (),
+        }
     }
 
     pub fn move_by(&mut self, amount: isize) {
@@ -307,7 +337,7 @@ async fn scan(
         .await;
 }
 
-/// Sequential queue: completed reports survive cancellation and the first failure.
+/// Sequential queue: individual failures do not skip the remaining images.
 async fn scan_batch(
     targets: Vec<Target>,
     generation: u64,
@@ -338,13 +368,13 @@ async fn scan_batch(
             cancel.clone(),
         );
         tokio::pin!(scan);
-        let mut failed = false;
+        let mut cancelled = false;
         loop {
             tokio::select! {
                 () = &mut scan => break,
                 Some(mut event) = local_rx.recv() => {
                     if let Outcome::Progress(text) = &mut event.result { *text = format!("Image {}/{} · {text}", index + 1, total); }
-                    failed |= matches!(&event.result, Outcome::Finished(Err(_)) | Outcome::Cancelled);
+                    cancelled |= matches!(&event.result, Outcome::Cancelled);
                     if tx.send(event).await.is_err() { return; }
                 }
             }
@@ -353,15 +383,12 @@ async fn scan_batch(
             if let Outcome::Progress(text) = &mut event.result {
                 *text = format!("Image {}/{} · {text}", index + 1, total);
             }
-            failed |= matches!(
-                &event.result,
-                Outcome::Finished(Err(_)) | Outcome::Cancelled
-            );
+            cancelled |= matches!(&event.result, Outcome::Cancelled);
             if tx.send(event).await.is_err() {
                 return;
             }
         }
-        if failed {
+        if cancelled {
             break;
         }
     }
@@ -380,7 +407,7 @@ async fn scan_batch(
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn batch_stops_at_first_error_without_attempting_other_targets() {
+    async fn batch_continues_after_individual_image_errors() {
         let target = Target {
             connection: Connection {
                 name: "fixture".into(),
@@ -392,18 +419,228 @@ mod tests {
             label: "first".into(),
         };
         let mut second = target.clone();
-        second.label = "must-not-run".into();
+        second.label = "second".into();
         let (tx, mut rx) = mpsc::channel(16);
         let (_cancel, cancel) = watch::channel(false);
         scan_batch(vec![target, second], 1, false, tx, cancel).await;
         let mut failures = Vec::new();
+        let mut view = View {
+            busy: true,
+            generation: 1,
+            ..Default::default()
+        };
         while let Some(event) = rx.recv().await {
             if matches!(event.result, Outcome::Finished(Err(_))) {
-                failures.push(event.target.label);
+                failures.push(event.target.label.clone());
             }
+            view.complete(event);
         }
-        assert_eq!(failures, ["first"]);
+        assert_eq!(failures, ["first", "second"]);
+        assert!(!view.busy);
+        assert!(view.batch.contains("0 completed · 2 failed"));
     }
+
+    #[tokio::test]
+    async fn cancelled_queue_does_not_attempt_images() {
+        let target = Target {
+            connection: Connection {
+                name: "fixture".into(),
+                kind: crate::config::BackendKind::Containerd,
+                endpoint: "unsupported".into(),
+            },
+            runtime: "fixture".into(),
+            image: "invalid".into(),
+            label: "must-not-run".into(),
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_cancel, cancel) = watch::channel(true);
+        scan_batch(vec![target.clone(), target], 1, false, tx, cancel).await;
+        assert!(matches!(
+            rx.recv().await.unwrap().result,
+            Outcome::Cancelled
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap().result,
+            Outcome::QueueDone
+        ));
+        assert!(rx.recv().await.is_none());
+    }
+    #[test]
+    fn queue_summary_preserves_failures_when_later_images_succeed() {
+        let target = Target {
+            connection: Connection {
+                name: "fixture".into(),
+                kind: crate::config::BackendKind::Docker,
+                endpoint: "unix:///fixture".into(),
+            },
+            runtime: "fixture".into(),
+            image: "fixture".into(),
+            label: "fixture".into(),
+        };
+        let mut view = View {
+            busy: true,
+            generation: 7,
+            ..Default::default()
+        };
+        view.complete(Event {
+            generation: 7,
+            target: target.clone(),
+            result: Outcome::Finished(Err("scan failed".into())),
+        });
+        // Opening findings while scanning must not invalidate the queue's generation.
+        view.select(None);
+        assert_eq!(view.generation, 7);
+        for _ in 0..2 {
+            view.complete(Event {
+                generation: 7,
+                target: target.clone(),
+                result: Outcome::Finished(Ok(Report {
+                    findings: vec![],
+                    scanner: "fixture".into(),
+                    database: "fixture".into(),
+                    scanned: 1,
+                })),
+            });
+        }
+        view.complete(Event {
+            generation: 7,
+            target,
+            result: Outcome::QueueDone,
+        });
+        assert!(!view.busy);
+        assert_eq!(view.completed, 2);
+        assert_eq!(view.failed, 1);
+        assert!(view.batch.contains("2 completed · 1 failed"));
+        view.select(None);
+        assert!(view.batch.contains("2 completed · 1 failed"));
+    }
+
+    #[test]
+    fn queue_progress_and_other_images_do_not_replace_the_selected_report() {
+        let target = Target {
+            connection: Connection {
+                name: "fixture".into(),
+                kind: crate::config::BackendKind::Docker,
+                endpoint: "unix:///fixture".into(),
+            },
+            runtime: "fixture".into(),
+            image: "selected".into(),
+            label: "selected".into(),
+        };
+        let report = Report {
+            findings: vec![],
+            scanner: "saved".into(),
+            database: "fixture".into(),
+            scanned: 1,
+        };
+        let mut view = View {
+            target: Some(target.clone()),
+            state: State::Ready(report.clone()),
+            selected: 2,
+            expanded: true,
+            ..Default::default()
+        };
+        view.start(2);
+        let generation = view.generation;
+        assert_eq!(view.selected, 2);
+        assert!(view.expanded);
+        let mut other = target.clone();
+        other.image = "other".into();
+        view.complete(Event {
+            generation,
+            target: other.clone(),
+            result: Outcome::Progress("Image 1/2 · Grype".into()),
+        });
+        assert_eq!(view.target, Some(target.clone()));
+        assert_eq!(view.scan_target, Some(other.clone()));
+        assert_eq!(view.progress, "Image 1/2 · Grype");
+        assert!(matches!(&view.state, State::Ready(report) if report.scanner == "saved"));
+        view.complete(Event {
+            generation,
+            target: other,
+            result: Outcome::Finished(Ok(Report {
+                scanner: "other-result".into(),
+                ..report.clone()
+            })),
+        });
+        assert_eq!(view.completed, 1);
+        assert!(matches!(&view.state, State::Ready(report) if report.scanner == "saved"));
+        view.complete(Event {
+            generation,
+            target: target.clone(),
+            result: Outcome::Finished(Ok(Report {
+                scanner: "fresh".into(),
+                ..report
+            })),
+        });
+        assert!(matches!(&view.state, State::Ready(report) if report.scanner == "fresh"));
+        view.complete(Event {
+            generation,
+            target: target.clone(),
+            result: Outcome::Finished(Err("rescan failed".into())),
+        });
+        assert!(matches!(&view.state, State::Ready(report) if report.scanner == "fresh"));
+        view.complete(Event {
+            generation,
+            target: target.clone(),
+            result: Outcome::Cancelled,
+        });
+        view.complete(Event {
+            generation,
+            target,
+            result: Outcome::QueueDone,
+        });
+        assert!(!view.busy);
+        assert!(
+            view.batch
+                .contains("Queue cancelled · 2 completed · 1 failed")
+        );
+        assert!(matches!(&view.state, State::Ready(report) if report.scanner == "fresh"));
+    }
+
+    #[test]
+    fn browsing_away_during_scan_keeps_queue_events_but_not_unrelated_findings() {
+        let target = Target {
+            connection: Connection {
+                name: "fixture".into(),
+                kind: crate::config::BackendKind::Docker,
+                endpoint: "unix:///fixture".into(),
+            },
+            runtime: "fixture".into(),
+            image: "selected".into(),
+            label: "selected".into(),
+        };
+        let mut view = View {
+            target: Some(target.clone()),
+            ..Default::default()
+        };
+        view.start(1);
+        let generation = view.generation;
+        view.select(None);
+        assert_eq!(view.generation, generation);
+        assert!(view.busy);
+        assert!(view.target.is_none());
+        view.complete(Event {
+            generation,
+            target: target.clone(),
+            result: Outcome::Finished(Ok(Report {
+                findings: vec![],
+                scanner: "fixture".into(),
+                database: String::new(),
+                scanned: 1,
+            })),
+        });
+        assert!(matches!(view.state, State::Idle));
+        assert!(view.target.is_none());
+        assert_eq!(view.completed, 1);
+        view.complete(Event {
+            generation,
+            target,
+            result: Outcome::QueueDone,
+        });
+        assert!(!view.busy);
+    }
+
     #[test]
     fn stale_results_do_not_replace_new_image_selection() {
         let target = Target {

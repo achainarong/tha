@@ -891,6 +891,13 @@ impl App {
     }
 
     pub fn request_security_scan(&mut self, checked: bool) {
+        let detail_focus = self.detail_focus;
+        // Either shortcut honors checked images, even when filters hide them.
+        let checked = checked
+            || self
+                .inventory_views
+                .get(&(self.inventory_engine, OverviewMode::Images))
+                .is_some_and(|view| !view.scan_marked.is_empty());
         if self.demo {
             self.notice = "Demo mode: security scans and downloads are disabled".into();
         } else if !self.security.enabled {
@@ -907,15 +914,19 @@ impl App {
                     self.notice = "No checked images remain to scan; select images with m".into();
                     return;
                 }
-                self.security.select(targets.first().cloned());
+                let selected = crate::ui::inventory::security_targets(self, false)
+                    .into_iter()
+                    .next()
+                    .or_else(|| targets.first().cloned());
+                self.security.select(selected);
                 self.security.queue = targets;
                 self.overview_mode = OverviewMode::Security;
                 self.tab = Tab::Security;
-                self.detail_focus = true;
             } else if self.tab != Tab::Security {
                 self.open_security();
             }
             if self.security.target.is_some() && self.tab == Tab::Security {
+                self.detail_focus = detail_focus;
                 if !checked {
                     self.security.queue.clear();
                 }
@@ -1459,6 +1470,9 @@ impl App {
         };
         if self.has_active_actions() {
             consider(now.checked_add(std::time::Duration::from_millis(100)));
+        }
+        if self.security.busy && self.overview_mode == OverviewMode::Security {
+            consider(now.checked_add(std::time::Duration::from_secs(1)));
         }
         for feedback in self.action_feedback.values() {
             for at in feedback
@@ -2840,6 +2854,25 @@ mod tests {
         app.project = None;
         app.prepare_row_presentations(0, 1, now, true);
         assert_eq!(app.row_presentation(&key).cpu, initial);
+    }
+
+    #[test]
+    fn security_status_ticks_only_while_scanning_and_visible() {
+        use std::time::{Duration, Instant};
+        let mut app = app();
+        let now = Instant::now();
+        app.overview_mode = OverviewMode::Security;
+        assert!(app.next_visual_deadline(now).is_none());
+        app.security.start(2);
+        assert_eq!(
+            app.next_visual_deadline(now),
+            Some(now + Duration::from_secs(1))
+        );
+        app.overview_mode = OverviewMode::Images;
+        assert!(app.next_visual_deadline(now).is_none());
+        app.overview_mode = OverviewMode::Security;
+        app.security.busy = false;
+        assert!(app.next_visual_deadline(now).is_none());
     }
 
     #[test]

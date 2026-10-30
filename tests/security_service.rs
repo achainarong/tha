@@ -221,7 +221,7 @@ async fn rpc(path: &std::path::Path, value: &serde_json::Value) -> serde_json::V
 }
 
 #[tokio::test]
-async fn disconnected_ui_queue_persists_reports_uses_selected_endpoint_and_stops_on_error() {
+async fn disconnected_ui_queue_persists_reports_uses_selected_endpoint_and_continues_on_error() {
     use tokio::net::UnixListener;
     let temp = tempfile::tempdir().unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -369,8 +369,8 @@ esac
         .query_row("SELECT count(*) FROM reports", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
-        reports, 1,
-        "Only the first completed report should survive the queue's second-image error"
+        reports, 2,
+        "Both successful reports should survive the queue's second-image error"
     );
     let json: String = db
         .query_row("SELECT report FROM reports", [], |row| row.get(0))
@@ -391,12 +391,12 @@ esac
         "Scanner must never mount a runtime socket"
     );
     assert!(
-        !requests
+        requests
             .lock()
             .unwrap()
             .iter()
             .any(|request| request.contains(&"e".repeat(64))),
-        "The queue must not attempt its third image after an error"
+        "The queue must attempt its third image after an error"
     );
     // SAFETY: this PID belongs to this test's child daemon.
     assert_eq!(

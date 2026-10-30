@@ -10,7 +10,7 @@ pub fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
         );
         return;
     }
-    if !app.security.busy && !app.detail_focus {
+    if !app.detail_focus {
         let target = inventory::security_targets(app, false).into_iter().next();
         app.security.select(target);
     }
@@ -30,6 +30,11 @@ pub fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
         (Some(area), None)
     };
     if let Some(images) = images {
+        let images = if findings.is_none() {
+            content_above_status(frame, app, images)
+        } else {
+            images
+        };
         app.overview_mode = OverviewMode::Images;
         inventory::draw_security_images(frame, app, images);
         app.overview_mode = OverviewMode::Security;
@@ -41,8 +46,15 @@ pub fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = pane(
+        app,
         if app.security.expanded {
             " Advisory details · Esc Back ".into()
+        } else if matches!(app.security.state, State::Ready(_)) {
+            if area.width < 50 {
+                " CVEs · saved report ".into()
+            } else {
+                " Vulnerabilities · saved report · z Expand/restore ".into()
+            }
         } else {
             " Vulnerabilities · z Expand/restore ".into()
         },
@@ -51,6 +63,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let inner = content_above_status(frame, app, inner);
+    if inner.height == 0 {
         return;
     }
     let mut lines = Vec::new();
@@ -71,33 +87,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             muted(),
         ));
     }
-    if !compact && !app.security.batch.is_empty() {
-        lines.push(Line::from(app.security.batch.clone()));
-    }
-    if !compact && !app.security.queue.is_empty() {
-        lines.push(Line::from(format!(
-            "{} images selected · :scan-images scans the checked queue",
-            app.security.queue.len()
-        )));
-    }
     match &app.security.state {
         State::Idle => lines.push(Line::from(if app.security.enabled {
-            "Not scanned · s Scan this image · S Scan checked images"
+            "No saved report yet · s Scan checked/selected images"
         } else {
             "Module not installed. Run: tha module install security"
         })),
-        State::Running(message) => {
-            lines.push(Line::from(message.clone()));
-            lines.push(Line::from(
-                "Service-owned queue · safe to close the UI · x Cancel",
-            ));
-        }
-        State::Cancelled => lines.push(Line::from(
-            "Queue cancelled. Previously completed reports remain in SQLite.",
-        )),
         State::Failed(error) => {
             lines.push(Line::styled(
-                "Queue stopped on error; this is NOT a clean scan.",
+                "Image scan failed; this is NOT a clean scan.",
                 accent(app, Color::Red),
             ));
             lines.push(Line::from(safe_text(error)));
@@ -218,6 +216,95 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(paragraph.scroll((app.detail_scroll as u16, 0)), inner);
 }
 
+fn content_above_status(frame: &mut Frame, app: &App, area: Rect) -> Rect {
+    if !app.security.busy && app.security.batch.is_empty() {
+        return area;
+    }
+    let status_height = if area.height >= 10 && app.security.busy {
+        3
+    } else {
+        1
+    };
+    let parts =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(status_height)]).split(area);
+    draw_status(frame, app, parts[1]);
+    parts[0]
+}
+
+fn scan_status_line(app: &App, now: std::time::Instant, width: u16) -> Line<'static> {
+    if !app.security.busy {
+        return ellipsize_line(
+            Line::styled(
+                app.security.batch.clone(),
+                if app.security.failed > 0 {
+                    accent(app, Color::Yellow)
+                } else {
+                    muted()
+                },
+            ),
+            width as usize,
+        );
+    }
+    let seconds = app
+        .security
+        .started
+        .map(|started| now.saturating_duration_since(started).as_secs())
+        .unwrap_or(0);
+    let spinner = ["⠋", "⠙", "⠹", "⠸"][(seconds % 4) as usize];
+    let elapsed = format!("{:02}:{:02}", seconds / 60, seconds % 60);
+    let suffix = if width >= 28 {
+        format!(" {elapsed} · x Cancel")
+    } else {
+        format!(" {elapsed} · x")
+    };
+    let suffix_width = UnicodeWidthStr::width(suffix.as_str());
+    let available = (width as usize).saturating_sub(suffix_width);
+    let mut line = ellipsize_line(
+        Line::styled(
+            format!("{spinner} {}", safe_text(&app.security.progress)),
+            accent(app, Color::Cyan),
+        ),
+        available,
+    );
+    line.spans.push(Span::raw(
+        " ".repeat(available.saturating_sub(line.width())),
+    ));
+    line.spans.push(Span::raw(suffix));
+    ellipsize_line(line, width as usize)
+}
+
+fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+    let inner = if area.height >= 3 {
+        let block = Block::default().borders(Borders::TOP).border_style(muted());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        inner
+    } else {
+        area
+    };
+    let mut lines = vec![scan_status_line(
+        app,
+        std::time::Instant::now(),
+        inner.width,
+    )];
+    if app.security.busy && inner.height > 1 {
+        lines.push(Line::styled(
+            app.security
+                .scan_target
+                .as_ref()
+                .map(|target| {
+                    format!(
+                        "Scanning {} · saved CVEs remain browsable",
+                        safe_text(&target.label)
+                    )
+                })
+                .unwrap_or_else(|| "Service-owned queue · safe to close the UI".into()),
+            muted(),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn severity_style(app: &App, rank: usize) -> Style {
     match rank {
         0 => accent(app, Color::Red).add_modifier(Modifier::BOLD),
@@ -330,7 +417,17 @@ fn draw_findings(frame: &mut Frame, app: &mut App, area: Rect) {
         TableState::default().with_selected(Some(app.security.selected.saturating_sub(start)));
     frame.render_stateful_widget(
         Table::new(rows, widths)
-            .header(TableRow::new(headers).style(muted()).bottom_margin(margin))
+            .header(
+                TableRow::new(headers.into_iter().map(|header| {
+                    Cell::from(Line::from(header).alignment(if header == "CVSS" {
+                        Alignment::Right
+                    } else {
+                        Alignment::Left
+                    }))
+                }))
+                .style(muted())
+                .bottom_margin(margin),
+            )
             .column_spacing(1)
             .row_highlight_style(selected())
             .highlight_symbol("› "),
@@ -389,6 +486,196 @@ mod tests {
             .count();
         assert_eq!(checkboxes, snapshot.images.as_ref().unwrap().len());
         assert_eq!(app.overview_mode, OverviewMode::Security);
+    }
+
+    #[test]
+    fn focused_pane_is_distinct_and_respects_monochrome() {
+        let mut app = App::new(crate::demo::connections(), 100, false, true);
+        crate::demo::populate(&mut app);
+        app.security.enabled = true;
+        app.overview_mode = OverviewMode::Security;
+        for monochrome in [false, true] {
+            app.monochrome = monochrome;
+            for findings_focus in [false, true] {
+                app.detail_focus = findings_focus;
+                let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+                terminal
+                    .draw(|frame| draw_overview(frame, &mut app, frame.area()))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let (active_x, active_y, inactive_x, inactive_y) = if findings_focus {
+                    (68, 0, 0, 1)
+                } else {
+                    (0, 1, 68, 0)
+                };
+                let active = &buffer[(active_x, active_y)];
+                let inactive = &buffer[(inactive_x, inactive_y)];
+                assert_eq!(active.symbol(), "┏");
+                assert_eq!(inactive.symbol(), "┌");
+                assert!(active.modifier.contains(Modifier::BOLD));
+                assert!(inactive.modifier.contains(Modifier::DIM));
+                assert_eq!(
+                    active.fg,
+                    if monochrome {
+                        Color::Reset
+                    } else {
+                        Color::Cyan
+                    }
+                );
+                assert_eq!(active.bg, Color::Reset);
+            }
+        }
+    }
+
+    #[test]
+    fn cvss_header_and_values_share_the_same_right_edge() {
+        let mut app = App::new(crate::demo::connections(), 100, false, true);
+        app.security.state = State::Ready(crate::security::Report {
+            findings: vec![crate::security::Finding {
+                id: "CVE-fixture".into(),
+                severity: "Critical".into(),
+                score: Some(9.8),
+                package: "example".into(),
+                installed: "1".into(),
+                fixed: "2".into(),
+                description: String::new(),
+                url: String::new(),
+            }],
+            scanner: "fixture".into(),
+            database: String::new(),
+            scanned: 123,
+        });
+        for width in [140, 90, 60, 35] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            terminal
+                .draw(|frame| draw_findings(frame, &mut app, frame.area()))
+                .unwrap();
+            let rows: Vec<String> = terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(width as usize)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+                .collect();
+            let header = rows.iter().find_map(|row| row.find("CVSS")).unwrap();
+            let value = rows
+                .iter()
+                .find_map(|row| {
+                    row.find("9.8")
+                        .map(|index| unicode_width::UnicodeWidthStr::width(&row[..index]))
+                })
+                .unwrap();
+            assert_eq!(header + 4, value + 3, "CVSS alignment at width {width}");
+        }
+    }
+
+    #[test]
+    fn scanning_keeps_saved_cves_visible_above_the_bottom_status() {
+        let mut app = App::new(crate::demo::connections(), 100, false, true);
+        app.security.state = State::Ready(crate::security::Report {
+            findings: vec![crate::security::Finding {
+                id: "CVE-saved".into(),
+                severity: "Critical".into(),
+                score: Some(9.8),
+                package: "example".into(),
+                installed: "1".into(),
+                fixed: "2".into(),
+                description: String::new(),
+                url: String::new(),
+            }],
+            scanner: "fixture".into(),
+            database: String::new(),
+            scanned: 123,
+        });
+        app.security.start(3);
+        app.security.progress = "Image 1/3 · Scanning image packages with Grype…".into();
+        for (width, height) in [(140, 30), (60, 20), (32, 10)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &mut app, frame.area()))
+                .unwrap();
+            let rows: Vec<String> = terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(width as usize)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+                .collect();
+            let cve = rows
+                .iter()
+                .position(|row| row.contains("CVE-saved"))
+                .unwrap();
+            let status = rows
+                .iter()
+                .position(|row| row.contains("Image 1/3"))
+                .unwrap();
+            assert!(cve < status);
+            assert!(status >= height as usize - 3);
+            assert!(rows[0].contains("saved report"));
+        }
+        for (width, height) in [(20, 5), (1, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &mut app, frame.area()))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn narrow_image_list_still_shows_the_active_scan_status() {
+        let mut app = App::new(crate::demo::connections(), 100, false, true);
+        crate::demo::populate(&mut app);
+        app.security.enabled = true;
+        app.overview_mode = OverviewMode::Security;
+        app.detail_focus = false;
+        app.security.start(3);
+        app.security.progress = "Image 1/3 · Grype".into();
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| draw_overview(frame, &mut app, frame.area()))
+            .unwrap();
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(60)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let status = rows
+            .iter()
+            .position(|row| row.contains("Image 1/3"))
+            .unwrap();
+        assert!(status >= 17);
+        assert!(!app.detail_focus);
+    }
+
+    #[test]
+    fn scan_status_animates_and_shows_elapsed_time_without_fabricating_progress() {
+        let mut app = App::new(crate::demo::connections(), 100, false, true);
+        let started = std::time::Instant::now();
+        app.security.start(3);
+        app.security.started = Some(started);
+        app.security.progress = "Image 1/3 · Waiting for Grype".into();
+        let first = scan_status_line(&app, started + std::time::Duration::from_secs(62), 100);
+        let next = scan_status_line(&app, started + std::time::Duration::from_secs(63), 100);
+        assert_ne!(first, next);
+        let text: String = first
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("01:02 · x Cancel"));
+        assert!(text.contains("Image 1/3 · Waiting for Grype"));
+        assert!(!text.contains('%'));
+        for width in [0, 1, 10, 28, 100] {
+            assert!(scan_status_line(&app, started, width).width() <= width as usize);
+        }
+        app.security.busy = false;
+        app.security.batch = "Queue complete · 3 completed · 0 failed".into();
+        assert_eq!(
+            scan_status_line(&app, started, 100),
+            scan_status_line(&app, started + std::time::Duration::from_secs(99), 100)
+        );
     }
 
     #[test]

@@ -92,14 +92,24 @@ Space/`u` cleanup marks; scanning works on used and unused images. The queue inc
 checked images still present in that runtime, even if a filter hides them. With no
 checks, it scans the selected image. A vanished checked image is skipped; no image is
 pulled as a replacement. Press **7** or **`:security`** on an image to browse its saved
-report, then **`:scan-image`** to scan/rescan it. **Tab** switches between Security's
+report, then **`:scan-image`** to scan/rescan it (clear checks first for just that image).
+**Tab** switches between Security's
 image list and findings; **Enter** on an image focuses its findings. A single container
 can also open its image in Security. Merely opening Security never scans or downloads anything.
-Within Security, **s** scans the selected/displayed image, **S** scans checked images,
+Within Security, **s** or **S** scans checked images (or the selected image if none are checked),
 and **x** cancels the service's active queue. These shortcuts never delete images.
 **Space** also toggles scan checks in Security; **c** clears scan checks without
 changing cleanup marks in Images. Findings use a responsive, scrollable table;
 narrow terminals show fewer columns, with all fields available under Enter.
+Starting a scan keeps keyboard focus where it was; use **Enter** or **Tab** to focus
+findings. The active pane has a thick, theme-colored border (bold in monochrome).
+Queues continue after individual image errors and summarize completed/failed images;
+cancellation still stops the remaining queue. A failed image is never a clean report.
+Saved CVEs remain visible and browsable during scanning; background scans do not
+change the selected image. The bottom status strip shows the service's current stage,
+an animated activity indicator, elapsed queue time, and **x** to cancel. The animation
+indicates UI activity, not measured scan progress. Findings refresh when the selected
+image finishes scanning; previously saved results are explicitly labeled as saved reports.
 
 Security findings are sorted Critical → High → Medium → Low → Negligible → Unknown,
 then by descending highest reported CVSS base score. Missing scores are shown as `—`,
