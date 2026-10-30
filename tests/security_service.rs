@@ -53,7 +53,8 @@ esac
     let output = Command::new(env!("CARGO_BIN_EXE_tha"))
         .args(["module", "install", "security"])
         .current_dir(temp.path())
-        .env("PATH", "bin")
+        // The trailing empty entry means the current directory under POSIX.
+        .env("PATH", "bin:")
         .env("XDG_DATA_HOME", temp.path())
         .env("DOCKER_HOST", "unix:///fixture.sock")
         .output()
@@ -77,6 +78,18 @@ esac
     );
     assert!(root.join("installed").is_file());
     assert!(root.join("enabled").is_file());
+    let saved_path = fs::read_to_string(root.join("docker-env-path")).unwrap();
+    let directories: Vec<_> = std::env::split_paths(&saved_path).collect();
+    assert_eq!(directories.len(), 2);
+    assert!(directories.iter().all(|directory| directory.is_absolute()));
+    assert_eq!(
+        directories[0].canonicalize().unwrap(),
+        bin.canonicalize().unwrap()
+    );
+    assert_eq!(
+        directories[1].canonicalize().unwrap(),
+        temp.path().canonicalize().unwrap()
+    );
 }
 
 #[tokio::test]
@@ -223,6 +236,7 @@ async fn disconnected_ui_queue_persists_reports_uses_selected_endpoint_and_stops
     let launcher = temp.path().join("fake-docker");
     fs::write(&launcher, r##"#!/bin/sh
 set -eu
+docker-credential-fixture
 printf '%s\n' "$*" >> "$FIXTURE_ROOT/calls"
 [ "$1" = --host ] || exit 90
 shift 2
@@ -244,6 +258,16 @@ esac
 "##).unwrap();
     fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(root.join("docker-path"), launcher.to_str().unwrap()).unwrap();
+    let helpers = temp.path().join("helpers");
+    fs::create_dir(&helpers).unwrap();
+    let helper = helpers.join("docker-credential-fixture");
+    fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        root.join("docker-env-path"),
+        format!("{}:/usr/bin:/bin", helpers.display()),
+    )
+    .unwrap();
     let old_scanner = format!("sha256:{}", "d".repeat(64));
     let scanner = format!("sha256:{}", "c".repeat(64));
     fs::write(
@@ -260,6 +284,7 @@ esac
         .arg("daemon")
         .env("XDG_DATA_HOME", temp.path())
         .env("FIXTURE_ROOT", temp.path())
+        .env("PATH", "/usr/bin:/bin")
         .env("FIXTURE_SCANNER", scanner)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

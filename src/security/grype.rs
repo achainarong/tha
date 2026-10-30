@@ -30,6 +30,13 @@ fn docker(connection: &Connection) -> Command {
         .map(|path| std::path::PathBuf::from(path.trim()))
         .unwrap_or_else(|| "docker".into());
     let mut command = Command::new(program);
+    if let Some(path) = super::root()
+        .ok()
+        .and_then(|root| std::fs::read(root.join("docker-env-path")).ok())
+    {
+        use std::os::unix::ffi::OsStringExt;
+        command.env("PATH", std::ffi::OsString::from_vec(path));
+    }
     command.args(["--host", &connection.endpoint]);
     // Context/TLS/API overrides must never redirect a selected runtime.
     for name in [
@@ -51,9 +58,21 @@ fn docker(connection: &Connection) -> Command {
 
 pub fn remember_executable() -> Result<()> {
     use std::{io::Write, os::unix::fs::PermissionsExt};
-    let program = std::env::var_os("PATH")
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    // Relative entries must keep their installation-time meaning in the daemon.
+    // An empty entry means the current directory, which `absolute` rejects as-is.
+    let directories = std::env::split_paths(&path)
+        .map(|entry| {
+            std::path::absolute(if entry.as_os_str().is_empty() {
+                ".".into()
+            } else {
+                entry
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let path = std::env::join_paths(&directories)?;
+    let program = directories
         .into_iter()
-        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
         .map(|path| path.join("docker"))
         .find(|path| {
             std::fs::metadata(path).is_ok_and(|metadata| {
@@ -74,6 +93,11 @@ pub fn remember_executable() -> Result<()> {
             .as_bytes(),
     )?;
     file.persist(root.join("docker-path"))?;
+    // Docker finds credential helpers via PATH even when its own path is absolute.
+    use std::os::unix::ffi::OsStrExt;
+    let mut file = tempfile::NamedTempFile::new_in(&root)?;
+    file.write_all(path.as_os_str().as_bytes())?;
+    file.persist(root.join("docker-env-path"))?;
     Ok(())
 }
 
