@@ -104,10 +104,10 @@ def main():
         keys(b"z")
         expect("latest")
         border = next(row for row in screen.display if "· Selected container" in row)
-        assert border[-1] == "┐", "Expanded Performance did not span terminal width"
+        assert border[-1] == "┓", "Expanded Performance did not span terminal width"
         keys(b"\x1b")
         border = next(row for row in screen.display if "· Selected container" in row)
-        assert border[59] == "┐", "Esc did not restore the compact panel"
+        assert border[59] == "┓", "Esc did not restore the compact panel"
         keys(b"p:networks\r")
         keys(b"?")
         expect("Shortcuts")
