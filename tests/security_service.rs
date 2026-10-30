@@ -50,7 +50,49 @@ esac
     fs::set_permissions(&tools, fs::Permissions::from_mode(0o755)).unwrap();
     std::os::unix::fs::symlink("docker-tools", bin.join("docker")).unwrap();
 
+    // Installing requires a running collector. Use a fixture daemon on a private
+    // database; the default path could find the developer's own service.
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let database = temp.path().join("history.sqlite3");
+    let config = temp.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "history_database = {:?}\nhistory_disk_mb = 16\n",
+            database.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let daemon_config = temp.path().join("daemon.toml");
+    fs::write(
+        &daemon_config,
+        format!(
+            "discover_connections = false\nhistory_database = {:?}\nhistory_disk_mb = 16\n[[connections]]\nname = 'offline fixture'\nkind = 'docker'\nendpoint = 'unix:///nonexistent/tha-security-fixture.sock'\n",
+            database.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_tha"))
+        .arg("--config")
+        .arg(&daemon_config)
+        .arg("daemon")
+        .env("XDG_DATA_HOME", temp.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_for(|| temp.path().join("history.sock").exists() || daemon.try_wait().unwrap().is_some())
+        .await;
+    assert!(
+        daemon.try_wait().unwrap().is_none(),
+        "Fixture daemon failed during startup"
+    );
+
     let output = Command::new(env!("CARGO_BIN_EXE_tha"))
+        .arg("--config")
+        .arg(&config)
         .args(["module", "install", "security"])
         .current_dir(temp.path())
         // The trailing empty entry means the current directory under POSIX.
