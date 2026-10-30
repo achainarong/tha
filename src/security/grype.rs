@@ -60,8 +60,10 @@ pub fn remember_executable() -> Result<()> {
                 metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
             })
         })
-        .context("Install the Docker CLI before enabling the security service module")?
-        .canonicalize()?;
+        .context("Install the Docker CLI before enabling the security service module")?;
+    // Keep the invocation name: multicall CLIs (e.g. OrbStack) dispatch on argv[0].
+    // An absolute path still lets the service run without the user's PATH.
+    let program = std::path::absolute(program)?;
     let root = super::root()?;
     std::fs::create_dir_all(&root)?;
     let mut file = tempfile::NamedTempFile::new_in(&root)?;

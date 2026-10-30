@@ -22,6 +22,64 @@ async fn wait_for(mut condition: impl FnMut() -> bool) {
 }
 
 #[tokio::test]
+async fn module_install_preserves_symlinked_docker_invocation_with_relative_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let tools = bin.join("docker-tools");
+    fs::write(
+        &tools,
+        r#"#!/bin/sh
+case "$0" in
+    */docker) ;;
+    *) echo "unsupported argv0 $0" >&2; exit 1 ;;
+esac
+if [ "$1" != "--host" ] || [ "$2" != "unix:///fixture.sock" ]; then
+    echo "unexpected endpoint" >&2
+    exit 1
+fi
+shift 2
+case "$1" in
+    pull|run|rm) exit 0 ;;
+    image) printf 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' ;;
+    *) echo "unexpected command" >&2; exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&tools, fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("docker-tools", bin.join("docker")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tha"))
+        .args(["module", "install", "security"])
+        .current_dir(temp.path())
+        .env("PATH", "bin")
+        .env("XDG_DATA_HOME", temp.path())
+        .env("DOCKER_HOST", "unix:///fixture.sock")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let root = temp.path().join("tha/modules/security");
+    let remembered = fs::read_to_string(root.join("docker-path")).unwrap();
+    let remembered = std::path::Path::new(&remembered);
+    assert!(remembered.is_absolute());
+    assert_eq!(remembered.file_name().unwrap(), "docker");
+    assert!(
+        fs::symlink_metadata(remembered)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(root.join("installed").is_file());
+    assert!(root.join("enabled").is_file());
+}
+
+#[tokio::test]
 async fn daemon_starts_and_stops_the_optional_worker_when_module_is_toggled() {
     let temp = tempfile::tempdir().unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
