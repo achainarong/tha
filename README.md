@@ -26,6 +26,13 @@ keeps 24 hours of metrics even when the UI is closed:
 curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sh -s -- service
 ```
 
+**Service + Security** additionally sets up the
+[security module](#optional-security-module) (Grype image vulnerability scanning):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | MODULES=security sh
+```
+
 The [script](scripts/install.sh) downloads the release archive and `SHA256SUMS`,
 verifies the checksum, and installs `tha` into `~/.local/bin`. It needs `curl` or
 `wget`, `tar`, and `sha256sum` (Linux) or `shasum` (macOS). Optional settings:
@@ -35,10 +42,102 @@ verifies the checksum, and installs `tha` into `~/.local/bin`. It needs `curl` o
 | `THA_MODE=service` | Same as passing `service` |
 | `THA_VERSION=v0.6.0` | Install that release instead of the latest (pin or roll back) |
 | `THA_BIN_DIR=...` | Install somewhere other than `~/.local/bin` |
+| `MODULES=security` | Install the Security service module; implies service mode; requires Docker CLI and a running Docker-compatible Unix endpoint |
 
 Re-running the script updates in place. A running collector is stopped before the
 binary is replaced and started again afterwards, in either mode. Configuration and
 history are never touched.
+
+### Optional security module
+
+```sh
+# MODULES belongs on the shell side of the pipe, not on curl.
+curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | MODULES="security" sh
+# Or add it to an existing service installation:
+tha service install
+tha service start
+tha module install security
+tha module disable security
+tha module enable security
+tha module status
+```
+
+`MODULES` is a comma-separated list; currently `security` is the only module.
+Modules extend **service mode only**. `MODULES=security` chooses service mode when no
+mode was specified; combining it with explicit `standalone` is rejected before any
+download. `tha --standalone` keeps the existing standalone feature set and hides Security.
+Enable/disable takes effect in the running service and UI without restarting them.
+Disabling cancels the active security queue and removes its scanner containers, but
+keeps the image cache, database volume and saved reports. Re-enabling does not download
+resources again until the next scan needs an update.
+Unknown names fail before the installer downloads or replaces Tha. Omitting it
+does not install security or remove modules already installed. The installed Tha
+release must include module support; a source build can use `cargo run -- module install security`.
+
+Setup pulls the official `anchore/grype:latest` scanner and initializes its database
+(approximately 196 MB compressed at time of writing, plus extracted disk usage).
+`DOCKER_HOST` selects the setup engine; otherwise the current Docker context is used.
+Setup does not start an engine. A setup failure leaves Tha installed and prints a retry command.
+The installer starts the per-user service before provisioning the module. Manual
+`tha module install security` requires that service to be running. The Docker CLI's
+absolute path is recorded during setup so launchd/systemd need not inherit your shell's PATH.
+
+When enabled, **Security is a fourth top-level view**, alongside Containers, Images
+and Volumes. **Shift+Left/Right** (or F7/F8) cycles all four; **Alt+4** opens Security
+directly. Without the module, only the original three views are shown.
+
+In **Security** (or **Images**, `:images`), press **m** to check individual images or **M** to check
+all visible images, then **`:scan-images`**. Checks are separate from the existing
+Space/`u` cleanup marks; scanning works on used and unused images. The queue includes
+checked images still present in that runtime, even if a filter hides them. With no
+checks, it scans the selected image. A vanished checked image is skipped; no image is
+pulled as a replacement. Press **7** or **`:security`** on an image to browse its saved
+report, then **`:scan-image`** to scan/rescan it. **Tab** switches between Security's
+image list and findings; **Enter** on an image focuses its findings. A single container
+can also open its image in Security. Merely opening Security never scans or downloads anything.
+Within Security, **s** scans the selected/displayed image, **S** scans checked images,
+and **x** cancels the service's active queue. These shortcuts never delete images.
+**Space** also toggles scan checks in Security; **c** clears scan checks without
+changing cleanup marks in Images. Findings use a responsive, scrollable table;
+narrow terminals show fewer columns, with all fields available under Enter.
+
+Security findings are sorted Critical → High → Medium → Low → Negligible → Unknown,
+then by descending highest reported CVSS base score. Missing scores are shown as `—`,
+not zero. **j/k** selects findings; **Enter** opens package versions, available fixes,
+description and advisory URL; **Esc** returns. **z** expands/restores Security across
+the terminal. Images also supports **z** to hide the application header and focus
+expanded image details. **`:cancel-scan`** cancels the queue.
+
+Scans run sequentially in the **selected image's runtime endpoint**, not whichever
+Docker context happens to be active. The module exports the immutable local image
+to a private temporary archive (10 GiB maximum), copies it into an ephemeral Grype
+container, and reads JSON findings. It never mounts the engine socket into Grype,
+executes the target image, or uploads the package inventory. The scan container has
+no network; a separate ephemeral database-update container has network access.
+The scanner containers are removed after use; the named volume
+`tha-security-grype-db` persists **per runtime**. Failed/cancelled scans do not become
+clean reports. Completed reports survive later queue errors and application restarts
+in `$XDG_DATA_HOME/tha/modules/security/reports.sqlite3` (default
+`~/.local/share/tha/modules/security/reports.sqlite3`), separate from metrics history.
+The latest report per runtime/image is retained, up to 200 images and a 128 MiB database budget.
+The service owns scan queues: closing Tha only disconnects the UI, not the job.
+Reopen an image in Security to load its completed report. `:cancel-scan` sends an
+explicit cancellation request, including for a queue started by a previous UI session.
+An application/service restart cancels in-progress work; queued jobs are not crash-durable.
+
+Opting into the module permits scanner pulls and database refreshes, checked at most
+once per day **on scan use**, not by an always-running container or background scheduler.
+The actual scanner image ID is pinned for each scan. After a successful update, Tha
+removes only the previously tracked Grype image, without force or parent pruning.
+If that old image is still referenced, the queue reports an error rather than force
+deleting it. **`:update-security-db`** forces an update and rescan of the selected image.
+Docker-compatible Unix endpoints are supported initially; native containerd is not.
+Podman compatibility depends on its Docker API and the Docker CLI and must be verified
+for the installed version.
+
+Reports describe the image, not running-container changes or mounted files. Old saved
+reports are not automatically reevaluated after database updates. Zero findings is
+not a guarantee of security; package detection and advisory coverage have limits.
 
 Then run `~/.local/bin/tha`, or add `~/.local/bin` to your `PATH`:
 
@@ -72,12 +171,14 @@ make demo       # Try the UI without contacting any runtime
 make run        # Discover and browse your actual engines
 make install                # Standalone: install tha into ~/.cargo/bin (or your Cargo root)
 make install MODE=service   # Also install and start the per-user background collector
+make install:full           # Service mode + security module, both installed and enabled
 tha
 ```
 
 Ensure Cargo's bin directory is on `PATH`. Installation does not require sudo.
 If both install locations are on `PATH`, `command -v tha` shows which takes precedence.
-Tha never starts an engine, VM, or container automatically.
+Tha never starts an engine, VM, or workload container automatically. Enabled service
+modules may run their documented helper containers after explicit setup/scan requests.
 
 ## First MVP
 
@@ -338,8 +439,11 @@ empty inventory; native containerd inventory is currently unavailable.
 ### Background collection and container Metrics
 
 Press **`5`** on a container (or `:metrics`; `:history` remains an alias) for CPU, RAM, disk read/write and
-network receive/transmit charts. **`[` / `]`** choose 1 minute, 5 minutes,
-15 minutes, 1 hour or 24 hours. **Left/right** browse the timeline; **`f`** returns
+network receive/transmit charts. The range legend highlights the selected window.
+**`[`** selects a shorter range; **`]`** selects a longer range: 1 minute, 3 minutes,
+5 minutes, 15 minutes, 30 minutes, 1 hour, 3 hours, 6 hours, 12 hours or 24 hours.
+Each container remembers its last selected range for the current Tha session.
+**Left/right** browse the timeline; **`f`** returns
 to live. **`c`** enables a shared time cursor and **`h` / `l`** inspect readings.
 **`z`** enlarges Metrics across the terminal and **Esc** restores the split view.
 Small terminals show one metric group at a time; **`j` / `k`** switches groups.
@@ -419,6 +523,9 @@ batches **every 15 seconds**, or earlier when the persistence buffer reaches
 buffer. An unexpected crash can lose the unflushed window (normally up to 15
 seconds); this is a deliberate durability/performance tradeoff, not downsampling.
 Every individual collected tick is preserved when it is flushed.
+Routine heartbeat, flush cadence and sample-count diagnostics go to the daemon's
+stderr log and remain available through `tha history status`, not the metrics UI.
+History errors and persistence/data-loss warnings remain visible in the UI.
 
 Opening a UI session fetches recent live readings as well as SQLite history. The
 merge excludes exact live timestamps from the SQL query, so a concurrent flush

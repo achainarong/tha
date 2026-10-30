@@ -131,6 +131,8 @@ pub async fn run(config: Config, initial: Vec<Connection>) -> Result<()> {
     let live: crate::live::Shared = Arc::new(Mutex::new(Default::default()));
     let server = crate::live::Server::bind(&path, live.clone())?;
     store.mark_collector()?;
+    let (security_stop, security_shutdown) = tokio::sync::watch::channel(false);
+    let security_worker = tokio::spawn(crate::security::serve(security_shutdown));
     let (sender, mut receiver) = mpsc::channel::<collector::WriteBatch>(8);
     let dropped = Arc::new(AtomicU64::new(0));
     let writer_dropped = dropped.clone();
@@ -153,6 +155,7 @@ pub async fn run(config: Config, initial: Vec<Connection>) -> Result<()> {
                 flushed = std::time::Instant::now();
                 let status = history::status(&writer_path)
                     .unwrap_or_else(|_| "History status unavailable".into());
+                eprintln!("tha daemon: {}", pending.source(&status));
                 if let Ok(mut cache) = writer_live.lock() {
                     cache.source = pending.source(&status);
                 }
@@ -216,6 +219,8 @@ pub async fn run(config: Config, initial: Vec<Connection>) -> Result<()> {
     for task in tasks.values() {
         task.abort();
     }
+    let _ = security_stop.send(true);
+    let _ = security_worker.await;
     for (_, task) in tasks {
         let _ = task.await;
     }

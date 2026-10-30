@@ -96,6 +96,7 @@ pub enum Tab {
     Exec,
     Layers,
     History,
+    Security,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -104,10 +105,12 @@ pub enum OverviewMode {
     Containers,
     Images,
     Volumes,
+    Security,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct InventoryView {
+    pub zoom: bool,
     pub query: String,
     pub filter: usize,
     pub sort: usize,
@@ -118,6 +121,7 @@ pub struct InventoryView {
     pub details_scroll: usize,
     pub pending_g: bool,
     pub marked: HashSet<String>,
+    pub scan_marked: HashSet<String>,
 }
 
 pub struct InventoryRemovalTarget {
@@ -244,6 +248,7 @@ pub enum PerformanceScope {
 }
 
 pub struct App {
+    pub service_modules: bool,
     pub overview_mode: OverviewMode,
     pub inventory_engine: usize,
     pub inventory_views: HashMap<(usize, OverviewMode), InventoryView>,
@@ -312,6 +317,7 @@ pub struct App {
     pub exec_dimensions: (u16, u16),
     pub platforms: crate::platform::Cache,
     pub layers: crate::layers::View,
+    pub security: crate::security::View,
     pub action_confirmation: Option<crate::actions::Confirmation>,
     pub action_request: Option<crate::actions::Request>,
     pub action_jobs: BTreeMap<u64, crate::actions::Progress>,
@@ -335,6 +341,7 @@ impl App {
     ) -> Self {
         let context_order = (0..connections.len()).collect();
         let mut app = Self {
+            service_modules: false,
             discover_connections: true,
             history_view: Default::default(),
             history_database: None,
@@ -417,6 +424,7 @@ impl App {
             exec_dimensions: (24, 80),
             platforms: Default::default(),
             layers: Default::default(),
+            security: Default::default(),
             action_confirmation: None,
             action_request: None,
             action_jobs: BTreeMap::new(),
@@ -811,7 +819,116 @@ impl App {
         self.available_layers_target().is_some()
     }
 
+    pub fn open_security(&mut self) {
+        if !self.security.enabled {
+            self.notice = "Install the security module first: tha module install security".into();
+            return;
+        }
+        if self.security.busy {
+            self.overview_mode = OverviewMode::Security;
+            self.detail_focus = true;
+            self.notice = "Showing the service's active queue; x cancels it".into();
+            return;
+        }
+        let checked = if matches!(
+            self.overview_mode,
+            OverviewMode::Images | OverviewMode::Security
+        ) {
+            crate::ui::inventory::security_targets(self, true)
+        } else {
+            Vec::new()
+        };
+        let target = if self.overview_mode != OverviewMode::Containers {
+            crate::ui::inventory::security_targets(self, false)
+                .into_iter()
+                .next()
+        } else {
+            self.available_layers_target()
+                .and_then(|(_, connection, container)| {
+                    let runtime = self
+                        .current()
+                        .and_then(|row| self.engines[row.engine].snapshot.as_ref())?
+                        .engine_id
+                        .clone()?;
+                    Some(crate::security::Target {
+                        connection,
+                        runtime,
+                        image: container.image_id?,
+                        label: container.image,
+                    })
+                })
+        };
+        let Some(target) = target else {
+            self.overview_mode = OverviewMode::Security;
+            self.detail_focus = false;
+            self.notice = "Select an image to inspect its security report".into();
+            return;
+        };
+        if let Some(engine) = self
+            .engines
+            .iter()
+            .position(|engine| engine.connection == target.connection)
+        {
+            self.inventory_engine = engine;
+            let view = self
+                .inventory_views
+                .entry((engine, OverviewMode::Images))
+                .or_default();
+            view.selected = Some(target.image.clone());
+            if self.overview_mode == OverviewMode::Containers {
+                view.filter = 0;
+                view.query.clear();
+                view.details = false;
+            }
+        }
+        self.security.select(Some(target));
+        self.security.queue = checked;
+        self.overview_mode = OverviewMode::Security;
+        self.tab = Tab::Security;
+        self.detail_focus = true;
+        self.performance_focus = false;
+        self.detail_scroll = 0;
+    }
+
+    pub fn request_security_scan(&mut self, checked: bool) {
+        if self.demo {
+            self.notice = "Demo mode: security scans and downloads are disabled".into();
+        } else if !self.security.enabled {
+            self.notice =
+                "Install first: tha module install security (or installer MODULES=security)".into();
+        } else if self.security.busy {
+            self.notice = "A security queue is already running".into();
+        } else {
+            if self.overview_mode == OverviewMode::Images
+                || (self.overview_mode == OverviewMode::Security && (!self.detail_focus || checked))
+            {
+                let targets = crate::ui::inventory::security_targets(self, checked);
+                if targets.is_empty() {
+                    self.notice = "No checked images remain to scan; select images with m".into();
+                    return;
+                }
+                self.security.select(targets.first().cloned());
+                self.security.queue = targets;
+                self.overview_mode = OverviewMode::Security;
+                self.tab = Tab::Security;
+                self.detail_focus = true;
+            } else if self.tab != Tab::Security {
+                self.open_security();
+            }
+            if self.security.target.is_some() && self.tab == Tab::Security {
+                if !checked {
+                    self.security.queue.clear();
+                }
+                self.security.request = true;
+                self.security.cancel = false;
+            }
+        }
+    }
+
     pub fn reconcile_detail_tab(&mut self) {
+        if self.tab == Tab::Security && self.overview_mode == OverviewMode::Containers {
+            self.tab = Tab::Overview;
+        }
         if self.tab == Tab::History && self.performance_container().is_none() {
             self.tab = Tab::Overview;
             self.history_view.expanded = false;

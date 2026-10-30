@@ -1,6 +1,6 @@
 //! Adaptive per-container analysis, with labeled axes and gap-aware Braille lines.
 use super::*;
-use crate::history::{Point, RANGE_NAMES};
+use crate::history::{Point, RANGE_LABELS, RANGE_NAMES, RANGES};
 use ratatui::{
     symbols::Marker,
     widgets::canvas::{Canvas, Line as CanvasLine, Points},
@@ -98,6 +98,15 @@ fn axis_value(metric: usize, number: f64, maximum: f64) -> String {
         if metric > 1 { "/s" } else { "" }
     )
 }
+fn history_notice(view: &crate::history::View) -> Option<&str> {
+    view.error.as_deref().or_else(|| {
+        view.data
+            .source
+            .split_once("Warning: ")
+            .map(|(_, warning)| warning.split(" · ").next().unwrap_or(warning))
+    })
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some((engine_index, container)) = app.performance_container() else {
         frame.render_widget(
@@ -133,8 +142,25 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     if inner.width < 12 || inner.height < 5 {
         return;
     }
+    let mut ranges = vec![Span::styled("Range: ", muted())];
+    for (index, label) in RANGE_LABELS.iter().enumerate() {
+        ranges.push(if index == view.range {
+            Span::styled(
+                format!("[{label}]"),
+                accent(app, Color::Cyan).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(*label, muted())
+        });
+        ranges.push(Span::raw(" "));
+    }
+    ranges.push(Span::styled("· [ shorter / ] longer", muted()));
+    let legend = Paragraph::new(Line::from(ranges)).wrap(Wrap { trim: true });
+    let legend_height = legend.line_count(inner.width) as u16;
+    let notice = history_notice(view);
     let parts = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(legend_height),
+        Constraint::Length(2 + u16::from(notice.is_some())),
         Constraint::Min(1),
         Constraint::Length(2),
     ])
@@ -144,7 +170,6 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         view.bounds()
     };
-    let source = view.error.as_deref().unwrap_or(&view.data.source);
     let counters = app.engines[engine_index]
         .metrics
         .samples
@@ -163,37 +188,38 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             )
         })
         .unwrap_or_else(|| "Latest I/O counters unavailable".into());
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(format!(
-                "{} · {} → {} UTC · {}{}",
-                RANGE_NAMES[view.range],
-                if view.range >= 3 {
-                    stamp(start)
-                } else {
-                    clock(start)
-                },
-                if view.range >= 3 {
-                    stamp(end)
-                } else {
-                    clock(end)
-                },
-                if view.end_ms.is_some() {
-                    "Paused"
-                } else {
-                    "Live"
-                },
-                if view.loading { " · Loading…" } else { "" }
-            )),
-            Line::styled(safe_text(source), muted()),
-            Line::styled(counters, muted()),
-        ]),
-        parts[0],
-    );
+    let mut header = vec![
+        Line::from(format!(
+            "{} · {} → {} UTC · {}{}",
+            RANGE_NAMES[view.range],
+            if RANGES[view.range] >= 3_600_000 {
+                stamp(start)
+            } else {
+                clock(start)
+            },
+            if RANGES[view.range] >= 3_600_000 {
+                stamp(end)
+            } else {
+                clock(end)
+            },
+            if view.end_ms.is_some() {
+                "Paused"
+            } else {
+                "Live"
+            },
+            if view.loading { " · Loading…" } else { "" }
+        )),
+        Line::styled(counters, muted()),
+    ];
+    if let Some(notice) = notice {
+        header.push(Line::styled(safe_text(notice), accent(app, Color::Yellow)));
+    }
+    frame.render_widget(Paragraph::new(header), parts[1]);
+    frame.render_widget(legend, parts[0]);
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
-                "[/] Range · ←/→ Pan · c Cursor · h/l Inspect · f Live · z Enlarge",
+                "←/→ Pan · c Cursor · h/l Inspect · f Live · z Enlarge",
                 muted(),
             ),
             Line::styled(
@@ -201,13 +227,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 muted(),
             ),
         ]),
-        parts[2],
+        parts[3],
     );
     if view.data.points.is_empty() {
-        frame.render_widget(Paragraph::new(view.error.as_deref().unwrap_or("No readings in this time range. Collection begins when Tha/daemon observes this container. [ selects a shorter range; f returns to live.")).wrap(Wrap{trim:false}),parts[1]);
+        frame.render_widget(Paragraph::new(view.error.as_deref().unwrap_or("No readings in this time range. Collection begins when Tha/daemon observes this container. [ selects a shorter range; f returns to live.")).wrap(Wrap{trim:false}),parts[2]);
         return;
     }
-    let all = parts[1].height >= 24;
+    let all = parts[2].height >= 24;
     let groups: &[usize] = if all {
         &[0, 1, 2, 3]
     } else {
@@ -217,7 +243,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Ratio(1, groups.len() as u32);
         groups.len()
     ])
-    .split(parts[1]);
+    .split(parts[2]);
     let cursor = view
         .cursor
         .and_then(|index| view.data.points.get(index.min(view.data.points.len() - 1)));
@@ -467,6 +493,67 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
     #[test]
+    fn routine_collector_diagnostics_are_hidden_but_warnings_and_errors_remain() {
+        let mut view = crate::history::View::default();
+        view.data.source = "Daemon · heartbeat 2s ago · 0 dropped samples · live 1s · SQLite flush 15s · session live overlay".into();
+        assert_eq!(history_notice(&view), None);
+        view.data.source = "Daemon live unavailable · persisted history · Warning: Disk budget reached · heartbeat 2s ago".into();
+        assert_eq!(history_notice(&view), Some("Disk budget reached"));
+        view.error = Some("Cannot read history".into());
+        assert_eq!(history_notice(&view), Some("Cannot read history"));
+    }
+
+    #[test]
+    fn range_legend_wraps_and_highlights_the_selection_even_without_readings() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.history_view.data.source =
+            "Daemon · heartbeat 2s ago · 0 dropped samples · SQLite flush 15s".into();
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, Scope::Container(_)))
+            .unwrap();
+        for (range, selected_label) in RANGE_LABELS.iter().enumerate() {
+            app.history_view.range = range;
+            for width in [40, 60, 160] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        let area = frame.area();
+                        draw(frame, &mut app, area);
+                    })
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let text = buffer
+                    .content
+                    .chunks(width as usize)
+                    .map(|row| {
+                        row[1..row.len() - 1]
+                            .iter()
+                            .map(|cell| cell.symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                for diagnostic in ["heartbeat", "SQLite", "dropped samples"] {
+                    assert!(!text.contains(diagnostic), "Unexpected {diagnostic}");
+                }
+                for label in RANGE_LABELS {
+                    assert!(text.contains(label), "Missing {label} at width {width}");
+                }
+                assert!(text.contains(&format!("[{selected_label}]")));
+                assert!(text.contains("[ shorter"));
+                assert!(text.contains("] longer"), "width {width}: {text}");
+                assert!(buffer.content.iter().any(|cell| {
+                    cell.symbol() == "[" && cell.modifier.contains(Modifier::BOLD)
+                }));
+            }
+        }
+    }
+
+    #[test]
     fn vertical_axis_uses_one_unit_for_zero_midpoint_and_maximum() {
         let maximum = 1.25 * 1024.0 * 1024.0;
         assert_eq!(axis_value(1, 0.0, maximum), "0.00 MiB");
@@ -542,7 +629,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(
-            text.contains("queried window")
+            text.contains("UTC")
                 && terminal
                     .backend()
                     .buffer()

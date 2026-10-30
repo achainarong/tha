@@ -12,6 +12,7 @@
 #   THA_MODE=service      same as passing `service`
 #   THA_VERSION=v0.6.0    install that release instead of the latest
 #   THA_BIN_DIR=...       where the tha command goes (default ~/.local/bin)
+#   MODULES=security      optional comma-separated modules (currently: security)
 #
 # Updating stops a running collector before the binary is replaced and starts it
 # again afterwards, in either mode. Configuration and history are left alone.
@@ -21,6 +22,7 @@ REPO=achainarong/tha
 MODE=${1:-${THA_MODE:-standalone}}
 VERSION=${THA_VERSION:-latest}
 BIN_DIR=${THA_BIN_DIR:-$HOME/.local/bin}
+MODULES=${MODULES:-}
 
 say() { printf 'tha: %s\n' "$*"; }
 die() { printf 'tha: %s\n' "$*" >&2; exit 1; }
@@ -28,6 +30,35 @@ die() { printf 'tha: %s\n' "$*" >&2; exit 1; }
 case $MODE in
     standalone | service) ;;
     *) die "mode must be standalone or service, not '$MODE'" ;;
+esac
+
+# Validate before downloading or replacing anything. Repeated names are harmless.
+case $MODULES in
+    '') ;;
+    ,* | *, | *,,*) die "MODULES must be a comma-separated list without empty names" ;;
+esac
+old_ifs=$IFS
+IFS=,
+set -f
+for module in $MODULES; do
+    case $module in
+        security) ;;
+        *) die "unknown module '$module'; available modules: security" ;;
+    esac
+done
+set +f
+IFS=$old_ifs
+
+case ,$MODULES, in
+    *,security,*)
+        if [ "$MODE" = standalone ]; then
+            if [ "${1:-${THA_MODE:-}}" = standalone ]; then
+                die "security is a service module; use service mode with MODULES=security"
+            fi
+            MODE=service
+            say "security requires service mode; installing the per-user service"
+        fi
+        ;;
 esac
 
 if [ "$VERSION" = latest ]; then
@@ -101,6 +132,14 @@ elif [ "$running" = 1 ]; then
     "$bin" service start
     say "background collector restarted; remove it with: tha service uninstall"
 fi
+
+case ,$MODULES, in
+    *,security,*)
+        say "installing security module (Grype image + vulnerability database; requires a running engine)"
+        "$bin" module install security ||
+            die "tha was installed, but security setup failed; retry: tha module install security"
+        ;;
+esac
 
 case :$PATH: in
     *:"$BIN_DIR":*) ;;

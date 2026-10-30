@@ -48,6 +48,7 @@ impl Keymap {
                 "exec" => KeyCode::Char('4'),
                 "metrics" => KeyCode::Char('5'),
                 "layers" => KeyCode::Char('6'),
+                "security" => KeyCode::Char('7'),
                 "open-exec" => KeyCode::Char('e'),
                 "actions" => KeyCode::Char('a'),
                 "performance" => KeyCode::Char('p'),

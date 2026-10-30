@@ -11,6 +11,10 @@ fn daemon_service_and_history_help_do_not_require_a_terminal() {
         vec!["service", "--help"],
         vec!["history", "--help"],
         vec!["service", "install", "--help"],
+        vec!["module", "--help"],
+        vec!["module", "install", "--help"],
+        vec!["module", "enable", "--help"],
+        vec!["module", "disable", "--help"],
     ] {
         let output = command().args(arguments).output().unwrap();
         assert!(output.status.success());
@@ -78,4 +82,30 @@ fn explicit_missing_config_is_an_error() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Configuration does not exist"));
+}
+
+#[test]
+fn service_modules_can_be_enabled_and_disabled_without_removing_saved_reports() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tha/modules/security");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("installed"), "fixture").unwrap();
+    std::fs::write(root.join("reports.sqlite3"), "saved reports fixture").unwrap();
+    for action in ["enable", "disable"] {
+        let output = command()
+            .args(["module", action, "security"])
+            .env("XDG_DATA_HOME", temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(root.join("enabled").exists(), action == "enable");
+        assert_eq!(
+            std::fs::read_to_string(root.join("reports.sqlite3")).unwrap(),
+            "saved reports fixture"
+        );
+    }
 }

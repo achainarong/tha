@@ -19,6 +19,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 mod history;
 pub mod inventory;
+mod security;
 
 pub const COMMANDS: &[(&str, &str)] = &[
     (
@@ -57,6 +58,26 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "Inspect resolved image filesystem layers and build history (6)",
     ),
     ("reload-layers", "Retry image layers lookup (read-only)"),
+    (
+        "security",
+        "Open selected image security findings (7; z expands)",
+    ),
+    (
+        "scan-image",
+        "Scan the selected image with containerized Grype",
+    ),
+    (
+        "scan-images",
+        "Scan checked images sequentially; stop on first error",
+    ),
+    (
+        "cancel-scan",
+        "Cancel the security queue and remove its scanner",
+    ),
+    (
+        "update-security-db",
+        "Refresh scanner/database and rescan the selected image",
+    ),
     (
         "actions",
         "Show contextual actions and disabled reasons (a)",
@@ -144,8 +165,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
         return;
     }
+    let inventory_zoom = app.overview_mode != OverviewMode::Containers
+        && app
+            .inventory_views
+            .get(&(app.inventory_engine, app.overview_mode))
+            .is_some_and(|view| view.zoom);
     let layout = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(if inventory_zoom { 0 } else { 2 }),
         Constraint::Min(1),
         Constraint::Length(footer_height(app)),
     ])
@@ -162,7 +188,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Span::raw(if app.demo { " Demo · " } else { " " }),
         Span::styled(
             format!(
-                "{} · {} · {}  ",
+                "{} · {} · {}{}  ",
                 if app.overview_mode == OverviewMode::Containers {
                     "[Containers]"
                 } else {
@@ -177,6 +203,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     "[Volumes]"
                 } else {
                     "Volumes"
+                },
+                if app.security.enabled {
+                    if app.overview_mode == OverviewMode::Security {
+                        " · [Security]"
+                    } else {
+                        " · Security"
+                    }
+                } else {
+                    ""
                 }
             ),
             Style::default().add_modifier(Modifier::BOLD),
@@ -206,11 +241,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Paragraph::new(vec![header, Line::styled(breadcrumb, muted())]),
         layout[0],
     );
+    let security_zoom = app.overview_mode == OverviewMode::Containers
+        && app.tab == Tab::Security
+        && app.security.zoom;
     let history_zoom = app.overview_mode == OverviewMode::Containers
         && app.tab == Tab::History
         && app.history_view.expanded;
     let expanded = app.overview_mode == OverviewMode::Containers
         && !history_zoom
+        && !security_zoom
         && app.performance_open
         && app.performance_expanded
         && layout[1].height >= 20;
@@ -225,8 +264,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         layout[1]
     };
-    if app.overview_mode != OverviewMode::Containers {
+    if app.overview_mode == OverviewMode::Security {
+        security::draw_overview(frame, app, body);
+    } else if app.overview_mode != OverviewMode::Containers {
         inventory::draw_overview(frame, app, body);
+    } else if security_zoom {
+        security::draw(frame, app, body);
     } else if history_zoom {
         history::draw(frame, app, body);
     } else if area.width >= 110 {
@@ -930,6 +973,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::Exec => "4 Exec",
         Tab::Layers => "6 Layers",
         Tab::History => "5 Metrics",
+        Tab::Security => "7 Security",
     };
     let exec_context = if app.tab == Tab::Exec {
         app.sessions
@@ -970,13 +1014,15 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
     if app.layers_available() {
         names.push(if inner.width >= 44 { "6 Layers" } else { "6" });
     }
+    let layers_index = names.len().saturating_sub(1);
     let active = match app.tab {
         Tab::Overview => 0,
         Tab::Logs => 1,
         Tab::Networks => 2,
         Tab::Exec => 3,
-        Tab::Layers => names.len().saturating_sub(1),
+        Tab::Layers => layers_index,
         Tab::History => 4,
+        Tab::Security => 0,
     };
     frame.render_widget(
         Tabs::new(names)
@@ -1044,6 +1090,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::Exec => draw_exec(frame, app, body),
         Tab::Layers => draw_layers(frame, app, body),
         Tab::History => history::draw(frame, app, body),
+        Tab::Security => security::draw(frame, app, body),
         Tab::Overview | Tab::Networks => {
             let lines = if app.tab == Tab::Networks {
                 network_lines(app)
@@ -2314,7 +2361,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]
     } else {
-        let hints = if app.overview_mode != OverviewMode::Containers {
+        let hints = if app.overview_mode == OverviewMode::Security {
+            "Security · s Scan · S Scan checked · x Cancel · Space/m Check · Tab Images/Findings · Enter Details · z Zoom"
+        } else if app.overview_mode != OverviewMode::Containers {
             "Space Mark · u Unused · c Clear · d Delete · / Search · f Filter · s Sort · Enter Details · Esc Back"
         } else if app.exec_input && app.tab == Tab::Exec {
             "Ctrl-] Navigate · SHELL INPUT · Keys go to the selected container session"
@@ -2327,7 +2376,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         } else if app.detail_focus && app.tab == Tab::Logs {
             "? Keys  F3 Filter  :export-logs  w Wrap  / Search  n/N Match  j/k Scroll  f Follow  Tab Explorer"
         } else {
-            "Shift+←/→ Overview  ? Keys  a Actions  p Performance  Enter Open  e Exec  Tab Pane  1..6 Details  : Commands"
+            "Shift+←/→ Overview  ? Keys  a Actions  p Performance  Enter Open  e Exec  Tab Pane  1..7 Details  : Commands"
         };
         vec![Line::styled(hints, muted()), Line::from(safe_text(notice))]
     };
@@ -2429,6 +2478,10 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         "f                 Toggle follow; scrolling pauses it\n",
         "                  Scrollbar + Rows readout track wrapped display lines\n",
         "Esc               Clear highlights without hiding log context\n",
+        "\nSecurity (optional module)\n",
+        "7 / :security     Open the selected image's Security view\n",
+        "Images m/M        Check image/all for :scan-images; 7 opens Security\n",
+        "Security Enter    Open advisory details; z enlarge; :cancel-scan stops queue\n",
         "\nActions\n",
         "e / :exec         Embedded shell in the right pane\n",
         "                  Services with replicas open a container picker\n",

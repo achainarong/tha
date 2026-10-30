@@ -33,6 +33,65 @@ async fn start() -> Result<()> {
     config.monochrome |= cli.monochrome || std::env::var_os("NO_COLOR").is_some();
     if let Some(command) = &cli.command {
         match command {
+            tha::cli::Command::Module { action } => {
+                anyhow::ensure!(
+                    !cli.standalone && !cli.demo,
+                    "Modules extend service mode; omit --standalone and --demo"
+                );
+                match action {
+                    tha::cli::ModuleAction::Install { name } => {
+                        anyhow::ensure!(
+                            name == "security",
+                            "Unknown module '{name}'; available modules: security"
+                        );
+                        let database = tha::history::path(&config)?;
+                        let mut ready = false;
+                        for _ in 0..50 {
+                            if tha::history::collector_running(&database)? {
+                                ready = true;
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        anyhow::ensure!(
+                            ready,
+                            "Security requires service mode: run tha service install and tha service start first"
+                        );
+                        tha::security::install(name).await?
+                    }
+                    tha::cli::ModuleAction::Enable { name } => {
+                        tha::security::set_enabled(name, true)?;
+                        println!("{name}: enabled (service module)");
+                    }
+                    tha::cli::ModuleAction::Disable { name } => {
+                        tha::security::set_enabled(name, false)?;
+                        println!("{name}: disabled; saved reports and resources retained");
+                    }
+                    tha::cli::ModuleAction::Status => {
+                        println!(
+                            "security: {}",
+                            if tha::security::enabled() {
+                                "enabled (service module)"
+                            } else if tha::security::installed() {
+                                "disabled (resources retained)"
+                            } else {
+                                "not installed"
+                            }
+                        );
+                        if tha::security::enabled() {
+                            println!(
+                                "security worker: {}",
+                                match tha::security::service_status().await {
+                                    Ok(true) => "running · queue active",
+                                    Ok(false) => "running · idle",
+                                    Err(_) => "unavailable; start/restart the per-user service",
+                                }
+                            );
+                        }
+                    }
+                }
+                return Ok(());
+            }
             tha::cli::Command::Daemon => {
                 if cli.demo || cli.standalone {
                     bail!("daemon cannot be combined with --demo or --standalone");
@@ -112,6 +171,8 @@ async fn start() -> Result<()> {
         cli.demo,
     );
     app.discover_connections = config.discover_connections;
+    app.service_modules = !cli.standalone;
+    app.security.enabled = app.service_modules && tha::security::enabled();
     if cli.demo {
         demo::populate(&mut app);
     }
@@ -312,6 +373,10 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let mut platform_task: Option<(tha::platform::Key, AbortTask)> = None;
     let (layers_tx, mut layers_rx) = mpsc::channel::<tha::layers::Event>(4);
     let mut layers_task: Option<AbortTask> = None;
+    let (security_tx, mut security_rx) = mpsc::channel::<tha::security::Event>(16);
+    let (security_notice_tx, mut security_notice_rx) = mpsc::channel::<String>(4);
+    let mut security_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut security_cancel: Option<watch::Sender<bool>> = None;
     let (export_tx, mut export_rx) = mpsc::channel::<String>(4);
     let (removal_tx, mut removal_rx) = mpsc::channel::<tha::backend::RemovalReport>(1);
     let mut removal_task: Option<AbortTask> = None;
@@ -449,8 +514,18 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 app.layers.complete(event);
                 redraw_now = true;
             },
+            Some(event) = security_rx.recv() => {
+                if let tha::security::Outcome::Finished(Err(error)) = &event.result {
+                    app.notice = format!("Security stopped on {}: {}", tha::model::safe_text(&event.target.label), tha::model::safe_text(error));
+                }
+                app.security.complete(event);
+                redraw_now = true;
+            },
+            Some(notice) = security_notice_rx.recv() => { app.notice = notice; redraw_now = true; },
             _ = redraw.tick() => {
                 if source_checked.elapsed() >= Duration::from_secs(1) {
+                    app.security.enabled = app.service_modules && tha::security::enabled();
+                    if !app.security.enabled && app.overview_mode == tha::app::OverviewMode::Security { app.overview_mode = tha::app::OverviewMode::Containers; }
                     source_checked=std::time::Instant::now();
                     if let Some(path)=app.auto_history_database.clone() {
                         if path.exists() { app.history_database=Some(path.clone()); }
@@ -523,6 +598,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                             .and_then(|snapshot| snapshot.engine_id.clone()),
                     );
                     let target = (runtime.clone(), container.key());
+                    app.history_view.select_target(target.clone());
                     let request = (
                         runtime,
                         container.key(),
@@ -545,7 +621,6 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                             }
                             app.history_view.error = None;
                         }
-                        app.history_view.target = Some(target.clone());
                         app.history_view.generation = app.history_view.generation.wrapping_add(1);
                         let generation = app.history_view.generation;
                         let (start, end) = app.history_view.bounds();
@@ -590,6 +665,51 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 })));
             }
             update_layers(&mut app, &mut layers_task, &layers_tx);
+            if app.security.cancel {
+                app.security.cancel = false;
+                let sender = security_notice_tx.clone();
+                tokio::spawn(async move {
+                    let notice = match tha::security::cancel_remote().await {
+                        Ok(()) => "Security queue cancellation requested".into(),
+                        Err(error) => format!("Cannot cancel security queue: {error:#}"),
+                    };
+                    let _ = sender.send(notice).await;
+                });
+            }
+            if app.security.request {
+                if security_task
+                    .as_ref()
+                    .is_some_and(|task| !task.is_finished())
+                {
+                    app.notice = "Security queue is still running or cleaning up".into();
+                } else if let Some(target) = app.security.target.clone() {
+                    let mut targets = std::mem::take(&mut app.security.queue);
+                    if targets.is_empty() {
+                        targets.push(target);
+                    }
+                    app.security.batch =
+                        format!("{} image(s) queued; stops on first error", targets.len());
+                    app.security.busy = true;
+                    app.security.generation = app.security.generation.wrapping_add(1);
+                    app.security.state =
+                        tha::security::State::Running("Starting security queue…".into());
+                    app.security.expanded = false;
+                    app.security.selected = 0;
+                    app.security.offset = 0;
+                    app.detail_scroll = 0;
+                    let (cancel_tx, cancel_rx) = watch::channel(false);
+                    security_cancel = Some(cancel_tx);
+                    security_task = Some(tokio::spawn(tha::security::submit(
+                        targets,
+                        app.security.generation,
+                        app.security.update,
+                        security_tx.clone(),
+                        cancel_rx,
+                    )));
+                }
+                app.security.request = false;
+                app.security.update = false;
+            }
             update_platform(&mut app, &mut platform_task, &platform_tx);
             update_logs(&mut app, &mut log_task, &log_tx, log_capacity);
             let frame_started = std::time::Instant::now();
@@ -598,6 +718,11 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
         }
     }
     drop(log_task);
+    drop(security_cancel);
+    if let Some(task) = security_task {
+        task.abort(); // Disconnect only: the service owns the queue and persists its reports.
+        let _ = task.await;
+    }
     drop(history_task);
     drop(action_tasks);
     drop(layers_task);
@@ -1146,7 +1271,14 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
     if app.input_mode == InputMode::InventorySearch {
         let view = app
             .inventory_views
-            .entry((app.inventory_engine, app.overview_mode))
+            .entry((
+                app.inventory_engine,
+                if app.overview_mode == tha::app::OverviewMode::Security {
+                    tha::app::OverviewMode::Images
+                } else {
+                    app.overview_mode
+                },
+            ))
             .or_default();
         match key.code {
             KeyCode::Esc => {
@@ -1256,6 +1388,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             KeyCode::Char('1') => Some(tha::app::OverviewMode::Containers),
             KeyCode::Char('2') => Some(tha::app::OverviewMode::Images),
             KeyCode::Char('3') => Some(tha::app::OverviewMode::Volumes),
+            KeyCode::Char('4') if app.security.enabled => Some(tha::app::OverviewMode::Security),
             _ => None,
         };
         if let Some(mode) = mode {
@@ -1270,15 +1403,112 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
     {
         use tha::app::OverviewMode::*;
         let forward = matches!(key.code, KeyCode::F(8) | KeyCode::Right);
-        let next = match (app.overview_mode, forward) {
-            (Containers, true) | (Volumes, false) => Images,
-            (Images, true) | (Containers, false) => Volumes,
-            _ => Containers,
+        let modes: &[tha::app::OverviewMode] = if app.security.enabled {
+            &[Containers, Images, Volumes, Security]
+        } else {
+            &[Containers, Images, Volumes]
         };
+        let index = modes
+            .iter()
+            .position(|mode| *mode == app.overview_mode)
+            .unwrap_or(0);
+        let next = modes[if forward {
+            (index + 1) % modes.len()
+        } else {
+            (index + modes.len() - 1) % modes.len()
+        }];
         switch_overview(app, next);
         return false;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if app.overview_mode == tha::app::OverviewMode::Security {
+        let finding_list =
+            !app.security.expanded && matches!(app.security.state, tha::security::State::Ready(_));
+        match key.code {
+            KeyCode::Char('s') if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                app.request_security_scan(false)
+            }
+            KeyCode::Char('S') if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                app.request_security_scan(true)
+            }
+            KeyCode::Char('x') if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                app.security.cancel = true
+            }
+            KeyCode::Char(' ') if !app.detail_focus && key.modifiers.is_empty() => {
+                app.overview_mode = tha::app::OverviewMode::Images;
+                ui::inventory::navigate(app, KeyCode::Char('m'), height);
+                app.overview_mode = tha::app::OverviewMode::Security;
+            }
+            KeyCode::Char('c') if !app.detail_focus => {
+                app.inventory_views
+                    .entry((app.inventory_engine, tha::app::OverviewMode::Images))
+                    .or_default()
+                    .scan_marked
+                    .clear();
+            }
+            KeyCode::Tab | KeyCode::BackTab => app.detail_focus = !app.detail_focus,
+            KeyCode::Char('z') if !ctrl => app.security.zoom = !app.security.zoom,
+            KeyCode::Enter if !app.detail_focus => app.open_security(),
+            KeyCode::Enter if matches!(&app.security.state, tha::security::State::Ready(report) if !report.findings.is_empty()) =>
+            {
+                app.security.expanded = !app.security.expanded;
+                app.detail_scroll = 0;
+            }
+            KeyCode::Enter => {}
+            KeyCode::Esc if app.security.expanded => {
+                app.security.expanded = false;
+                app.detail_scroll = 0;
+            }
+            KeyCode::Esc if app.security.zoom => app.security.zoom = false,
+            KeyCode::Esc if app.detail_focus => app.detail_focus = false,
+            KeyCode::Char('j') | KeyCode::Down if app.detail_focus && finding_list => {
+                app.security.move_by(1)
+            }
+            KeyCode::Char('k') | KeyCode::Up if app.detail_focus && finding_list => {
+                app.security.move_by(-1)
+            }
+            KeyCode::Char('g') | KeyCode::Home if app.detail_focus && finding_list => {
+                app.security.move_by(isize::MIN)
+            }
+            KeyCode::Char('G') | KeyCode::End if app.detail_focus && finding_list => {
+                app.security.move_by(isize::MAX)
+            }
+            KeyCode::PageDown if app.detail_focus && finding_list => {
+                app.security.move_by(height as isize)
+            }
+            KeyCode::PageUp if app.detail_focus && finding_list => {
+                app.security.move_by(-(height as isize))
+            }
+            KeyCode::Char('j') | KeyCode::Down if app.detail_focus => {
+                app.detail_scroll = app.detail_scroll.saturating_add(1)
+            }
+            KeyCode::Char('k') | KeyCode::Up if app.detail_focus => {
+                app.detail_scroll = app.detail_scroll.saturating_sub(1)
+            }
+            KeyCode::PageDown if app.detail_focus => {
+                app.detail_scroll = app.detail_scroll.saturating_add(height)
+            }
+            KeyCode::PageUp if app.detail_focus => {
+                app.detail_scroll = app.detail_scroll.saturating_sub(height)
+            }
+            KeyCode::Char('g') | KeyCode::Home if app.detail_focus => app.detail_scroll = 0,
+            KeyCode::Char('G') | KeyCode::End if app.detail_focus => {
+                app.detail_scroll = u16::MAX as usize
+            }
+            KeyCode::Delete | KeyCode::Char('d' | 'u' | ' ') => {
+                app.notice = "Security is scan-only; use Images for cleanup".into();
+            }
+            _ => {
+                app.overview_mode = tha::app::OverviewMode::Images;
+                let quit = handle_key(app, key, height, refresh);
+                if app.overview_mode == tha::app::OverviewMode::Images {
+                    app.overview_mode = tha::app::OverviewMode::Security;
+                }
+                return quit;
+            }
+        }
+        return false;
+    }
     if app.overview_mode != tha::app::OverviewMode::Containers {
         match key.code {
             KeyCode::Delete | KeyCode::Char('d') if key.modifiers.is_empty() => {
@@ -1327,12 +1557,18 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             | KeyCode::Home
             | KeyCode::End
             | KeyCode::Enter
-            | KeyCode::Char('j' | 'k' | 'g' | 'G' | 'f' | 's' | ' ' | 'u' | 'c')
+            | KeyCode::Char('j' | 'k' | 'g' | 'G' | 'f' | 's' | ' ' | 'u' | 'c' | 'z')
                 if !ctrl =>
             {
                 ui::inventory::navigate(app, key.code, height)
             }
             KeyCode::Char('r') => refresh.send_modify(|value| *value += 1),
+            KeyCode::Char('7') if key.modifiers.is_empty() => app.open_security(),
+            KeyCode::Char('m' | 'M')
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                ui::inventory::navigate(app, key.code, height)
+            }
             KeyCode::Char('1'..='6') if key.modifiers.is_empty() => {
                 switch_overview(app, tha::app::OverviewMode::Containers);
                 return handle_key(app, key, height, refresh);
@@ -1340,6 +1576,60 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             _ => {}
         }
         return false;
+    }
+    if app.detail_focus
+        && app.tab == Tab::Security
+        && !ctrl
+        && !key.modifiers.contains(KeyModifiers::ALT)
+    {
+        let handled = match key.code {
+            KeyCode::Char('z') => {
+                app.security.zoom = !app.security.zoom;
+                true
+            }
+            KeyCode::Enter => {
+                app.security.expanded = !app.security.expanded;
+                app.detail_scroll = 0;
+                true
+            }
+            KeyCode::Esc if app.security.expanded => {
+                app.security.expanded = false;
+                app.detail_scroll = 0;
+                true
+            }
+            KeyCode::Esc if app.security.zoom => {
+                app.security.zoom = false;
+                true
+            }
+            KeyCode::Char('j') | KeyCode::Down if !app.security.expanded => {
+                app.security.move_by(1);
+                true
+            }
+            KeyCode::Char('k') | KeyCode::Up if !app.security.expanded => {
+                app.security.move_by(-1);
+                true
+            }
+            KeyCode::Char('g') if !app.security.expanded => {
+                app.security.move_by(isize::MIN);
+                true
+            }
+            KeyCode::Char('G') if !app.security.expanded => {
+                app.security.move_by(isize::MAX);
+                true
+            }
+            KeyCode::PageDown if !app.security.expanded => {
+                app.security.move_by(height as isize);
+                true
+            }
+            KeyCode::PageUp if !app.security.expanded => {
+                app.security.move_by(-(height as isize));
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            return false;
+        }
     }
     if app.detail_focus
         && app.tab == Tab::History
@@ -1528,6 +1818,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             app.layers.expanded = false;
             app.detail_scroll = 0;
         }
+        KeyCode::Char('7') if !ctrl => app.open_security(),
         KeyCode::Char('5') if !ctrl && app.performance_container().is_some() => {
             app.tab = Tab::History;
             app.detail_focus = true;
@@ -1686,12 +1977,18 @@ fn move_by(app: &mut App, amount: isize, _height: usize) {
 }
 
 fn switch_overview(app: &mut App, mode: tha::app::OverviewMode) {
+    if mode == tha::app::OverviewMode::Security && !app.security.enabled {
+        return;
+    }
     if app.overview_mode == tha::app::OverviewMode::Containers
         && mode != tha::app::OverviewMode::Containers
     {
         app.inventory_engine = app.current().map(|row| row.engine).unwrap_or(0);
     }
     app.overview_mode = mode;
+    if mode == tha::app::OverviewMode::Security {
+        app.detail_focus = false;
+    }
 }
 
 fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
@@ -1703,6 +2000,19 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
     }
     app.notice.clear();
     match command {
+        "security" => app.open_security(),
+        "scan-image" => app.request_security_scan(false),
+        "scan-images" => app.request_security_scan(true),
+        "cancel-scan" => {
+            app.security.cancel = true;
+            app.notice = "Cancelling security queue and removing scanner…".into();
+        }
+        "update-security-db" => {
+            app.request_security_scan(false);
+            if app.security.request {
+                app.security.update = true;
+            }
+        }
         "removal-results" => {
             if app.inventory_removal_report.is_some() {
                 app.inventory_removal_results_visible = true;
@@ -1961,6 +2271,81 @@ mod tests {
         handle_key(&mut app, w, 20, &tx);
         assert!(app.log_view.wrap);
         assert_eq!(app.input, "w");
+    }
+
+    #[test]
+    fn security_zoom_and_advisory_details_are_navigation_only_and_escape_restores() {
+        let mut app = app();
+        let (tx, _) = watch::channel(0);
+        app.tab = Tab::Security;
+        app.detail_focus = true;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        handle_key(&mut app, key(KeyCode::Char('z')), 20, &tx);
+        assert!(app.security.zoom);
+        handle_key(&mut app, key(KeyCode::Enter), 20, &tx);
+        assert!(app.security.expanded);
+        handle_key(&mut app, key(KeyCode::Esc), 20, &tx);
+        assert!(!app.security.expanded);
+        assert!(app.security.zoom);
+        handle_key(&mut app, key(KeyCode::Esc), 20, &tx);
+        assert!(!app.security.zoom);
+        app.input_mode = InputMode::Command;
+        handle_key(&mut app, key(KeyCode::Char('z')), 20, &tx);
+        assert!(!app.security.zoom);
+        assert_eq!(app.input, "z");
+    }
+
+    #[test]
+    fn enabled_security_is_the_fourth_top_level_overview_and_is_hidden_without_the_module() {
+        use tha::app::OverviewMode;
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.security.enabled = false;
+        app.overview_mode = OverviewMode::Volumes;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+            25,
+            &refresh,
+        );
+        assert_eq!(app.overview_mode, OverviewMode::Containers);
+        app.security.enabled = true;
+        app.overview_mode = OverviewMode::Volumes;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+            25,
+            &refresh,
+        );
+        assert_eq!(app.overview_mode, OverviewMode::Security);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            25,
+            &refresh,
+        );
+        assert!(app.security.zoom);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+            25,
+            &refresh,
+        );
+        assert_eq!(app.overview_mode, OverviewMode::Containers);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT),
+            25,
+            &refresh,
+        );
+        assert_eq!(app.overview_mode, OverviewMode::Security);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT),
+            25,
+            &refresh,
+        );
+        assert_eq!(app.overview_mode, OverviewMode::Security);
     }
 
     #[test]

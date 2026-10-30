@@ -19,6 +19,7 @@ pub mod model;
 pub mod platform;
 pub mod preferences;
 pub mod runtime;
+pub mod security;
 pub mod service;
 pub mod sessions;
 pub mod terminal;

@@ -17,8 +17,33 @@ use std::{
 
 pub const RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 const APPLICATION_ID: i64 = 0x54484131; // THA1
-pub const RANGES: [i64; 5] = [60_000, 300_000, 900_000, 3_600_000, RETENTION_MS];
-pub const RANGE_NAMES: [&str; 5] = ["1 minute", "5 minutes", "15 minutes", "1 hour", "24 hours"];
+pub const RANGES: [i64; 10] = [
+    60_000,
+    180_000,
+    300_000,
+    900_000,
+    1_800_000,
+    3_600_000,
+    10_800_000,
+    21_600_000,
+    43_200_000,
+    RETENTION_MS,
+];
+pub const RANGE_NAMES: [&str; RANGES.len()] = [
+    "1 minute",
+    "3 minutes",
+    "5 minutes",
+    "15 minutes",
+    "30 minutes",
+    "1 hour",
+    "3 hours",
+    "6 hours",
+    "12 hours",
+    "24 hours",
+];
+pub const RANGE_LABELS: [&str; RANGES.len()] = [
+    "1m", "3m", "5m", "15m", "30m", "1h", "3h", "6h", "12h", "24h",
+];
 const COLUMNS: &str =
     "cpu,memory,mem_limit,rx,tx,dread,dwrite,rx_rate,tx_rate,read_rate,write_rate,flags";
 
@@ -711,6 +736,7 @@ pub struct View {
     pub loading: bool,
     pub error: Option<String>,
     pub generation: u64,
+    ranges_by_container: std::collections::HashMap<(String, String), usize>,
     scale_cache: std::collections::VecDeque<((String, String, usize), ChartScale)>,
 }
 
@@ -809,6 +835,21 @@ pub struct Event {
     pub data: Result<Data, String>,
 }
 impl View {
+    pub fn select_target(&mut self, target: (String, String)) {
+        if self.target.as_ref() == Some(&target) {
+            return;
+        }
+        if let Some(previous) = self.target.take() {
+            self.ranges_by_container.insert(previous, self.range);
+        }
+        self.range = self.ranges_by_container.get(&target).copied().unwrap_or(0);
+        self.target = Some(target);
+        self.end_ms = None;
+        self.cursor = None;
+        self.data = Data::default();
+        self.error = None;
+    }
+
     /// Bounded LRU, keyed by runtime identity, immutable container key and selected range.
     pub fn chart_scale(&mut self, runtime: String, container: String) -> ChartScale {
         let key = (runtime, container, self.range);
@@ -853,6 +894,48 @@ impl View {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn range_navigation_covers_every_supported_duration_and_clamps_at_ends() {
+        let mut view = View {
+            end_ms: Some(now_ms()),
+            ..Default::default()
+        };
+        for minutes in [1, 3, 5, 15, 30, 60, 180, 360, 720, 1440] {
+            let (start, end) = view.bounds();
+            assert_eq!(end - start, minutes * 60_000);
+            view.range_by(1);
+        }
+        assert_eq!(view.range, RANGES.len() - 1);
+        view.range_by(-100);
+        assert_eq!(view.range, 0);
+    }
+
+    #[test]
+    fn selected_range_is_restored_per_runtime_and_container() {
+        let mut view = View::default();
+        let first = ("docker".into(), "api".into());
+        let second = ("docker".into(), "worker".into());
+        let other_runtime = ("podman".into(), "api".into());
+        view.select_target(first.clone());
+        view.range_by(6);
+        view.select_target(second.clone());
+        assert_eq!(view.range, 0, "New containers use the default range");
+        view.range_by(isize::MAX);
+        view.select_target(other_runtime);
+        assert_eq!(view.range, 0, "Runtime identities must remain separate");
+        view.end_ms = Some(now_ms());
+        view.cursor = Some(3);
+        view.select_target(first);
+        assert_eq!(RANGES[view.range], 10_800_000);
+        assert!(view.end_ms.is_none() && view.cursor.is_none());
+        view.select_target(second.clone());
+        assert_eq!(RANGES[view.range], RETENTION_MS);
+        view.end_ms = Some(now_ms());
+        let paused = view.end_ms;
+        view.select_target(second);
+        assert_eq!(view.end_ms, paused, "Redraws must not reset the timeline");
+    }
+
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     pub(crate) struct Fixture(PathBuf);
     impl Fixture {
@@ -1049,7 +1132,7 @@ pub(crate) mod tests {
     fn ranges_and_pan_are_bounded_to_retention() {
         let mut view = View::default();
         view.range_by(isize::MAX);
-        assert_eq!(view.range, 4);
+        assert_eq!(view.range, RANGES.len() - 1);
         view.pan(-100);
         assert!(view.end_ms.unwrap() >= now_ms() - 10);
         view.range_by(isize::MIN);

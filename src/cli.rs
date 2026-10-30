@@ -38,7 +38,12 @@ pub struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
-    /// Collect read-only container metrics without a terminal (foreground)
+    /// Install or inspect optional modules (security uses containerized Grype)
+    Module {
+        #[command(subcommand)]
+        action: ModuleAction,
+    },
+    /// Run the metrics collector and enabled service modules (foreground)
     Daemon,
     /// Manage the opt-in per-user background collector
     Service {
@@ -50,6 +55,17 @@ pub enum Command {
         #[command(subcommand)]
         action: HistoryAction,
     },
+}
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum ModuleAction {
+    /// Enable a module and download its resources; requires a running Docker-compatible engine
+    Install { name: String },
+    /// Enable an installed service module without downloading it again
+    Enable { name: String },
+    /// Disable a service module, keeping resources and reports
+    Disable { name: String },
+    /// Show installed service modules and security worker state
+    Status,
 }
 #[derive(Debug, Clone, Copy, clap::Subcommand)]
 pub enum ServiceAction {

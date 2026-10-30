@@ -551,6 +551,17 @@ pub fn navigate(app: &mut App, code: KeyCode, height: usize) {
         };
     } else {
         match code {
+            KeyCode::Char('z') if app.security.enabled => view.zoom = !view.zoom,
+            KeyCode::Char('m') if key.1 == OverviewMode::Images && app.security.enabled => {
+                if let Some(row) = rows.get(view.index)
+                    && !view.scan_marked.remove(&row.key)
+                {
+                    view.scan_marked.insert(row.key.clone());
+                }
+            }
+            KeyCode::Char('M') if key.1 == OverviewMode::Images && app.security.enabled => {
+                view.scan_marked = rows.iter().map(|row| row.key.clone()).collect();
+            }
             KeyCode::Char(' ') if !view.details => {
                 if let Some(row) = rows.get(view.index) {
                     if row.status == "unreferenced"
@@ -574,7 +585,10 @@ pub fn navigate(app: &mut App, code: KeyCode, height: usize) {
                     .map(|row| row.key.clone())
                     .collect()
             }
-            KeyCode::Char('c') if !view.details => view.marked.clear(),
+            KeyCode::Char('c') if !view.details => {
+                view.marked.clear();
+                view.scan_marked.clear();
+            }
             KeyCode::Up | KeyCode::Char('k') => view.index = view.index.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => view.index = view.index.saturating_add(1),
             KeyCode::PageUp => view.index = view.index.saturating_sub(amount),
@@ -607,7 +621,61 @@ pub fn navigate(app: &mut App, code: KeyCode, height: usize) {
     app.inventory_views.insert(key, view);
 }
 
+/// Resolve only currently available images in the chosen engine, including unused ones.
+pub fn security_targets(app: &App, checked: bool) -> Vec<crate::security::Target> {
+    let key = (app.inventory_engine, OverviewMode::Images);
+    let view = app.inventory_views.get(&key).cloned().unwrap_or_default();
+    let Some(engine) = app
+        .engines
+        .get(key.0)
+        .filter(|engine| engine.error.is_none() && engine.alias.is_none())
+    else {
+        return vec![];
+    };
+    let Some(snapshot) = engine.snapshot.as_ref() else {
+        return vec![];
+    };
+    let Some(runtime) = snapshot.engine_id.as_ref() else {
+        return vec![];
+    };
+    let rows = visible(entries(snapshot, key.1, false), &view, key.1, &view.query);
+    let selected = view
+        .selected
+        .as_ref()
+        .and_then(|id| rows.iter().find(|row| &row.key == id))
+        .or_else(|| rows.get(view.index));
+    // Scan every checked image still in inventory, including checked rows hidden by filters.
+    let all = entries(snapshot, key.1, false);
+    all.into_iter()
+        .filter(|row| {
+            if checked && !view.scan_marked.is_empty() {
+                view.scan_marked.contains(&row.key)
+            } else {
+                selected.is_some_and(|selected| selected.key == row.key)
+            }
+        })
+        .map(|row| crate::security::Target {
+            connection: engine.connection.clone(),
+            runtime: runtime.clone(),
+            image: row.key,
+            label: format!("{}:{}", row.name, row.tags),
+        })
+        .collect()
+}
+
 pub fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
+    draw_overview_inner(frame, app, area, false);
+}
+
+pub fn draw_security_images(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.inventory_views
+        .entry((app.inventory_engine, OverviewMode::Images))
+        .or_default()
+        .details = false;
+    draw_overview_inner(frame, app, area, true);
+}
+
+fn draw_overview_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
     let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
     let names: Vec<_> = app
         .engines
@@ -624,19 +692,25 @@ pub fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
         parts[0],
     );
     let block = pane(
-        if app.overview_mode == OverviewMode::Images {
+        if scan_only {
+            " Security images · m/M Check · Enter Findings ".into()
+        } else if app.overview_mode == OverviewMode::Images {
             " Images overview ".into()
         } else {
             " Volumes overview ".into()
         },
-        true,
+        if scan_only { !app.detail_focus } else { true },
     );
     let inner = block.inner(parts[1]);
     frame.render_widget(block, parts[1]);
-    draw(frame, app, inner);
+    draw_inner(frame, app, inner, scan_only);
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
+    draw_inner(frame, app, area, false);
+}
+
+fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -705,11 +779,21 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         .style(muted()),
         parts[0],
     );
+    let marks = if scan_only {
+        format!("{} checked for scan", view.scan_marked.len())
+    } else if app.security.enabled && key.1 == OverviewMode::Images {
+        format!(
+            "{} cleanup / {} scan checked",
+            view.marked.len(),
+            view.scan_marked.len()
+        )
+    } else {
+        format!("{} marked", view.marked.len())
+    };
     frame.render_widget(
         Paragraph::new(format!(
-            "{} / {total} shown · {used} used · {unused} unreferenced · {} marked{}",
+            "{} / {total} shown · {used} used · {unused} unreferenced · {marks}{}",
             rows.len(),
-            view.marked.len(),
             if query.is_empty() {
                 String::new()
             } else {
@@ -719,11 +803,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         parts[1],
     );
     frame.render_widget(
-        Paragraph::new(format!(
-            "Row {} / {} · Space Mark  u Mark unused  c Clear  d Delete · / Search  f Filter  s Sort  Enter Details",
+        Paragraph::new(if scan_only { "Space/m Check · M All · s/S Scan · Enter Findings · Tab Focus · z Zoom".into() } else if app.security.enabled && key.1 == OverviewMode::Images { format!(
+            "Row {} / {} · m/M Check scan/all · 7 Security · :scan-images · z Zoom · Space Cleanup · d Delete · Enter Details",
             if rows.is_empty() { 0 } else { view.index + 1 },
             rows.len()
-        ))
+        ) } else { format!("Row {} / {} · Space Mark  u Mark unused  c Clear  d Delete · / Search  f Filter  s Sort  Enter Details", if rows.is_empty() { 0 } else { view.index + 1 }, rows.len()) })
         .style(muted()),
         parts[3],
     );
@@ -741,7 +825,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             body,
         );
     } else {
-        let (table_area, details_area) = if view.details && body.width >= 110 {
+        let (table_area, details_area) = if view.details && body.width >= 110 && !view.zoom {
             let split =
                 Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
                     .split(body);
@@ -834,7 +918,16 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     row.name.clone()
                 };
-                let mark = if view.marked.contains(&row.key) {
+                // Security checks every image for scanning; cleanup marks only exist in Images.
+                let mark = if scan_only {
+                    if view.scan_marked.contains(&row.key) {
+                        "[x] "
+                    } else {
+                        "[ ] "
+                    }
+                } else if app.security.enabled && view.scan_marked.contains(&row.key) {
+                    "[✓] "
+                } else if view.marked.contains(&row.key) {
                     "[x] "
                 } else if row.status == "unreferenced" {
                     "[ ] "
@@ -1115,6 +1208,55 @@ mod tests {
         assert_eq!(
             image_name("localhost:5055/app:dev"),
             ("localhost:5055/app", "dev")
+        );
+    }
+
+    #[test]
+    fn scan_checks_include_used_images_and_are_independent_of_cleanup_and_filters() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        app.security.enabled = true;
+        crate::demo::populate(&mut app);
+        app.overview_mode = OverviewMode::Images;
+        let snapshot = app.engines[0].snapshot.as_mut().unwrap();
+        snapshot.engine_id = Some("fixture-engine".into());
+        snapshot.images = Some(vec![
+            Image {
+                id: "sha256:used".into(),
+                tags: vec!["used:latest".into()],
+                size: None,
+            },
+            Image {
+                id: "sha256:unused".into(),
+                tags: vec!["unused:latest".into()],
+                size: None,
+            },
+        ]);
+        snapshot.containers[0].image_id = Some("sha256:used".into());
+        navigate(&mut app, KeyCode::Char('M'), 25);
+        assert_eq!(security_targets(&app, true).len(), 2);
+        let view = app
+            .inventory_views
+            .get_mut(&(0, OverviewMode::Images))
+            .unwrap();
+        assert!(view.marked.is_empty());
+        view.query = "used:latest".into();
+        assert_eq!(
+            security_targets(&app, true).len(),
+            2,
+            "Hidden checks remain in the scan queue"
+        );
+        app.engines[0]
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .images
+            .as_mut()
+            .unwrap()
+            .retain(|image| image.id == "sha256:used");
+        assert_eq!(
+            security_targets(&app, true).len(),
+            1,
+            "Vanished checks are skipped"
         );
     }
     #[test]

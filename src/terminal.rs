@@ -679,7 +679,7 @@ mod tests {
 
     #[test]
     fn costly_csi_counts_are_clamped_to_screen_dimensions_across_reads() {
-        for code in [b'@', b'L', b'T'] {
+        for code in *b"@LT" {
             for parameter in ["65535", "999999999999999999999999", "65535;2", "65535:2"] {
                 let input = format!(
                     "abcdef\r\nsecond\x1b[1;1H\x1b[{parameter}{}ok",

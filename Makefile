@@ -1,8 +1,8 @@
 .DEFAULT_GOAL := help
-.PHONY: help build release run demo install uninstall fmt lint test check clean
+.PHONY: help build release run demo install install\:full uninstall fmt lint test check clean
 
 help: ## Show available commands
-	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  %-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk '/^[a-z][a-z\\:-]*:.*## / {name = $$0; sub(/: .*/, "", name); gsub(/\\/, "", name); printf "  %-14s %s\n", name, substr($$0, index($$0, "## ") + 3)}' $(MAKEFILE_LIST)
 
 build: ## Build a debug binary
 	cargo build --locked
@@ -21,7 +21,16 @@ MODE ?= standalone
 install: ## Install tha into Cargo's bin directory (MODE=standalone|service, no sudo)
 	@case "$(MODE)" in standalone|service) ;; *) echo "MODE must be standalone or service" >&2; exit 1 ;; esac
 	cargo install --path . --locked
-	@if [ "$(MODE)" = "service" ]; then "$${CARGO_HOME:-$$HOME/.cargo}/bin/tha" service install && "$${CARGO_HOME:-$$HOME/.cargo}/bin/tha" service start; fi
+	@# Replace any existing service (e.g. one from the curl installer) so it runs this build.
+	@if [ "$(MODE)" = "service" ]; then \
+		tha="$${CARGO_HOME:-$$HOME/.cargo}/bin/tha"; \
+		"$$tha" service uninstall && "$$tha" service install && "$$tha" service start; \
+	fi
+
+install\:full: ## Install tha in service mode with the security module enabled
+	$(MAKE) install MODE=service
+	"$${CARGO_HOME:-$$HOME/.cargo}/bin/tha" module install security
+	"$${CARGO_HOME:-$$HOME/.cargo}/bin/tha" module enable security
 
 uninstall: ## Uninstall tha using Cargo
 	cargo uninstall tha
