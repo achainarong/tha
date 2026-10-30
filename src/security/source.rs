@@ -1,7 +1,10 @@
 use super::Target;
 use anyhow::{Context, Result, ensure};
 use futures_util::StreamExt;
-use std::io::Write;
+use std::{
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+};
 
 pub fn validate(target: &Target) -> Result<()> {
     ensure!(
@@ -41,12 +44,31 @@ pub async fn verify(target: &Target) -> Result<bollard::Docker> {
     Ok(docker)
 }
 
-pub async fn export(target: &Target) -> Result<tempfile::NamedTempFile> {
+/// An exported image archive in a private (0700) directory, removed on drop.
+pub struct Archive {
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+impl Archive {
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+pub async fn export(target: &Target) -> Result<Archive> {
     let docker = verify(target).await?;
-    let mut file = tempfile::Builder::new()
-        .prefix("tha-security-")
-        .suffix(".tar")
-        .tempfile()?;
+    let dir = tempfile::Builder::new().prefix("tha-security-").tempdir()?;
+    let path = dir.path().join("image.tar");
+    // `docker cp` keeps the host owner and mode, and the scanner runs as root without
+    // CAP_DAC_OVERRIDE, so the file must be world-readable; the 0700 directory keeps it
+    // private on the host.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    // Explicit, because the service runs with UMask=0077.
+    file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
     let mut bytes = 0_u64;
     let mut stream = docker.export_image(&target.image);
     while let Some(chunk) = stream.next().await {
@@ -59,5 +81,5 @@ pub async fn export(target: &Target) -> Result<tempfile::NamedTempFile> {
         file.write_all(&chunk)?;
     }
     file.flush()?;
-    Ok(file)
+    Ok(Archive { _dir: dir, path })
 }
