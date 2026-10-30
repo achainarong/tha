@@ -200,9 +200,9 @@ def main():
             expect("1 minute")
             expect("Disk read / write")
             expect("Network receive / transmit")
-            expect("Daemon")
+            assert "heartbeat" not in "\n".join(screen.display), "Routine daemon diagnostics belong in the log, not Metrics"
             assert scalar("SELECT COUNT(*) FROM samples")==0,"History should render before the first SQLite flush"
-            keys(b"]]]]")
+            keys(b"]"*9)
             expect("24 hours")
             keys(b"c")
             expect("Paused")
