@@ -220,6 +220,11 @@ esac
     let mut ui = UnixStream::connect(&socket).await.unwrap();
     ui.write_u32(bytes.len() as u32).await.unwrap();
     ui.write_all(&bytes).await.unwrap();
+    // Disconnect only once the queue has started: macOS cannot read the peer
+    // credentials of a socket whose client already closed.
+    let length = ui.read_u32().await.unwrap();
+    let mut first = vec![0; length as usize];
+    ui.read_exact(&mut first).await.unwrap();
     drop(ui); // The worker, not this connection, must own the full queue.
     wait_for(|| {
         fs::read_to_string(temp.path().join("calls"))
