@@ -22,6 +22,7 @@ pub mod runtime;
 pub mod security;
 pub mod service;
 pub mod sessions;
+pub mod shortcuts;
 pub mod terminal;
 pub mod ui;
 pub mod workspace;

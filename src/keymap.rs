@@ -1,11 +1,12 @@
 //! Navigation-only aliases, parsed by crokey rather than a custom key grammar.
+use crate::shortcuts::ActionId;
 use anyhow::{Context, Result, bail};
 use crokey::KeyCombination;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::BTreeMap;
 
 #[derive(Default)]
-pub struct Keymap(Vec<(KeyCombination, KeyEvent)>);
+pub struct Keymap(Vec<(KeyCombination, ActionId)>);
 impl Keymap {
     pub fn parse(bindings: &BTreeMap<String, String>) -> Result<Self> {
         let mut mapped = Vec::new();
@@ -33,43 +34,21 @@ impl Keymap {
             if mapped.iter().any(|(existing, _)| existing == &combination) {
                 bail!("Duplicate normalized navigation key {key:?}");
             }
-            let code = match action.as_str() {
-                "down" => KeyCode::Down,
-                "up" => KeyCode::Up,
-                "left" => KeyCode::Left,
-                "right" => KeyCode::Right,
-                "page-down" => KeyCode::PageDown,
-                "page-up" => KeyCode::PageUp,
-                "first" => KeyCode::Home,
-                "last" => KeyCode::End,
-                "overview" => KeyCode::Char('1'),
-                "logs" => KeyCode::Char('2'),
-                "networks" => KeyCode::Char('3'),
-                "exec" => KeyCode::Char('4'),
-                "metrics" => KeyCode::Char('5'),
-                "layers" => KeyCode::Char('6'),
-                "security" => KeyCode::Char('7'),
-                "open-exec" => KeyCode::Char('e'),
-                "actions" => KeyCode::Char('a'),
-                "performance" => KeyCode::Char('p'),
-                "sort-contexts" => KeyCode::Char('o'),
-                "wrap" => KeyCode::Char('w'),
-                "follow" => KeyCode::Char('f'),
-                "help" => KeyCode::F(1),
-                "filter-logs" => KeyCode::F(3),
-                "exec-sessions" => KeyCode::F(6),
-                _ => bail!("Unknown navigation action {action:?} for {key:?}"),
-            };
-            mapped.push((combination, KeyEvent::new(code, KeyModifiers::NONE)));
+            let action = ActionId::configurable(action)
+                .with_context(|| format!("Unknown navigation action {action:?} for {key:?}"))?;
+            mapped.push((combination, action));
         }
         Ok(Self(mapped))
     }
-    pub fn translate(&self, event: KeyEvent) -> KeyEvent {
+    pub fn action(&self, event: KeyEvent) -> Option<ActionId> {
         self.0
             .iter()
-            .find(|(key, _)| *key == KeyCombination::from(event))
-            .map(|(_, mapped)| *mapped)
-            .unwrap_or(event)
+            .find(|(key, _)| *key == KeyCombination::from(event).normalized())
+            .map(|(_, action)| *action)
+    }
+
+    pub fn bindings(&self) -> impl Iterator<Item = (KeyCombination, ActionId)> + '_ {
+        self.0.iter().copied()
     }
 }
 
@@ -81,9 +60,8 @@ mod tests {
         let bindings = BTreeMap::from([("alt-j".into(), "down".into())]);
         let map = Keymap::parse(&bindings).unwrap();
         assert_eq!(
-            map.translate(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT))
-                .code,
-            KeyCode::Down
+            map.action(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT)),
+            Some(ActionId::Down)
         );
         for key in ["ctrl-c", "ctrl-]", "enter", "esc", ":", "/"] {
             assert!(
@@ -97,12 +75,12 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(
-            map.translate(KeyEvent::from(KeyCode::Char('m'))).code,
-            KeyCode::Char('5')
+            map.action(KeyEvent::from(KeyCode::Char('m'))),
+            Some(ActionId::Metrics)
         );
         assert_eq!(
-            map.translate(KeyEvent::from(KeyCode::Char('l'))).code,
-            KeyCode::Char('6')
+            map.action(KeyEvent::from(KeyCode::Char('l'))),
+            Some(ActionId::Layers)
         );
         assert!(
             Keymap::parse(&BTreeMap::from([(
@@ -110,6 +88,70 @@ mod tests {
                 "delete-without-confirmation".into()
             )]))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn all_existing_names_and_views_resolve_to_typed_actions() {
+        for name in [
+            "down",
+            "up",
+            "left",
+            "right",
+            "page-down",
+            "page-up",
+            "first",
+            "last",
+            "overview",
+            "logs",
+            "networks",
+            "exec",
+            "metrics",
+            "layers",
+            "security",
+            "open-exec",
+            "actions",
+            "performance",
+            "sort-contexts",
+            "wrap",
+            "follow",
+            "help",
+            "filter-logs",
+            "exec-sessions",
+            "views",
+        ] {
+            let map = Keymap::parse(&BTreeMap::from([("alt-j".into(), name.into())])).unwrap();
+            assert_eq!(
+                map.action(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT)),
+                ActionId::configurable(name)
+            );
+        }
+        assert!(
+            Keymap::parse(&BTreeMap::from([
+                ("alt-j".into(), "down".into()),
+                ("ALT-j".into(), "up".into())
+            ]))
+            .is_err()
+        );
+        for key in [
+            "ctrl-5",
+            "ctrl-]",
+            "ctrl-c",
+            "tab",
+            "shift-tab",
+            "esc",
+            "enter",
+            ":",
+            "/",
+        ] {
+            assert!(
+                Keymap::parse(&BTreeMap::from([(key.into(), "views".into())])).is_err(),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            Keymap::default().action(KeyEvent::from(KeyCode::Char('v'))),
+            None
         );
     }
 }

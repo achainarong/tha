@@ -12,6 +12,7 @@ use tha::{
     logs::{self, LogEvent},
     metrics,
     model::Snapshot,
+    shortcuts::{self, ActionId as A, NavigationContext},
     ui,
 };
 use tokio::{
@@ -1374,26 +1375,38 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         return false;
     }
     // Only navigation reaches this point. Editors, confirmations and PTYs retain raw keys.
-    if key.modifiers == KeyModifiers::ALT {
-        let mode = match key.code {
-            KeyCode::Char('1') => Some(tha::app::OverviewMode::Containers),
-            KeyCode::Char('2') => Some(tha::app::OverviewMode::Images),
-            KeyCode::Char('3') => Some(tha::app::OverviewMode::Volumes),
-            KeyCode::Char('4') if app.security.enabled => Some(tha::app::OverviewMode::Security),
-            _ => None,
-        };
-        if let Some(mode) = mode {
-            switch_overview(app, mode);
-            return false;
-        }
+    let context = NavigationContext::of(app);
+    let Some(action) = shortcuts::resolve(context, key, &app.keymap, app.security.enabled) else {
+        app.pending_g = false;
+        return false;
+    };
+    if !action.info().scope.includes(context) {
+        app.notice = format!(
+            "{} is unavailable in {}",
+            action.info().label,
+            context.label()
+        );
+        return false;
     }
-    let key = app.keymap.translate(key);
-    if (matches!(key.code, KeyCode::F(7) | KeyCode::F(8)) && key.modifiers.is_empty())
-        || (matches!(key.code, KeyCode::Left | KeyCode::Right)
-            && key.modifiers == KeyModifiers::SHIFT)
+    if app.keymap.action(key).is_some()
+        && let Some(reason) = shortcuts::unavailable(app, action)
     {
+        app.notice = reason;
+        return false;
+    }
+    dispatch_navigation(app, action, key, height, refresh)
+}
+
+fn dispatch_navigation(
+    app: &mut App,
+    action: A,
+    key: KeyEvent,
+    height: usize,
+    refresh: &watch::Sender<u64>,
+) -> bool {
+    if matches!(action, A::PreviousView | A::NextView) {
         use tha::app::OverviewMode::*;
-        let forward = matches!(key.code, KeyCode::F(8) | KeyCode::Right);
+        let forward = action == A::NextView;
         let modes: &[tha::app::OverviewMode] = if app.security.enabled {
             &[Containers, Images, Volumes, Security]
         } else {
@@ -1411,87 +1424,108 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         switch_overview(app, next);
         return false;
     }
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match action {
+        A::ContainersView => switch_overview(app, tha::app::OverviewMode::Containers),
+        A::ImagesView => switch_overview(app, tha::app::OverviewMode::Images),
+        A::VolumesView => switch_overview(app, tha::app::OverviewMode::Volumes),
+        A::SecurityView => switch_overview(app, tha::app::OverviewMode::Security),
+        A::Help => {
+            app.help = true;
+            app.help_scroll = 0;
+        }
+        A::Commands => {
+            app.input_mode = InputMode::Command;
+            app.input.clear();
+        }
+        A::Views => {
+            return execute(app, "views", refresh);
+        }
+        _ => {}
+    }
+    if matches!(
+        action,
+        A::ContainersView
+            | A::ImagesView
+            | A::VolumesView
+            | A::SecurityView
+            | A::Help
+            | A::Commands
+            | A::Views
+    ) {
+        return false;
+    }
+    // Detail shortcuts explicitly return from an inventory to workload details.
+    if matches!(
+        action,
+        A::Overview | A::Logs | A::Networks | A::Exec | A::Metrics | A::Layers
+    ) {
+        switch_overview(app, tha::app::OverviewMode::Containers);
+    }
     if app.overview_mode == tha::app::OverviewMode::Security {
         let finding_list =
             !app.security.expanded && matches!(app.security.state, tha::security::State::Ready(_));
-        match key.code {
-            KeyCode::Char('s') if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                app.request_security_scan(false)
-            }
-            KeyCode::Char('S') if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                app.request_security_scan(true)
-            }
-            KeyCode::Char('x') if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                app.security.cancel = true
-            }
-            KeyCode::Char(' ') if !app.detail_focus && key.modifiers.is_empty() => {
+        match action {
+            A::ScanImage => app.request_security_scan(false),
+            A::ScanImages => app.request_security_scan(true),
+            A::CancelScan => app.security.cancel = true,
+            A::CheckSecurityImage | A::CheckImage | A::CheckImages => {
                 app.overview_mode = tha::app::OverviewMode::Images;
-                ui::inventory::navigate(app, KeyCode::Char('m'), height);
+                ui::inventory::navigate(
+                    app,
+                    if action == A::CheckImages {
+                        KeyCode::Char('M')
+                    } else {
+                        KeyCode::Char('m')
+                    },
+                    height,
+                );
                 app.overview_mode = tha::app::OverviewMode::Security;
             }
-            KeyCode::Char('c') if !app.detail_focus => {
+            A::ClearScanChecks => {
                 app.inventory_views
                     .entry((app.inventory_engine, tha::app::OverviewMode::Images))
                     .or_default()
                     .scan_marked
                     .clear();
             }
-            KeyCode::Tab | KeyCode::BackTab => app.detail_focus = !app.detail_focus,
-            KeyCode::Char('z') if !ctrl => app.security.zoom = !app.security.zoom,
-            KeyCode::Enter if !app.detail_focus => app.open_security(),
-            KeyCode::Enter if matches!(&app.security.state, tha::security::State::Ready(report) if !report.findings.is_empty()) =>
+            A::SecurityFocusNext => app.detail_focus = !app.detail_focus,
+            A::Zoom => app.security.zoom = !app.security.zoom,
+            A::Open if !app.detail_focus => app.open_security(),
+            A::Open if matches!(&app.security.state, tha::security::State::Ready(report) if !report.findings.is_empty()) =>
             {
                 app.security.expanded = !app.security.expanded;
                 app.detail_scroll = 0;
             }
-            KeyCode::Enter => {}
-            KeyCode::Esc if app.security.expanded => {
+            A::Open => {}
+            A::Escape if app.security.expanded => {
                 app.security.expanded = false;
                 app.detail_scroll = 0;
             }
-            KeyCode::Esc if app.security.zoom => app.security.zoom = false,
-            KeyCode::Esc if app.detail_focus => app.detail_focus = false,
-            KeyCode::Char('j') | KeyCode::Down if app.detail_focus && finding_list => {
-                app.security.move_by(1)
-            }
-            KeyCode::Char('k') | KeyCode::Up if app.detail_focus && finding_list => {
-                app.security.move_by(-1)
-            }
-            KeyCode::Char('g') | KeyCode::Home if app.detail_focus && finding_list => {
-                app.security.move_by(isize::MIN)
-            }
-            KeyCode::Char('G') | KeyCode::End if app.detail_focus && finding_list => {
-                app.security.move_by(isize::MAX)
-            }
-            KeyCode::PageDown if app.detail_focus && finding_list => {
+            A::Escape if app.security.zoom => app.security.zoom = false,
+            A::Escape if app.detail_focus => app.detail_focus = false,
+            A::Down if app.detail_focus && finding_list => app.security.move_by(1),
+            A::Up if app.detail_focus && finding_list => app.security.move_by(-1),
+            A::First if app.detail_focus && finding_list => app.security.move_by(isize::MIN),
+            A::Last if app.detail_focus && finding_list => app.security.move_by(isize::MAX),
+            A::PageDown if app.detail_focus && finding_list => {
                 app.security.move_by(height as isize)
             }
-            KeyCode::PageUp if app.detail_focus && finding_list => {
+            A::PageUp if app.detail_focus && finding_list => {
                 app.security.move_by(-(height as isize))
             }
-            KeyCode::Char('j') | KeyCode::Down if app.detail_focus => {
-                app.detail_scroll = app.detail_scroll.saturating_add(1)
-            }
-            KeyCode::Char('k') | KeyCode::Up if app.detail_focus => {
-                app.detail_scroll = app.detail_scroll.saturating_sub(1)
-            }
-            KeyCode::PageDown if app.detail_focus => {
+            A::Down if app.detail_focus => app.detail_scroll = app.detail_scroll.saturating_add(1),
+            A::Up if app.detail_focus => app.detail_scroll = app.detail_scroll.saturating_sub(1),
+            A::PageDown if app.detail_focus => {
                 app.detail_scroll = app.detail_scroll.saturating_add(height)
             }
-            KeyCode::PageUp if app.detail_focus => {
+            A::PageUp if app.detail_focus => {
                 app.detail_scroll = app.detail_scroll.saturating_sub(height)
             }
-            KeyCode::Char('g') | KeyCode::Home if app.detail_focus => app.detail_scroll = 0,
-            KeyCode::Char('G') | KeyCode::End if app.detail_focus => {
-                app.detail_scroll = u16::MAX as usize
-            }
-            KeyCode::Delete | KeyCode::Char('d' | 'u' | ' ') => {
-                app.notice = "Security is scan-only; use Images for cleanup".into();
-            }
+            A::First if app.detail_focus => app.detail_scroll = 0,
+            A::Last if app.detail_focus => app.detail_scroll = u16::MAX as usize,
             _ => {
                 app.overview_mode = tha::app::OverviewMode::Images;
-                let quit = handle_key(app, key, height, refresh);
+                let quit = dispatch_navigation(app, action, key, height, refresh);
                 if app.overview_mode == tha::app::OverviewMode::Images {
                     app.overview_mode = tha::app::OverviewMode::Security;
                 }
@@ -1501,38 +1535,32 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         return false;
     }
     if app.overview_mode != tha::app::OverviewMode::Containers {
-        match key.code {
-            KeyCode::Delete | KeyCode::Char('d') if key.modifiers.is_empty() => {
-                ui::inventory::begin_removal(app)
-            }
-            KeyCode::Esc
+        match action {
+            A::RemoveResources => ui::inventory::begin_removal(app),
+            A::Escape
                 if app
                     .inventory_views
                     .get(&(app.inventory_engine, app.overview_mode))
                     .is_some_and(|view| view.details) =>
             {
-                ui::inventory::navigate(app, key.code, height)
+                ui::inventory::navigate(app, KeyCode::Esc, height)
             }
-            KeyCode::Esc => switch_overview(app, tha::app::OverviewMode::Containers),
-            KeyCode::Char('q') => return true,
-            KeyCode::Char(':') => {
-                app.input_mode = InputMode::Command;
-                app.input.clear();
+            A::Escape => switch_overview(app, tha::app::OverviewMode::Containers),
+            A::Back => return true,
+            A::PreviousRuntime
+            | A::NextRuntime
+            | A::SecurityPreviousRuntime
+            | A::SecurityNextRuntime => {
+                app.inventory_engine =
+                    if matches!(action, A::PreviousRuntime | A::SecurityPreviousRuntime) {
+                        app.inventory_engine.saturating_sub(1)
+                    } else {
+                        app.inventory_engine
+                            .saturating_add(1)
+                            .min(app.engines.len().saturating_sub(1))
+                    };
             }
-            KeyCode::Char('?') => {
-                app.help = true;
-                app.help_scroll = 0;
-            }
-            KeyCode::Left | KeyCode::Right => {
-                app.inventory_engine = if key.code == KeyCode::Left {
-                    app.inventory_engine.saturating_sub(1)
-                } else {
-                    app.inventory_engine
-                        .saturating_add(1)
-                        .min(app.engines.len().saturating_sub(1))
-                };
-            }
-            KeyCode::Char('/') => {
+            A::Search => {
                 let view = app
                     .inventory_views
                     .entry((app.inventory_engine, app.overview_mode))
@@ -1541,78 +1569,87 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                 view.details = false;
                 app.input_mode = InputMode::InventorySearch;
             }
-            KeyCode::Up
-            | KeyCode::Down
-            | KeyCode::PageUp
-            | KeyCode::PageDown
-            | KeyCode::Home
-            | KeyCode::End
-            | KeyCode::Enter
-            | KeyCode::Char('j' | 'k' | 'g' | 'G' | 'f' | 's' | ' ' | 'u' | 'c' | 'z')
-                if !ctrl =>
-            {
-                ui::inventory::navigate(app, key.code, height)
+            A::Up
+            | A::Down
+            | A::PageUp
+            | A::PageDown
+            | A::First
+            | A::Last
+            | A::Open
+            | A::InventoryFilter
+            | A::InventorySort
+            | A::Mark
+            | A::MarkUnused
+            | A::ClearMarks
+            | A::Zoom
+            | A::CheckImage
+            | A::CheckImages => {
+                // The existing inventory operation accepts a canonical key, not
+                // a user binding. Never feed it the original configured key.
+                let code = if action == A::First
+                    && (key.code == KeyCode::Home || app.keymap.action(key).is_some())
+                {
+                    KeyCode::Home
+                } else if action == A::Last {
+                    KeyCode::End
+                } else {
+                    let binding = action.info().bindings.first().expect("inventory binding");
+                    let event: KeyEvent = binding
+                        .key
+                        .parse::<crokey::KeyCombination>()
+                        .expect("catalog key")
+                        .into();
+                    event.code
+                };
+                ui::inventory::navigate(app, code, height)
             }
-            KeyCode::Char('r') => refresh.send_modify(|value| *value += 1),
-            KeyCode::Char('7') if key.modifiers.is_empty() => app.open_security(),
-            KeyCode::Char('m' | 'M')
-                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-            {
-                ui::inventory::navigate(app, key.code, height)
-            }
-            KeyCode::Char('1'..='6') if key.modifiers.is_empty() => {
-                switch_overview(app, tha::app::OverviewMode::Containers);
-                return handle_key(app, key, height, refresh);
-            }
+            A::RefreshInventory => refresh.send_modify(|value| *value += 1),
+            A::Security => app.open_security(),
             _ => {}
         }
         return false;
     }
-    if app.detail_focus
-        && app.tab == Tab::Security
-        && !ctrl
-        && !key.modifiers.contains(KeyModifiers::ALT)
-    {
-        let handled = match key.code {
-            KeyCode::Char('z') => {
+    if app.detail_focus && app.tab == Tab::Security {
+        let handled = match action {
+            A::Zoom => {
                 app.security.zoom = !app.security.zoom;
                 true
             }
-            KeyCode::Enter => {
+            A::Open => {
                 app.security.expanded = !app.security.expanded;
                 app.detail_scroll = 0;
                 true
             }
-            KeyCode::Esc if app.security.expanded => {
+            A::Escape if app.security.expanded => {
                 app.security.expanded = false;
                 app.detail_scroll = 0;
                 true
             }
-            KeyCode::Esc if app.security.zoom => {
+            A::Escape if app.security.zoom => {
                 app.security.zoom = false;
                 true
             }
-            KeyCode::Char('j') | KeyCode::Down if !app.security.expanded => {
+            A::Down if !app.security.expanded => {
                 app.security.move_by(1);
                 true
             }
-            KeyCode::Char('k') | KeyCode::Up if !app.security.expanded => {
+            A::Up if !app.security.expanded => {
                 app.security.move_by(-1);
                 true
             }
-            KeyCode::Char('g') if !app.security.expanded => {
+            A::First if !app.security.expanded => {
                 app.security.move_by(isize::MIN);
                 true
             }
-            KeyCode::Char('G') if !app.security.expanded => {
+            A::Last if !app.security.expanded => {
                 app.security.move_by(isize::MAX);
                 true
             }
-            KeyCode::PageDown if !app.security.expanded => {
+            A::PageDown if !app.security.expanded => {
                 app.security.move_by(height as isize);
                 true
             }
-            KeyCode::PageUp if !app.security.expanded => {
+            A::PageUp if !app.security.expanded => {
                 app.security.move_by(-(height as isize));
                 true
             }
@@ -1622,26 +1659,26 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             return false;
         }
     }
-    if app.detail_focus
-        && app.tab == Tab::History
-        && !ctrl
-        && !key.modifiers.contains(KeyModifiers::ALT)
-    {
+    if app.detail_focus && app.tab == Tab::History {
         let view = &mut app.history_view;
-        let handled = match key.code {
-            KeyCode::Char('[') => {
+        let handled = match action {
+            A::PreviousRange => {
                 view.range_by(-1);
                 true
             }
-            KeyCode::Char(']') => {
+            A::NextRange => {
                 view.range_by(1);
                 true
             }
-            KeyCode::Left | KeyCode::Right if view.cursor.is_none() => {
-                view.pan(if key.code == KeyCode::Left { -1 } else { 1 });
+            A::MetricsLeft | A::MetricsRight
+                if view.cursor.is_none()
+                    && (matches!(key.code, KeyCode::Left | KeyCode::Right)
+                        || app.keymap.action(key).is_some()) =>
+            {
+                view.pan(if action == A::MetricsLeft { -1 } else { 1 });
                 true
             }
-            KeyCode::Char('h') | KeyCode::Left => {
+            A::MetricsLeft => {
                 view.cursor = Some(
                     view.cursor
                         .unwrap_or(view.data.points.len().saturating_sub(1))
@@ -1650,7 +1687,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                 view.end_ms.get_or_insert_with(tha::history::now_ms);
                 true
             }
-            KeyCode::Char('l') | KeyCode::Right => {
+            A::MetricsRight => {
                 view.cursor = Some(
                     view.cursor
                         .unwrap_or(0)
@@ -1660,7 +1697,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                 view.end_ms.get_or_insert_with(tha::history::now_ms);
                 true
             }
-            KeyCode::Char('c') => {
+            A::MetricsCursor => {
                 view.cursor = if view.cursor.is_some() {
                     None
                 } else {
@@ -1669,28 +1706,28 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                 view.end_ms.get_or_insert_with(tha::history::now_ms);
                 true
             }
-            KeyCode::Char('f') => {
+            A::MetricsLive => {
                 view.end_ms = None;
                 view.cursor = None;
                 true
             }
-            KeyCode::Char('z') => {
+            A::Zoom => {
                 view.expanded = !view.expanded;
                 true
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            A::Down => {
                 view.metric = (view.metric + 1) % 4;
                 true
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            A::Up => {
                 view.metric = (view.metric + 3) % 4;
                 true
             }
-            KeyCode::Esc if view.expanded => {
+            A::Escape if view.expanded => {
                 view.expanded = false;
                 true
             }
-            KeyCode::Esc if view.cursor.is_some() => {
+            A::Escape if view.cursor.is_some() => {
                 view.cursor = None;
                 true
             }
@@ -1700,27 +1737,17 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             return false;
         }
     }
-    let lifecycle_key = !app.detail_focus
-        && !key.modifiers.intersects(
-            KeyModifiers::CONTROL
-                | KeyModifiers::ALT
-                | KeyModifiers::SUPER
-                | KeyModifiers::HYPER
-                | KeyModifiers::META,
-        )
-        && key.kind == KeyEventKind::Press;
     let pending_g = app.pending_g;
     app.pending_g = false;
-    match key.code {
-        KeyCode::F(3) if app.tab == Tab::Logs && app.detail_focus => {
+    match action {
+        A::FilterLogs => {
             app.input_mode = InputMode::LogFilter;
             app.input = app.log_filter_text.clone();
         }
-        KeyCode::Char('S') if lifecycle_key => app.request_action(tha::actions::Action::Start),
-        KeyCode::Char('s') if lifecycle_key => app.request_action(tha::actions::Action::Stop),
-        KeyCode::Char('r') if lifecycle_key => app.request_action(tha::actions::Action::Restart),
-        KeyCode::Char('d') if lifecycle_key => app.request_action(tha::actions::Action::Delete),
-        KeyCode::Char('q') => {
+        A::Start | A::Stop | A::Restart | A::DeleteContainer => {
+            app.request_action(action.lifecycle().expect("lifecycle action"))
+        }
+        A::Back => {
             if app.tab == Tab::History && app.history_view.expanded {
                 app.history_view.expanded = false;
             } else if app.performance_focus {
@@ -1731,7 +1758,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                 return true;
             }
         }
-        KeyCode::Esc => {
+        A::Escape => {
             if app.tab == Tab::History && app.history_view.expanded {
                 app.history_view.expanded = false;
             } else if app.performance_open && app.performance_expanded {
@@ -1752,54 +1779,42 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                 app.back();
             }
         }
-        KeyCode::Backspace => {
+        A::WorkspaceBack => {
             app.back();
         }
-        KeyCode::Char('?') | KeyCode::F(1) => {
-            app.help = true;
-            app.help_scroll = 0;
-        }
-        KeyCode::Char('e') => app.request_exec(),
-        KeyCode::Char('p') => app.toggle_performance(),
-        KeyCode::Char('P') if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-            app.switch_performance_scope()
-        }
-        KeyCode::Char('z')
-            if app.performance_focus && !ctrl && !key.modifiers.contains(KeyModifiers::ALT) =>
-        {
+        A::OpenExec => app.request_exec(),
+        A::Performance | A::PerformanceSpace => app.toggle_performance(),
+        A::PerformanceScope => app.switch_performance_scope(),
+        A::Zoom if app.performance_focus => {
             app.performance_expanded = !app.performance_expanded;
         }
-        KeyCode::Char('o') => app.pick_context_sort(),
-        KeyCode::F(6) => app.pick_sessions(),
-        KeyCode::Char('a') if lifecycle_key => app.open_actions(),
-        KeyCode::Char(':') => {
-            app.input_mode = InputMode::Command;
-            app.input.clear();
-        }
-        KeyCode::Char('/') => {
+        A::SortContexts => app.pick_context_sort(),
+        A::ExecSessions => app.pick_sessions(),
+        A::Actions => app.open_actions(),
+        A::Search => {
             app.input_mode = InputMode::Search;
             app.input.clear();
         }
-        KeyCode::Tab | KeyCode::BackTab => app.cycle_focus(key.code == KeyCode::BackTab),
-        KeyCode::Char('1') => {
+        A::FocusNext | A::FocusPrevious => app.cycle_focus(action == A::FocusPrevious),
+        A::Overview => {
             app.tab = Tab::Overview;
             app.detail_scroll = 0;
         }
-        KeyCode::Char('2') => {
+        A::Logs => {
             app.tab = Tab::Logs;
             app.detail_scroll = 0;
         }
-        KeyCode::Char('3') => {
+        A::Networks => {
             app.tab = Tab::Networks;
             app.detail_scroll = 0;
         }
-        KeyCode::Char('4') => {
+        A::Exec => {
             app.tab = Tab::Exec;
             app.detail_focus = true;
             app.performance_focus = false;
             app.exec_input = false;
         }
-        KeyCode::Char('6') if !ctrl => {
+        A::Layers => {
             if !app.layers_available() {
                 return false;
             }
@@ -1809,13 +1824,13 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             app.layers.expanded = false;
             app.detail_scroll = 0;
         }
-        KeyCode::Char('7') if !ctrl => app.open_security(),
-        KeyCode::Char('5') if !ctrl && app.performance_container().is_some() => {
+        A::Security => app.open_security(),
+        A::Metrics if app.performance_container().is_some() => {
             app.tab = Tab::History;
             app.detail_focus = true;
             app.performance_focus = false;
         }
-        KeyCode::Enter => {
+        A::Open => {
             if app.performance_focus
                 && app.performance_scope == tha::app::PerformanceScope::Container
             {
@@ -1861,30 +1876,29 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                 app.open_selected();
             }
         }
-        KeyCode::Char(' ') if app.performance_focus => app.toggle_performance(),
-        KeyCode::Char(' ') if !app.detail_focus => app.toggle_branch(),
-        KeyCode::Char('j') | KeyCode::Down => move_by(app, 1, height),
-        KeyCode::Char('k') | KeyCode::Up => move_by(app, -1, height),
-        KeyCode::Char('d') if ctrl => move_by(app, (height / 2).max(1) as isize, height),
-        KeyCode::Char('u') if ctrl => move_by(app, -((height / 2).max(1) as isize), height),
-        KeyCode::PageDown => move_by(app, height.max(1) as isize, height),
-        KeyCode::PageUp => move_by(app, -(height.max(1) as isize), height),
-        KeyCode::Char('h') | KeyCode::Left => {
+        A::ToggleBranch => app.toggle_branch(),
+        A::Down => move_by(app, 1, height),
+        A::Up => move_by(app, -1, height),
+        A::HalfPageDown => move_by(app, (height / 2).max(1) as isize, height),
+        A::HalfPageUp => move_by(app, -((height / 2).max(1) as isize), height),
+        A::PageDown => move_by(app, height.max(1) as isize, height),
+        A::PageUp => move_by(app, -(height.max(1) as isize), height),
+        A::Left => {
             if !app.detail_focus && !app.performance_focus {
                 app.collapse();
             } else if app.tab == Tab::Logs && !app.log_view.wrap {
                 app.log_view.horizontal = app.log_view.horizontal.saturating_sub(8);
             }
         }
-        KeyCode::Char('l') | KeyCode::Right => {
+        A::Right => {
             if !app.detail_focus && !app.performance_focus {
                 app.expand();
             } else if app.tab == Tab::Logs && !app.log_view.wrap {
                 app.log_view.horizontal = (app.log_view.horizontal + 8).min(16_384);
             }
         }
-        KeyCode::Char('g') => {
-            if pending_g {
+        A::First => {
+            if pending_g || key.code == KeyCode::Home || app.keymap.action(key).is_some() {
                 if app.performance_focus {
                     app.move_performance_selection(isize::MIN);
                 } else if !app.detail_focus {
@@ -1905,7 +1919,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                 app.pending_g = true;
             }
         }
-        KeyCode::Char('G') => {
+        A::Last => {
             if app.performance_focus {
                 app.move_performance_selection(isize::MAX);
             } else if !app.detail_focus {
@@ -1922,18 +1936,16 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                 app.detail_scroll = u16::MAX as usize;
             }
         }
-        KeyCode::Char('f') if app.tab == Tab::Logs && app.detail_focus => {
+        A::Follow => {
             if app.logs.follow {
                 app.log_view.scroll(&mut app.logs, 0);
             } else {
                 app.logs.follow = true;
             }
         }
-        KeyCode::Char('w') if app.tab == Tab::Logs && app.detail_focus => {
-            app.log_view.toggle_wrap(&app.logs)
-        }
-        KeyCode::Char('n') | KeyCode::Char('N') => {
-            let backwards = key.code == KeyCode::Char('N');
+        A::Wrap => app.log_view.toggle_wrap(&app.logs),
+        A::NextMatch | A::PreviousMatch => {
+            let backwards = action == A::PreviousMatch;
             if app.detail_focus && app.tab == Tab::Logs {
                 app.log_view.next_match(&mut app.logs, backwards);
             } else {
@@ -2125,6 +2137,50 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_navigation_routes_every_pane_without_stealing_modal_input() {
+        use tha::app::OverviewMode as O;
+        let (tx, _) = watch::channel(0);
+        for (overview, focus, performance, tab, details, expanded) in [
+            (O::Containers, false, false, Tab::Overview, false, false),
+            (O::Containers, false, true, Tab::Overview, false, false),
+            (O::Containers, true, false, Tab::Overview, false, false),
+            (O::Containers, true, false, Tab::Logs, false, false),
+            (O::Containers, true, false, Tab::Exec, false, false),
+            (O::Containers, true, false, Tab::History, false, false),
+            (O::Containers, true, false, Tab::Layers, false, false),
+            (O::Images, false, false, Tab::Overview, false, false),
+            (O::Images, false, false, Tab::Overview, true, false),
+            (O::Volumes, false, false, Tab::Overview, false, false),
+            (O::Volumes, false, false, Tab::Overview, true, false),
+            (O::Security, false, false, Tab::Security, false, false),
+            (O::Security, true, false, Tab::Security, false, false),
+            (O::Security, true, false, Tab::Security, false, true),
+        ] {
+            let mut app = app();
+            app.overview_mode = overview;
+            app.detail_focus = focus;
+            app.performance_focus = performance;
+            app.tab = tab;
+            app.security.enabled = true;
+            app.security.expanded = expanded;
+            app.inventory_views
+                .entry((0, overview))
+                .or_default()
+                .details = details;
+            let context = NavigationContext::of(&app);
+            assert_eq!(
+                shortcuts::resolve(context, KeyEvent::from(KeyCode::Down), &app.keymap, true),
+                Some(A::Down)
+            );
+            handle_key(&mut app, KeyEvent::from(KeyCode::Down), 20, &tx);
+            handle_key(&mut app, KeyEvent::from(KeyCode::F(1)), 20, &tx);
+            assert!(app.help, "{context:?}");
+            assert!(app.action_request.is_none());
+            assert!(app.exec_request.is_none());
+            assert!(!app.security.request);
+        }
+    }
     #[test]
     fn history_navigation_is_container_only_and_does_not_steal_editor_or_shell_input() {
         let mut app = app();
