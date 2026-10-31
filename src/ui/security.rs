@@ -294,7 +294,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 .as_ref()
                 .map(|target| {
                     format!(
-                        "Scanning {} · saved CVEs remain browsable",
+                        "Target {} · saved CVEs remain browsable",
                         safe_text(&target.label)
                     )
                 })
@@ -566,6 +566,32 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(header + 4, value + 3, "CVSS alignment at width {width}");
+        }
+    }
+
+    #[test]
+    fn scan_status_shows_scanner_pull_and_database_update_stages() {
+        let mut app = App::new(crate::demo::connections(), 100, false, true);
+        app.security.start(1);
+        for stage in [
+            "Pulling scanner image anchore/grype:latest…",
+            "Updating vulnerability database…",
+            "Downloading vulnerability database: 12.0 MB / 180.0 MB",
+            "Scanning image packages with Grype…",
+        ] {
+            app.security.progress = stage.into();
+            let mut terminal = Terminal::new(TestBackend::new(100, 3)).unwrap();
+            terminal
+                .draw(|frame| draw_status(frame, &app, frame.area()))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains(stage), "Missing scan stage: {stage}");
         }
     }
 

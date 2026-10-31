@@ -306,7 +306,13 @@ async fn scan(
         source::verify(&target).await?;
         progress("Checking scanner and vulnerability database (daily)…");
         update_started = true;
-        let scanner = updates::ensure(&target.connection, force_update, &update_name).await?;
+        let scanner = updates::ensure_with_progress(
+            &target.connection,
+            force_update,
+            &update_name,
+            &progress,
+        )
+        .await?;
         progress("Exporting the exact image; no runtime socket is shared with Grype…");
         let archive = source::export(&target).await?;
         progress("Scanning image packages with Grype…");

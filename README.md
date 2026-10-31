@@ -127,7 +127,9 @@ Queues continue after individual image errors and summarize completed/failed ima
 cancellation still stops the remaining queue. A failed image is never a clean report.
 Saved CVEs remain visible and browsable during scanning; background scans do not
 change the selected image. The bottom status strip shows the service's current stage,
-an animated activity indicator, elapsed queue time, and **x** to cancel. The animation
+including pulling `anchore/grype:latest` again if the scanner image is missing (for
+example after pruning images) and refreshing the vulnerability database, plus an
+animated activity indicator, elapsed queue time, and **x** to cancel. The animation
 indicates UI activity, not measured scan progress. Findings refresh when the selected
 image finishes scanning; previously saved results are explicitly labeled as saved reports.
 

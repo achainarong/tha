@@ -39,10 +39,6 @@ pub fn lock() -> Result<File> {
     Ok(file)
 }
 
-pub async fn ensure(connection: &Connection, force: bool, update_name: &str) -> Result<String> {
-    ensure_with_progress(connection, force, update_name, &|_| {}).await
-}
-
 pub async fn stage<T>(
     progress: &(impl Fn(&str) + Sync),
     message: &str,

@@ -402,6 +402,17 @@ esac
     let length = ui.read_u32().await.unwrap();
     let mut first = vec![0; length as usize];
     ui.read_exact(&mut first).await.unwrap();
+    // A missing scanner must be visible in the UI, not hidden behind a generic stage.
+    let mut frame = first;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !String::from_utf8_lossy(&frame).contains("Pulling scanner image anchore/grype") {
+            let length = ui.read_u32().await.unwrap();
+            frame = vec![0; length as usize];
+            ui.read_exact(&mut frame).await.unwrap();
+        }
+    })
+    .await
+    .expect("Scan queue should report the scanner pull to the UI");
     drop(ui); // The worker, not this connection, must own the full queue.
     wait_for(|| {
         fs::read_to_string(temp.path().join("calls"))
