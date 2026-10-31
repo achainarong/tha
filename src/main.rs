@@ -2064,6 +2064,10 @@ fn dispatch_navigation(
             app.detail_scroll = 0;
         }
         A::Exec => {
+            if !app.exec_tab_available() {
+                app.notice = "Exec requires a running container or service.".into();
+                return false;
+            }
             app.tab = Tab::Exec;
             app.detail_focus = true;
             app.performance_focus = false;
@@ -2118,6 +2122,8 @@ fn dispatch_navigation(
                     app.layers.expanded = !app.layers.expanded;
                     app.detail_scroll = 0;
                 }
+            } else if app.detail_focus && app.network_cursor_active() {
+                app.open_network_target();
             } else if app.detail_focus && app.tab == Tab::Exec {
                 if let Some(session) = app.sessions.active_mut()
                     && session.running()
@@ -2143,6 +2149,8 @@ fn dispatch_navigation(
                 app.collapse();
             } else if app.tab == Tab::Logs && !app.log_view.wrap {
                 app.log_view.horizontal = app.log_view.horizontal.saturating_sub(8);
+            } else if app.detail_focus {
+                return cycle_tab(app, false, key, height, refresh);
             }
         }
         A::Right => {
@@ -2150,8 +2158,12 @@ fn dispatch_navigation(
                 app.expand();
             } else if app.tab == Tab::Logs && !app.log_view.wrap {
                 app.log_view.horizontal = (app.log_view.horizontal + 8).min(16_384);
+            } else if app.detail_focus {
+                return cycle_tab(app, true, key, height, refresh);
             }
         }
+        A::PreviousTab => return cycle_tab(app, false, key, height, refresh),
+        A::NextTab => return cycle_tab(app, true, key, height, refresh),
         A::First => {
             if pending_g || key.code == KeyCode::Home || app.keymap.action(key).is_some() {
                 if app.performance_focus {
@@ -2160,6 +2172,8 @@ fn dispatch_navigation(
                     app.selected = 0;
                 } else if app.tab == Tab::Logs {
                     app.log_view.first(&mut app.logs);
+                } else if app.network_cursor_active() {
+                    app.move_network_cursor(isize::MIN);
                 } else if app.tab == Tab::Layers && !app.layers.expanded {
                     app.layers.selected = 0;
                     app.detail_scroll = 0;
@@ -2181,6 +2195,8 @@ fn dispatch_navigation(
                 app.selected = app.rows.len().saturating_sub(1);
             } else if app.tab == Tab::Logs {
                 app.logs.follow = true;
+            } else if app.network_cursor_active() {
+                app.move_network_cursor(isize::MAX);
             } else if app.tab == Tab::Layers && !app.layers.expanded {
                 app.layers.move_by(isize::MAX);
             } else if app.tab == Tab::Exec {
@@ -2212,6 +2228,34 @@ fn dispatch_navigation(
     false
 }
 
+/// Moves along the tab bar through the same actions as the number keys.
+fn cycle_tab(
+    app: &mut App,
+    forward: bool,
+    key: KeyEvent,
+    height: usize,
+    refresh: &watch::Sender<u64>,
+) -> bool {
+    let tabs = app.available_tabs();
+    let index = tabs.iter().position(|tab| *tab == app.tab).unwrap_or(0);
+    let next = if forward {
+        (index + 1) % tabs.len()
+    } else {
+        (index + tabs.len() - 1) % tabs.len()
+    };
+    let action = match tabs[next] {
+        Tab::Overview => A::Overview,
+        Tab::Logs => A::Logs,
+        Tab::Networks => A::Networks,
+        Tab::Exec => A::Exec,
+        Tab::Events => A::Events,
+        Tab::History => A::Metrics,
+        Tab::Layers => A::Layers,
+        Tab::Security => A::Security,
+    };
+    dispatch_navigation(app, action, key, height, refresh)
+}
+
 fn move_by(app: &mut App, amount: isize, _height: usize) {
     if app.performance_focus {
         app.move_performance_selection(amount);
@@ -2220,6 +2264,8 @@ fn move_by(app: &mut App, amount: isize, _height: usize) {
         app.detail_scroll = 0;
     } else if app.tab == Tab::Logs {
         app.log_view.scroll(&mut app.logs, amount);
+    } else if app.network_cursor_active() {
+        app.move_network_cursor(amount);
     } else if app.tab == Tab::Layers && !app.layers.expanded {
         app.layers.move_by(amount);
     } else if app.tab == Tab::Exec {
@@ -4091,6 +4137,254 @@ mod tests {
         handle_key(&mut app, KeyEvent::from(KeyCode::F(7)), 25, &refresh);
         assert_eq!(app.overview_mode, OverviewMode::Volumes);
         assert_eq!(app.inventory_views[&(0, OverviewMode::Volumes)].filter, 1);
+    }
+
+    fn draw_at(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| tha::ui::draw(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn highlighted(buffer: &ratatui::buffer::Buffer, text: &str) -> bool {
+        (0..buffer.area.height).any(|y| {
+            let row: String = (0..buffer.area.width)
+                .filter(|x| {
+                    buffer[(*x, y)]
+                        .modifier
+                        .contains(ratatui::style::Modifier::REVERSED)
+                })
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            row.contains(text)
+        })
+    }
+
+    fn focused_networks_app() -> App {
+        let mut app = app();
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| row.title == "shop-api-2")
+            .unwrap();
+        app.tab = Tab::Networks;
+        app.detail_focus = true;
+        app
+    }
+
+    #[tokio::test]
+    async fn focused_networks_moves_a_row_cursor_and_leaves_left_right_to_the_tabs() {
+        let mut app = focused_networks_app();
+        let (refresh, _) = watch::channel(0);
+        let selected = app.selected;
+        let buffer = draw_at(&mut app, 120, 40);
+        assert!(highlighted(&buffer, "shop_default"));
+        assert_eq!(app.network_targets.len(), 4);
+        for (key, expected) in [
+            (KeyCode::Char('j'), 1),
+            (KeyCode::Down, 2),
+            (KeyCode::Char('k'), 1),
+            (KeyCode::Up, 0),
+            (KeyCode::Up, 0),
+            (KeyCode::Char('G'), 3),
+            (KeyCode::Down, 3),
+            (KeyCode::Home, 0),
+            (KeyCode::PageDown, 3),
+        ] {
+            handle_key(&mut app, KeyEvent::from(key), 20, &refresh);
+            assert_eq!(app.network_cursor, expected, "{key:?}");
+        }
+        assert_eq!(app.selected, selected);
+        let buffer = draw_at(&mut app, 120, 40);
+        assert!(highlighted(&buffer, "shop-postgres-1"));
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Right), 20, &refresh);
+        assert_eq!(app.tab, Tab::Exec);
+        assert_eq!(app.network_cursor, 3);
+    }
+
+    #[tokio::test]
+    async fn networks_cursor_needs_focus_follows_scrolling_and_resets_with_the_selection() {
+        let mut app = focused_networks_app();
+        let (refresh, _) = watch::channel(0);
+        app.detail_focus = false;
+        let buffer = draw_at(&mut app, 120, 40);
+        assert!(!highlighted(&buffer, "shop_default"));
+        let selected = app.selected;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Down), 20, &refresh);
+        assert_eq!(app.selected, selected + 1, "the Explorer keeps the keys");
+        assert_eq!(app.network_cursor, 0);
+        app.selected = selected;
+
+        app.detail_focus = true;
+        draw_at(&mut app, 120, 40);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('G')), 20, &refresh);
+        let buffer = draw_at(&mut app, 120, 12);
+        assert!(app.detail_scroll > 0);
+        assert!(highlighted(&buffer, "shop-postgres-1"));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Home), 20, &refresh);
+        let buffer = draw_at(&mut app, 120, 12);
+        assert_eq!(app.detail_scroll, 0);
+        assert!(highlighted(&buffer, "shop_default"));
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('G')), 20, &refresh);
+        app.selected -= 1;
+        draw_at(&mut app, 120, 40);
+        assert_eq!(app.network_cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_network_member_selects_it_in_the_explorer() {
+        let mut app = focused_networks_app();
+        let (refresh, _) = watch::channel(0);
+        draw_at(&mut app, 120, 40);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &refresh);
+        assert!(app.detail_focus, "a network heading has nothing to open");
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('G')), 20, &refresh);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &refresh);
+        assert!(!app.detail_focus);
+        assert_eq!(app.tab, Tab::Networks);
+        assert_eq!(app.current().unwrap().title, "shop-postgres-1");
+    }
+
+    #[tokio::test]
+    async fn exec_tab_only_appears_for_a_selection_that_can_exec() {
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| row.title == "shop-api-2")
+            .unwrap();
+        assert!(app.available_tabs().contains(&Tab::Exec));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('4')), 20, &refresh);
+        assert_eq!(app.tab, Tab::Exec);
+        let rendered = |buffer: &ratatui::buffer::Buffer| {
+            buffer
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        assert!(rendered(&draw_at(&mut app, 240, 40)).contains("│ 4 Exec"));
+
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.scope,
+                    tha::app::Scope::Resources {
+                        kind: tha::app::ResourceKind::Network,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        app.detail_focus = false;
+        assert!(!app.available_tabs().contains(&Tab::Exec));
+        let text = rendered(&draw_at(&mut app, 240, 40));
+        assert_eq!(app.tab, Tab::Overview, "Exec gives way when unavailable");
+        assert!(!text.contains("4 Exec"));
+        assert!(text.contains("3 Networks"));
+        assert!(text.contains("5 Events"));
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('4')), 20, &refresh);
+        assert_eq!(app.tab, Tab::Overview);
+        assert!(app.notice.contains("Exec requires"));
+        assert!(tha::shortcuts::unavailable(&app, tha::shortcuts::ActionId::Exec).is_some());
+
+        app.detail_focus = true;
+        app.tab = Tab::Networks;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Right), 20, &refresh);
+        assert_eq!(app.tab, Tab::Events, "tab movement skips Exec");
+    }
+
+    #[tokio::test]
+    async fn focused_details_move_along_the_tab_bar_with_arrows_and_vim_keys() {
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, tha::app::Scope::Container(_)))
+            .unwrap();
+        app.detail_focus = true;
+        let selected = app.selected;
+        for (key, tab) in [
+            (KeyCode::Right, Tab::Logs),
+            (KeyCode::Char('l'), Tab::Networks),
+            (KeyCode::Char('L'), Tab::Exec),
+            (KeyCode::Left, Tab::Networks),
+            (KeyCode::Char('h'), Tab::Logs),
+            (KeyCode::Char('H'), Tab::Overview),
+        ] {
+            handle_key(&mut app, KeyEvent::from(key), 20, &refresh);
+            assert_eq!(app.tab, tab, "{key:?}");
+            assert!(app.detail_focus);
+            assert_eq!(app.selected, selected);
+        }
+
+        // Going left from the first tab wraps to the last one available.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Left), 20, &refresh);
+        assert_eq!(Some(&app.tab), app.available_tabs().last());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Right), 20, &refresh);
+        assert_eq!(app.tab, Tab::Overview);
+    }
+
+    #[tokio::test]
+    async fn tab_keys_skip_unavailable_tabs_and_leave_the_explorer_alone() {
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, tha::app::Scope::Engine))
+            .unwrap();
+        assert!(!app.available_tabs().contains(&Tab::Layers));
+        app.detail_focus = true;
+        app.tab = Tab::Overview;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Left), 20, &refresh);
+        assert_eq!(Some(&app.tab), app.available_tabs().last());
+        assert_ne!(app.tab, Tab::Layers);
+
+        app.tab = Tab::Overview;
+        app.detail_focus = false;
+        for key in [
+            KeyCode::Right,
+            KeyCode::Left,
+            KeyCode::Char('L'),
+            KeyCode::Char('H'),
+        ] {
+            handle_key(&mut app, KeyEvent::from(key), 20, &refresh);
+            assert_eq!(app.tab, Tab::Overview, "{key:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn horizontal_panes_keep_arrows_and_leave_with_shift_h_l() {
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, tha::app::Scope::Container(_)))
+            .unwrap();
+        app.detail_focus = true;
+        app.tab = Tab::Logs;
+        app.log_view.wrap = false;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Right), 20, &refresh);
+        assert_eq!(app.tab, Tab::Logs);
+        assert_eq!(app.log_view.horizontal, 8);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('L')), 20, &refresh);
+        assert_eq!(app.tab, Tab::Networks);
+
+        app.tab = Tab::History;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Left), 20, &refresh);
+        assert_eq!(app.tab, Tab::History);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('H')), 20, &refresh);
+        assert_eq!(app.tab, Tab::Events);
     }
 
     #[tokio::test]

@@ -58,7 +58,8 @@ configured keys take precedence.
 | `none` | Disable this key in navigation |
 | `help`, `views`, `commands` | Open help, view picker, or command palette |
 | `back`, `escape`, `quit` | Back/quit from home; cancel/restore/back; quit immediately |
-| `up`, `down`, `left`, `right` | Move/scroll; left/right adapt to tree, logs, metrics, or runtime selection |
+| `up`, `down`, `left`, `right` | Move/scroll; left/right adapt to tree, detail tabs, logs, metrics, or runtime selection |
+| `previous-tab`, `next-tab` | Previous/next detail tab from any focused detail tab |
 | `page-up`, `page-down`, `half-page-up`, `half-page-down` | Page or half-page navigation |
 | `first`, `last` | First/last item; last also resumes log following |
 | `open`, `search` | Open/inspect the current item; search the current view |

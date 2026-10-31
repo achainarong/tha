@@ -66,6 +66,14 @@ pub struct Row {
     pub running: Option<bool>,
 }
 
+/// One cursor stop in the Networks tab, recorded by the last draw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkTarget {
+    pub line: usize,
+    /// Explorer key of an attached container; absent for a network heading.
+    pub container: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct Node {
     row: Row,
@@ -290,6 +298,9 @@ pub struct App {
     pub performance_scroll: usize,
     pub performance_offset: usize,
     pub detail_scroll: usize,
+    pub network_cursor: usize,
+    pub network_cursor_owner: Option<String>,
+    pub network_targets: Vec<NetworkTarget>,
     pub log_view: LogView,
     pub log_filter_text: String,
     pub log_export_scope: Option<String>,
@@ -410,6 +421,9 @@ impl App {
             inventory_removal_results_visible: false,
             inventory_removal_results_scroll: 0,
             detail_scroll: 0,
+            network_cursor: 0,
+            network_cursor_owner: None,
+            network_targets: Vec::new(),
             log_view: LogView::new(true),
             log_filter_text: "{}".into(),
             log_export_scope: None,
@@ -975,6 +989,44 @@ impl App {
         self.available_layers_target()
     }
 
+    /// Detail tabs shown for the current selection, in tab-bar order.
+    pub fn available_tabs(&self) -> Vec<Tab> {
+        let mut tabs = vec![Tab::Overview, Tab::Logs, Tab::Networks];
+        if self.exec_tab_available() {
+            tabs.push(Tab::Exec);
+        }
+        tabs.push(Tab::Events);
+        if self.performance_container().is_some() {
+            tabs.push(Tab::History);
+        }
+        if self.layers_available() {
+            tabs.push(Tab::Layers);
+        }
+        if self.security_tab_available() {
+            tabs.push(Tab::Security);
+        }
+        tabs
+    }
+
+    /// An open session stays reachable while browsing, whatever is selected.
+    pub fn exec_tab_available(&self) -> bool {
+        self.sessions.active().is_some() || self.exec_selection_eligible()
+    }
+
+    fn exec_selection_eligible(&self) -> bool {
+        let Some(row) = self.current() else {
+            return false;
+        };
+        let engine = &self.engines[row.engine];
+        matches!(row.scope, Scope::Container(_) | Scope::Service { .. })
+            && engine.error.is_none()
+            && engine.alias.is_none()
+            && self
+                .selected_containers()
+                .into_iter()
+                .any(|c| c.running() && !c.managed)
+    }
+
     pub fn layers_available(&self) -> bool {
         self.available_layers_target().is_some()
     }
@@ -1121,6 +1173,11 @@ impl App {
                 self.security.expanded = false;
                 self.security.zoom = false;
             }
+        }
+        if self.tab == Tab::Exec && !self.exec_tab_available() {
+            self.tab = Tab::Overview;
+            self.exec_input = false;
+            self.detail_scroll = 0;
         }
         if self.tab == Tab::History && self.performance_container().is_none() {
             self.tab = Tab::Overview;
@@ -2015,6 +2072,51 @@ impl App {
             .min(self.rows.len().saturating_sub(1));
     }
 
+    /// The Networks tab falls back to plain scrolling when it has no rows to select.
+    pub fn network_cursor_active(&self) -> bool {
+        self.tab == Tab::Networks && !self.network_targets.is_empty()
+    }
+
+    pub fn move_network_cursor(&mut self, amount: isize) {
+        self.network_cursor = self
+            .network_cursor
+            .saturating_add_signed(amount)
+            .min(self.network_targets.len().saturating_sub(1));
+    }
+
+    /// Selects the container under the Networks cursor in the Explorer.
+    pub fn open_network_target(&mut self) {
+        let Some(key) = self
+            .network_targets
+            .get(self.network_cursor)
+            .and_then(|target| target.container.clone())
+        else {
+            return;
+        };
+        let Some(tree) = self
+            .current()
+            .and_then(|row| self.explorer_tree(row.engine))
+        else {
+            return;
+        };
+        let mut path = Vec::new();
+        if !container_path(&tree, &key, &mut path) {
+            return;
+        }
+        let Some((target, ancestors)) = path.split_last() else {
+            return;
+        };
+        let target = target.clone();
+        self.expanded.extend(ancestors.iter().cloned());
+        self.tree_query.clear();
+        self.refresh_tree();
+        if let Some(index) = self.rows.iter().position(|row| row.key == target) {
+            self.selected = index;
+            self.detail_focus = false;
+            self.detail_scroll = 0;
+        }
+    }
+
     pub fn next_tree_match(&mut self, backwards: bool) {
         if self.rows.is_empty() {
             return;
@@ -2741,6 +2843,19 @@ fn container_node(index: usize, c: &Container) -> Node {
     let mut item = node(index, Scope::Container(c.key()), c.name.clone(), vec![]);
     item.row.running = Some(c.running());
     item
+}
+
+fn container_path(node: &Node, key: &str, path: &mut Vec<String>) -> bool {
+    path.push(node.row.key.clone());
+    let found = matches!(&node.row.scope, Scope::Container(candidate) if candidate == key)
+        || node
+            .children
+            .iter()
+            .any(|child| container_path(child, key, path));
+    if !found {
+        path.pop();
+    }
+    found
 }
 
 fn contains_match(node: &Node, query: &str) -> bool {

@@ -144,6 +144,8 @@ pub enum Scope {
     Explorer,
     Workloads,
     TreeOrLogs,
+    TreeOrTabs,
+    DetailTabs,
     Logs,
     Metrics,
     Inventory,
@@ -165,6 +167,22 @@ impl Scope {
             Self::Explorer => context == C::Explorer,
             Self::Workloads => matches!(context, C::Explorer | C::Performance),
             Self::TreeOrLogs => matches!(context, C::Explorer | C::Logs),
+            // Metrics keeps these keys for panning; see DetailTabs for its way out.
+            Self::TreeOrTabs => {
+                context == C::Explorer
+                    || (context != C::Metrics && Self::DetailTabs.includes(context))
+            }
+            Self::DetailTabs => matches!(
+                context,
+                C::Overview
+                    | C::Logs
+                    | C::Networks
+                    | C::Exec
+                    | C::Metrics
+                    | C::Layers
+                    | C::Events
+                    | C::ContainerSecurity
+            ),
             Self::Logs => context == C::Logs,
             Self::Metrics => context == C::Metrics,
             Self::Inventory => context.inventory(),
@@ -275,8 +293,10 @@ catalog! {
     Security, "Selected image security", ["security"], Global, 30, true, ["8"], [];
     Events, "Container events timeline", ["events"], Global, 30, false, ["5"], [];
     Search, "Search", [], Global, 6, false, ["/"], [];
-    Left, "Collapse / parent; scroll unwrapped logs", [], TreeOrLogs, 40, false, ["h"], ["left"];
-    Right, "Expand / child; scroll unwrapped logs", [], TreeOrLogs, 40, false, ["l"], ["right"];
+    Left, "Collapse / parent; previous tab; scroll unwrapped logs", [], TreeOrTabs, 40, false, ["h"], ["left"];
+    Right, "Expand / child; next tab; scroll unwrapped logs", [], TreeOrTabs, 40, false, ["l"], ["right"];
+    PreviousTab, "Previous detail tab", [], DetailTabs, 40, false, ["shift-h"], [];
+    NextTab, "Next detail tab", [], DetailTabs, 40, false, ["shift-l"], [];
     PreviousRuntime, "Previous runtime", [], Inventory, 40, false, ["left"], [];
     NextRuntime, "Next runtime", [], Inventory, 40, false, ["right"], [];
     SecurityPreviousRuntime, "Previous runtime", [], SecurityImages, 40, true, ["left"], [];
@@ -402,6 +422,8 @@ impl ActionId {
             Self::Search => "search",
             Self::Left => "left",
             Self::Right => "right",
+            Self::PreviousTab => "previous-tab",
+            Self::NextTab => "next-tab",
             Self::PreviousRuntime => "previous-runtime",
             Self::NextRuntime => "next-runtime",
             Self::SecurityPreviousRuntime => "security-previous-runtime",
@@ -583,6 +605,9 @@ pub fn unavailable(app: &App, action: ActionId) -> Option<String> {
             if app.overview_mode == crate::app::OverviewMode::Containers =>
         {
             Some("Scans run from the Security view".into())
+        }
+        A::Exec if !app.exec_tab_available() => {
+            Some("Select a running container or service".into())
         }
         A::Layers if !app.layers_available() => {
             Some("Select a container or single-container service".into())

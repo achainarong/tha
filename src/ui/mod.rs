@@ -1,5 +1,8 @@
 use crate::{
-    app::{App, Choice, InputMode, OverviewMode, PerformanceScope, ResourceKind, Scope, Tab},
+    app::{
+        App, Choice, InputMode, NetworkTarget, OverviewMode, PerformanceScope, ResourceKind, Scope,
+        Tab,
+    },
     config::BackendKind,
     logs::view::{self as log_view, Field},
     metrics,
@@ -1063,13 +1066,17 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Min(1),
     ])
     .split(inner);
-    let mut names = if inner.width >= 82 {
-        vec!["1 Overview", "2 Logs", "3 Networks", "4 Exec"]
+    let (mut names, exec_name) = if inner.width >= 82 {
+        (vec!["1 Overview", "2 Logs", "3 Networks"], "4 Exec")
     } else if inner.width >= 70 {
-        vec!["1 Info", "2 Logs", "3 Net", "4 Exec"]
+        (vec!["1 Info", "2 Logs", "3 Net"], "4 Exec")
     } else {
-        vec!["1", "2", "3", "4"]
+        (vec!["1", "2", "3"], "4")
     };
+    let exec_index = names.len();
+    if app.exec_tab_available() {
+        names.push(exec_name);
+    }
     names.push(if inner.width >= 56 { "5 Events" } else { "5" });
     let events_index = names.len() - 1;
     let metrics_index = names.len();
@@ -1088,7 +1095,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::Overview => 0,
         Tab::Logs => 1,
         Tab::Networks => 2,
-        Tab::Exec => 3,
+        Tab::Exec => exec_index,
         Tab::Layers => layers_index,
         Tab::History => metrics_index,
         Tab::Security => security_index,
@@ -1162,13 +1169,9 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::History => history::draw(frame, app, body),
         Tab::Events => events::draw(frame, app, body),
         Tab::Security => security::draw_report(frame, app, body),
-        Tab::Overview | Tab::Networks => {
-            let lines = if app.tab == Tab::Networks {
-                network_lines(app)
-            } else {
-                overview_lines(app)
-            };
-            let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        Tab::Networks => draw_networks(frame, app, body),
+        Tab::Overview => {
+            let paragraph = Paragraph::new(overview_lines(app)).wrap(Wrap { trim: false });
             let maximum = paragraph
                 .line_count(body.width)
                 .saturating_sub(body.height as usize);
@@ -2084,9 +2087,53 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+fn draw_networks(frame: &mut Frame, app: &mut App, area: Rect) {
+    let (mut lines, targets) = network_view(app);
+    let owner = app.current().map(|row| row.key.clone());
+    if app.network_cursor_owner != owner {
+        app.network_cursor_owner = owner;
+        app.network_cursor = 0;
+    }
+    app.network_cursor = app.network_cursor.min(targets.len().saturating_sub(1));
+    let cursor = app
+        .detail_focus
+        .then(|| targets.get(app.network_cursor))
+        .flatten();
+    if let Some(target) = cursor {
+        // Wrapped rows take several terminal lines, so measure before scrolling to the cursor.
+        let rows = |line: &Line<'static>| {
+            Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(area.width)
+        };
+        let top: usize = lines[..target.line].iter().map(rows).sum();
+        let bottom = top + rows(&lines[target.line]);
+        if app.network_cursor == 0 {
+            app.detail_scroll = 0;
+        } else if top < app.detail_scroll {
+            app.detail_scroll = top;
+        } else if bottom > app.detail_scroll + area.height as usize {
+            app.detail_scroll = bottom - area.height as usize;
+        }
+        lines[target.line] = lines[target.line].clone().patch_style(selected());
+    }
+    app.network_targets = targets;
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let maximum = paragraph
+        .line_count(area.width)
+        .saturating_sub(area.height as usize);
+    app.detail_scroll = app.detail_scroll.min(maximum).min(u16::MAX as usize);
+    frame.render_widget(paragraph.scroll((app.detail_scroll as u16, 0)), area);
+}
+
+#[cfg(test)]
 fn network_lines(app: &App) -> Vec<Line<'static>> {
+    network_view(app).0
+}
+
+fn network_view(app: &App) -> (Vec<Line<'static>>, Vec<NetworkTarget>) {
     let Some(row) = app.current() else {
-        return vec![];
+        return (vec![], vec![]);
     };
     let engine = &app.engines[row.engine];
     let mut lines = vec![
@@ -2101,7 +2148,7 @@ fn network_lines(app: &App) -> Vec<Line<'static>> {
             "Browse {} for this engine's resources.",
             safe_text(alias)
         )));
-        return lines;
+        return (lines, vec![]);
     }
     if engine.error.is_some() {
         lines.push(Line::styled(
@@ -2116,15 +2163,16 @@ fn network_lines(app: &App) -> Vec<Line<'static>> {
         lines.push(Line::from(
             "Networks depend on the launcher and its CNI configuration.",
         ));
-        return lines;
+        return (lines, vec![]);
     }
     let Some(snapshot) = &engine.snapshot else {
         lines.push(Line::from("Engine has not returned an inventory."));
-        return lines;
+        return (lines, vec![]);
     };
     let containers = app.selected_containers();
     let engine_scope = matches!(row.scope, Scope::Engine);
     let mut count = 0;
+    let mut targets = Vec::new();
     for network in &snapshot.networks {
         let explicit = matches!(&row.scope, Scope::Resource { name, kind: ResourceKind::Network } if name == &network.name);
         let owned = match &row.scope {
@@ -2149,6 +2197,10 @@ fn network_lines(app: &App) -> Vec<Line<'static>> {
             continue;
         }
         count += 1;
+        targets.push(NetworkTarget {
+            line: lines.len(),
+            container: None,
+        });
         lines.push(Line::styled(
             format!(
                 "{}{}",
@@ -2167,7 +2219,10 @@ fn network_lines(app: &App) -> Vec<Line<'static>> {
             accent(app, Color::Cyan),
         ));
         lines.push(Line::from(format!("  {}", safe_text(&network.details))));
-        for name in &network.containers {
+        // Engines report attachments in no fixed order, which would move the cursor's row.
+        let mut members: Vec<_> = network.containers.iter().collect();
+        members.sort();
+        for name in members {
             if app.project.as_ref().is_some_and(|project| {
                 !snapshot
                     .containers
@@ -2176,12 +2231,16 @@ fn network_lines(app: &App) -> Vec<Line<'static>> {
             }) {
                 continue;
             }
-            let project = snapshot
-                .containers
-                .iter()
-                .find(|c| &c.name == name)
+            let container = snapshot.containers.iter().find(|c| &c.name == name);
+            let project = container
                 .and_then(|c| c.project.as_deref())
                 .unwrap_or("Standalone");
+            if let Some(container) = container {
+                targets.push(NetworkTarget {
+                    line: lines.len(),
+                    container: Some(container.key()),
+                });
+            }
             lines.push(Line::from(format!(
                 "  └─ {} / {}",
                 safe_text(project),
@@ -2217,7 +2276,7 @@ fn network_lines(app: &App) -> Vec<Line<'static>> {
     for warning in &snapshot.warnings {
         lines.push(Line::styled(safe_text(warning), accent(app, Color::Yellow)));
     }
-    lines
+    (lines, targets)
 }
 
 fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {

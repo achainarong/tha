@@ -332,10 +332,11 @@ your navigation. Demo mode never auto-opens a project.
 
 | Key | Action |
 | --- | --- |
-| `j` / `k`, arrows | Move or scroll the focused pane |
-| `h` / `l` | Collapse/parent or expand/child in the tree; horizontal scroll in unwrapped logs |
+| `j` / `k`, up / down | Move or scroll the focused pane |
+| `h` / `l`, left / right | Collapse/parent or expand/child in the tree; previous/next tab in focused details; horizontal scroll in unwrapped logs; pan in Metrics |
+| `H` / `L` | Previous/next tab from any focused detail tab, including Metrics and unwrapped logs |
 | `Space` | Toggle the selected explorer branch open or closed |
-| `Enter` | Enter a Compose workspace; otherwise open details |
+| `Enter` | Enter a Compose workspace; otherwise open details; on a focused Networks row, select that container in the Explorer |
 | `Backspace` | Return to the previous workspace |
 | `gg` / `G` | First / last; `G` resumes log following |
 | `Ctrl-u` / `Ctrl-d` | Half-page up / down |
@@ -346,7 +347,7 @@ your navigation. Demo mode never auto-opens a project.
 | `Esc` (Performance expanded) | Restore compact view first |
 | `o` / `:sort-contexts` | Choose connected-first, name, CPU, or memory context order |
 | `S` / `s` / `r` / `d` in Explorer | Start / Stop / Restart / Delete selected container or Compose workload |
-| `1` … `8` | Overview / Logs / Networks / Exec / Events / Metrics / Layers / Security on the right |
+| `1` … `8` | Overview / Logs / Networks / Exec / Events / Metrics / Layers / Security on the right; a tab is hidden when the selection cannot use it, and Exec needs a running container, a running service, or an open session |
 | `a` / `:actions` | Contextual lifecycle menu with eligibility counts and disabled reasons |
 | `F3` in Logs / `:filter-logs` | Edit structured retained-log filters |
 | `:clear-log-filter` | Clear filters without clearing highlighted search |
