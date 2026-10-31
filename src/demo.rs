@@ -1,7 +1,8 @@
 use crate::{
     app::{App, Scope},
     config::{BackendKind, Connection},
-    model::{Container, Resource, Snapshot},
+    diagnostics::{Attempt, Endpoint, HealthCheck, Inspection, Probe, ProbeSource},
+    model::{Container, PortBinding, Resource, Snapshot},
 };
 
 pub fn connections() -> Vec<Connection> {
@@ -20,6 +21,110 @@ pub fn connections() -> Vec<Connection> {
     .collect()
 }
 
+/// What a real inspect would report for the seeded containers.
+pub fn inspection(container: &Container) -> Inspection {
+    let stamp = |ago: i64| {
+        (time::OffsetDateTime::now_utc() - time::Duration::seconds(ago))
+            .format(&time::format_description::well_known::Rfc3339)
+            .ok()
+    };
+    let failing = container.id == "api-2";
+    let health = match container.id.as_str() {
+        "api-2" => HealthCheck::Configured {
+            status: Some("unhealthy".into()),
+            failing_streak: Some(3),
+            attempts: [30, 60, 90]
+                .into_iter()
+                .map(|ago| Attempt {
+                    started_at: stamp(ago + 1),
+                    ended_at: stamp(ago),
+                    exit_code: Some(1),
+                    output:
+                        "curl: (7) Failed to connect to localhost port 3000\nConnection refused"
+                            .into(),
+                    truncated: false,
+                })
+                .collect(),
+            omitted: 0,
+        },
+        "db-1" => HealthCheck::Configured {
+            status: Some("healthy".into()),
+            failing_streak: Some(0),
+            attempts: vec![Attempt {
+                started_at: stamp(31),
+                ended_at: stamp(30),
+                exit_code: Some(0),
+                output: "accepting connections".into(),
+                truncated: false,
+            }],
+            omitted: 0,
+        },
+        _ => HealthCheck::NotConfigured,
+    };
+    let network_id = |name: &str| Some(format!("demo-network-{name}"));
+    Inspection {
+        id: container.id.clone(),
+        state: Some(container.state.clone()),
+        restart_count: Some(i64::from(failing)),
+        exit_code: Some(0),
+        oom_killed: Some(false),
+        error: None,
+        started_at: stamp(7200),
+        finished_at: failing.then(|| stamp(7205)).flatten(),
+        health,
+        probe: match container.id.as_str() {
+            "api-2" => Some(Probe {
+                test: r#"["CMD-SHELL", "curl -f http://localhost:3000/health"]"#.into(),
+                interval_ns: Some(30_000_000_000),
+                timeout_ns: Some(5_000_000_000),
+                start_period_ns: Some(10_000_000_000),
+                retries: Some(3),
+            }),
+            "db-1" => Some(Probe {
+                test: r#"["CMD", "pg_isready", "-U", "postgres"]"#.into(),
+                interval_ns: Some(10_000_000_000),
+                retries: Some(5),
+                ..Default::default()
+            }),
+            _ => None,
+        },
+        probe_source: match container.id.as_str() {
+            "api-2" => ProbeSource::Container,
+            "db-1" => ProbeSource::Image,
+            _ => ProbeSource::Unknown,
+        },
+        command: matches!(container.id.as_str(), "api-1" | "api-2")
+            .then(|| "node server.js --port 3000".into()),
+        network_mode: Some(
+            container
+                .networks
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "none".into()),
+        ),
+        endpoints: Some(
+            container
+                .networks
+                .iter()
+                .enumerate()
+                .map(|(index, name)| Endpoint {
+                    network: name.clone(),
+                    id: network_id(name),
+                    ipv4: Some(format!("172.18.{index}.{}", 10 + container.name.len())),
+                    ipv6: None,
+                    aliases: vec![
+                        container.service.clone().unwrap_or_default(),
+                        container.name.clone(),
+                    ],
+                    omitted_aliases: 0,
+                })
+                .collect(),
+        ),
+        omitted_endpoints: 0,
+        ..Default::default()
+    }
+}
+
 pub fn populate(app: &mut App) {
     let container = |id: &str, name: &str, project: &str, service: &str| Container {
         id: id.into(),
@@ -35,6 +140,29 @@ pub fn populate(app: &mut App) {
     let mut api = container("api-1", "shop-api-1", "shop", "api");
     api.ports = vec!["127.0.0.1:8080 → 3000/tcp".into()];
     api.bind_mounts = vec!["/home/demo/shop → /app".into()];
+    api.port_bindings = vec![PortBinding {
+        host_ip: Some("127.0.0.1".into()),
+        host_port: Some(8080),
+        container_port: 3000,
+        protocol: "tcp".into(),
+    }];
+    let mut api_failing = container("api-2", "shop-api-2", "shop", "api");
+    api_failing.status = "Up 2 hours (unhealthy)".into();
+    api_failing.health = Some("unhealthy".into());
+    api_failing.port_bindings = vec![
+        PortBinding {
+            host_ip: Some("0.0.0.0".into()),
+            host_port: Some(8080),
+            container_port: 3000,
+            protocol: "tcp".into(),
+        },
+        PortBinding {
+            host_ip: None,
+            host_port: None,
+            container_port: 9090,
+            protocol: "tcp".into(),
+        },
+    ];
     let mut db = container("db-1", "shop-postgres-1", "shop", "postgres");
     db.volumes = vec!["shop_data".into()];
     app.update_engine(
@@ -46,7 +174,7 @@ pub fn populate(app: &mut App) {
             cpu_count: Some(4),
             containers: vec![
                 api,
-                container("api-2", "shop-api-2", "shop", "api"),
+                api_failing,
                 db,
                 Container {
                     id: "scratch".into(),
@@ -164,6 +292,16 @@ pub fn populate(app: &mut App) {
         (540_000, "/api-1", "shop-api-1", "api", "oom", ""),
         (539_000, "/api-1", "shop-api-1", "api", "die", "exit 137"),
         (537_000, "/api-1", "shop-api-1", "api", "start", ""),
+        (7_205_000, "/api-2", "shop-api-2", "api", "die", "exit 137"),
+        (7_200_000, "/api-2", "shop-api-2", "api", "start", ""),
+        (
+            90_000,
+            "/api-2",
+            "shop-api-2",
+            "api",
+            "health_status",
+            "unhealthy",
+        ),
         (
             120_000,
             "/db-1",

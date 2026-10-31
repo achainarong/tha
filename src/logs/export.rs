@@ -159,6 +159,29 @@ mod tests {
     }
 
     #[test]
+    fn export_contains_exactly_the_original_entries_the_combined_filter_shows() {
+        let directory = Directory::new();
+        let path = directory.0.join("logs.jsonl");
+        let mut logs = LogBuffer::new(10);
+        logs.push("api", r#"{"level":"error","msg":"backend1 500"}"#, false);
+        logs.push("api", r#"{"level":"info","msg":"backend1 500"}"#, false);
+        logs.push("backend1", r#"{"level":"error","msg":"HTTP 500"}"#, false);
+        logs.set_pretty_json(true);
+        let mut filter = Filter::parse(r#"{"min_level":"error"}"#).unwrap();
+        filter.set_text("backend1 500");
+        Request::snapshot(path.clone(), &logs, &filter)
+            .unwrap()
+            .write()
+            .unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.lines().count(), 1);
+        let value: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(value["text"], r#"{"level":"error","msg":"backend1 500"}"#);
+        filter.set_text("absent");
+        assert!(Request::snapshot(directory.0.join("none.jsonl"), &logs, &filter).is_err());
+    }
+
+    #[test]
     fn empty_and_oversized_snapshots_create_no_file() {
         let directory = Directory::new();
         let path = directory.0.join("logs.jsonl");

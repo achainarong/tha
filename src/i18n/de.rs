@@ -1206,16 +1206,8 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ),
     (" Export retained logs ", " Gespeicherte Logs exportieren "),
     (
-        " Filter retained logs · JSON ",
-        " Gespeicherte Logs filtern · JSON ",
-    ),
-    (
         "Resize to review this dialog (at least 60 × 18). Esc cancels.",
         "Zum Prüfen dieses Dialogs vergrößern (mindestens 60 × 18). Esc bricht ab.",
-    ),
-    (
-        "{matched} matching / {a0} retained entries in the current scope.\nLogs may contain SECRETS. Choose an explicit destination filename.\nNew JSONL file only; mode 0600; existing files/symlinks refused.\nNo history fetch, no automatic redaction, no silent truncation.\nSnapshot limit: 16 MiB; destination directory must already exist.",
-        "{matched} passende / {a0} gespeicherte Einträge im aktuellen Bereich.\nLogs können GEHEIMNISSE enthalten. Einen expliziten Zieldateinamen wählen.\nNur neue JSONL-Datei; Modus 0600; vorhandene Dateien/Symlinks werden abgelehnt.\nKein Nachladen des Verlaufs, kein automatisches Schwärzen, kein stilles Kürzen.\nSnapshot-Limit: 16 MiB; das Zielverzeichnis muss bereits existieren.",
     ),
     (
         "{} clears filters. Supported keys: source, level, min_level, fields, since, until.\nExample: {\"source\":\"api\",\"min_level\":\"warn\",\"fields\":{\"/http/status\":500}}\nTime bounds: RFC3339, e.g. \"since\":\"2026-10-29T10:00:00Z\".\nMissing required metadata does not match. Search remains separate.\nOnly retained entries are filtered; no older logs are fetched.",
@@ -1224,10 +1216,6 @@ pub const ENTRIES: &[(&str, &str)] = &[
     (
         "Enter Export snapshot · Esc Cancel · Ctrl-u Clear",
         "Enter Snapshot exportieren · Esc Abbrechen · Strg-u Leeren",
-    ),
-    (
-        "Enter Apply · Esc Cancel · Ctrl-u Clear; paste appends JSON",
-        "Enter Anwenden · Esc Abbrechen · Strg-u Leeren; Einfügen hängt JSON an",
     ),
     (
         "Resize to at least 60 × 18 to review lifecycle targets.\nEsc cancels confirmation; running actions continue.",
@@ -1658,10 +1646,6 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ),
     ("regex ", "Regex "),
     (
-        "No matching retained logs. F3 edits; :clear-log-filter resets.",
-        "Keine passenden gespeicherten Logs. F3 bearbeitet; :clear-log-filter setzt zurück.",
-    ),
-    (
         "Waiting for logs. Select a container, service, or project.",
         "Warten auf Logs. Container, Service oder Projekt auswählen.",
     ),
@@ -2008,14 +1992,6 @@ pub const ENTRIES: &[(&str, &str)] = &[
     (
         "Switch retained Exec sessions (F6 in navigation)",
         "Zwischen offenen Exec-Sitzungen wechseln (F6 in der Navigation)",
-    ),
-    (
-        "Edit retained-log JSON/source/severity/time filters (F3)",
-        "JSON-/Quellen-/Schweregrad-/Zeitfilter für gespeicherte Logs bearbeiten (F3)",
-    ),
-    (
-        "Clear retained-log filters without changing search",
-        "Filter für gespeicherte Logs löschen, ohne die Suche zu ändern",
     ),
     (
         "Export matching retained logs to a new private JSONL file",
@@ -2415,14 +2391,6 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ),
     ("Follow logs", "Logs live ansehen"),
     (
-        "Structured retained-log filters",
-        "Strukturierte Filter für gespeicherte Logs",
-    ),
-    (
-        "Clear retained-log filters",
-        "Filter für gespeicherte Logs löschen",
-    ),
-    (
         "Export retained logs (may contain secrets)",
         "Gespeicherte Logs exportieren (kann Geheimnisse enthalten)",
     ),
@@ -2586,4 +2554,478 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("stopped-only", "nur gestoppt"),
     ("unreferenced", "ohne Referenz"),
     ("unused", "ungenutzt"),
+    (
+        " Filter retained logs · Advanced JSON ",
+        " Gespeicherte Logs filtern · Erweitert (JSON) ",
+    ),
+    (
+        " Filter retained logs · Text ",
+        " Gespeicherte Logs filtern · Text ",
+    ),
+    ("Advanced JSON log filter", "Erweiterter JSON-Logfilter"),
+    (
+        "Clear text and advanced log filters",
+        "Text- und erweiterte Logfilter löschen",
+    ),
+    (
+        "Clear text and advanced log filters without changing search",
+        "Text- und erweiterte Logfilter löschen, ohne die Suche zu ändern",
+    ),
+    (
+        "Edit retained-log JSON/source/severity/time filters",
+        "JSON-/Quellen-/Schweregrad-/Zeitfilter für gespeicherte Logs bearbeiten",
+    ),
+    (
+        "Enter Apply · Esc Cancel · Ctrl-u Clear · Tab Advanced JSON",
+        "Enter Anwenden · Esc Abbrechen · Strg-u Leeren · Tab Erweitert (JSON)",
+    ),
+    (
+        "Enter Apply · Esc Cancel · Ctrl-u Clear · Tab Text; paste appends JSON",
+        "Enter Anwenden · Esc Abbrechen · Strg-u Leeren · Tab Text; Einfügen hängt JSON an",
+    ),
+    (
+        "Filter retained logs by text",
+        "Gespeicherte Logs nach Text filtern",
+    ),
+    (
+        "Hide retained logs unless the message has every word (F3)",
+        "Nur Logs zeigen, deren Nachricht jedes Wort enthält (F3)",
+    ),
+    (
+        "No retained logs match this filter. F3 edits; :clear-log-filter resets.",
+        "Keine gespeicherten Logs passen zu diesem Filter. F3 bearbeitet; :clear-log-filter setzt zurück.",
+    ),
+    (
+        "Show entries whose message contains every word, in any order. backend1 500 needs both.\nCase-insensitive literal text: no quotes, operators or regex. Source names do not count.\nEmpty text removes only this constraint. Advanced filters still apply on top.\nHidden entries stay retained; no older logs are fetched. / highlights without hiding.\nTab switches to Advanced JSON for source, severity, fields and time.",
+        "Zeigt Einträge, deren Nachricht jedes Wort enthält, in beliebiger Reihenfolge. backend1 500 braucht beide.\nWörtlicher Text ohne Groß-/Kleinschreibung: keine Anführungszeichen, Operatoren oder Regex. Quellnamen zählen nicht.\nLeerer Text entfernt nur diese Bedingung. Erweiterte Filter gelten weiterhin zusätzlich.\nAusgeblendete Einträge bleiben gespeichert; ältere Logs werden nicht geladen. / hebt hervor, ohne auszublenden.\nTab wechselt zu Erweitert (JSON) für Quelle, Schweregrad, Felder und Zeit.",
+    ),
+    (
+        "Showing entries whose message contains every term. Retained logs are kept; F3 edits, :clear-log-filter resets.",
+        "Es werden Einträge gezeigt, deren Nachricht jeden Begriff enthält. Gespeicherte Logs bleiben erhalten; F3 bearbeitet, :clear-log-filter setzt zurück.",
+    ),
+    (
+        "Text filter cleared; advanced filters are unchanged.",
+        "Textfilter gelöscht; erweiterte Filter bleiben unverändert.",
+    ),
+    ("advanced", "erweitert"),
+    (
+        "{matched} matching / {a0} retained entries in the current scope. Filter: {filter}.\nLogs may contain SECRETS. Choose an explicit destination filename.\nNew JSONL file only; mode 0600; existing files/symlinks refused.\nNo history fetch, no automatic redaction, no silent truncation.\nSnapshot limit: 16 MiB; destination directory must already exist.",
+        "{matched} passende / {a0} gespeicherte Einträge im aktuellen Bereich. Filter: {filter}.\nLogs können GEHEIMNISSE enthalten. Einen expliziten Zieldateinamen wählen.\nNur neue JSONL-Datei; Modus 0600; vorhandene Dateien/Symlinks werden abgelehnt.\nKein Nachladen des Verlaufs, kein automatisches Schwärzen, kein stilles Kürzen.\nSnapshot-Limit: 16 MiB; das Zielverzeichnis muss bereits existieren.",
+    ),
+    ("{terms} + advanced", "{terms} + erweitert"),
+    (
+        "    Also attached: {names}",
+        "    Ebenfalls verbunden: {names}",
+    ),
+    (
+        "    IPv4 {ipv4} · IPv6 {ipv6}",
+        "    IPv4 {ipv4} · IPv6 {ipv6}",
+    ),
+    (
+        "    Reported aliases: {aliases} (resolution not tested)",
+        "    Gemeldete Aliase: {aliases} (Auflösung nicht getestet)",
+    ),
+    (
+        "    Reported aliases: {value}",
+        "    Gemeldete Aliase: {value}",
+    ),
+    (
+        "    That container is not running, so its binding is configuration, not active.",
+        "    Dieser Container läuft nicht; seine Bindung ist also Konfiguration und nicht aktiv.",
+    ),
+    (
+        "    {hidden} attachments outside this project (hidden)",
+        "    {hidden} Verbindungen außerhalb dieses Projekts (ausgeblendet)",
+    ),
+    ("    {more} more attached", "    {more} weitere verbunden"),
+    (
+        "    {omitted} more aliases not shown",
+        "    {omitted} weitere Aliase nicht angezeigt",
+    ),
+    (
+        "    … output truncated at 4 KiB",
+        "    … Ausgabe bei 4 KiB abgeschnitten",
+    ),
+    (
+        "  Addresses are on the runtime host. They are not verified from this workstation.",
+        "  Die Adressen liegen auf dem Runtime-Host und wurden von diesem Rechner aus nicht geprüft.",
+    ),
+    (
+        "  An OOM event at {oom} came before the failure at {failure}. The order alone does not prove a cause.",
+        "  Ein OOM-Ereignis um {oom} lag vor dem Fehler um {failure}. Die Reihenfolge allein beweist keine Ursache.",
+    ),
+    (
+        "  Both report a network named {name}, but with different IDs. It is not the same network.",
+        "  Beide melden ein Netzwerk namens {name}, aber mit unterschiedlichen IDs. Es ist nicht dasselbe Netzwerk.",
+    ),
+    (
+        "  Comparison incomplete: a network ID is missing, and names do not prove identity.",
+        "  Vergleich unvollständig: Eine Netzwerk-ID fehlt, und Namen belegen keine Identität.",
+    ),
+    (
+        "  Comparison incomplete: host, none or container-sharing mode is not described by network membership.",
+        "  Vergleich unvollständig: Die Modi host, none und Container-Sharing lassen sich nicht über die Netzwerkmitgliedschaft beschreiben.",
+    ),
+    (
+        "  Comparison incomplete: network details are missing for at least one container.",
+        "  Vergleich unvollständig: Für mindestens einen Container fehlen Netzwerkdetails.",
+    ),
+    (
+        "  Comparison incomplete: the two containers are not known to be on the same runtime.",
+        "  Vergleich unvollständig: Es ist nicht bekannt, ob beide Container auf derselben Runtime liegen.",
+    ),
+    (
+        "  Coverage: last 24 hours, saved by the service",
+        "  Abdeckung: letzte 24 Stunden, vom Dienst gespeichert",
+    ),
+    (
+        "  Coverage: only what the engine retained and Tha saw while open",
+        "  Abdeckung: nur was die Engine vorhält und Tha während der Laufzeit gesehen hat",
+    ),
+    ("  Error      {error}", "  Fehler     {error}"),
+    (
+        "  Host processes are not checked, and no bind failure is implied.",
+        "  Host-Prozesse werden nicht geprüft, und ein Bind-Fehler ist damit nicht gemeint.",
+    ),
+    ("  Inventory  {status}", "  Inventar   {status}"),
+    ("  Last exit code {code}", "  Letzter Exit-Code {code}"),
+    (
+        "  Last exit code {code} at {at} (history, not necessarily the current cause)",
+        "  Letzter Exit-Code {code} um {at} (Verlauf, nicht unbedingt die aktuelle Ursache)",
+    ),
+    (
+        "  Last exit code {code} · no exit time reported",
+        "  Letzter Exit-Code {code} · keine Exit-Zeit gemeldet",
+    ),
+    ("  Last started {at}", "  Zuletzt gestartet {at}"),
+    (
+        "  Membership is unknown.",
+        "  Mitgliedschaft ist unbekannt.",
+    ),
+    ("  Mode {mode}", "  Modus {mode}"),
+    (
+        "  No attempts reported yet.",
+        "  Noch keine Versuche gemeldet.",
+    ),
+    (
+        "  No current failure is reported. History below may still be useful.",
+        "  Aktuell wird kein Fehler gemeldet. Der Verlauf unten kann trotzdem hilfreich sein.",
+    ),
+    (
+        "  No events available for this container ID.",
+        "  Für diese Container-ID sind keine Ereignisse verfügbar.",
+    ),
+    (
+        "  No health check is configured, so none has passed or failed.",
+        "  Es ist kein Healthcheck konfiguriert, also ist auch keiner bestanden oder fehlgeschlagen.",
+    ),
+    (
+        "  No logs are retained for exactly this container yet. Opening this view does not load them; l does.",
+        "  Für genau diesen Container sind noch keine Logs gespeichert. Diese Ansicht lädt sie nicht; l schon.",
+    ),
+    (
+        "  No network attachments reported.",
+        "  Keine Netzwerkverbindungen gemeldet.",
+    ),
+    (
+        "  No peer chosen. Choose a container on this runtime to compare network identities.",
+        "  Kein Vergleichscontainer gewählt. Einen Container auf dieser Runtime wählen, um Netzwerk-IDs zu vergleichen.",
+    ),
+    ("  No ports reported.", "  Keine Ports gemeldet."),
+    (
+        "  No retained log has a timestamp near the failure at {at}.",
+        "  Kein gespeichertes Log hat einen Zeitstempel nahe dem Fehler um {at}.",
+    ),
+    (
+        "  No shared network is reported. This does not rule out published-port, host-network, routed or external paths.",
+        "  Es wird kein gemeinsames Netzwerk gemeldet. Wege über veröffentlichte Ports, das Host-Netzwerk, Routing oder extern sind damit nicht ausgeschlossen.",
+    ),
+    (
+        "  Nothing in the available evidence suggests one.",
+        "  Die verfügbaren Hinweise legen keine nahe.",
+    ),
+    ("  OOM flag not set", "  OOM-Flag nicht gesetzt"),
+    (
+        "  OOM flag set for the run that ended {at} (history; not a proven cause)",
+        "  OOM-Flag gesetzt für den Lauf, der um {at} endete (Verlauf; keine bewiesene Ursache)",
+    ),
+    (
+        "  OOM flag set; time unavailable (not a proven cause)",
+        "  OOM-Flag gesetzt; Zeit nicht verfügbar (keine bewiesene Ursache)",
+    ),
+    ("  OOM flag {value}", "  OOM-Flag {value}"),
+    (
+        "  Peer {name} · ID {id}",
+        "  Vergleich mit {name} · ID {id}",
+    ),
+    (
+        "  Possible overlap, not confirmed: {other} also reports host port {port}/{protocol}.",
+        "  Mögliche Überschneidung, nicht bestätigt: {other} meldet ebenfalls Host-Port {port}/{protocol}.",
+    ),
+    (
+        "  Possible restart loop: {count} timed exits within 10 minutes in the available events.",
+        "  Mögliche Neustartschleife: {count} Exits mit Zeitstempel innerhalb von 10 Minuten in den verfügbaren Ereignissen.",
+    ),
+    (
+        "  Recent available logs. No failure time is known, so they are not tied to a failure.",
+        "  Neueste verfügbare Logs. Es ist keine Fehlerzeit bekannt, daher gehören sie nicht zwingend zu einem Fehler.",
+    ),
+    ("  Restart count {count}", "  Neustarts {count}"),
+    (
+        "  Restart count {count} (a total; it does not show a restart loop)",
+        "  Neustarts {count} (Gesamtzahl; zeigt keine Neustartschleife)",
+    ),
+    (
+        "  Shared network: {networks}. This is configuration; connectivity has not been tested.",
+        "  Gemeinsames Netzwerk: {networks}. Das ist Konfiguration; die Verbindung wurde nicht getestet.",
+    ),
+    ("  State      {state}", "  Zustand    {state}"),
+    (
+        "  Status {status} (inventory). Check details are unknown.",
+        "  Status {status} (Inventar). Details zum Check sind unbekannt.",
+    ),
+    (
+        "  Status {status} · failing streak {streak}",
+        "  Status {status} · Fehlerserie {streak}",
+    ),
+    (
+        "  This container is not running, so these bindings are configuration, not active.",
+        "  Dieser Container läuft nicht; diese Bindungen sind also Konfiguration und nicht aktiv.",
+    ),
+    (
+        "  Timestamped within 60 s before or 10 s after the failure at {at}.",
+        "  Zeitstempel bis 60 s vor oder 10 s nach dem Fehler um {at}.",
+    ),
+    (
+        "  Uncertain overlap: {other} also reports host port {port}/{protocol}. It depends on the address family or an unreported address.",
+        "  Unsichere Überschneidung: {other} meldet ebenfalls Host-Port {port}/{protocol}. Das hängt von der Adressfamilie oder einer nicht gemeldeten Adresse ab.",
+    ),
+    (
+        "  Why?       :diagnose shows the evidence (read-only)",
+        "  Warum?     :diagnose zeigt die Hinweise (nur lesend)",
+    ),
+    (
+        "  container: shares the network stack of {other}.",
+        "  container: nutzt den Netzwerk-Stack von {other} mit.",
+    ),
+    (
+        "  host: uses the runtime host's network stack, so it has no ordinary network membership or container address.",
+        "  host: nutzt den Netzwerk-Stack des Runtime-Hosts und hat daher keine normale Netzwerkmitgliedschaft oder Container-Adresse.",
+    ),
+    (
+        "  none: no network is configured for this container.",
+        "  none: Für diesen Container ist kein Netzwerk konfiguriert.",
+    ),
+    ("  {at} · exit {code}", "  {at} · Exit {code}"),
+    (
+        "  {hidden} of these are hidden in Logs by the active filter ({filter}).",
+        "  {hidden} davon blendet der aktive Filter ({filter}) in den Logs aus.",
+    ),
+    (
+        "  {hidden} possible port overlaps with containers outside this project (hidden)",
+        "  {hidden} mögliche Port-Überschneidungen mit Containern außerhalb dieses Projekts (ausgeblendet)",
+    ),
+    ("  {mode}", "  {mode}"),
+    (
+        "  {network} · ID unknown · addresses unavailable",
+        "  {network} · ID unbekannt · Adressen nicht verfügbar",
+    ),
+    ("  {network} · ID {id}", "  {network} · ID {id}"),
+    (
+        "  {omitted} more networks not shown",
+        "  {omitted} weitere Netzwerke nicht angezeigt",
+    ),
+    (
+        "  {omitted} older attempts not shown",
+        "  {omitted} ältere Versuche nicht angezeigt",
+    ),
+    ("  {port} (reported)", "  {port} (gemeldet)"),
+    (" Troubleshoot network ", " Netzwerk prüfen "),
+    (" Why is this unhealthy? ", " Warum ist das unhealthy? "),
+    (
+        " j/k Scroll · r Refresh · l Logs · e Events · m Metrics · Esc Close ",
+        " j/k Scrollen · r Aktualisieren · l Logs · e Ereignisse · m Metriken · Esc Schließen ",
+    ),
+    (
+        " j/k Scroll · r Refresh · p Peer · n Networks · Esc Close ",
+        " j/k Scrollen · r Aktualisieren · p Vergleich · n Netzwerke · Esc Schließen ",
+    ),
+    (
+        ":network-diagnose shows addresses, ports and a peer comparison (no probes)",
+        ":network-diagnose zeigt Adressen, Ports und einen Containervergleich (ohne Tests)",
+    ),
+    (
+        "Compare with a container on this runtime",
+        "Mit einem Container auf dieser Runtime vergleichen",
+    ),
+    (
+        "Connection unavailable; detailed inspection was not attempted",
+        "Verbindung nicht verfügbar; die Detailabfrage wurde nicht versucht",
+    ),
+    (
+        "Container inspection timed out after 5s",
+        "Container-Abfrage nach 5 s abgebrochen",
+    ),
+    ("Current state", "Aktueller Zustand"),
+    (
+        "Detailed inspection unavailable: {error}",
+        "Detailabfrage nicht verfügbar: {error}",
+    ),
+    (
+        "Evidence stays on this machine and is not saved or exported by this view.",
+        "Die Hinweise bleiben auf diesem Rechner; diese Ansicht speichert und exportiert nichts.",
+    ),
+    ("Exit, OOM and restarts", "Exit, OOM und Neustarts"),
+    (
+        "Exposed and published ports",
+        "Freigegebene und veröffentlichte Ports",
+    ),
+    ("Health checks", "Healthchecks"),
+    (
+        "Loading from the runtime…",
+        "Wird von der Runtime geladen …",
+    ),
+    (
+        "Logs keep the active filter ({filter}), which may hide related entries. :clear-log-filter shows them.",
+        "Die Logs behalten den aktiven Filter ({filter}), der zugehörige Einträge ausblenden kann. :clear-log-filter zeigt sie.",
+    ),
+    (
+        "Metrics show only samples collected so far; earlier history may not exist.",
+        "Metriken zeigen nur bisher erfasste Messwerte; ein früherer Verlauf existiert eventuell nicht.",
+    ),
+    ("Network mode", "Netzwerkmodus"),
+    ("Networks and addresses", "Netzwerke und Adressen"),
+    (
+        "No other container is visible on this runtime",
+        "Auf dieser Runtime ist kein weiterer Container sichtbar",
+    ),
+    ("No peer", "Kein Vergleich"),
+    ("Observed {at}", "Abgefragt {at}"),
+    (
+        "Passive network evidence and peer comparison; sends no probes",
+        "Passive Netzwerkhinweise und Containervergleich; sendet keine Tests",
+    ),
+    (
+        "Passive: reported configuration only. Nothing is resolved, pinged or probed, so connectivity is not tested.",
+        "Passiv: nur gemeldete Konfiguration. Nichts wird aufgelöst, angepingt oder getestet, die Verbindung bleibt also ungeprüft.",
+    ),
+    (
+        "Peer comparison (p chooses a peer)",
+        "Containervergleich (p wählt einen Container)",
+    ),
+    (
+        "Peer comparison needs detailed inspection, which this backend does not have",
+        "Der Containervergleich braucht die Detailabfrage, die dieses Backend nicht bietet",
+    ),
+    (
+        "Possible explanations (not proven)",
+        "Mögliche Erklärungen (nicht bewiesen)",
+    ),
+    (
+        "Read-only: no health check is run and nothing is changed. Reported evidence, not a verdict.",
+        "Nur lesend: Es wird kein Healthcheck ausgeführt und nichts geändert. Gemeldete Hinweise, kein Urteil.",
+    ),
+    (
+        "Related events ({shown} of {total} · e opens Events)",
+        "Zugehörige Ereignisse ({shown} von {total} · e öffnet Ereignisse)",
+    ),
+    (
+        "Related logs (l opens Logs)",
+        "Zugehörige Logs (l öffnet Logs)",
+    ),
+    (
+        "Runtime answered for a different container; result discarded",
+        "Die Runtime hat für einen anderen Container geantwortet; Ergebnis verworfen",
+    ),
+    (
+        "Runtime {runtime} · Container {name} · ID {id}",
+        "Runtime {runtime} · Container {name} · ID {id}",
+    ),
+    (
+        "Select a single container; diagnostics do not cover groups",
+        "Einen einzelnen Container auswählen; die Diagnose gilt nicht für Gruppen",
+    ),
+    (
+        "Stale: the endpoint now reports a different runtime. This evidence is about the previous one.",
+        "Veraltet: Der Endpunkt meldet jetzt eine andere Runtime. Diese Hinweise betreffen die vorherige.",
+    ),
+    (
+        "Stale: the engine is offline, so this may no longer be true.",
+        "Veraltet: Die Engine ist offline, das stimmt also eventuell nicht mehr.",
+    ),
+    (
+        "Stale: this container ID is gone. A new container with the same name has none of this evidence.",
+        "Veraltet: Diese Container-ID gibt es nicht mehr. Ein neuer Container gleichen Namens hat nichts mit diesen Hinweisen zu tun.",
+    ),
+    (
+        "This backend has no detailed inspection; only inventory facts are shown.",
+        "Dieses Backend bietet keine Detailabfrage; es werden nur Inventardaten angezeigt.",
+    ),
+    (
+        "This container is no longer the selection; close and review the current one",
+        "Dieser Container ist nicht mehr ausgewählt; schließen und den aktuellen prüfen",
+    ),
+    (
+        "This container no longer exists here; close and select the current one",
+        "Diesen Container gibt es hier nicht mehr; schließen und den aktuellen auswählen",
+    ),
+    (
+        "Troubleshoot network (read-only, no probes)",
+        "Netzwerk prüfen (nur lesend, ohne Tests)",
+    ),
+    (
+        "Troubleshoot network · read-only",
+        "Netzwerk prüfen · nur lesend",
+    ),
+    (
+        "Why is this unhealthy? (read-only evidence)",
+        "Warum ist das unhealthy? (nur lesende Hinweise)",
+    ),
+    (
+        "Why is this unhealthy? Read-only evidence for one container",
+        "Warum ist das unhealthy? Nur lesende Hinweise zu einem Container",
+    ),
+    (
+        "Why is this unhealthy? · read-only",
+        "Warum ist das unhealthy? · nur lesend",
+    ),
+    (
+        "a container outside this project",
+        "einem Container außerhalb dieses Projekts",
+    ),
+    ("time unavailable", "Zeit nicht verfügbar"),
+    (
+        "  Exit code: none for the current run. It is cleared on start, so look at the events for earlier exits.",
+        "  Exit-Code: keiner für den aktuellen Lauf. Er wird beim Start gelöscht; frühere Exits stehen in den Ereignissen.",
+    ),
+    ("  Previous run ended {at}", "  Vorheriger Lauf endete {at}"),
+    (
+        "  OOM flag not set for the current run; it is cleared on start",
+        "  OOM-Flag für den aktuellen Lauf nicht gesetzt; es wird beim Start gelöscht",
+    ),
+    ("  Health     {a0}", "  Health     {a0}"),
+    (
+        "  The check command and schedule are on the Overview tab (1).",
+        "  Check-Befehl und Zeitplan stehen im Tab Übersicht (1).",
+    ),
+    ("  Command    {a0}", "  Befehl     {a0}"),
+    (
+        "  Failing    {count} checks in a row",
+        "  Fehler     {count} Checks in Folge",
+    ),
+    (
+        "  Last check {at} · exit {code}",
+        "  Letzter    {at} · Exit {code}",
+    ),
+    ("  Output     {a0}", "  Ausgabe    {a0}"),
+    ("  Entrypoint {a0}", "  Entrypoint {a0}"),
+    (
+        "  Healthcheck (from the image)",
+        "  Healthcheck (aus dem Image)",
+    ),
+    (
+        "  Healthcheck (set on this container, by Compose or run)",
+        "  Healthcheck (am Container gesetzt, per Compose oder run)",
+    ),
+    ("  Healthcheck", "  Healthcheck"),
 ];

@@ -179,8 +179,57 @@ pub enum InputMode {
     Search,
     InventorySearch,
     Command,
+    /// Plain-text terms; F3 opens this one.
+    LogTextFilter,
+    /// The advanced JSON document.
     LogFilter,
     ExportLogs,
+}
+
+impl App {
+    /// Opens a log filter field, with the other field's active value ready behind Tab.
+    pub fn open_log_filter(&mut self, mode: InputMode) {
+        let (input, other) = if mode == InputMode::LogFilter {
+            (&self.log_filter_text, &self.log_filter_terms)
+        } else {
+            (&self.log_filter_terms, &self.log_filter_text)
+        };
+        self.input = input.clone();
+        self.log_filter_other_draft = other.clone();
+        self.input_mode = mode;
+    }
+
+    /// Switches fields without applying or losing what was typed. Only the shown field applies.
+    pub fn toggle_log_filter_field(&mut self) {
+        std::mem::swap(&mut self.input, &mut self.log_filter_other_draft);
+        self.input_mode = if self.input_mode == InputMode::LogFilter {
+            InputMode::LogTextFilter
+        } else {
+            InputMode::LogFilter
+        };
+    }
+
+    /// Clears both parts of the filter. Retained entries and highlight search are untouched.
+    pub fn clear_log_filters(&mut self) {
+        self.log_view.filter = Default::default();
+        self.log_filter_text = "{}".into();
+        self.log_filter_terms.clear();
+    }
+
+    /// What currently narrows the log view, as shown in the status line and export review.
+    pub fn log_filter_summary(&self) -> String {
+        let filter = &self.log_view.filter;
+        let terms = crate::model::safe_text(&self.log_filter_terms);
+        match (filter.text_active(), filter.advanced_active()) {
+            (false, false) => crate::i18n::t("off").into(),
+            (true, false) => terms.split_whitespace().collect::<Vec<_>>().join(" "),
+            (false, true) => crate::i18n::t("advanced").into(),
+            (true, true) => crate::tf!(
+                "{terms} + advanced",
+                terms = terms.split_whitespace().collect::<Vec<_>>().join(" ")
+            ),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -209,6 +258,9 @@ pub enum Choice {
         container: Box<Container>,
     },
     Compose(crate::compose::Action),
+    Diagnose(crate::diagnostics::Kind),
+    DiagnosticPeer(Box<Container>),
+    DiagnosticPeerNone,
 }
 
 pub struct Picker {
@@ -340,6 +392,10 @@ pub struct App {
     pub log_scrollbar_drag: bool,
     pub log_view: LogView,
     pub log_filter_text: String,
+    /// The text terms as typed, for reopening the editor.
+    pub log_filter_terms: String,
+    /// The unapplied other field while Tab switches between Text and Advanced.
+    pub log_filter_other_draft: String,
     pub log_export_scope: Option<String>,
     pub log_export_review_visible: bool,
     pub log_export_request: Option<crate::logs::export::Request>,
@@ -353,6 +409,14 @@ pub struct App {
     pub monochrome: bool,
     pub logs: LogBuffer,
     pub log_scope: Option<String>,
+    /// Engine and container keys the retained logs were subscribed for.
+    pub log_scope_targets: Option<(usize, Vec<String>)>,
+    pub diagnostics: Option<crate::diagnostics::View>,
+    pub diagnostics_requests: Vec<crate::diagnostics::Request>,
+    /// Inspect details for the one container the Overview tab is showing.
+    pub overview_details: Option<crate::diagnostics::Side>,
+    overview_details_at: Option<std::time::Instant>,
+    diagnostics_generation: u64,
     pub log_generation: u64,
     /// Unix second the logs start from; None shows recent lines.
     pub log_since: Option<i64>,
@@ -474,6 +538,8 @@ impl App {
             log_scrollbar_drag: false,
             log_view: LogView::new(true),
             log_filter_text: "{}".into(),
+            log_filter_terms: String::new(),
+            log_filter_other_draft: String::new(),
             log_export_scope: None,
             log_export_review_visible: false,
             log_export_request: None,
@@ -487,6 +553,12 @@ impl App {
             monochrome,
             logs: LogBuffer::new(log_capacity),
             log_scope: None,
+            log_scope_targets: None,
+            diagnostics: None,
+            diagnostics_requests: Vec::new(),
+            overview_details: None,
+            overview_details_at: None,
+            diagnostics_generation: 0,
             log_generation: 0,
             log_since: None,
             compose_confirmation: None,
@@ -928,9 +1000,307 @@ impl App {
                     .filter(|_| compose)
                     .map(Choice::Compose),
             )
+            .chain(
+                [
+                    crate::diagnostics::Kind::Health,
+                    crate::diagnostics::Kind::Network,
+                ]
+                .into_iter()
+                .filter(|_| !self.performance_focus && self.diagnostic_container().is_some())
+                .map(Choice::Diagnose),
+            )
             .collect(),
             selected: 0,
         });
+    }
+
+    /// A row that means one workload. A runtime that merely has one container does not count.
+    fn diagnostic_container(&self) -> Option<Container> {
+        let row = self.current()?;
+        if matches!(row.scope, Scope::Engine | Scope::Namespace(_)) {
+            return None;
+        }
+        let mut containers = self.selected_containers();
+        (containers.len() == 1).then(|| containers.remove(0))
+    }
+
+    fn diagnostic_side(&self, engine: usize, container: &Container) -> crate::diagnostics::Side {
+        let state = &self.engines[engine];
+        crate::diagnostics::Side {
+            target: crate::diagnostics::Target::new(
+                engine,
+                &state.connection,
+                state
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.engine_id.clone()),
+                container,
+            ),
+            container: container.clone(),
+            status: crate::diagnostics::Status::Loading,
+            evidence: None,
+            generation: 0,
+        }
+    }
+
+    /// Opens read-only evidence for the one selected container. Sends only an inspect.
+    pub fn open_diagnostics(&mut self, kind: crate::diagnostics::Kind) {
+        let Some(engine) = self.current().map(|row| row.engine) else {
+            self.notice = crate::i18n::t("Select a container").into();
+            return;
+        };
+        if let Some(alias) = &self.engines[engine].alias {
+            self.notice = crate::tf!(
+                "Browse {a0} for this engine's resources.",
+                a0 = crate::model::safe_text(alias)
+            );
+            return;
+        }
+        let Some(container) = self.diagnostic_container() else {
+            self.notice =
+                crate::i18n::t("Select a single container; diagnostics do not cover groups").into();
+            return;
+        };
+        self.diagnostics = Some(crate::diagnostics::View {
+            kind,
+            main: self.diagnostic_side(engine, &container),
+            peer: None,
+            scroll: 0,
+            message: None,
+        });
+        self.load_diagnostics(crate::diagnostics::Role::Main);
+    }
+
+    /// Starts one load, invalidating whatever the same side had in flight.
+    fn load_diagnostics(&mut self, role: crate::diagnostics::Role) {
+        use crate::diagnostics::Status;
+        self.diagnostics_generation = self.diagnostics_generation.wrapping_add(1);
+        let generation = self.diagnostics_generation;
+        let demo = self.demo;
+        let side = if role == crate::diagnostics::Role::Overview {
+            self.overview_details.as_mut()
+        } else {
+            self.diagnostics
+                .as_mut()
+                .and_then(|view| view.side_mut(role))
+        };
+        let Some(side) = side else {
+            return;
+        };
+        side.generation = generation;
+        let engine = &self.engines[side.target.engine];
+        if engine.connection.kind != crate::config::BackendKind::Docker {
+            side.status = Status::Unsupported;
+        } else if engine.error.is_some() {
+            side.status = Status::Failed(
+                crate::i18n::t("Connection unavailable; detailed inspection was not attempted")
+                    .into(),
+            );
+        } else if demo {
+            side.evidence = Some((
+                crate::demo::inspection(&side.container),
+                crate::history::now_ms(),
+            ));
+            side.status = Status::Ready;
+        } else {
+            side.status = Status::Loading;
+            let request = crate::diagnostics::Request {
+                role,
+                generation,
+                target: side.target.clone(),
+                connection: engine.connection.clone(),
+            };
+            self.diagnostics_requests.push(request);
+        }
+    }
+
+    pub fn diagnostics_freshness(
+        &self,
+        target: &crate::diagnostics::Target,
+    ) -> crate::diagnostics::Freshness {
+        use crate::diagnostics::Freshness;
+        let engine = &self.engines[target.engine];
+        let Some(snapshot) = engine.snapshot.as_ref().filter(|_| engine.error.is_none()) else {
+            return Freshness::EngineOffline;
+        };
+        if snapshot.engine_id != target.runtime || engine.connection.endpoint != target.endpoint {
+            return Freshness::RuntimeChanged;
+        }
+        if snapshot
+            .containers
+            .iter()
+            .any(|container| container.key() == target.container_key())
+        {
+            Freshness::Current
+        } else {
+            Freshness::Removed
+        }
+    }
+
+    /// Reloads both sides. A replaced target is reported, never followed by its name.
+    pub fn refresh_diagnostics(&mut self) {
+        use crate::diagnostics::{Freshness, Role};
+        let Some(view) = &self.diagnostics else {
+            return;
+        };
+        let main = view.main.target.clone();
+        let peer = view.peer.as_ref().map(|peer| peer.target.clone());
+        if matches!(
+            self.diagnostics_freshness(&main),
+            Freshness::Removed | Freshness::RuntimeChanged
+        ) {
+            if let Some(view) = &mut self.diagnostics {
+                view.message = Some(
+                    crate::i18n::t(
+                        "This container no longer exists here; close and select the current one",
+                    )
+                    .into(),
+                );
+            }
+            return;
+        }
+        if let Some(view) = &mut self.diagnostics {
+            view.message = None;
+        }
+        self.load_diagnostics(Role::Main);
+        if let Some(peer) = peer
+            && matches!(
+                self.diagnostics_freshness(&peer),
+                Freshness::Current | Freshness::EngineOffline
+            )
+        {
+            self.load_diagnostics(Role::Peer);
+        }
+    }
+
+    pub fn diagnostics_close(&mut self) {
+        self.diagnostics = None;
+        self.diagnostics_requests
+            .retain(|request| request.role == crate::diagnostics::Role::Overview);
+    }
+
+    /// Keeps details current for the selected container only, and only while Overview shows it.
+    /// No other container is ever inspected for this, however many there are.
+    pub fn update_overview_details(&mut self) {
+        use crate::diagnostics::{OVERVIEW_REFRESH, Role};
+        let wanted = (self.tab == Tab::Overview && self.overview_mode == OverviewMode::Containers)
+            .then(|| self.diagnostic_container())
+            .flatten()
+            .zip(self.current().map(|row| row.engine))
+            .filter(|(_, engine)| self.engines[*engine].alias.is_none());
+        let Some((container, engine)) = wanted else {
+            self.overview_details = None;
+            self.overview_details_at = None;
+            return;
+        };
+        let side = self.diagnostic_side(engine, &container);
+        let same = self
+            .overview_details
+            .as_ref()
+            .is_some_and(|known| known.target == side.target);
+        if same
+            && self
+                .overview_details_at
+                .is_some_and(|at| at.elapsed() < OVERVIEW_REFRESH)
+        {
+            return;
+        }
+        if !same {
+            self.overview_details = Some(side);
+        }
+        self.overview_details_at = Some(std::time::Instant::now());
+        self.load_diagnostics(Role::Overview);
+    }
+
+    /// Links only ever open views for the same immutable container.
+    pub fn diagnostics_link_ready(&self) -> Result<(), String> {
+        let Some(view) = &self.diagnostics else {
+            return Err(crate::i18n::t("Select a container").into());
+        };
+        let selected = self.selected_containers();
+        if self.diagnostics_freshness(&view.main.target) == crate::diagnostics::Freshness::Removed
+            || self.diagnostics_freshness(&view.main.target)
+                == crate::diagnostics::Freshness::RuntimeChanged
+            || !matches!(selected.as_slice(), [container] if container.key() == view.main.target.container_key())
+        {
+            return Err(crate::i18n::t(
+                "This container is no longer the selection; close and review the current one",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Containers this view may compare with: same runtime, and inside the active workspace.
+    pub fn diagnostic_peers(&self) -> Vec<Container> {
+        let Some(view) = &self.diagnostics else {
+            return vec![];
+        };
+        let target = &view.main.target;
+        self.engines[target.engine]
+            .snapshot
+            .iter()
+            .flat_map(|snapshot| &snapshot.containers)
+            .filter(|container| container.key() != target.container_key())
+            .filter(|container| {
+                self.project
+                    .as_ref()
+                    .is_none_or(|project| project.contains(container))
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn open_diagnostic_peers(&mut self) {
+        let peers = self.diagnostic_peers();
+        let Some(view) = &mut self.diagnostics else {
+            return;
+        };
+        if self.engines[view.main.target.engine].connection.kind
+            != crate::config::BackendKind::Docker
+        {
+            view.message = Some(
+                crate::i18n::t(
+                    "Peer comparison needs detailed inspection, which this backend does not have",
+                )
+                .into(),
+            );
+            return;
+        }
+        if peers.is_empty() {
+            view.message =
+                Some(crate::i18n::t("No other container is visible on this runtime").into());
+            return;
+        }
+        let selected = view
+            .peer
+            .as_ref()
+            .and_then(|peer| {
+                peers
+                    .iter()
+                    .position(|container| container.key() == peer.target.container_key())
+            })
+            .map_or(0, |index| index + 1);
+        self.picker = Some(Picker {
+            title: crate::i18n::t("Compare with a container on this runtime").into(),
+            choices: std::iter::once(Choice::DiagnosticPeerNone)
+                .chain(
+                    peers
+                        .into_iter()
+                        .map(|peer| Choice::DiagnosticPeer(Box::new(peer))),
+                )
+                .collect(),
+            selected,
+        });
+    }
+
+    /// Only true when the log buffer was subscribed for exactly this one container.
+    pub fn logs_cover(&self, target: &crate::diagnostics::Target) -> bool {
+        self.log_scope_targets
+            .as_ref()
+            .is_some_and(|(engine, keys)| {
+                *engine == target.engine && keys.as_slice() == [target.container_key()]
+            })
     }
 
     pub fn compose_busy(&self) -> bool {
@@ -2717,6 +3087,29 @@ impl App {
                     crate::tf!("Context order: {a0} · o to sort again", a0 = mode.label());
             }
             Choice::Project(project) => self.open_project(project),
+            Choice::Diagnose(kind) => self.open_diagnostics(kind),
+            Choice::DiagnosticPeerNone => {
+                if let Some(view) = &mut self.diagnostics {
+                    view.peer = None;
+                    view.message = None;
+                }
+            }
+            Choice::DiagnosticPeer(container) => {
+                let Some(engine) = self
+                    .diagnostics
+                    .as_ref()
+                    .map(|view| view.main.target.engine)
+                else {
+                    return;
+                };
+                let side = self.diagnostic_side(engine, &container);
+                if let Some(view) = &mut self.diagnostics {
+                    view.peer = Some(side);
+                    view.message = None;
+                    view.scroll = 0;
+                }
+                self.load_diagnostics(crate::diagnostics::Role::Peer);
+            }
             Choice::Exec { engine, container } => {
                 if self.engines[engine].error.is_some() || self.engines[engine].alias.is_some() {
                     self.notice = crate::i18n::t(

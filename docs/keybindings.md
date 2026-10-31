@@ -103,7 +103,8 @@ configured keys take precedence.
 | Action names | Behavior |
 | --- | --- |
 | `wrap`, `follow`, `json` | Toggle log wrapping, following, or pretty-printed JSON |
-| `filter-logs`, `clear-log-filter` | Edit or clear retained-log filters |
+| `diagnose`, `network-diagnose` | Open read-only health evidence or network troubleshooting for the selected container |
+| `filter-logs`, `filter-logs-advanced`, `clear-log-filter` | Edit the text filter, edit the advanced JSON filter, or clear both |
 | `export-logs` | Open the reviewed export dialog; never exports immediately |
 | `logs-since` | Prompt for a log start time (`15m`, `2h`, `1d`, RFC 3339, or `off`) |
 | `reconnect-logs` | Reload the current logs now; streams also reconnect automatically |

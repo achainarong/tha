@@ -11,7 +11,7 @@ pub fn tone_style(app: &App, tone: Tone) -> Style {
     }
 }
 
-fn stamp(at_ms: i64) -> String {
+pub(super) fn stamp(at_ms: i64) -> String {
     time::OffsetDateTime::from_unix_timestamp(at_ms.div_euclid(1000))
         .map(|at| {
             format!(

@@ -22,6 +22,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 mod compose;
+mod diagnostics;
 mod events;
 mod history;
 pub mod inventory;
@@ -107,12 +108,24 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "Switch retained Exec sessions (F6 in navigation)",
     ),
     (
+        "diagnose",
+        "Why is this unhealthy? Read-only evidence for one container",
+    ),
+    (
+        "network-diagnose",
+        "Passive network evidence and peer comparison; sends no probes",
+    ),
+    (
         "filter-logs",
-        "Edit retained-log JSON/source/severity/time filters (F3)",
+        "Hide retained logs unless the message has every word (F3)",
+    ),
+    (
+        "filter-logs-advanced",
+        "Edit retained-log JSON/source/severity/time filters",
     ),
     (
         "clear-log-filter",
-        "Clear retained-log filters without changing search",
+        "Clear text and advanced log filters without changing search",
     ),
     (
         "export-logs",
@@ -410,8 +423,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.input_mode == InputMode::Command {
         draw_palette(frame, app, area);
     }
-    if matches!(app.input_mode, InputMode::LogFilter | InputMode::ExportLogs) {
+    if matches!(
+        app.input_mode,
+        InputMode::LogTextFilter | InputMode::LogFilter | InputMode::ExportLogs
+    ) {
         draw_log_editor(frame, app, area);
+    }
+    if app.diagnostics.is_some() {
+        diagnostics::draw(frame, app, area);
     }
     if app.picker.is_some() {
         draw_picker(frame, app, area);
@@ -438,10 +457,13 @@ fn draw_log_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     let review_visible = area.width >= 60 && area.height >= 18;
     let area = centered(area, 100, 20);
     frame.render_widget(Clear, area);
+    let text_filter = app.input_mode == InputMode::LogTextFilter;
     let block = Block::bordered().title(if exporting {
         crate::i18n::t(" Export retained logs ")
+    } else if text_filter {
+        crate::i18n::t(" Filter retained logs · Text ")
     } else {
-        crate::i18n::t(" Filter retained logs · JSON ")
+        crate::i18n::t(" Filter retained logs · Advanced JSON ")
     });
     let inner = padded(block.inner(area));
     frame.render_widget(block, area);
@@ -464,17 +486,14 @@ fn draw_log_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     ])
     .split(inner);
     let hint = if exporting {
-        let matched = app
-            .logs
-            .entries
-            .iter()
-            .filter(|entry| app.log_view.filter.matches(entry))
-            .count();
         crate::tf!(
-            "{matched} matching / {a0} retained entries in the current scope.\nLogs may contain SECRETS. Choose an explicit destination filename.\nNew JSONL file only; mode 0600; existing files/symlinks refused.\nNo history fetch, no automatic redaction, no silent truncation.\nSnapshot limit: 16 MiB; destination directory must already exist.",
-            matched = matched,
-            a0 = app.logs.entries.len()
+            "{matched} matching / {a0} retained entries in the current scope. Filter: {filter}.\nLogs may contain SECRETS. Choose an explicit destination filename.\nNew JSONL file only; mode 0600; existing files/symlinks refused.\nNo history fetch, no automatic redaction, no silent truncation.\nSnapshot limit: 16 MiB; destination directory must already exist.",
+            matched = app.log_view.matching_entries(),
+            a0 = app.logs.entries.len(),
+            filter = app.log_filter_summary()
         )
+    } else if text_filter {
+        t("Show entries whose message contains every word, in any order. backend1 500 needs both.\nCase-insensitive literal text: no quotes, operators or regex. Source names do not count.\nEmpty text removes only this constraint. Advanced filters still apply on top.\nHidden entries stay retained; no older logs are fetched. / highlights without hiding.\nTab switches to Advanced JSON for source, severity, fields and time.").into()
     } else {
         t("{} clears filters. Supported keys: source, level, min_level, fields, since, until.\nExample: {\"source\":\"api\",\"min_level\":\"warn\",\"fields\":{\"/http/status\":500}}\nTime bounds: RFC3339, e.g. \"since\":\"2026-10-29T10:00:00Z\".\nMissing required metadata does not match. Search remains separate.\nOnly retained entries are filtered; no older logs are fetched.").into()
     };
@@ -494,8 +513,10 @@ fn draw_log_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(
         Paragraph::new(if exporting {
             crate::i18n::t("Enter Export snapshot · Esc Cancel · Ctrl-u Clear")
+        } else if text_filter {
+            crate::i18n::t("Enter Apply · Esc Cancel · Ctrl-u Clear · Tab Advanced JSON")
         } else {
-            crate::i18n::t("Enter Apply · Esc Cancel · Ctrl-u Clear; paste appends JSON")
+            crate::i18n::t("Enter Apply · Esc Cancel · Ctrl-u Clear · Tab Text; paste appends JSON")
         })
         .wrap(Wrap { trim: false }),
         parts[3],
@@ -999,6 +1020,84 @@ fn ellipsize_line(mut line: Line<'_>, width: usize) -> Line<'_> {
     line
 }
 
+/// Where the wrapped rows of an indented line start. `  Label      value` rows have their values
+/// at column 13, so continuations stay under the value instead of under the label.
+fn hanging_indent(text: &str) -> usize {
+    const VALUE_COLUMN: usize = 13;
+    let leading = text.len() - text.trim_start_matches(' ').len();
+    let bytes = text.as_bytes();
+    if leading == 2
+        && text.is_char_boundary(VALUE_COLUMN)
+        && bytes.get(VALUE_COLUMN - 1) == Some(&b' ')
+        && bytes.get(VALUE_COLUMN).is_some_and(|byte| *byte != b' ')
+    {
+        VALUE_COLUMN
+    } else if leading >= 4 {
+        leading + 2
+    } else {
+        leading
+    }
+}
+
+/// Wraps indented lines so their continuation rows keep the indent, which `Paragraph` cannot do.
+/// Unindented lines, and panes too narrow to spare the indent, are left for `Paragraph` to wrap.
+fn hanging_wrap(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    const MIN_VALUE_WIDTH: usize = 12;
+    let mut wrapped = Vec::with_capacity(lines.len());
+    for line in lines {
+        let text = line.to_string();
+        let indent = hanging_indent(&text);
+        if line.width() <= width || indent == 0 || width < indent + MIN_VALUE_WIDTH {
+            wrapped.push(line);
+            continue;
+        }
+        let cells: Vec<(&str, Style, usize)> = line
+            .spans
+            .iter()
+            .flat_map(|span| {
+                span.content
+                    .graphemes(true)
+                    .map(|grapheme| (grapheme, span.style, UnicodeWidthStr::width(grapheme)))
+            })
+            .collect();
+        let mut start = 0;
+        while start < cells.len() {
+            let first = start == 0;
+            let capacity = if first { width } else { width - indent };
+            let (mut end, mut used, mut space) = (start, 0, None);
+            while end < cells.len() && used + cells[end].2 <= capacity {
+                // JSON has no spaces, so commas are break points too. The first row's own
+                // indent is not somewhere to break.
+                if matches!(cells[end].0, " " | ",") && end > start && (!first || end > indent) {
+                    space = Some(end);
+                }
+                used += cells[end].2;
+                end += 1;
+            }
+            if end < cells.len() {
+                end = space.map_or(end.max(start + 1), |space| space + 1);
+            }
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            if !first {
+                spans.push(Span::raw(" ".repeat(indent)));
+            }
+            for (grapheme, style, _) in &cells[start..end] {
+                match spans.last_mut() {
+                    Some(last) if last.style == *style => last.content.to_mut().push_str(grapheme),
+                    _ => spans.push(Span::styled((*grapheme).to_owned(), *style)),
+                }
+            }
+            wrapped.push(Line {
+                spans,
+                style: line.style,
+                alignment: line.alignment,
+            });
+            start = end;
+        }
+    }
+    wrapped
+}
+
 fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = pane(
         app,
@@ -1359,7 +1458,8 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::Security => security::draw_report(frame, app, body),
         Tab::Networks => draw_networks(frame, app, body),
         Tab::Overview => {
-            let paragraph = Paragraph::new(overview_lines(app)).wrap(Wrap { trim: false });
+            let lines = hanging_wrap(overview_lines(app), body.width as usize);
+            let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
             let maximum = paragraph
                 .line_count(body.width)
                 .saturating_sub(body.height as usize);
@@ -2150,6 +2250,19 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
                 condition_style(app, condition),
             ));
             lines.push(Line::from(format!("  {}", safe_text(&container.status))));
+            if let Some(health) = container.health_status() {
+                lines.push(Line::styled(
+                    crate::tf!(
+                        "  Health     {a0}",
+                        a0 = safe_text(crate::i18n::dynamic(&health))
+                    ),
+                    match health.as_str() {
+                        "healthy" => accent(app, Color::Green),
+                        "unhealthy" => accent(app, Color::Red),
+                        _ => accent(app, Color::Yellow),
+                    },
+                ));
+            }
             let usage = engine.metrics.summary(
                 std::iter::once(container),
                 std::time::Instant::now(),
@@ -2268,6 +2381,17 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
                     a0 = safe_text(network)
                 )));
             }
+            if containers.len() == 1
+                && matches!(
+                    container.condition().tone,
+                    crate::model::Tone::Error | crate::model::Tone::Warning
+                )
+            {
+                lines.push(Line::styled(
+                    crate::i18n::t("  Why?       :diagnose shows the evidence (read-only)"),
+                    muted(),
+                ));
+            }
             for volume in &container.volumes {
                 lines.push(Line::from(crate::tf!(
                     "  Volume     {a0}",
@@ -2279,6 +2403,10 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
                     crate::i18n::t("  Kubernetes-managed · inspection only"),
                     accent(app, Color::Yellow),
                 ));
+            }
+            // Last, because commands and check output vary in length and would move the rest.
+            if containers.len() == 1 {
+                lines.extend(diagnostics::overview_lines(app, row.engine, container));
             }
             lines.push(Line::from(""));
         }
@@ -2549,6 +2677,14 @@ fn network_view(app: &App) -> (Vec<Line<'static>>, Vec<NetworkTarget>) {
             "No networks reported for this selection.",
         )));
     }
+    if containers.len() == 1 {
+        lines.push(Line::styled(
+            crate::i18n::t(
+                ":network-diagnose shows addresses, ports and a peer comparison (no probes)",
+            ),
+            muted(),
+        ));
+    }
     for warning in &snapshot.warnings {
         lines.push(Line::styled(safe_text(warning), accent(app, Color::Yellow)));
     }
@@ -2610,18 +2746,9 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
     let search = if app.log_view.query().is_empty() {
         crate::tf!(
             "{a0}/{a1} entries retained · Filter: {a2} · {a3} evicted",
-            a0 = app
-                .logs
-                .entries
-                .iter()
-                .filter(|entry| app.log_view.filter.matches(entry))
-                .count(),
+            a0 = app.log_view.matching_entries(),
             a1 = app.logs.entries.len(),
-            a2 = if app.log_view.filter.active() {
-                crate::i18n::t("on")
-            } else {
-                crate::i18n::t("off")
-            },
+            a2 = app.log_filter_summary(),
             a3 = app.logs.evicted
         )
     } else {
@@ -2635,11 +2762,7 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
                 ""
             },
             a3 = safe_text(app.log_view.query()),
-            a4 = if app.log_view.filter.active() {
-                crate::i18n::t("on")
-            } else {
-                crate::i18n::t("off")
-            }
+            a4 = app.log_filter_summary()
         )
     };
     frame.render_widget(
@@ -2674,7 +2797,9 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
     if visible.is_empty() {
         frame.render_widget(
             Paragraph::new(if app.log_view.filter.active() {
-                crate::i18n::t("No matching retained logs. F3 edits; :clear-log-filter resets.")
+                crate::i18n::t(
+                    "No retained logs match this filter. F3 edits; :clear-log-filter resets.",
+                )
             } else {
                 crate::i18n::t("Waiting for logs. Select a container, service, or project.")
             }),
@@ -2788,7 +2913,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         shorter = app.key_hint(crate::shortcuts::ActionId::PreviousRange),
         longer = app.key_hint(crate::shortcuts::ActionId::NextRange)
     );
-    let mut lines = if matches!(app.input_mode, InputMode::LogFilter | InputMode::ExportLogs) {
+    let mut lines = if matches!(
+        app.input_mode,
+        InputMode::LogTextFilter | InputMode::LogFilter | InputMode::ExportLogs
+    ) {
         vec![
             Line::styled(
                 crate::i18n::t("Log dialog · Enter Apply/Export · Esc Cancel"),
@@ -3189,6 +3317,20 @@ fn draw_picker(frame: &mut Frame, app: &mut App, area: Rect) {
                         .unwrap_or_else(|_| crate::i18n::t("disabled").into())
                 ),
                 Choice::Compose(action) => action.label().into(),
+                Choice::Diagnose(crate::diagnostics::Kind::Health) => {
+                    crate::i18n::t("Why is this unhealthy? · read-only").into()
+                }
+                Choice::Diagnose(crate::diagnostics::Kind::Network) => {
+                    crate::i18n::t("Troubleshoot network · read-only").into()
+                }
+                Choice::DiagnosticPeerNone => crate::i18n::t("No peer").into(),
+                Choice::DiagnosticPeer(container) => {
+                    format!(
+                        "{} · {}",
+                        container.name,
+                        crate::i18n::dynamic(&container.state)
+                    )
+                }
                 Choice::ContextSort(mode) => mode.label().into(),
                 Choice::Project(project) => format!(
                     "{} / {}{}",
@@ -4366,6 +4508,153 @@ mod tests {
         assert!(text.contains("ENV MODE=production"));
     }
 
+    fn wrap(text: &str, width: usize) -> Vec<String> {
+        hanging_wrap(vec![Line::from(text.to_owned())], width)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn wrapped_label_rows_continue_under_their_value() {
+        let rows = wrap("  Command    one two three four five six seven", 28);
+        assert_eq!(rows[0], "  Command    one two three ");
+        assert!(rows[1..].iter().all(|row| row.starts_with(&" ".repeat(13))));
+        assert!(
+            rows.iter()
+                .all(|row| UnicodeWidthStr::width(row.as_str()) <= 28)
+        );
+        let joined: String = rows.iter().map(|row| row.trim_start()).collect();
+        assert_eq!(joined, "Command    one two three four five six seven");
+    }
+
+    #[test]
+    fn json_wraps_after_commas_and_a_single_long_token_is_still_kept_whole() {
+        let rows = wrap(r#"  Command    {"level":"info","duration_ms":12}"#, 34);
+        assert!(rows[0].ends_with(r#""info","#), "{rows:?}");
+        assert!(
+            rows[1].trim_start().starts_with(r#""duration_ms""#),
+            "{rows:?}"
+        );
+        let rows = wrap(&format!("  Command    {}", "x".repeat(50)), 30);
+        let joined: String = rows.iter().map(|row| row.trim_start()).collect();
+        assert!(joined.ends_with(&"x".repeat(50)), "{rows:?}");
+    }
+
+    #[test]
+    fn hanging_wrap_leaves_short_unindented_and_too_narrow_lines_alone_and_keeps_style() {
+        assert_eq!(wrap("  Image      nginx", 80), ["  Image      nginx"]);
+        let plain = "no indent ".repeat(10);
+        assert_eq!(wrap(&plain, 20), std::slice::from_ref(&plain));
+        let narrow = "  Command    one two three four";
+        assert_eq!(wrap(narrow, 20), [narrow]);
+        assert_eq!(
+            wrap("    test: aaaa bbbb cccc dddd", 20)[1],
+            "      cccc dddd"
+        );
+        let styled = Line::styled(
+            "  Output     red words that are long enough to wrap",
+            Style::default().fg(Color::Red),
+        );
+        let rows = hanging_wrap(vec![styled], 30);
+        assert!(rows.len() > 1);
+        assert!(rows.iter().all(|row| {
+            row.style.fg == Some(Color::Red)
+                || row
+                    .spans
+                    .iter()
+                    .all(|span| span.style.fg == Some(Color::Red))
+        }));
+    }
+
+    #[test]
+    fn variable_length_container_details_come_after_the_fixed_ones() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.demo = true;
+        loop {
+            let before = app.expanded.len();
+            let branches: Vec<_> = app
+                .rows
+                .iter()
+                .filter(|row| row.branch)
+                .map(|row| row.key.clone())
+                .collect();
+            app.expanded.extend(branches);
+            app.refresh_tree();
+            if app.expanded.len() == before {
+                break;
+            }
+        }
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(&row.scope, Scope::Container(found) if found == "/api-2"))
+            .unwrap();
+        app.tab = Tab::Overview;
+        app.update_overview_details();
+        let mut terminal = Terminal::new(TestBackend::new(170, 50)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        for fixed in ["Health     unhealthy", "Image  ", "Port  ", "Network  "] {
+            assert!(at(fixed) < at("Command  "), "{fixed}");
+        }
+        assert!(at("Command  ") < at("Healthcheck ("));
+        assert!(at("Healthcheck (") < at("Last check"));
+    }
+
+    #[test]
+    fn container_overview_shows_health_only_when_a_status_is_reported() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        loop {
+            let before = app.expanded.len();
+            let branches: Vec<_> = app
+                .rows
+                .iter()
+                .filter(|row| row.branch)
+                .map(|row| row.key.clone())
+                .collect();
+            app.expanded.extend(branches);
+            app.refresh_tree();
+            if app.expanded.len() == before {
+                break;
+            }
+        }
+        app.tab = Tab::Overview;
+        for (key, expected) in [
+            ("/api-2", Some("Health     unhealthy")),
+            ("/db-1", Some("Health     healthy")),
+            ("/scratch", None),
+        ] {
+            app.selected = app
+                .rows
+                .iter()
+                .position(|row| matches!(&row.scope, Scope::Container(found) if found == key))
+                .unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            match expected {
+                Some(expected) => assert!(text.contains(expected), "{key}: {expected}"),
+                None => assert!(!text.contains("Health  "), "{key} has no health status"),
+            }
+        }
+    }
+
     #[test]
     fn log_dialogs_explain_filtering_and_require_visible_private_export_review() {
         let mut app = App::new(crate::demo::connections(), 100, true, true);
@@ -4385,6 +4674,17 @@ mod tests {
         assert!(text.contains("Filter retained logs"));
         assert!(text.contains("JSON"));
         assert!(text.contains("RFC3339"));
+        app.input_mode = InputMode::LogTextFilter;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("every word"));
+        assert!(text.contains("Tab Advanced JSON"));
         app.input_mode = InputMode::ExportLogs;
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert!(app.log_export_review_visible);
@@ -4396,6 +4696,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(text.contains("SECRETS"));
+        assert!(text.contains("Filter: off"));
         assert!(text.contains("0600"));
         assert!(text.contains("existing files/symlinks refused"));
         let mut tiny = Terminal::new(TestBackend::new(50, 15)).unwrap();

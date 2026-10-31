@@ -352,8 +352,11 @@ your navigation. Demo mode never auto-opens a project.
 | `S` / `s` / `r` / `d` in Explorer | Start / Stop / Restart / Delete selected container or Compose workload |
 | `1` … `8` | Overview / Logs / Networks / Exec / Events / Metrics / Layers / Security on the right; a tab is hidden when the selection cannot use it, and Exec needs a running container, a running service, or an open session |
 | `a` / `:actions` | Contextual lifecycle menu with eligibility counts and disabled reasons |
-| `F3` in Logs / `:filter-logs` | Edit structured retained-log filters |
-| `:clear-log-filter` | Clear filters without clearing highlighted search |
+| `F3` in Logs / `:filter-logs` | Hide retained logs unless the message contains every word; Tab switches to the advanced JSON filter |
+| `:filter-logs-advanced` | Edit the advanced JSON filter directly |
+| `:diagnose` or `a` | Why is this unhealthy? Read-only evidence for the selected container |
+| `:network-diagnose` or `a` | Passive network evidence and peer comparison for the selected container; sends no probes |
+| `:clear-log-filter` | Clear text and advanced filters without clearing highlighted search |
 | `:export-logs` | Export matching retained entries to an explicitly chosen new JSONL file |
 | `/` | Search tree or highlight log matches when the log pane is focused |
 | `n` / `N` | Next / previous match; logs navigate individual occurrences |
@@ -848,11 +851,106 @@ Other default keys remain active unless overridden or set to `none`. Restart Tha
 after editing the config. Configured aliases are listed in `?` help. Lifecycle
 shortcuts can be rebound, but confirmation input and all safety checks are unchanged.
 
-## Structured log filters and export
+## Why is this unhealthy?
 
-Press **F3 in Logs** or run `:filter-logs` to edit a JSON filter. Ctrl-u clears the
-editor, Enter applies valid JSON, and Esc cancels. Invalid filters leave the
-previous filter intact. Examples:
+With one container selected, run **`:diagnose`** or choose it from the **`a`** menu. It works
+for healthy, unhealthy, restarting and stopped containers, and the runtime is only asked to
+inspect: no check is run and nothing is changed. Sections keep what is reported apart from
+what might follow from it:
+
+- **Current state**, including a plain statement when no current failure is reported.
+- **Health checks**: status, failing streak, and the latest 10 reported attempts with time,
+  exit code and output, capped at 4 KiB each. The check command is on the Overview tab.
+- **Exit, OOM and restarts**, with times. An old exit or OOM is labeled as history and not as
+  the cause of a current failure, and a restart total is not treated as a restart loop. Docker
+  clears the exit code and OOM flag when a container starts, so for a running container the
+  events are the place to look for earlier exits.
+- **Possible explanations (not proven)**. A possible restart loop needs 3 timed exits within
+  10 minutes in the available events. It also withholds the "no current failure" statement,
+  because a crash-looping container looks fine between crashes.
+- **Related events and logs**, previewing 20 of each, only from this exact container ID. Logs
+  are called related to a failure only when timestamps place them from 60 seconds before it
+  to 10 seconds after. With no known failure time they are labeled recent available logs.
+
+Anything not reported reads *unavailable* or *unknown*, never as zero or healthy.
+
+The Overview tab (`1`) also shows the selected container's health check as configured, with the
+same names as a Compose file (`test`, `interval`, `timeout`, `start_period`, `retries`), plus its
+failing streak and latest result. Settings that were not set are left out. It says whether the
+check came from the image or was set on the container; the runtime keeps no record of Compose
+versus `docker run`. `Entrypoint` and `Command` appear only when they differ from the image's own,
+so a value set to exactly what the image already has does not show. Docker-compatible engines
+have one health check per container, with no separate liveness or readiness probes, and
+Kubernetes probes are not visible through the runtime. **These commands can contain credentials,
+and this tab shows them as configured.** Tha re-reads only the selected container, every 10 seconds
+while the tab is open. A group selection shows only the health status of each container.
+
+Keys: **`j`/`k`** scroll, **`r`** refreshes, **`l`**, **`e`** and **`m`** open Logs, Events and
+Metrics for the same container, and **Esc** closes. Logs keep your filter, and the view warns
+when it hides related entries. This view does not load logs itself, so its preview is empty
+until Logs has been opened for exactly this container. Event coverage is the last 24 hours
+with the service, and otherwise only what the engine retained and Tha saw while open.
+
+Each load has a 5-second deadline, and detailed inspection runs only when you open or refresh.
+If a container is recreated, its evidence stays labeled stale and does not move to the new
+container with the same name. Native containerd shows inventory facts with a notice, because
+that adapter has no detailed inspection. Nothing is uploaded or saved. Remember that
+health-check output on screen can itself contain secrets.
+
+## Network troubleshooting
+
+With one container selected, run **`:network-diagnose`** or choose it from the **`a`** menu.
+**This view is passive.** It reads what the runtime reports and sends no DNS lookups, pings,
+TCP or HTTP probes, runs no exec, and starts no helper containers. It cannot tell you that
+two containers can reach each other, only what is configured.
+
+- **Network mode**: host, none and container-sharing modes are named as such, and are not
+  shown as ordinary network membership.
+- **Networks and addresses**: network ID, IPv4 and IPv6 addresses, and reported aliases, which
+  are marked as resolution not tested. Missing values read *unavailable* or *unknown*.
+- **Exposed and published ports**: exposed-only ports are not shown as host endpoints, and each
+  binding states its scope. Addresses are on the runtime host, which may not be this
+  workstation.
+- **Possible overlaps** with other containers on the same runtime, for the same protocol and
+  port. They are labeled unconfirmed: wildcard and dual-stack cases depend on things the
+  metadata does not say, and host processes are not checked.
+- **Peer comparison**: press **`p`** to choose another container on this runtime. Networks are
+  compared by ID, not by name, so two networks that share a name are reported as different.
+  A shared network is configuration, not proof of connectivity. No shared network does not
+  rule out published-port, host-network, routed or external paths. Missing IDs and special
+  modes give an incomplete comparison rather than a definite one.
+
+Keys: **`j`/`k`** scroll, **`r`** refreshes, **`p`** chooses a peer, **`n`** opens Networks, and
+**Esc** closes. Inside a project workspace, containers outside the project are not offered as
+peers, and appear only as counts of hidden attachments and overlaps. Native containerd keeps
+its existing limits: no detailed inspection and no peer comparison.
+
+## Log filters and export
+
+### Text filter
+
+Press **F3 in Logs** or run `:filter-logs` and type some words. Only entries whose
+message contains **every** word stay visible, so `backend1 500` keeps
+`backend1 returned 500` and `500 returned by BACKEND1`, but hides `backend1 returned 200`,
+`backend2 returned 500`, and a `backend1` entry that happens to be next to a `500` entry.
+
+Words are case-insensitive literal text in any order. There are no quotes, operators or
+regex, so `[500]` means those five characters. Matching looks at the original message, not
+the source name, the timestamp the engine adds, or the indentation from `J`: an entry from
+a source named `backend1` with the message `HTTP 500` does not match `backend1 500`. Use
+the advanced `source` key to narrow by source.
+
+Enter applies and Esc keeps the previous filter. Applying empty text removes only the text
+constraint. **`/` stays a separate highlight search** that hides nothing, and it only
+counts entries the filter leaves visible.
+
+### Advanced JSON filter
+
+Press **Tab** in the F3 dialog, or run `:filter-logs-advanced`, to edit a JSON filter. It
+combines with the text filter using AND, and applying one never changes the other. Tab
+keeps what you typed in the other field, but Enter applies only the field on screen.
+Ctrl-u clears the editor, Enter applies valid JSON, and Esc cancels. Invalid filters leave
+the previous filter intact. Examples:
 
 ```json
 {"source":"api","min_level":"warn"}
@@ -877,15 +975,16 @@ required metadata do not match the corresponding filter.
 
 Filtering never deletes retained entries or fetches older history. Counts show
 matching/retained entries; wrapping, scrolling, highlighted search, and match
-navigation operate on matching entries. `:clear-log-filter` (or `{}` in the editor)
-restores all retained entries without clearing search. Filters remain visible and
+navigation operate on matching entries. `:clear-log-filter` clears the text and advanced
+filters together and restores all retained entries without clearing search; `{}` in the
+advanced editor clears only the advanced part. Filters remain visible and
 active when browsing another scope until explicitly cleared; they are not written
 to disk.
 
 With the desired **Logs view open and reviewed**, run `:export-logs`. The dialog
 warns that logs may contain secrets and requires an explicit filename in an
-existing directory. Enter exports a frozen snapshot of matching retained entries
-as JSONL (`sequence`, `source`, `text`, `level`, `timestamp`). Scope changes require
+existing directory, and it names the active filter. Enter exports a frozen snapshot of
+matching retained entries, with the same text and advanced filters as the view, as JSONL (`sequence`, `source`, `text`, `level`, `timestamp`). Scope changes require
 canceling and reopening the dialog. A terminal of at least 60 × 18 is required.
 
 New files use mode **0600** (or stricter under your umask). Existing files and

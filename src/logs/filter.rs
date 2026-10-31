@@ -183,6 +183,108 @@ mod tests {
         assert!(!Filter::parse("{}").unwrap().active());
     }
 
+    fn text_filter(text: &str) -> Filter {
+        let mut filter = Filter::default();
+        filter.set_text(text);
+        filter
+    }
+
+    fn matching<'a>(filter: &Filter, logs: &'a LogBuffer) -> Vec<&'a str> {
+        logs.entries
+            .iter()
+            .filter(|entry| filter.matches(entry))
+            .map(|entry| entry.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn every_text_term_must_occur_in_the_same_message_in_any_order() {
+        let mut logs = LogBuffer::new(10);
+        for text in [
+            "backend1 returned 500",
+            "500 returned by BACKEND1",
+            "backend1 returned 200",
+            "backend2 returned 500",
+        ] {
+            logs.push("api", text, false);
+        }
+        assert_eq!(
+            matching(&text_filter("backend1 500"), &logs),
+            ["backend1 returned 500", "500 returned by BACKEND1"]
+        );
+        let mut separate = LogBuffer::new(10);
+        separate.push("api", "only backend1", false);
+        separate.push("api", "only 500", false);
+        assert!(matching(&text_filter("backend1 500"), &separate).is_empty());
+    }
+
+    #[test]
+    fn text_terms_are_literal_and_whitespace_only_text_is_no_constraint() {
+        let mut logs = LogBuffer::new(10);
+        logs.push("api", "backend1 [500] done", false);
+        logs.push("api", "backend1 5 done", false);
+        logs.push("api", "\"quoted\" GRÜẞE", false);
+        assert_eq!(
+            matching(&text_filter("  backend1   [500]  "), &logs),
+            ["backend1 [500] done"]
+        );
+        assert!(matching(&text_filter("back.nd1"), &logs).is_empty());
+        assert_eq!(matching(&text_filter("\"quoted\""), &logs).len(), 1);
+        assert_eq!(matching(&text_filter("grüße"), &logs).len(), 1);
+        let empty = text_filter(" \t ");
+        assert!(!empty.active());
+        assert_eq!(matching(&empty, &logs).len(), 3);
+    }
+
+    #[test]
+    fn text_matches_the_message_rather_than_source_timestamp_or_presentation() {
+        let mut logs = LogBuffer::new(10);
+        logs.push("backend1", "HTTP 500", false);
+        assert!(matching(&text_filter("backend1 500"), &logs).is_empty());
+        assert_eq!(matching(&text_filter("500"), &logs).len(), 1);
+
+        let mut stamped = LogBuffer::new(10);
+        stamped.push("api", "2026-10-29T10:00:00.500Z request done", false);
+        assert!(matching(&text_filter("500"), &stamped).is_empty());
+        assert!(matching(&text_filter("2026"), &stamped).is_empty());
+        assert_eq!(matching(&text_filter("done"), &stamped).len(), 1);
+
+        // Indentation added for display cannot split or create a match.
+        let mut pretty = LogBuffer::new(10);
+        pretty.set_pretty_json(true);
+        pretty.push("api", r#"{"a":"backend1","b":500}"#, false);
+        assert!(pretty.entries[0].pretty.is_some());
+        assert_eq!(
+            matching(&text_filter("\"a\":\"backend1\""), &pretty).len(),
+            1
+        );
+        assert_eq!(matching(&text_filter("\"b\":500"), &pretty).len(), 1);
+    }
+
+    #[test]
+    fn text_and_advanced_predicates_combine_and_replace_only_their_own_part() {
+        let mut logs = LogBuffer::new(10);
+        logs.push("api", "ERROR backend1 500", false);
+        logs.push("api", "INFO backend1 500", false);
+        logs.push("api", "ERROR backend2 500", false);
+        let mut filter = Filter::parse(r#"{"min_level":"error"}"#).unwrap();
+        filter.set_text("backend1 500");
+        assert_eq!(matching(&filter, &logs), ["ERROR backend1 500"]);
+        assert!(filter.text_active() && filter.advanced_active());
+
+        filter.set_text("");
+        assert!(!filter.text_active() && filter.advanced_active());
+        assert_eq!(matching(&filter, &logs).len(), 2);
+
+        filter.set_text("backend1");
+        filter.set_advanced(Filter::parse("{}").unwrap());
+        assert!(filter.text_active() && !filter.advanced_active());
+        assert_eq!(matching(&filter, &logs).len(), 2);
+        // JSON documents never turn into text terms, and terms are not part of the JSON grammar.
+        assert!(Filter::parse(r#"{"terms":["a"]}"#).is_err());
+        assert!(Filter::parse("backend1").is_err());
+    }
+
     #[test]
     fn invalid_filters_fail_instead_of_silently_guessing() {
         for input in [
@@ -251,8 +353,12 @@ pub struct Filter {
     fields: BTreeMap<String, Value>,
     since: Option<OffsetDateTime>,
     until: Option<OffsetDateTime>,
+    /// Lowercased literal terms; an entry must contain all of them in its message.
+    terms: Vec<String>,
 }
 impl Filter {
+    /// Parses the advanced JSON document. Text terms are set separately with `set_text`,
+    /// because log text can itself look like JSON and must never be guessed at.
     pub fn parse(text: &str) -> Result<Self> {
         let spec: Spec = serde_json::from_str(text)?;
         if spec.fields.len() > 16 {
@@ -290,10 +396,40 @@ impl Filter {
             fields: spec.fields,
             since,
             until,
+            terms: Vec::new(),
         })
     }
     pub fn active(&self) -> bool {
         self != &Self::default()
+    }
+    /// Replaces the text terms and leaves the advanced predicates alone.
+    pub fn set_text(&mut self, text: &str) {
+        self.terms = text.split_whitespace().map(str::to_lowercase).collect();
+    }
+    /// Replaces the advanced predicates and leaves the text terms alone.
+    pub fn set_advanced(&mut self, advanced: Self) {
+        let terms = std::mem::take(&mut self.terms);
+        *self = Self { terms, ..advanced };
+    }
+    pub fn text_active(&self) -> bool {
+        !self.terms.is_empty()
+    }
+    pub fn advanced_active(&self) -> bool {
+        self.source.is_some()
+            || self.level.is_some()
+            || self.min_level.is_some()
+            || !self.fields.is_empty()
+            || self.since.is_some()
+            || self.until.is_some()
+    }
+    /// Every term must occur in this one message. The source label, the timestamp the engine
+    /// adds and any pretty-printing are not part of it: `500` must not match `10:00:00.500Z`.
+    fn matches_text(&self, entry: &super::Entry) -> bool {
+        if self.terms.is_empty() {
+            return true;
+        }
+        let message = split_timestamp(&entry.text).1.to_lowercase();
+        self.terms.iter().all(|term| message.contains(term))
     }
     pub fn matches(&self, entry: &super::Entry) -> bool {
         self.source
@@ -318,5 +454,7 @@ impl Filter {
                     .as_ref()
                     .is_some_and(|json| json.pointer(pointer) == Some(value))
             })
+            // Last, since it is the only predicate that allocates.
+            && self.matches_text(entry)
     }
 }

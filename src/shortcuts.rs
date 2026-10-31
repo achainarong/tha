@@ -314,14 +314,17 @@ catalog! {
     Stop, "Stop (confirmation required)", [], Workloads, 20, false, ["s"], [];
     Restart, "Restart (confirmation required)", [], Workloads, 20, false, ["r"], [];
     DeleteContainer, "Delete stopped containers (type name to confirm)", [], Workloads, 20, false, ["d"], [];
+    Diagnose, "Why is this unhealthy? (read-only evidence)", ["diagnose"], Containers, 40, false, [], [];
+    NetworkDiagnose, "Troubleshoot network (read-only, no probes)", ["network-diagnose"], Containers, 40, false, [], [];
     Performance, "Performance", ["performance"], Performance, 10, false, ["p"], [];
     PerformanceScope, "Runtime / container Performance scope", [], Performance, 25, false, ["shift-p"], [];
     SortContexts, "Sort contexts", ["sort-contexts"], Containers, 25, false, ["o"], [];
     Zoom, "Expand / restore focused view", [], Zoom, 9, false, ["z"], [];
     Wrap, "Wrap logs", ["wrap"], Logs, 7, false, ["w"], [];
     Follow, "Follow logs", [], Logs, 8, false, ["f"], [];
-    FilterLogs, "Structured retained-log filters", ["filter-logs"], Logs, 9, false, ["F3"], [];
-    ClearLogFilter, "Clear retained-log filters", ["clear-log-filter"], Logs, 40, false, [], [];
+    FilterLogs, "Filter retained logs by text", ["filter-logs"], Logs, 9, false, ["F3"], [];
+    AdvancedLogFilter, "Advanced JSON log filter", ["filter-logs-advanced"], Logs, 40, false, [], [];
+    ClearLogFilter, "Clear text and advanced log filters", ["clear-log-filter"], Logs, 40, false, [], [];
     ExportLogs, "Export retained logs (may contain secrets)", ["export-logs"], Logs, 40, false, [], [];
     ReconnectLogs, "Reload logs now (streams also reconnect automatically)", ["reconnect-logs"], Logs, 40, false, [], [];
     LogsSince, "Load logs from a start time", ["logs-since"], Logs, 12, false, [], [];
@@ -448,7 +451,10 @@ impl ActionId {
             Self::Zoom => "zoom",
             Self::Wrap => "wrap",
             Self::Follow => "follow",
+            Self::Diagnose => "diagnose",
+            Self::NetworkDiagnose => "network-diagnose",
             Self::FilterLogs => "filter-logs",
+            Self::AdvancedLogFilter => "filter-logs-advanced",
             Self::ClearLogFilter => "clear-log-filter",
             Self::ExportLogs => "export-logs",
             Self::ReconnectLogs => "reconnect-logs",

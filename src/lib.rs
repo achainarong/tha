@@ -8,6 +8,7 @@ pub mod config;
 pub mod context_sort;
 pub mod daemon;
 pub mod demo;
+pub mod diagnostics;
 pub mod discovery;
 pub mod events;
 pub mod exec;

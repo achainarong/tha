@@ -63,6 +63,9 @@ pub struct LogView {
     pub match_count: usize,
     pub match_index: Option<usize>,
     layouts: VecDeque<EntryLayout>,
+    /// Newest entry the filter has judged. Rejected entries have no layout to remember them,
+    /// and judging them again on every idle frame would rescan the buffer.
+    layout_scanned: Option<u64>,
     layout_mode: Option<(usize, bool, bool, super::filter::Filter)>,
     search_stamp: Option<(u64, u64, usize)>,
     search_filter: Option<super::filter::Filter>,
@@ -70,6 +73,8 @@ pub struct LogView {
     search_last: Option<u64>,
     #[cfg(test)]
     search_scans: usize,
+    #[cfg(test)]
+    layout_scans: usize,
 }
 
 impl LogView {
@@ -89,6 +94,7 @@ impl LogView {
             match_count: 0,
             match_index: None,
             layouts: VecDeque::new(),
+            layout_scanned: None,
             layout_mode: None,
             search_stamp: None,
             search_filter: None,
@@ -96,6 +102,8 @@ impl LogView {
             search_last: None,
             #[cfg(test)]
             search_scans: 0,
+            #[cfg(test)]
+            layout_scans: 0,
         }
     }
 
@@ -109,8 +117,14 @@ impl LogView {
         self.regex.as_ref()
     }
 
+    /// Retained entries passing the filter, as of the last `sync`.
+    pub fn matching_entries(&self) -> usize {
+        self.layouts.len()
+    }
+
     pub fn reset_content(&mut self) {
         self.layouts.clear();
+        self.layout_scanned = None;
         self.reset_search_counts();
         self.anchor = None;
         self.active = None;
@@ -238,6 +252,7 @@ impl LogView {
         );
         if self.layout_mode.as_ref() != Some(&mode) {
             self.layouts.clear();
+            self.layout_scanned = None;
             self.search_stamp = None;
             self.layout_mode = Some(mode);
         }
@@ -249,14 +264,25 @@ impl LogView {
         {
             self.layouts.pop_front();
         }
-        let last = self.layouts.back().map(|layout| layout.sequence);
-        for entry in buffer.entries.iter().filter(|entry| {
-            last.is_none_or(|sequence| entry.sequence > sequence) && self.filter.matches(entry)
-        }) {
-            self.layouts.push_back(EntryLayout {
-                sequence: entry.sequence,
-                ranges: row_ranges(entry.display(), self.width, self.wrap),
-            });
+        let start = self.layout_scanned.map_or(0, |scanned| {
+            buffer
+                .entries
+                .partition_point(|entry| entry.sequence <= scanned)
+        });
+        for entry in buffer.entries.range(start..) {
+            #[cfg(test)]
+            {
+                self.layout_scans += 1;
+            }
+            if self.filter.matches(entry) {
+                self.layouts.push_back(EntryLayout {
+                    sequence: entry.sequence,
+                    ranges: row_ranges(entry.display(), self.width, self.wrap),
+                });
+            }
+        }
+        if let Some(entry) = buffer.entries.back() {
+            self.layout_scanned = Some(entry.sequence);
         }
         let stamp = buffer
             .entries
@@ -546,6 +572,111 @@ mod tests {
                 .map(|index| index + 1)
         );
         assert!(view.search_counts.len() <= buffer.entries.len());
+    }
+
+    fn text_filter(text: &str) -> crate::logs::filter::Filter {
+        let mut filter = crate::logs::filter::Filter::default();
+        filter.set_text(text);
+        filter
+    }
+
+    #[test]
+    fn idle_frames_do_not_rejudge_entries_the_filter_rejected() {
+        let mut buffer = LogBuffer::new(100);
+        for _ in 0..50 {
+            buffer.push("api", "nothing to see", false);
+        }
+        let mut view = LogView::new(true);
+        view.filter = text_filter("backend1 500");
+        view.sync(&buffer, 80, 10);
+        assert_eq!(view.layout_scans, 50);
+        assert_eq!(view.matching_entries(), 0);
+        for _ in 0..3 {
+            view.sync(&buffer, 80, 10);
+        }
+        assert_eq!(view.layout_scans, 50, "Idle frames must not rescan");
+
+        buffer.push("api", "backend1 500", false);
+        buffer.push("api", "backend1 only", false);
+        view.sync(&buffer, 80, 10);
+        assert_eq!(view.layout_scans, 52, "Only new entries are judged");
+        assert_eq!(view.matching_entries(), 1);
+
+        view.filter = text_filter("nothing");
+        view.sync(&buffer, 80, 10);
+        assert_eq!(
+            view.layout_scans, 104,
+            "A new filter judges everything once"
+        );
+        assert_eq!(view.matching_entries(), 50);
+
+        view.reset_content();
+        view.sync(&LogBuffer::new(1), 80, 10);
+        let mut fresh = LogBuffer::new(4);
+        fresh.push("api", "nothing again", false);
+        view.sync(&fresh, 80, 10);
+        assert_eq!(
+            view.matching_entries(),
+            1,
+            "A reset starts from the beginning"
+        );
+    }
+
+    #[test]
+    fn text_filter_keeps_wrapped_entries_whole_and_follows_live_arrivals() {
+        let mut buffer = LogBuffer::new(4);
+        buffer.push("api", "backend1 aaaaaaaaaaaaaaaaaaaaaaaaaaa 500", false);
+        buffer.push("api", "backend1 only", false);
+        let mut view = LogView::new(true);
+        view.filter = text_filter("backend1 500");
+        // The terms land on different rows at this width, and the entry stays whole.
+        view.sync(&buffer, 10, 20);
+        assert!(view.total_rows() > 1);
+        let rows = view.visible(&buffer);
+        assert!(rows.iter().all(|row| row.sequence == 0));
+        assert_eq!(rows.last().unwrap().range.end, buffer.entries[0].text.len());
+
+        buffer.push("api", "backend1 returned 500", false);
+        buffer.push("api", "backend2 returned 500", false);
+        view.sync(&buffer, 80, 20);
+        assert_eq!(view.matching_entries(), 2);
+        assert_eq!(view.visible(&buffer).last().unwrap().sequence, 2);
+        // Eviction still applies, and hidden entries count against capacity.
+        buffer.push("api", "other", false);
+        buffer.push("api", "other", false);
+        view.sync(&buffer, 80, 20);
+        assert_eq!(view.matching_entries(), 1);
+        assert_eq!(buffer.entries.len(), 4);
+    }
+
+    #[test]
+    fn hiding_a_paused_anchor_moves_to_a_valid_position_and_search_skips_hidden_entries() {
+        let mut buffer = LogBuffer::new(10);
+        for text in ["needle first", "needle backend1 500", "needle last"] {
+            buffer.push("api", text, false);
+        }
+        let mut view = LogView::new(true);
+        view.sync(&buffer, 80, 1);
+        view.first(&mut buffer);
+        assert!(!buffer.follow);
+        assert_eq!(view.visible(&buffer)[0].sequence, 0);
+
+        view.set_query("needle".into(), &mut buffer);
+        view.filter = text_filter("backend1 500");
+        view.sync(&buffer, 80, 1);
+        assert_eq!(view.match_count, 1, "Hidden occurrences are not counted");
+        assert_eq!(view.visible(&buffer)[0].sequence, 1);
+
+        view.filter = text_filter("absent");
+        view.sync(&buffer, 80, 1);
+        assert!(view.visible(&buffer).is_empty());
+        assert_eq!(view.match_count, 0);
+        assert_eq!(buffer.entries.len(), 3);
+
+        view.filter = Default::default();
+        view.sync(&buffer, 80, 1);
+        assert_eq!(view.matching_entries(), 3);
+        assert_eq!(view.match_count, 3);
     }
 
     #[test]

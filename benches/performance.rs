@@ -91,6 +91,33 @@ fn logs() {
             },
         );
         check_search(&view, &buffer);
+        // Nothing matches, so nothing has a layout: idle frames must still not rescan.
+        let mut filtered = LogView::new(true);
+        filtered.filter.set_text("needle absent");
+        measure(
+            &format!("logs/{capacity}/{length}/text_filter_cold"),
+            1,
+            || {
+                let mut view = LogView::new(true);
+                view.filter.set_text("needle absent");
+                view.sync(black_box(&buffer), 60, 30);
+                black_box(view);
+            },
+        );
+        filtered.sync(&buffer, 60, 30);
+        measure(
+            &format!("logs/{capacity}/{length}/text_filter_idle_sync"),
+            100,
+            || filtered.sync(black_box(&buffer), 60, 30),
+        );
+        measure(
+            &format!("logs/{capacity}/{length}/text_filter_push_and_sync"),
+            20,
+            || {
+                buffer.push("api", &text, false);
+                filtered.sync(&buffer, 60, 30);
+            },
+        );
         let mut app = App::new(tha::demo::connections(), capacity, false, true);
         tha::demo::populate(&mut app);
         app.logs = buffer;

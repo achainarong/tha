@@ -391,6 +391,9 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let mut platform_task: Option<(tha::platform::Key, AbortTask)> = None;
     let (layers_tx, mut layers_rx) = mpsc::channel::<tha::layers::Event>(4);
     let mut layers_task: Option<AbortTask> = None;
+    let (diagnostics_tx, mut diagnostics_rx) = mpsc::channel::<tha::diagnostics::Event>(4);
+    // One per side, so a new peer or a refresh aborts what it replaces. No other inspect runs.
+    let mut diagnostics_tasks: [Option<AbortTask>; 3] = [None, None, None];
     let (security_tx, mut security_rx) = mpsc::channel::<tha::security::Event>(16);
     let (security_notice_tx, mut security_notice_rx) = mpsc::channel::<String>(4);
     let mut security_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -590,6 +593,17 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 app.layers.complete(event);
                 redraw_now = true;
             },
+            Some(event) = diagnostics_rx.recv() => {
+                let now = tha::history::now_ms();
+                if event.role == tha::diagnostics::Role::Overview {
+                    if let Some(side) = &mut app.overview_details {
+                        side.complete(event, now);
+                    }
+                } else if let Some(view) = &mut app.diagnostics {
+                    view.complete(event, now);
+                }
+                redraw_now = true;
+            },
             Some(event) = security_rx.recv() => {
                 if let tha::security::Outcome::Finished(Err(error)) = &event.result {
                     app.notice = tha::tf!("Security scan failed for {a0}: {a1}", a0 = tha::model::safe_text(&event.target.label), a1 = tha::model::safe_text(error));
@@ -649,6 +663,33 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                     action_tx.clone(),
                 ))),
             );
+        }
+        app.update_overview_details();
+        if app.diagnostics.is_none() {
+            diagnostics_tasks[0] = None;
+            diagnostics_tasks[1] = None;
+        }
+        if app.overview_details.is_none() {
+            diagnostics_tasks[2] = None;
+        }
+        for request in app.diagnostics_requests.drain(..) {
+            let sender = diagnostics_tx.clone();
+            diagnostics_tasks[request.role as usize] = Some(AbortTask(tokio::spawn(async move {
+                // Only Overview shows what was overridden, so only it reads the image.
+                let with_image = request.role == tha::diagnostics::Role::Overview;
+                let result =
+                    tha::diagnostics::inspect(&request.connection, &request.target.id, with_image)
+                        .await
+                        .map_err(|error| tha::tf!("{error}", error = format!("{error:#}")));
+                let _ = sender
+                    .send(tha::diagnostics::Event {
+                        role: request.role,
+                        generation: request.generation,
+                        target: request.target,
+                        result,
+                    })
+                    .await;
+            })));
         }
         if let Some(request) = app.log_export_request.take() {
             let sender = export_tx.clone();
@@ -1054,6 +1095,10 @@ fn update_logs(
     *task = None;
     app.log_generation += 1;
     app.log_scope = Some(scope);
+    app.log_scope_targets = Some((
+        row.engine,
+        containers.iter().map(|container| container.key()).collect(),
+    ));
     let pretty_json = app.logs.pretty_json;
     app.logs = logs::LogBuffer::new(capacity);
     app.logs.pretty_json = pretty_json;
@@ -1083,6 +1128,15 @@ fn update_logs(
                 let text = if n % 7 == 0 {
                     format!(
                         "2026-10-29T14:32:{:02}Z {{\"level\":\"warn\",\"message\":\"upstream retry\",\"attempt\":2}}",
+                        n % 60
+                    )
+                } else if n % 3 == 0 {
+                    // Enough variety to try the text filter: `backend1 500` needs both words.
+                    let (upstream, status) =
+                        [("backend1", 500), ("backend1", 200), ("backend2", 500)]
+                            [(n / 3) as usize % 3];
+                    format!(
+                        "2026-10-29T14:32:{:02}Z ERROR upstream={upstream} status={status} path=/checkout",
                         n % 60
                     )
                 } else {
@@ -1516,6 +1570,9 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         }
         return false;
     }
+    if app.diagnostics.is_some() {
+        return handle_diagnostics_key(app, key, height, refresh);
+    }
     if app.input_mode == InputMode::InventorySearch {
         let view = app
             .inventory_views
@@ -1577,10 +1634,18 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                 if mode == InputMode::Command {
                     return execute(app, &input, refresh);
                 }
-                if mode == InputMode::LogFilter {
+                if mode == InputMode::LogTextFilter {
+                    app.log_view.filter.set_text(&input);
+                    app.log_filter_terms = input;
+                    app.notice = if app.log_view.filter.text_active() {
+                        tha::i18n::t("Showing entries whose message contains every term. Retained logs are kept; F3 edits, :clear-log-filter resets.").into()
+                    } else {
+                        tha::i18n::t("Text filter cleared; advanced filters are unchanged.").into()
+                    };
+                } else if mode == InputMode::LogFilter {
                     match logs::filter::Filter::parse(&input) {
                         Ok(filter) => {
-                            app.log_view.filter = filter;
+                            app.log_view.filter.set_advanced(filter);
                             app.log_filter_text = input;
                             app.notice = tha::i18n::t("Applied retained-log filter; entries without required metadata do not match. :clear-log-filter resets it.").into();
                         }
@@ -1629,6 +1694,14 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             {
                 app.log_view.regex_search = !app.log_view.regex_search;
             }
+            KeyCode::Tab
+                if matches!(
+                    app.input_mode,
+                    InputMode::LogTextFilter | InputMode::LogFilter
+                ) =>
+            {
+                app.toggle_log_filter_field();
+            }
             KeyCode::Tab if app.input_mode == InputMode::Command => {
                 if let Some((command, _)) = ui::COMMANDS
                     .iter()
@@ -1642,7 +1715,10 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
             }
             KeyCode::Char('u')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(app.input_mode, InputMode::LogFilter | InputMode::ExportLogs) =>
+                    && matches!(
+                        app.input_mode,
+                        InputMode::LogTextFilter | InputMode::LogFilter | InputMode::ExportLogs
+                    ) =>
             {
                 app.input.clear()
             }
@@ -1679,6 +1755,87 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
     dispatch_navigation(app, action, key, height, refresh)
 }
 
+/// The overlay is modal, so its keys never compete with global shortcuts.
+fn handle_diagnostics_key(
+    app: &mut App,
+    key: KeyEvent,
+    height: usize,
+    refresh: &watch::Sender<u64>,
+) -> bool {
+    use tha::diagnostics::Kind;
+    let Some(view) = &mut app.diagnostics else {
+        return false;
+    };
+    let kind = view.kind;
+    let page = height.max(1);
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.diagnostics_close(),
+        KeyCode::Char('j') | KeyCode::Down => view.scroll = view.scroll.saturating_add(1),
+        KeyCode::Char('k') | KeyCode::Up => view.scroll = view.scroll.saturating_sub(1),
+        KeyCode::PageDown => view.scroll = view.scroll.saturating_add(page),
+        KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(page),
+        KeyCode::Char('d') if control => view.scroll = view.scroll.saturating_add(page / 2),
+        KeyCode::Char('u') if control => view.scroll = view.scroll.saturating_sub(page / 2),
+        KeyCode::Char('g') | KeyCode::Home => view.scroll = 0,
+        KeyCode::Char('G') | KeyCode::End => view.scroll = usize::MAX,
+        KeyCode::Char('r') => app.refresh_diagnostics(),
+        KeyCode::Char('p') if kind == Kind::Network => app.open_diagnostic_peers(),
+        KeyCode::Char('n') if kind == Kind::Network => {
+            return follow_diagnostics_link(app, A::Networks, key, height, refresh);
+        }
+        KeyCode::Char('l') if kind == Kind::Health => {
+            return follow_diagnostics_link(app, A::Logs, key, height, refresh);
+        }
+        KeyCode::Char('e') if kind == Kind::Health => {
+            return follow_diagnostics_link(app, A::Events, key, height, refresh);
+        }
+        KeyCode::Char('m') if kind == Kind::Health => {
+            return follow_diagnostics_link(app, A::Metrics, key, height, refresh);
+        }
+        _ => {}
+    }
+    false
+}
+
+/// Opens an existing view for the same container, with its filters left exactly as they are.
+fn follow_diagnostics_link(
+    app: &mut App,
+    action: A,
+    key: KeyEvent,
+    height: usize,
+    refresh: &watch::Sender<u64>,
+) -> bool {
+    let blocked = app
+        .diagnostics_link_ready()
+        .err()
+        .or_else(|| shortcuts::unavailable(app, action));
+    if let Some(reason) = blocked {
+        if let Some(view) = &mut app.diagnostics {
+            view.message = Some(reason);
+        }
+        return false;
+    }
+    app.diagnostics_close();
+    let quit = dispatch_navigation(app, action, key, height, refresh);
+    match action {
+        A::Logs if app.log_view.filter.active() => {
+            app.notice = tha::tf!(
+                "Logs keep the active filter ({filter}), which may hide related entries. :clear-log-filter shows them.",
+                filter = app.log_filter_summary()
+            );
+        }
+        A::Metrics => {
+            app.notice = tha::i18n::t(
+                "Metrics show only samples collected so far; earlier history may not exist.",
+            )
+            .into();
+        }
+        _ => {}
+    }
+    quit
+}
+
 fn dispatch_navigation(
     app: &mut App,
     action: A,
@@ -1690,7 +1847,10 @@ fn dispatch_navigation(
     if matches!(
         action,
         A::AllRuntimes
+            | A::AdvancedLogFilter
             | A::ClearLogFilter
+            | A::Diagnose
+            | A::NetworkDiagnose
             | A::ExportLogs
             | A::ReconnectLogs
             | A::LogsSince
@@ -2052,10 +2212,7 @@ fn dispatch_navigation(
     let pending_g = app.pending_g;
     app.pending_g = false;
     match action {
-        A::FilterLogs => {
-            app.input_mode = InputMode::LogFilter;
-            app.input = app.log_filter_text.clone();
-        }
+        A::FilterLogs => app.open_log_filter(InputMode::LogTextFilter),
         A::Start | A::Stop | A::Restart | A::DeleteContainer => {
             app.request_action(action.lifecycle().expect("lifecycle action"))
         }
@@ -2390,6 +2547,7 @@ fn handle_mouse(
     if app.help
         || app.settings.is_some()
         || app.picker.is_some()
+        || app.diagnostics.is_some()
         || app.inventory_removal_results_visible
         || app.action_results_visible
         || app.compose_output_visible
@@ -2851,13 +3009,17 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
             app.tab = Tab::Logs;
             app.detail_focus = true;
             app.performance_focus = false;
-            app.input_mode = InputMode::LogFilter;
-            app.input = app.log_filter_text.clone();
+            app.open_log_filter(InputMode::LogTextFilter);
         }
-        "clear-log-filter" => {
-            app.log_view.filter = Default::default();
-            app.log_filter_text = "{}".into();
+        "filter-logs-advanced" => {
+            app.tab = Tab::Logs;
+            app.detail_focus = true;
+            app.performance_focus = false;
+            app.open_log_filter(InputMode::LogFilter);
         }
+        "clear-log-filter" => app.clear_log_filters(),
+        "diagnose" => app.open_diagnostics(tha::diagnostics::Kind::Health),
+        "network-diagnose" => app.open_diagnostics(tha::diagnostics::Kind::Network),
         "export-logs" => {
             if app.tab != Tab::Logs || app.log_scope.is_none() {
                 app.notice =
@@ -5746,6 +5908,309 @@ mod tests {
         assert!(app.action_request.is_some());
     }
 
+    fn demo_container(app: &mut App, key: &str) {
+        loop {
+            let before = app.expanded.len();
+            let branches: Vec<_> = app
+                .rows
+                .iter()
+                .filter(|row| row.branch)
+                .map(|row| row.key.clone())
+                .collect();
+            app.expanded.extend(branches);
+            app.refresh_tree();
+            if app.expanded.len() == before {
+                break;
+            }
+        }
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(&row.scope, tha::app::Scope::Container(found) if found == key))
+            .unwrap();
+    }
+
+    fn demo_app() -> App {
+        let mut app = App::new(tha::demo::connections(), 100, true, true);
+        tha::demo::populate(&mut app);
+        app.demo = true;
+        app
+    }
+
+    #[test]
+    fn diagnostics_open_from_commands_and_the_actions_menu_only_for_one_container() {
+        let (tx, _) = watch::channel(0);
+        let mut app = demo_app();
+        demo_container(&mut app, "/api-2");
+        execute(&mut app, "diagnose", &tx);
+        assert_eq!(
+            app.diagnostics.as_ref().unwrap().kind,
+            tha::diagnostics::Kind::Health
+        );
+        app.diagnostics_close();
+        execute(&mut app, "network-diagnose", &tx);
+        assert_eq!(
+            app.diagnostics.as_ref().unwrap().kind,
+            tha::diagnostics::Kind::Network
+        );
+        app.diagnostics_close();
+
+        app.open_actions();
+        let picker = app.picker.as_mut().unwrap();
+        let index = picker
+            .choices
+            .iter()
+            .position(|choice| {
+                matches!(
+                    choice,
+                    tha::app::Choice::Diagnose(tha::diagnostics::Kind::Health)
+                )
+            })
+            .unwrap();
+        picker.selected = index;
+        app.choose();
+        assert!(app.diagnostics.is_some());
+        app.diagnostics_close();
+
+        // A runtime or group row has no single container to explain.
+        let engine = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, tha::app::Scope::Engine))
+            .unwrap();
+        app.selected = engine;
+        execute(&mut app, "diagnose", &tx);
+        assert!(app.diagnostics.is_none());
+        assert!(app.notice.contains("single container"));
+        app.open_actions();
+        assert!(
+            !app.picker
+                .as_ref()
+                .unwrap()
+                .choices
+                .iter()
+                .any(|choice| matches!(choice, tha::app::Choice::Diagnose(_)))
+        );
+    }
+
+    #[test]
+    fn diagnostics_keys_stay_in_the_overlay_and_never_reach_lifecycle_or_quit() {
+        let (tx, _) = watch::channel(0);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = demo_app();
+        demo_container(&mut app, "/api-2");
+        execute(&mut app, "diagnose", &tx);
+        let selected = app.selected;
+        // `s`, `r` and `d` stop, restart and delete in navigation. `r` refreshes here.
+        for code in ['s', 'S', 'd', 'x', 'p', 'n'] {
+            assert!(!handle_key(&mut app, key(KeyCode::Char(code)), 20, &tx));
+        }
+        assert!(app.action_confirmation.is_none());
+        assert!(app.picker.is_none(), "p is only the peer key on Network");
+        assert_eq!(app.selected, selected);
+        handle_key(&mut app, key(KeyCode::Char('r')), 20, &tx);
+        assert!(app.action_confirmation.is_none());
+        handle_key(&mut app, key(KeyCode::Char('j')), 20, &tx);
+        handle_key(&mut app, key(KeyCode::PageDown), 20, &tx);
+        assert_eq!(app.diagnostics.as_ref().unwrap().scroll, 21);
+        handle_key(&mut app, key(KeyCode::Char('g')), 20, &tx);
+        assert_eq!(app.diagnostics.as_ref().unwrap().scroll, 0);
+        assert!(!handle_key(&mut app, key(KeyCode::Char('q')), 20, &tx));
+        assert!(app.diagnostics.is_none(), "q closes rather than quitting");
+    }
+
+    #[test]
+    fn diagnostics_links_keep_the_container_and_the_log_filter() {
+        let (tx, _) = watch::channel(0);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = demo_app();
+        demo_container(&mut app, "/api-2");
+        app.log_view.filter.set_text("backend1 500");
+        app.log_filter_terms = "backend1 500".into();
+        let row = app.current().unwrap().key.clone();
+
+        execute(&mut app, "diagnose", &tx);
+        handle_key(&mut app, key(KeyCode::Char('l')), 20, &tx);
+        assert!(app.diagnostics.is_none());
+        assert_eq!(app.tab, Tab::Logs);
+        assert_eq!(app.current().unwrap().key, row);
+        assert!(
+            app.log_view.filter.text_active(),
+            "The filter is the user's"
+        );
+        assert!(app.notice.contains("backend1 500"), "{}", app.notice);
+
+        for (link, tab) in [('e', Tab::Events), ('m', Tab::History)] {
+            execute(&mut app, "diagnose", &tx);
+            handle_key(&mut app, key(KeyCode::Char(link)), 20, &tx);
+            assert!(app.diagnostics.is_none());
+            assert_eq!(app.tab, tab);
+            assert_eq!(app.current().unwrap().key, row);
+        }
+        assert!(app.notice.contains("earlier history may not exist"));
+
+        execute(&mut app, "network-diagnose", &tx);
+        handle_key(&mut app, key(KeyCode::Char('n')), 20, &tx);
+        assert_eq!(app.tab, Tab::Networks);
+        assert_eq!(app.current().unwrap().key, row);
+    }
+
+    #[test]
+    fn a_link_to_a_replaced_container_stays_put_and_explains_why() {
+        let (tx, _) = watch::channel(0);
+        let mut app = demo_app();
+        demo_container(&mut app, "/api-2");
+        execute(&mut app, "diagnose", &tx);
+        let tab = app.tab;
+        for container in &mut app.engines[0].snapshot.as_mut().unwrap().containers {
+            if container.id == "api-2" {
+                container.id = "api-2-new".into();
+            }
+        }
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert_eq!(app.tab, tab);
+        let view = app.diagnostics.as_ref().unwrap();
+        assert!(
+            view.message
+                .as_ref()
+                .unwrap()
+                .contains("no longer the selection")
+        );
+    }
+
+    #[test]
+    fn the_peer_picker_opens_over_the_network_view_and_closes_back_to_it() {
+        let (tx, _) = watch::channel(0);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = demo_app();
+        demo_container(&mut app, "/api-2");
+        execute(&mut app, "network-diagnose", &tx);
+        handle_key(&mut app, key(KeyCode::Char('p')), 20, &tx);
+        assert!(app.picker.is_some());
+        handle_key(&mut app, key(KeyCode::Esc), 20, &tx);
+        assert!(app.picker.is_none());
+        assert!(app.diagnostics.is_some(), "Esc leaves only the picker");
+
+        handle_key(&mut app, key(KeyCode::Char('p')), 20, &tx);
+        handle_key(&mut app, key(KeyCode::Char('j')), 20, &tx);
+        handle_key(&mut app, key(KeyCode::Enter), 20, &tx);
+        let peer = app.diagnostics.as_ref().unwrap().peer.as_ref().unwrap();
+        assert_ne!(
+            peer.target.container_key(),
+            "/api-2",
+            "A container is not its own peer"
+        );
+        assert_eq!(peer.target.engine, 0, "Peers stay on this runtime");
+    }
+
+    #[tokio::test]
+    async fn closing_or_switching_diagnostics_never_blocks_and_late_results_are_ignored() {
+        let (tx, _) = watch::channel(0);
+        let mut app = demo_app();
+        app.demo = false;
+        demo_container(&mut app, "/api-2");
+        execute(&mut app, "network-diagnose", &tx);
+        let request = app.diagnostics_requests.pop().unwrap();
+        assert_eq!(request.role, tha::diagnostics::Role::Main);
+        // Refreshing replaces the generation while the first request is still out.
+        app.refresh_diagnostics();
+        let newer = app.diagnostics_requests.pop().unwrap();
+        assert_ne!(request.generation, newer.generation);
+        let late = |generation, target: &tha::diagnostics::Target| tha::diagnostics::Event {
+            role: tha::diagnostics::Role::Main,
+            generation,
+            target: target.clone(),
+            result: Err("late".into()),
+        };
+        let view = app.diagnostics.as_mut().unwrap();
+        view.complete(late(request.generation, &request.target), 1);
+        assert_eq!(view.main.status, tha::diagnostics::Status::Loading);
+        view.complete(late(newer.generation, &newer.target), 1);
+        assert!(matches!(
+            view.main.status,
+            tha::diagnostics::Status::Failed(_)
+        ));
+        app.diagnostics_close();
+        assert!(app.diagnostics_requests.is_empty());
+    }
+
+    #[test]
+    fn text_filter_applies_on_enter_cancels_on_esc_and_keeps_advanced_constraints() {
+        let (tx, _) = watch::channel(0);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = lifecycle_app("running");
+        app.tab = Tab::Logs;
+        app.detail_focus = true;
+        app.logs.push("backend1", "ERROR HTTP 500", false);
+        app.logs.push("nginx", "ERROR backend1 returned 500", false);
+        app.logs.push("nginx", "INFO backend1 returned 500", false);
+        app.logs.push("nginx", "ERROR backend2 returned 500", false);
+        let visible = |app: &App| {
+            app.logs
+                .entries
+                .iter()
+                .filter(|entry| app.log_view.filter.matches(entry))
+                .count()
+        };
+
+        handle_key(&mut app, key(KeyCode::F(3)), 20, &tx);
+        for ch in "backend1 500".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)), 20, &tx);
+        }
+        // Esc keeps the previously active filter, which here is none.
+        handle_key(&mut app, key(KeyCode::Esc), 20, &tx);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(!app.log_view.filter.active());
+
+        handle_key(&mut app, key(KeyCode::F(3)), 20, &tx);
+        assert_eq!(app.input, "");
+        // Text that looks like JSON or is not valid JSON is still just text.
+        app.input = "backend1 500".into();
+        handle_key(&mut app, key(KeyCode::Enter), 20, &tx);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(visible(&app), 2, "The source name alone does not match");
+        assert_eq!(app.logs.entries.len(), 4);
+
+        // Tab keeps the unapplied draft, and only the shown field is applied.
+        handle_key(&mut app, key(KeyCode::F(3)), 20, &tx);
+        assert_eq!(app.input, "backend1 500");
+        handle_key(&mut app, key(KeyCode::Char('x')), 20, &tx);
+        handle_key(&mut app, key(KeyCode::Tab), 20, &tx);
+        assert_eq!(app.input_mode, InputMode::LogFilter);
+        assert_eq!(app.input, "{}");
+        app.input = r#"{"min_level":"error"}"#.into();
+        handle_key(&mut app, key(KeyCode::Enter), 20, &tx);
+        assert_eq!(app.log_filter_terms, "backend1 500");
+        assert_eq!(visible(&app), 1, "Text and severity combine with AND");
+        assert!(app.log_filter_summary().contains("backend1 500"));
+
+        // An empty text field removes only the text constraint.
+        handle_key(&mut app, key(KeyCode::F(3)), 20, &tx);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            20,
+            &tx,
+        );
+        handle_key(&mut app, key(KeyCode::Enter), 20, &tx);
+        assert!(!app.log_view.filter.text_active() && app.log_view.filter.advanced_active());
+        assert_eq!(visible(&app), 3);
+
+        app.input = "500".into();
+        app.input_mode = InputMode::LogTextFilter;
+        handle_key(&mut app, key(KeyCode::Enter), 20, &tx);
+        execute(&mut app, "clear-log-filter", &tx);
+        assert!(!app.log_view.filter.active());
+        assert_eq!(app.log_filter_terms, "");
+        assert_eq!(app.log_filter_text, "{}");
+        assert_eq!(visible(&app), 4);
+    }
+
     #[test]
     fn log_filter_editor_validates_without_destroying_retained_logs_and_export_pins_scope() {
         let (tx, _) = watch::channel(0);
@@ -5757,6 +6222,13 @@ mod tests {
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE),
+            20,
+            &tx,
+        );
+        assert_eq!(app.input_mode, InputMode::LogTextFilter);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
             20,
             &tx,
         );

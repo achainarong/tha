@@ -145,6 +145,27 @@ impl Container {
         self.state.eq_ignore_ascii_case("running") || self.state.starts_with("Up")
     }
 
+    /// The reported health status. Older APIs only put it in the status text. `None` means no
+    /// status was reported, which the inventory cannot tell apart from having no check.
+    pub fn health_status(&self) -> Option<String> {
+        let reported = self
+            .health
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .filter(|health| !health.is_empty() && health != "none");
+        reported.or_else(|| {
+            let status = self.status.to_ascii_lowercase();
+            [
+                ("(unhealthy)", "unhealthy"),
+                ("(healthy)", "healthy"),
+                ("health: starting", "starting"),
+            ]
+            .into_iter()
+            .find(|(text, _)| status.contains(text))
+            .map(|(_, health)| health.to_owned())
+        })
+    }
+
     pub fn condition(&self) -> Condition {
         let state = self.state.to_ascii_lowercase();
         let status = self.status.to_ascii_lowercase();
@@ -393,6 +414,38 @@ pub fn safe_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_status_comes_from_the_field_then_the_status_text_and_is_otherwise_unknown() {
+        let container = |health: Option<&str>, status: &str| Container {
+            health: health.map(Into::into),
+            status: status.into(),
+            ..Default::default()
+        };
+        let health = |health, status| container(health, status).health_status();
+        assert_eq!(
+            health(Some("unhealthy"), "Up 1 hour").as_deref(),
+            Some("unhealthy")
+        );
+        assert_eq!(
+            health(None, "Up 1 hour (healthy)").as_deref(),
+            Some("healthy")
+        );
+        assert_eq!(
+            health(None, "Up 1 hour (unhealthy)").as_deref(),
+            Some("unhealthy")
+        );
+        assert_eq!(
+            health(None, "Up 1 second (health: starting)").as_deref(),
+            Some("starting")
+        );
+        assert_eq!(health(Some("none"), "Up 1 hour"), None);
+        assert_eq!(
+            health(Some(""), "Up 1 hour (healthy)").as_deref(),
+            Some("healthy")
+        );
+        assert_eq!(health(None, "Exited (0) 1 hour ago"), None);
+    }
 
     #[test]
     fn grouping_requires_real_labels() {
