@@ -282,8 +282,30 @@ fn reconcile(view: &mut InventoryView, rows: &[Entry]) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CleanupSelection {
+    Selected,
+    AllUnreferenced,
+}
+
 /// Navigation is called only after editors, dialogs and embedded shells consume keys.
 pub fn begin_removal(app: &mut App) {
+    begin_cleanup(app, CleanupSelection::Selected);
+}
+
+/// Freeze the entire runtime's unused inventory, independently of search and marks.
+pub fn begin_prune(app: &mut App) {
+    begin_cleanup(app, CleanupSelection::AllUnreferenced);
+}
+
+fn begin_cleanup(app: &mut App, selection: CleanupSelection) {
+    if !matches!(
+        app.overview_mode,
+        OverviewMode::Images | OverviewMode::Volumes
+    ) {
+        app.notice = "Open Images or Volumes to prune unreferenced resources".into();
+        return;
+    }
     if app.inventory_removal.is_some() {
         app.notice = "Resource cleanup is already awaiting confirmation or running".into();
         return;
@@ -294,7 +316,8 @@ pub fn begin_removal(app: &mut App) {
     }
     let key = (app.inventory_engine, app.overview_mode);
     let view = app.inventory_views.get(&key).cloned().unwrap_or_default();
-    if key.1 == OverviewMode::Volumes && view.filter == 5 {
+    if selection == CleanupSelection::Selected && key.1 == OverviewMode::Volumes && view.filter == 5
+    {
         app.notice = "Bind mounts cannot be deleted from Tha".into();
         return;
     }
@@ -309,13 +332,26 @@ pub fn begin_removal(app: &mut App) {
     let Some(snapshot) = &engine.snapshot else {
         return;
     };
-    let rows = visible(entries(snapshot, key.1, false), &view, key.1, &view.query);
+    if engine.connection.kind != crate::config::BackendKind::Docker {
+        app.notice = "Resource removal is unsupported for this backend".into();
+        return;
+    }
+    let all = entries(snapshot, key.1, false);
+    let rows = if selection == CleanupSelection::AllUnreferenced {
+        all
+    } else {
+        visible(all, &view, key.1, &view.query)
+    };
     let index = view
         .selected
         .as_ref()
         .and_then(|key| rows.iter().position(|row| &row.key == key))
         .unwrap_or(view.index);
-    let chosen: Vec<_> = if view.marked.is_empty() {
+    let chosen: Vec<_> = if selection == CleanupSelection::AllUnreferenced {
+        rows.iter()
+            .filter(|row| row.status == "unreferenced")
+            .collect()
+    } else if view.marked.is_empty() {
         rows.get(index)
             .into_iter()
             .filter(|row| row.status == "unreferenced")
@@ -326,7 +362,11 @@ pub fn begin_removal(app: &mut App) {
             .collect()
     };
     if chosen.is_empty() {
-        app.notice="Select unreferenced resources first; running/stopped references and unknown usage are protected".into();
+        app.notice = if selection == CleanupSelection::AllUnreferenced {
+            "No unreferenced resources to prune; running/stopped references and unknown usage are protected"
+        } else {
+            "Select unreferenced resources first; running/stopped references and unknown usage are protected"
+        }.into();
         return;
     }
     let Some(identity) = snapshot.engine_id.clone().filter(|id| !id.is_empty()) else {
@@ -805,10 +845,10 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
     );
     frame.render_widget(
         Paragraph::new(if scan_only { "Space/m Check · M All · s/S Scan · Enter Findings · Tab Focus · z Zoom".into() } else if app.security.enabled && key.1 == OverviewMode::Images { format!(
-            "Row {} / {} · m/M Check scan/all · 7 Security · :scan-images · z Zoom · Space Cleanup · d Delete · Enter Details",
+            "Row {} / {} · m/M Check scan/all · 7 Security · :scan-images · z Zoom · Space Cleanup · d Delete · p Prune all unused · Enter Details",
             if rows.is_empty() { 0 } else { view.index + 1 },
             rows.len()
-        ) } else { format!("Row {} / {} · Space Mark  u Mark unused  c Clear  d Delete · / Search  f Filter  s Sort  Enter Details", if rows.is_empty() { 0 } else { view.index + 1 }, rows.len()) })
+        ) } else { format!("Row {} / {} · Space Mark  u Mark unused  c Clear  d Delete  p Prune all unused · / Search  f Filter  s Sort  Enter Details", if rows.is_empty() { 0 } else { view.index + 1 }, rows.len()) })
         .style(muted()),
         parts[3],
     );
@@ -1039,6 +1079,93 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn prune_freezes_all_unused_resources_ignoring_search_filter_and_marks() {
+        for mode in [OverviewMode::Images, OverviewMode::Volumes] {
+            let mut app = App::new(crate::demo::connections(), 100, true, true);
+            app.demo = false;
+            app.overview_mode = mode;
+            app.engines[0].snapshot = Some(Snapshot {
+                engine_id: Some("fixture".into()),
+                containers: vec![
+                    Container {
+                        image_id: Some("running".into()),
+                        volumes: vec!["running".into()],
+                        state: "running".into(),
+                        ..Default::default()
+                    },
+                    Container {
+                        image_id: Some("stopped".into()),
+                        volumes: vec!["stopped".into()],
+                        state: "exited".into(),
+                        ..Default::default()
+                    },
+                ],
+                images: Some(
+                    ["running", "stopped", "unused-one", "unused-two"]
+                        .into_iter()
+                        .map(|id| Image {
+                            id: id.into(),
+                            tags: vec![format!("{id}:latest")],
+                            size: None,
+                        })
+                        .collect(),
+                ),
+                volumes_available: true,
+                volumes: ["running", "stopped", "unused-one", "unused-two"]
+                    .into_iter()
+                    .map(|name| crate::model::Resource {
+                        name: name.into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            });
+            let view = app.inventory_views.entry((0, mode)).or_default();
+            view.filter = 1;
+            view.query = "no matches".into();
+            view.marked.insert("unused-one".into());
+
+            begin_prune(&mut app);
+
+            let removal = app.inventory_removal.as_ref().unwrap();
+            assert_eq!(
+                removal
+                    .targets
+                    .iter()
+                    .map(|target| target.request.key.as_str())
+                    .collect::<Vec<_>>(),
+                ["unused-one", "unused-two"]
+            );
+            assert!(!removal.pending);
+            assert!(app.inventory_removal_request.is_none());
+            app.engines[0]
+                .snapshot
+                .as_mut()
+                .unwrap()
+                .volumes
+                .push(crate::model::Resource {
+                    name: "new-unused".into(),
+                    ..Default::default()
+                });
+            assert_eq!(app.inventory_removal.as_ref().unwrap().targets.len(), 2);
+        }
+    }
+
+    #[test]
+    fn prune_protects_unknown_image_usage_and_demo_mode() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.overview_mode = OverviewMode::Images;
+        begin_prune(&mut app);
+        assert!(app.inventory_removal.is_none());
+        app.demo = false;
+        begin_prune(&mut app);
+        assert!(app.inventory_removal.is_none());
+        assert!(app.notice.contains("No unreferenced resources"));
+    }
+
     #[test]
     fn marking_is_unused_only_query_scoped_and_confirmation_targets_are_frozen() {
         let mut app = App::new(crate::demo::connections(), 100, true, true);

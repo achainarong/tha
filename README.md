@@ -446,6 +446,11 @@ changes clear marks; runtime and overview switching keep their selections separa
 One scrollable confirmation lists the frozen count and names: **y / Enter confirms**,
 **n / Esc cancels**. No full-ID typing is required for images or volumes.
 
+**p** (or **`:prune`**) prunes all unreferenced images or managed volumes in the
+selected runtime, including resources hidden by search/filter and regardless of
+marks. It opens the same confirmation with the exact count and names before any
+deletion; resources appearing afterward are not added to the confirmed list.
+
 Deleting volumes permanently destroys their stored data. Tha rechecks runtime
 identity and all running/stopped references before **each** non-forced deletion,
 with at most four requests in flight. Newly referenced resources are skipped;

@@ -28,6 +28,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     ("overview", "Show workload overview"),
     (
+        "prune",
+        "Prune all unreferenced resources in Images/Volumes (confirmation required)",
+    ),
+    (
         "removal-results",
         "Review the last image/volume cleanup results",
     ),

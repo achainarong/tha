@@ -309,6 +309,7 @@ catalog! {
     MarkUnused, "Mark visible unused resources", [], InventoryList, 15, false, ["u"], [];
     ClearMarks, "Clear resource and scan marks", [], InventoryList, 15, false, ["c"], [];
     RemoveResources, "Delete unused resources (confirmation required)", [], Inventory, 10, false, ["d"], ["delete"];
+    PruneResources, "Prune all unreferenced resources (confirmation required)", ["prune"], Inventory, 11, false, ["p"], [];
     InventoryFilter, "Filter inventory", [], Inventory, 8, false, ["f"], [];
     InventorySort, "Sort inventory", [], Inventory, 9, false, ["s"], [];
     RefreshInventory, "Refresh all engines", [], Inventory, 25, false, ["r"], [];
@@ -423,6 +424,7 @@ impl ActionId {
             Self::MarkUnused => "mark-unused",
             Self::ClearMarks => "clear-marks",
             Self::RemoveResources => "remove-resources",
+            Self::PruneResources => "prune-resources",
             Self::InventoryFilter => "inventory-filter",
             Self::InventorySort => "inventory-sort",
             Self::RefreshInventory => "refresh-inventory",

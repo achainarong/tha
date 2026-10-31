@@ -1555,6 +1555,7 @@ fn dispatch_navigation(
     if app.overview_mode != tha::app::OverviewMode::Containers {
         match action {
             A::RemoveResources => ui::inventory::begin_removal(app),
+            A::PruneResources => ui::inventory::begin_prune(app),
             A::Escape
                 if app
                     .inventory_views
@@ -2035,6 +2036,7 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
         "security" => app.open_security(),
         "scan-image" => app.request_security_scan(false),
         "scan-images" => app.request_security_scan(true),
+        "prune" => ui::inventory::begin_prune(app),
         "cancel-scan" => {
             app.security.cancel = true;
             app.notice = "Cancelling security queue and removing scanner…".into();
@@ -3558,6 +3560,28 @@ mod tests {
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('P')), 20, &tx);
         assert_eq!(app.performance_scope, PerformanceScope::Runtime);
         assert!(app.action_request.is_none());
+    }
+
+    #[tokio::test]
+    async fn prune_shortcut_and_command_require_confirmation_and_allow_cancellation() {
+        use tha::app::OverviewMode;
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.demo = false;
+        switch_overview(&mut app, OverviewMode::Volumes);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('p')), 25, &refresh);
+        assert!(app.inventory_removal.is_some());
+        assert!(app.inventory_removal_request.is_none());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 25, &refresh);
+        assert!(app.inventory_removal_request.is_none());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 25, &refresh);
+        assert!(app.inventory_removal.is_none());
+
+        execute(&mut app, "prune", &refresh);
+        app.inventory_removal.as_mut().unwrap().visible = true;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('y')), 25, &refresh);
+        assert_eq!(app.inventory_removal_request.as_ref().unwrap().len(), 1);
+        assert!(app.inventory_removal.as_ref().unwrap().pending);
     }
 
     #[tokio::test]

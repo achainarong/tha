@@ -102,6 +102,7 @@ configured keys take precedence.
 | `previous-runtime`, `next-runtime` | Select an inventory runtime |
 | `mark`, `mark-unused`, `clear-marks` | Manage inventory cleanup marks |
 | `remove-resources` | Open unused-resource removal confirmation |
+| `prune-resources` | Confirm pruning all unreferenced images or volumes in the selected runtime (`p` / `:prune`; ignores search/filter) |
 | `inventory-filter`, `inventory-sort`, `refresh-inventory` | Filter, sort, or refresh inventory |
 | `removal-results` | Review the last cleanup results |
 
