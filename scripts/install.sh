@@ -13,6 +13,7 @@
 #   THA_VERSION=v0.6.0    install that release instead of the latest
 #   THA_BIN_DIR=...       where the tha command goes (default ~/.local/bin)
 #   MODULES=security      optional comma-separated modules (currently: security)
+#   THA_INSTALL_LOG_DIR=...  debug log directory (default ~/.local/state/tha/install)
 #
 # Updating stops a running collector before the binary is replaced and starts it
 # again afterwards, in either mode. Configuration and history are left alone.
@@ -26,6 +27,53 @@ MODULES=${MODULES:-}
 
 say() { printf 'tha: %s\n' "$*"; }
 die() { printf 'tha: %s\n' "$*" >&2; exit 1; }
+
+log_dir=${THA_INSTALL_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tha/install}
+mkdir -p "$log_dir" || die "couldn't create installer log directory: $log_dir"
+log_file=$(mktemp "$log_dir/install-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX") ||
+    die "couldn't create installer log in $log_dir"
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/tha-install.XXXXXX") || die "couldn't create installer workspace; log: $log_file"
+stage=initialization
+# A FIFO keeps subprocess output live (including module setup), without losing
+# command failures to a pipeline or requiring bash/process substitution.
+mkfifo "$tmp/output" "$tmp/errors" || die "couldn't create installer output pipes; log: $log_file"
+exec 3>&1 4>&2
+tee -a "$log_file" < "$tmp/output" &
+logger_pid=$!
+tee -a "$log_file" < "$tmp/errors" >&2 &
+logger_err_pid=$!
+exec > "$tmp/output" 2> "$tmp/errors"
+finish() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    if [ "$status" = 0 ]; then
+        say "installation complete; debug log: $log_file"
+    else
+        say "installation failed during $stage (exit $status); debug log: $log_file" >&2
+    fi
+    exec 1>&3 2>&4 3>&- 4>&-
+    wait "$logger_pid" || printf 'tha: warning: could not finish writing debug log: %s\n' "$log_file" >&2
+    wait "$logger_err_pid" || printf 'tha: warning: could not finish writing debug log: %s\n' "$log_file" >&2
+    rm -rf "$tmp"
+    exit "$status"
+}
+trap finish EXIT
+trap 'exit 1' HUP INT TERM
+debug() { printf '[%s] DEBUG %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$log_file"; }
+step() { stage=$*; debug "stage: $stage"; say "$stage"; }
+run() {
+    debug "running: $*"
+    if "$@"; then
+        debug "command completed (exit 0)"
+    else
+        result=$?
+        debug "command failed (exit $result)"
+        return "$result"
+    fi
+}
+say "debug log: $log_file"
+step "validating installation options"
+debug "mode=$MODE version=$VERSION bin_dir=$BIN_DIR modules=$MODULES"
 
 case $MODE in
     standalone | service) ;;
@@ -68,7 +116,10 @@ else
     base=https://github.com/$REPO/releases/download/$VERSION
 fi
 
-case $(uname -s)-$(uname -m) in
+step "detecting platform"
+platform=$(uname -s)-$(uname -m)
+debug "platform=$platform"
+case $platform in
     Linux-x86_64 | Linux-amd64) asset=tha-linux-amd64.tar.gz ;;
     Linux-aarch64 | Linux-arm64) asset=tha-linux-arm64.tar.gz ;;
     Darwin-arm64 | Darwin-x86_64)
@@ -83,60 +134,64 @@ esac
 # fetch URL FILE
 fetch() {
     if command -v curl >/dev/null 2>&1; then
-        curl --proto '=https' --tlsv1.2 -fsSL "$1" -o "$2"
+        run curl --proto '=https' --tlsv1.2 -fsSL "$1" -o "$2"
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$2" "$1"
+        run wget -q -O "$2" "$1"
     else
         die "needs curl or wget"
     fi || die "couldn't download $1"
 }
 
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/tha-install.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT
-trap 'exit 1' HUP INT TERM
-
-say "downloading $asset ($VERSION)"
+step "downloading $asset ($VERSION)"
 fetch "$base/$asset" "$tmp/$asset"
 fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS"
 
+step "verifying release checksum"
 awk -v asset="$asset" '$2 == asset { print }' "$tmp/SHA256SUMS" > "$tmp/CHECKSUM"
 [ "$(wc -l < "$tmp/CHECKSUM" | tr -d '[:space:]')" = 1 ] ||
     die "missing or duplicate checksum for $asset; nothing installed"
 (
     cd "$tmp"
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum -c CHECKSUM >/dev/null
+        run sha256sum -c CHECKSUM
     else
-        shasum -a 256 -c CHECKSUM >/dev/null
+        run shasum -a 256 -c CHECKSUM
     fi
 ) || die "checksum mismatch for $asset; nothing installed"
-tar -xzf "$tmp/$asset" -C "$tmp" tha || die "couldn't unpack $asset; nothing installed"
+step "unpacking release"
+run tar -xzf "$tmp/$asset" -C "$tmp" tha || die "couldn't unpack $asset; nothing installed"
 
 bin=$BIN_DIR/tha
 running=0
 # Never replace the executable under a running collector.
-if [ -x "$bin" ] && "$bin" service status 2>/dev/null | grep -q ': running$'; then
-    say "stopping the background collector for the update"
-    "$bin" service stop
+debug "checking existing collector status at $bin"
+if [ -x "$bin" ] && "$bin" service status 2>> "$log_file" | grep -q ': running$'; then
+    step "stopping the background collector for the update"
+    run "$bin" service stop
     running=1
 fi
-mkdir -p "$BIN_DIR"
-install -m 755 "$tmp/tha" "$bin"
-say "installed $("$bin" --version) to $bin"
+step "installing binary to $BIN_DIR"
+run mkdir -p "$BIN_DIR"
+run install -m 755 "$tmp/tha" "$bin"
+installed_version=$(run "$bin" --version)
+say "installed $installed_version to $bin"
 
 if [ "$MODE" = service ]; then
-    "$bin" service install
-    "$bin" service start
+    step "installing background collector service"
+    run "$bin" service install
+    step "starting background collector"
+    run "$bin" service start
     say "background collector running; check it with: tha service status"
 elif [ "$running" = 1 ]; then
-    "$bin" service start
+    step "restarting background collector"
+    run "$bin" service start
     say "background collector restarted; remove it with: tha service uninstall"
 fi
 
 case ,$MODULES, in
     *,security,*)
-        say "installing security module (Grype image + vulnerability database; requires a running engine)"
-        "$bin" module install security ||
+        step "installing security module (Grype image + vulnerability database; requires a running engine)"
+        run "$bin" module install security ||
             die "tha was installed, but security setup failed; retry: tha module install security"
         ;;
 esac

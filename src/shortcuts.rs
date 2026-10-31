@@ -174,6 +174,11 @@ impl Scope {
                 matches!(
                     context,
                     C::Performance
+                        | C::Overview
+                        | C::Logs
+                        | C::Networks
+                        | C::Exec
+                        | C::Layers
                         | C::Metrics
                         | C::Images
                         | C::ImageDetails
@@ -232,6 +237,7 @@ macro_rules! catalog {
 }
 
 catalog! {
+    Noop, "Disabled key", [], Global, 40, false, [], [];
     Help, "Help", ["help"], Global, 0, false, ["?"], ["F1"];
     Views, "Views", ["views"], Global, 1, false, ["v"], [];
     Commands, "Commands", [], Global, 2, false, [":"], [];
@@ -247,8 +253,8 @@ catalog! {
     FocusNext, "Next pane", [], Containers, 5, false, ["tab"], [];
     FocusPrevious, "Previous pane", [], Containers, 40, false, ["shift-tab"], [];
     SecurityFocusNext, "Images / findings pane", [], Security, 5, true, ["tab"], ["shift-tab"];
-    PreviousView, "Previous overview", [], Global, 40, false, [], ["shift-left", "F7"];
-    NextView, "Next overview", [], Global, 40, false, [], ["shift-right", "F8"];
+    PreviousView, "Previous overview", [], Global, 40, false, ["ctrl-left"], ["shift-left", "F7"];
+    NextView, "Next overview", [], Global, 40, false, ["ctrl-right"], ["shift-right", "F8"];
     ContainersView, "Containers view", [], Global, 40, false, [], ["alt-1"];
     ImagesView, "Images view", ["images"], Global, 40, false, [], ["alt-2"];
     VolumesView, "Volumes view", ["volumes"], Global, 40, false, [], ["alt-3"];
@@ -341,36 +347,107 @@ impl ActionId {
         }
     }
 
-    /// Configuration remains navigation-only, not a way to bind mutations.
+    /// Stable configuration names for every action in the shared catalog.
+    /// Bindings only apply in navigation; input owners and confirmations go first.
+    pub fn config_name(self) -> &'static str {
+        match self {
+            Self::Noop => "none",
+            Self::Help => "help",
+            Self::Views => "views",
+            Self::Commands => "commands",
+            Self::Back => "back",
+            Self::Escape => "escape",
+            Self::Down => "down",
+            Self::Up => "up",
+            Self::PageDown => "page-down",
+            Self::PageUp => "page-up",
+            Self::First => "first",
+            Self::Last => "last",
+            Self::Open => "open",
+            Self::FocusNext => "focus-next",
+            Self::FocusPrevious => "focus-previous",
+            Self::SecurityFocusNext => "security-focus-next",
+            Self::PreviousView => "previous-view",
+            Self::NextView => "next-view",
+            Self::ContainersView => "containers-view",
+            Self::ImagesView => "images-view",
+            Self::VolumesView => "volumes-view",
+            Self::SecurityView => "security-view",
+            Self::Overview => "overview",
+            Self::Logs => "logs",
+            Self::Networks => "networks",
+            Self::Exec => "exec",
+            Self::Metrics => "metrics",
+            Self::Layers => "layers",
+            Self::Security => "security",
+            Self::Search => "search",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::PreviousRuntime => "previous-runtime",
+            Self::NextRuntime => "next-runtime",
+            Self::SecurityPreviousRuntime => "security-previous-runtime",
+            Self::SecurityNextRuntime => "security-next-runtime",
+            Self::ToggleBranch => "toggle-branch",
+            Self::PerformanceSpace => "performance-close",
+            Self::HalfPageDown => "half-page-down",
+            Self::HalfPageUp => "half-page-up",
+            Self::NextMatch => "next-match",
+            Self::PreviousMatch => "previous-match",
+            Self::WorkspaceBack => "workspace-back",
+            Self::AllRuntimes => "all-runtimes",
+            Self::OpenExec => "open-exec",
+            Self::Actions => "actions",
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+            Self::DeleteContainer => "delete-container",
+            Self::Performance => "performance",
+            Self::PerformanceScope => "performance-scope",
+            Self::SortContexts => "sort-contexts",
+            Self::Zoom => "zoom",
+            Self::Wrap => "wrap",
+            Self::Follow => "follow",
+            Self::FilterLogs => "filter-logs",
+            Self::ClearLogFilter => "clear-log-filter",
+            Self::ExportLogs => "export-logs",
+            Self::ReconnectLogs => "reconnect-logs",
+            Self::ExecSessions => "exec-sessions",
+            Self::CloseExec => "close-exec",
+            Self::PreviousRange => "previous-range",
+            Self::NextRange => "next-range",
+            Self::MetricsLeft => "metrics-left",
+            Self::MetricsRight => "metrics-right",
+            Self::MetricsCursor => "metrics-cursor",
+            Self::MetricsLive => "metrics-live",
+            Self::Mark => "mark",
+            Self::MarkUnused => "mark-unused",
+            Self::ClearMarks => "clear-marks",
+            Self::RemoveResources => "remove-resources",
+            Self::InventoryFilter => "inventory-filter",
+            Self::InventorySort => "inventory-sort",
+            Self::RefreshInventory => "refresh-inventory",
+            Self::CheckImage => "check-image",
+            Self::CheckImages => "check-images",
+            Self::CheckSecurityImage => "check-security-image",
+            Self::ClearScanChecks => "clear-scan-checks",
+            Self::ScanImage => "scan-image",
+            Self::ScanImages => "scan-images",
+            Self::CancelScan => "cancel-scan",
+            Self::UpdateSecurity => "update-security-db",
+            Self::ReloadLayers => "reload-layers",
+            Self::Refresh => "refresh",
+            Self::ActionResults => "action-results",
+            Self::RemovalResults => "removal-results",
+            Self::Monochrome => "monochrome",
+            Self::Quit => "quit",
+        }
+    }
+
     pub fn configurable(name: &str) -> Option<Self> {
-        Some(match name {
-            "down" => Self::Down,
-            "up" => Self::Up,
-            "left" => Self::Left,
-            "right" => Self::Right,
-            "page-down" => Self::PageDown,
-            "page-up" => Self::PageUp,
-            "first" => Self::First,
-            "last" => Self::Last,
-            "overview" => Self::Overview,
-            "logs" => Self::Logs,
-            "networks" => Self::Networks,
-            "exec" => Self::Exec,
-            "metrics" => Self::Metrics,
-            "layers" => Self::Layers,
-            "security" => Self::Security,
-            "open-exec" => Self::OpenExec,
-            "actions" => Self::Actions,
-            "performance" => Self::Performance,
-            "sort-contexts" => Self::SortContexts,
-            "wrap" => Self::Wrap,
-            "follow" => Self::Follow,
-            "help" => Self::Help,
-            "filter-logs" => Self::FilterLogs,
-            "exec-sessions" => Self::ExecSessions,
-            "views" => Self::Views,
-            _ => return None,
-        })
+        ACTIONS
+            .iter()
+            .find(|info| info.id.config_name() == name)
+            .map(|info| info.id)
     }
 }
 
@@ -445,9 +522,16 @@ pub fn resolve(
                 ActionId::SecurityPreviousRuntime
             }
             (ActionId::Right, NavigationContext::SecurityImages) => ActionId::SecurityNextRuntime,
+            (
+                ActionId::FocusNext | ActionId::FocusPrevious,
+                NavigationContext::SecurityImages
+                | NavigationContext::SecurityFindings
+                | NavigationContext::SecurityAdvisory,
+            ) => ActionId::SecurityFocusNext,
             _ => action,
         })
         .or_else(|| default_action(context, event, security))
+        .filter(|action| action.lifecycle().is_none() || event.kind == KeyEventKind::Press)
 }
 
 /// Reasons are read-only projections. Execution must still revalidate state.
@@ -491,6 +575,54 @@ pub fn unavailable(app: &App, action: ActionId) -> Option<String> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn overview_navigation_defaults_to_control_arrows_and_keeps_compatibility_aliases() {
+        for context in NavigationContext::ALL {
+            for (code, action) in [
+                (crossterm::event::KeyCode::Left, ActionId::PreviousView),
+                (crossterm::event::KeyCode::Right, ActionId::NextView),
+            ] {
+                for modifiers in [
+                    crossterm::event::KeyModifiers::CONTROL,
+                    crossterm::event::KeyModifiers::SHIFT,
+                ] {
+                    assert_eq!(
+                        default_action(context, KeyEvent::new(code, modifiers), true),
+                        Some(action)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn configured_lifecycle_bindings_ignore_repeat_and_release_events() {
+        let keymap = crate::keymap::Keymap::parse(&std::collections::BTreeMap::from([(
+            "alt-s".into(),
+            "stop".into(),
+        )]))
+        .unwrap();
+        let event = KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::ALT,
+        );
+        assert_eq!(
+            resolve(NavigationContext::Explorer, event, &keymap, true),
+            Some(ActionId::Stop)
+        );
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert_eq!(
+                resolve(
+                    NavigationContext::Explorer,
+                    KeyEvent { kind, ..event },
+                    &keymap,
+                    true
+                ),
+                None
+            );
+        }
+    }
 
     #[test]
     fn catalog_has_unique_ids_commands_and_contextual_keys() {

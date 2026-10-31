@@ -40,7 +40,17 @@ if [ "$1" != "--host" ] || [ "$2" != "unix:///fixture.sock" ]; then
 fi
 shift 2
 case "$1" in
-    pull|run|rm) exit 0 ;;
+    info)
+        if [ "$THA_FIXTURE_ENGINE_OFFLINE" = 1 ]; then
+            echo "fixture engine is offline" >&2
+            exit 1
+        fi
+        exit 0 ;;
+    pull|rm) exit 0 ;;
+    run)
+        [ "$2" = --tty ] || exit 1
+        printf '\033[32mVulnerability DB\033[0m [12 MB / 180 MB]\rVulnerability DB [validating]\r'
+        exit 0 ;;
     image) printf 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' ;;
     *) echo "unexpected command" >&2; exit 1 ;;
 esac
@@ -107,6 +117,48 @@ esac
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut remaining = stderr.as_ref();
+    for stage in [
+        "Setup requires the Docker CLI and a running Docker-compatible engine",
+        "Locating Docker CLI",
+        "Resolving Docker endpoint",
+        "Using endpoint unix:///fixture.sock",
+        "Checking container engine",
+        "Container engine is ready",
+        "Pulling scanner image anchore/grype:latest",
+        "Checking scanner image identity",
+        "Updating vulnerability database",
+        "Downloading vulnerability database: 12.0 MB / 180.0 MB",
+        "Download finished; validating vulnerability database",
+        "Vulnerability database is ready",
+        "Saving security update metadata",
+        "Enabling security module",
+    ] {
+        let position = remaining
+            .find(stage)
+            .unwrap_or_else(|| panic!("Missing or out-of-order stage {stage}: {stderr}"));
+        remaining = &remaining[position + stage.len()..];
+    }
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Security service module ready"));
+
+    let failed = Command::new(env!("CARGO_BIN_EXE_tha"))
+        .arg("--config")
+        .arg(&config)
+        .args(["module", "install", "security"])
+        .current_dir(temp.path())
+        .env("PATH", "bin:")
+        .env("XDG_DATA_HOME", temp.path())
+        .env("DOCKER_HOST", "unix:///fixture.sock")
+        .env("THA_FIXTURE_ENGINE_OFFLINE", "1")
+        .output()
+        .await
+        .unwrap();
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("start it, check `docker info`"), "{stderr}");
+    assert!(stderr.contains("fixture engine is offline"), "{stderr}");
+    assert!(!stderr.contains("Pulling scanner image"), "{stderr}");
     let root = temp.path().join("tha/modules/security");
     let remembered = fs::read_to_string(root.join("docker-path")).unwrap();
     let remembered = std::path::Path::new(&remembered);

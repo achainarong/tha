@@ -9,11 +9,24 @@ exec_command = ["sh"] # Use ["bash", "-l"] if your image has bash instead.
 max_exec_sessions = 4 # Includes exited sessions; F6 selects, :close-exec frees a slot (1–8).
 save_preferences = true # Separate XDG state file; never stores logs or shells. Demo never writes state.
 
-# Navigation-only aliases; editors, confirmations, pickers, and shell input keep original keys.
-# [bindings]
+# Keys apply only in navigation; editors, confirmations, pickers, and shells keep raw keys.
+# Full action list and examples: docs/keybindings.md. Restart Tha after changes.
+# Custom keys override matching defaults; other defaults remain available.
+[bindings]
+"z" = "zoom"
+"ctrl-left" = "previous-view"
+"ctrl-right" = "next-view"
+# To move fullscreen from z to x, replace the z line above with these two lines:
+# "z" = "none"
+# "x" = "zoom"
 # "alt-j" = "down"
 # "alt-k" = "up"
-# "F7" = "exec-sessions"
+# "alt-n" = "focus-next"
+# "alt-p" = "focus-previous"
+# "F6" = "exec-sessions"
+# "alt-f" = "filter-logs"
+# "alt-c" = "metrics-cursor"
+# "alt-s" = "stop" # Still opens a confirmation; never bypasses safety checks.
 
 # Discovery still runs alongside these explicit connections.
 # Docker API connections currently require a Unix socket. SSH/TLS contexts

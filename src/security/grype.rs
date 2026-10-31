@@ -112,6 +112,15 @@ async fn bounded(mut input: impl tokio::io::AsyncRead + Unpin, limit: u64) -> Re
 }
 
 pub async fn command(connection: &Connection, args: &[&str], seconds: u64) -> Result<Vec<u8>> {
+    command_with_progress(connection, args, seconds, None).await
+}
+
+async fn command_with_progress(
+    connection: &Connection,
+    args: &[&str],
+    seconds: u64,
+    progress: Option<&(dyn Fn(&str) + Sync)>,
+) -> Result<Vec<u8>> {
     let mut child = docker(connection).args(args).spawn().context(
         "Security requires the Docker CLI on PATH and a running Docker-compatible engine",
     )?;
@@ -119,19 +128,134 @@ pub async fn command(connection: &Connection, args: &[&str], seconds: u64) -> Re
     let stderr = child.stderr.take().context("Missing scanner stderr")?;
     tokio::time::timeout(Duration::from_secs(seconds), async {
         let (stdout, stderr, status) = tokio::try_join!(
-            bounded(stdout, MAX_OUTPUT),
-            bounded(stderr, 256 * 1024),
+            async {
+                match progress {
+                    Some(progress) => progress_output(stdout, MAX_OUTPUT, progress).await,
+                    None => bounded(stdout, MAX_OUTPUT).await,
+                }
+            },
+            async {
+                match progress {
+                    Some(progress) => progress_output(stderr, 256 * 1024, progress).await,
+                    None => bounded(stderr, 256 * 1024).await,
+                }
+            },
             async { Ok::<_, anyhow::Error>(child.wait().await?) }
         )?;
         ensure!(
             status.success(),
             "Scanner command failed: {}",
-            crate::layers::text(&String::from_utf8_lossy(&stderr))
+            crate::layers::text(&String::from_utf8_lossy(
+                if progress.is_some() && stderr.is_empty() {
+                    &stdout
+                } else {
+                    &stderr
+                }
+            ))
         );
         Ok(stdout)
     })
     .await
     .context("Scanner command timed out")?
+}
+
+fn database_progress(line: &str) -> Option<String> {
+    use std::sync::LazyLock;
+    static TRANSFER: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"([0-9]+(?:\.[0-9]+)?)\s*(B|kB|KB|MB|GB|TB|KiB|MiB|GiB)\s*/\s*([0-9]+(?:\.[0-9]+)?)\s*(B|kB|KB|MB|GB|TB|KiB|MiB|GiB)")
+            .expect("database progress pattern")
+    });
+    let line = crate::model::safe_text(line);
+    if !line.contains("Vulnerability DB") {
+        return None;
+    }
+    if let Some(captures) = TRANSFER.captures(&line) {
+        let megabytes = |number: &str, unit: &str| -> Option<f64> {
+            let multiplier = match unit {
+                "B" => 1.0,
+                "kB" | "KB" => 1_000.0,
+                "MB" => 1_000_000.0,
+                "GB" => 1_000_000_000.0,
+                "TB" => 1_000_000_000_000.0,
+                "KiB" => 1024.0,
+                "MiB" => 1024.0 * 1024.0,
+                "GiB" => 1024.0 * 1024.0 * 1024.0,
+                _ => return None,
+            };
+            Some(number.parse::<f64>().ok()? * multiplier / 1_000_000.0)
+        };
+        let current = megabytes(&captures[1], &captures[2])?;
+        let total = megabytes(&captures[3], &captures[4])?;
+        if current.is_finite() && total.is_finite() && total > 0.0 && current <= total {
+            return Some(format!(
+                "Downloading vulnerability database: {current:.1} MB / {total:.1} MB"
+            ));
+        }
+    }
+    for (stage, message) in [
+        (
+            "validating",
+            "Download finished; validating vulnerability database…",
+        ),
+        (
+            "unarchiving",
+            "Download verified; unpacking vulnerability database…",
+        ),
+        ("importing", "Importing vulnerability database…"),
+    ] {
+        if line.contains(stage) {
+            return Some(message.into());
+        }
+    }
+    None
+}
+
+async fn progress_output(
+    mut input: impl tokio::io::AsyncRead + Unpin,
+    limit: u64,
+    progress: &(dyn Fn(&str) + Sync),
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut line = Vec::new();
+    let mut chunk = [0; 4096];
+    let mut previous = None;
+    let mut reported_at: Option<tokio::time::Instant> = None;
+    loop {
+        let count = input.read(&mut chunk).await?;
+        for &byte in &chunk[..count] {
+            if byte == b'\r' || byte == b'\n' {
+                if let Some(message) = database_progress(&String::from_utf8_lossy(&line)) {
+                    let now = tokio::time::Instant::now();
+                    if previous.as_ref() != Some(&message)
+                        && (!message.starts_with("Downloading")
+                            || reported_at.is_none_or(|last| {
+                                now.duration_since(last) >= Duration::from_secs(1)
+                            }))
+                    {
+                        progress(&message);
+                        previous = Some(message);
+                        reported_at = Some(now);
+                    }
+                }
+                line.clear();
+            } else if line.len() < 8192 {
+                line.push(byte);
+            }
+        }
+        ensure!(
+            output.len() as u64 + count as u64 <= limit,
+            "Scanner output exceeded its size limit"
+        );
+        output.extend_from_slice(&chunk[..count]);
+        if count == 0 {
+            if let Some(message) = database_progress(&String::from_utf8_lossy(&line))
+                && previous.as_ref() != Some(&message)
+            {
+                progress(&message);
+            }
+            return Ok(output);
+        }
+    }
 }
 
 pub async fn default_connection() -> Result<Connection> {
@@ -219,15 +343,23 @@ pub async fn remove_image(connection: &Connection, image: &str) -> Result<()> {
     }
 }
 
-pub async fn update_database(connection: &Connection, scanner: &str, name: &str) -> Result<()> {
+pub async fn update_database(
+    connection: &Connection,
+    scanner: &str,
+    name: &str,
+    progress: &(impl Fn(&str) + Sync),
+) -> Result<()> {
     let _cleanup = Cleanup {
         connection: connection.clone(),
         name: name.into(),
     };
-    let result = command(
+    let result = command_with_progress(
         connection,
         &[
             "run",
+            // Grype emits byte counters only with its terminal UI enabled. This
+            // allocates a container TTY, not interactive input from the caller.
+            "--tty",
             "--rm",
             "--name",
             name,
@@ -240,15 +372,22 @@ pub async fn update_database(connection: &Connection, scanner: &str, name: &str)
             "GRYPE_DB_CACHE_DIR=/cache",
             "-e",
             "GRYPE_CHECK_FOR_APP_UPDATE=false",
+            "-e",
+            "NO_COLOR=1",
+            "-e",
+            "TERM=xterm",
             scanner,
             "db",
             "update",
         ],
         600,
+        Some(progress),
     )
     .await;
     remove(connection, name).await?;
-    result.map(|_| ())
+    result?;
+    progress("Vulnerability database is ready.");
+    Ok(())
 }
 
 pub async fn scan(
@@ -420,6 +559,90 @@ fn parse(bytes: &[u8]) -> Result<Report> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn database_progress_formats_real_byte_counts_and_download_stages() {
+        for (line, expected) in [
+            (
+                "\x1b[32mVulnerability DB\x1b[0m [12 MB / 180 MB]",
+                "Downloading vulnerability database: 12.0 MB / 180.0 MB",
+            ),
+            (
+                "Vulnerability DB [500 kB / 1.2 GB]",
+                "Downloading vulnerability database: 0.5 MB / 1200.0 MB",
+            ),
+            (
+                "Vulnerability DB [1 MiB / 2 MiB]",
+                "Downloading vulnerability database: 1.0 MB / 2.1 MB",
+            ),
+            (
+                "Vulnerability DB [validating]",
+                "Download finished; validating vulnerability database…",
+            ),
+            (
+                "Vulnerability DB [unarchiving]",
+                "Download verified; unpacking vulnerability database…",
+            ),
+        ] {
+            assert_eq!(super::database_progress(line).as_deref(), Some(expected));
+        }
+        for line in [
+            "other task 1 MB / 2 MB",
+            "Vulnerability DB [0 B / 0 B]",
+            "Vulnerability DB [3 MB / 2 MB]",
+        ] {
+            assert_eq!(super::database_progress(line), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn database_progress_streams_before_completion_and_preserves_raw_diagnostics() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let reported = tokio::sync::Notify::new();
+        let messages = std::sync::Mutex::new(Vec::new());
+        let progress = |message: &str| {
+            messages.lock().unwrap().push(message.to_owned());
+            reported.notify_one();
+        };
+        let write = async {
+            writer.write_all(b"\x1b[32mVulnerability ").await.unwrap();
+            writer
+                .write_all(b"DB [12 MB / 180 MB]\x1b[0m\r")
+                .await
+                .unwrap();
+            // The child waits for a live progress event before exiting.
+            reported.notified().await;
+            writer
+                .write_all(b"Vulnerability DB [validating]")
+                .await
+                .unwrap();
+            writer.shutdown().await.unwrap();
+        };
+        let read = super::progress_output(reader, 1024, &progress);
+        let ((), output) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(write, read)
+        })
+        .await
+        .unwrap();
+        assert!(String::from_utf8_lossy(&output.unwrap()).contains("12 MB / 180 MB"));
+        assert_eq!(
+            *messages.lock().unwrap(),
+            [
+                "Downloading vulnerability database: 12.0 MB / 180.0 MB",
+                "Download finished; validating vulnerability database…"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn database_progress_output_remains_bounded() {
+        assert!(
+            super::progress_output(&b"oversized output"[..], 4, &|_| {})
+                .await
+                .is_err()
+        );
+    }
+
     use super::*;
     #[test]
     fn findings_are_prioritized_and_missing_scores_are_not_zero() {

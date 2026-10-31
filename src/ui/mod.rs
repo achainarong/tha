@@ -222,7 +222,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ),
     ]);
     let breadcrumb = if app.overview_mode != OverviewMode::Containers {
-        " Shift+←/→ or F7/F8 Overview · ←/→ Runtime · ↑/↓ Select · / Search · Enter Details".into()
+        " Ctrl+←/→ or F7/F8 Overview · ←/→ Runtime · ↑/↓ Select · / Search · Enter Details".into()
     } else if let Some(project) = &app.project {
         format!(
             " All runtimes › {}{} › {}  · Backspace Back",
@@ -247,9 +247,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let history_zoom = app.overview_mode == OverviewMode::Containers
         && app.tab == Tab::History
         && app.history_view.expanded;
+    let detail_zoom = app.overview_mode == OverviewMode::Containers
+        && app.detail_focus
+        && !app.performance_focus
+        && app.detail_zoom == Some(app.tab);
     let expanded = app.overview_mode == OverviewMode::Containers
         && !history_zoom
         && !security_zoom
+        && !detail_zoom
         && app.performance_open
         && app.performance_expanded
         && layout[1].height >= 20;
@@ -272,6 +277,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         security::draw(frame, app, body);
     } else if history_zoom {
         history::draw(frame, app, body);
+    } else if detail_zoom {
+        draw_details(frame, app, body);
     } else if area.width >= 110 {
         let tree_width = (area.width / 2).clamp(52, 72);
         let panes =
@@ -2385,7 +2392,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         } else if app.detail_focus && app.tab == Tab::Logs {
             "? Keys  F3 Filter  :export-logs  w Wrap  / Search  n/N Match  j/k Scroll  f Follow  Tab Explorer"
         } else {
-            "Shift+←/→ Overview  ? Keys  a Actions  p Performance  Enter Open  e Exec  Tab Pane  1..7 Details  : Commands"
+            "Ctrl+←/→ Overview  ? Keys  a Actions  p Performance  Enter Open  e Exec  Tab Pane  1..7 Details  : Commands"
         };
         vec![Line::styled(hints, muted()), Line::from(safe_text(notice))]
     };
@@ -2463,7 +2470,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         "Tab / Shift-Tab   Cycle Explorer / Performance (open) / Details\n",
         "p                 Open/close Performance (compact by default)\n",
         "P (Shift-p)       Switch Runtime / Selected container; open Performance\n",
-        "z                 Zoom focused Performance to full-width bottom panel\n",
+        "z                 Expand / restore the focused detail tab or Performance\n",
         "Esc               Restore compact Performance before other navigation\n",
         "o                 Sort contexts (pins first; usage is a snapshot)\n",
         "S / s / r / d     Start / Stop / Restart / Delete in Explorer\n",
@@ -2471,7 +2478,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         "                  y/Enter confirms; n/Esc cancels; Delete: type name + Enter\n",
         "                  Delete stopped containers only; keep networks/volumes/images\n",
         "1..6              Overview / Logs / Net / Exec / Metrics / Layers\n",
-        "Shift+←/→, F7/F8   Cycle overviews · Alt+1/2/3 direct\n",
+        "Ctrl+←/→, F7/F8    Cycle overviews · Alt+1/2/3 direct\n",
         "a                 Contextual actions with disabled reasons (Explorer)\n",
         "Enter in Layers   Expand details; Esc returns; no image pulls\n",
         "F6 / :exec-sessions Switch retained shells (navigation mode only)\n",
@@ -2516,7 +2523,24 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|(key, action)| format!("{} → {}\n", safe_text(key), safe_text(action)))
         .collect::<String>();
     let text = format!(
-        "{defaults}\n\nCustom navigation bindings (override defaults only in navigation)\n{custom}"
+        "{defaults}\n\nSet a key to 'none' to disable it. Restart after editing config.toml.\n\nConfigurable action names (built-in defaults; custom keys below take precedence)\n{}\nCustom navigation bindings (override defaults only in navigation)\n{custom}\nExec and lifecycle actions can change workloads. Confirmations remain required.",
+        crate::shortcuts::ACTIONS
+            .iter()
+            .map(|info| {
+                let keys = info
+                    .bindings
+                    .iter()
+                    .map(|binding| binding.key)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "{} — {} [{}]\n",
+                    info.id.config_name(),
+                    info.label,
+                    if keys.is_empty() { "unbound" } else { &keys }
+                )
+            })
+            .collect::<String>()
     );
     let block = Block::bordered()
         .title(" Tha · Shortcuts / Cheatsheet ")
@@ -2712,6 +2736,46 @@ mod tests {
         assert!(axis.contains("−60s"));
         assert!(axis.ends_with("latest"));
         assert_eq!(history_axis(2, Duration::from_secs(60)).chars().count(), 2);
+    }
+
+    #[test]
+    fn inner_tabs_zoom_to_full_width_and_survive_resize() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, Scope::Container(_)))
+            .unwrap();
+        app.detail_focus = true;
+        app.performance_open = true;
+        app.performance_expanded = true;
+        for tab in [
+            Tab::Overview,
+            Tab::Logs,
+            Tab::Networks,
+            Tab::Exec,
+            Tab::Layers,
+        ] {
+            app.tab = tab;
+            app.detail_zoom = Some(tab);
+            for (width, height) in [(140, 40), (60, 20), (32, 10), (140, 40)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let row: String = (0..width).map(|x| buffer[(x, 2)].symbol()).collect();
+                let label = match tab {
+                    Tab::Overview => "1 Overview",
+                    Tab::Logs => "2 Logs",
+                    Tab::Networks => "3 Networks",
+                    Tab::Exec => "4 Exec",
+                    Tab::Layers => "6 Layers",
+                    _ => unreachable!(),
+                };
+                assert!(row.contains(label), "{tab:?}: {row}");
+                assert_eq!(buffer[(width - 1, 2)].symbol(), "┓");
+            }
+        }
     }
 
     #[test]

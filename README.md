@@ -29,6 +29,9 @@ curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/instal
 **Service + Security** additionally sets up the
 [security module](#optional-security-module) (Grype image vulnerability scanning):
 
+Requires the Docker CLI and a **running Docker-compatible container engine** during
+setup and scanning. Colima is optional; native Docker Engine works on Linux.
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | MODULES=security sh
 ```
@@ -42,13 +45,30 @@ verifies the checksum, and installs `tha` into `~/.local/bin`. It needs `curl` o
 | `THA_MODE=service` | Same as passing `service` |
 | `THA_VERSION=v0.6.0` | Install that release instead of the latest (pin or roll back) |
 | `THA_BIN_DIR=...` | Install somewhere other than `~/.local/bin` |
+| `THA_INSTALL_LOG_DIR=...` | Override the installer debug log directory (default `$XDG_STATE_HOME/tha/install`, or `~/.local/state/tha/install`) |
 | `MODULES=security` | Install the Security service module; implies service mode; requires Docker CLI and a running Docker-compatible Unix endpoint |
 
 Re-running the script updates in place. A running collector is stopped before the
 binary is replaced and started again afterwards, in either mode. Configuration and
 history are never touched.
 
+The installer displays progress and prints the path to a private debug log on
+success or failure. Each run keeps its own log with timestamps, command exit codes,
+and subprocess output (including Security setup). Review logs before sharing:
+diagnostics may contain local paths or runtime details. There is no environment
+dump or shell tracing. Logs are kept until you remove them.
+
+Security database downloads display real transferred/total counts, for example
+`12.0 MB / 180.0 MB`, followed by validation/unpacking status. If the scanner does
+not report byte counts, setup still reports elapsed activity rather than guessing
+the download size or percentage.
+
 ### Optional security module
+
+Start your Docker-compatible container engine before installing or scanning. Setup
+pulls the scanner image and runs it to initialize the vulnerability database; Tha
+does not start the engine for you. Installation prints each setup stage and elapsed
+time every 10 seconds while pulling the scanner or updating its database.
 
 ```sh
 # MODULES belongs on the shell side of the pipe, not on curl.
@@ -83,7 +103,7 @@ The installer starts the per-user service before provisioning the module. Manual
 absolute path is recorded during setup so launchd/systemd need not inherit your shell's PATH.
 
 When enabled, **Security is a fourth top-level view**, alongside Containers, Images
-and Volumes. **Shift+Left/Right** (or F7/F8) cycles all four; **Alt+4** opens Security
+and Volumes. **Ctrl+Left/Right** (or F7/F8) cycles all four; **Alt+4** opens Security
 directly. Without the module, only the original three views are shown.
 
 In **Security** (or **Images**, `:images`), press **m** to check individual images or **M** to check
@@ -181,7 +201,7 @@ make demo       # Try the UI without contacting any runtime
 make run        # Discover and browse your actual engines
 make install                # Standalone: install tha into ~/.cargo/bin (or your Cargo root)
 make install MODE=service   # Also install and start the per-user background collector
-make install:full           # Service mode + security module, both installed and enabled
+make install:full           # Service + security; requires Docker CLI and a running engine
 tha
 ```
 
@@ -343,8 +363,8 @@ your navigation. Demo mode never auto-opens a project.
 
 Search is applied with `Enter`; `Esc` cancels input. Navigation shortcuts do not
 fire while typing. Toggling a search-expanded branch with `Space` clears the tree
-filter and collapses that branch, keeping it selected. Bindings are fixed for
-this MVP; configurable bindings follow later.
+filter and collapses that branch, keeping it selected. Shortcuts can be customized
+in the config's `[bindings]` table; see [keybindings](docs/keybindings.md).
 
 ### Logs
 
@@ -387,7 +407,7 @@ semantic multiline grouping, and export are follow-up work.
 ### Runtime Images and Volumes
 
 Use **F7 / F8** to cycle backward/forward through Containers, Images and Volumes.
-**Shift+Left / Shift+Right** also cycles these three overview screens.
+**Ctrl+Left / Ctrl+Right** cycles these three overview screens. Shift+arrows remain compatibility aliases.
 Existing configured navigation bindings take precedence over these defaults.
 Or switch directly with **Alt+1** (Containers),
 **Alt+2** (Images, also `:images`), and **Alt+3** (Volumes, also `:volumes`).
@@ -705,17 +725,25 @@ Add navigation-only aliases using crokey key syntax in `config.toml`:
 [bindings]
 "alt-j" = "down"
 "alt-k" = "up"
-"F7" = "exec-sessions"
+"ctrl-left" = "previous-view"
+"ctrl-right" = "next-view"
+"x" = "zoom"
+"z" = "none" # Disable the old fullscreen key.
+"alt-n" = "focus-next"
+"alt-s" = "stop" # Confirmation and runtime checks still apply.
 ```
 
-Actions: `up`, `down`, `left`, `right`, `page-up`, `page-down`, `first`, `last`,
-`overview`, `logs`, `networks`, `exec`, `layers`, `open-exec`, `exec-sessions`,
-`actions`, `performance`, `sort-contexts`, `wrap`, `follow`, `filter-logs`, `help`.
+Every action in the shortcut catalog can be bound, including fullscreen, pane and
+overview navigation, metrics controls, inventory, Security, and lifecycle actions.
+See the [complete action reference](docs/keybindings.md) or the action-name list in
+`?` help. The [example config](tha.example.toml) includes common bindings.
 Bindings override matching defaults **only in navigation**; editors, pickers,
 confirmations, and embedded shells receive the original keys. Esc, Enter, Tab,
 BackTab, `/`, `:`, Ctrl-c and Ctrl-] (including Ctrl-5) are reserved. Invalid,
 duplicate-normalized, and unsupported multi-key bindings fail configuration loading.
-Configured aliases are listed in `?` help. Lifecycle confirmations are not remappable.
+Other default keys remain active unless overridden or set to `none`. Restart Tha
+after editing the config. Configured aliases are listed in `?` help. Lifecycle
+shortcuts can be rebound, but confirmation input and all safety checks are unchanged.
 
 ## Structured log filters and export
 

@@ -235,10 +235,33 @@ pub async fn install(name: &str) -> Result<()> {
     if name != "security" {
         bail!("Unknown module '{name}'; available modules: security");
     }
+    let progress = |message: &str| eprintln!("Security: {message}");
+    progress(
+        "Setup requires the Docker CLI and a running Docker-compatible engine; Tha does not start it for you.",
+    );
+    progress("Locating Docker CLI…");
     grype::remember_executable()?;
-    let connection = grype::default_connection().await?;
+    let connection = updates::stage(
+        &progress,
+        "Resolving Docker endpoint…",
+        grype::default_connection(),
+    )
+    .await?;
+    progress(&format!(
+        "Using endpoint {}",
+        crate::layers::text(&connection.endpoint)
+    ));
+    updates::stage(
+        &progress,
+        "Checking container engine…",
+        grype::command(&connection, &["info", "--format", "{{.ServerVersion}}"], 10),
+    )
+    .await
+    .context("Cannot reach the container engine; start it, check `docker info`, then retry `tha module install security`")?;
+    progress("Container engine is ready. Acquiring security update lock…");
     let _lock = updates::lock()?;
-    updates::ensure(&connection, true, &grype::container_name()).await?;
+    updates::ensure_with_progress(&connection, true, &grype::container_name(), &progress).await?;
+    progress("Enabling security module…");
     let root = root()?;
     std::fs::create_dir_all(&root)?;
     use std::io::Write;
@@ -247,7 +270,7 @@ pub async fn install(name: &str) -> Result<()> {
     marker.persist(root.join("installed"))?;
     set_enabled(name, true)?;
     println!(
-        "Security service module ready. Shift+Right opens Security; scan queues continue after closing the UI."
+        "Security service module ready. Ctrl+Right cycles to Security; scan queues continue after closing the UI."
     );
     Ok(())
 }

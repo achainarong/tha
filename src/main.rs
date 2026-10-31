@@ -1404,6 +1404,24 @@ fn dispatch_navigation(
     height: usize,
     refresh: &watch::Sender<u64>,
 ) -> bool {
+    // Command-only actions use the same implementation and safeguards as the palette.
+    if matches!(
+        action,
+        A::AllRuntimes
+            | A::ClearLogFilter
+            | A::ExportLogs
+            | A::ReconnectLogs
+            | A::CloseExec
+            | A::UpdateSecurity
+            | A::ReloadLayers
+            | A::Refresh
+            | A::ActionResults
+            | A::RemovalResults
+            | A::Monochrome
+            | A::Quit
+    ) {
+        return execute(app, action.info().commands[0], refresh);
+    }
     if matches!(action, A::PreviousView | A::NextView) {
         use tha::app::OverviewMode::*;
         let forward = action == A::NextView;
@@ -1748,7 +1766,9 @@ fn dispatch_navigation(
             app.request_action(action.lifecycle().expect("lifecycle action"))
         }
         A::Back => {
-            if app.tab == Tab::History && app.history_view.expanded {
+            if app.detail_zoom == Some(app.tab) {
+                app.detail_zoom = None;
+            } else if app.tab == Tab::History && app.history_view.expanded {
                 app.history_view.expanded = false;
             } else if app.performance_focus {
                 app.performance_focus = false;
@@ -1759,7 +1779,9 @@ fn dispatch_navigation(
             }
         }
         A::Escape => {
-            if app.tab == Tab::History && app.history_view.expanded {
+            if app.detail_zoom == Some(app.tab) {
+                app.detail_zoom = None;
+            } else if app.tab == Tab::History && app.history_view.expanded {
                 app.history_view.expanded = false;
             } else if app.performance_open && app.performance_expanded {
                 app.performance_expanded = false;
@@ -1787,6 +1809,13 @@ fn dispatch_navigation(
         A::PerformanceScope => app.switch_performance_scope(),
         A::Zoom if app.performance_focus => {
             app.performance_expanded = !app.performance_expanded;
+        }
+        A::Zoom if app.detail_focus => {
+            app.detail_zoom = if app.detail_zoom == Some(app.tab) {
+                None
+            } else {
+                Some(app.tab)
+            };
         }
         A::SortContexts => app.pick_context_sort(),
         A::ExecSessions => app.pick_sessions(),
@@ -2672,6 +2701,36 @@ mod tests {
     }
 
     #[test]
+    fn inner_tabs_zoom_toggle_and_restore_without_losing_focus_or_search() {
+        let mut app = app();
+        let (tx, _) = watch::channel(0);
+        app.detail_focus = true;
+        app.tree_query = "preserve search".into();
+        for tab in [
+            Tab::Overview,
+            Tab::Logs,
+            Tab::Networks,
+            Tab::Exec,
+            Tab::Layers,
+        ] {
+            app.tab = tab;
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char('z')), 20, &tx);
+            assert_eq!(app.detail_zoom, Some(tab));
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char('z')), 20, &tx);
+            assert_eq!(app.detail_zoom, None);
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char('z')), 20, &tx);
+            handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 20, &tx);
+            assert_eq!(app.detail_zoom, None);
+            assert!(app.detail_focus);
+            assert_eq!(app.tree_query, "preserve search");
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char('z')), 20, &tx);
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char('q')), 20, &tx);
+            assert_eq!(app.detail_zoom, None);
+            assert!(app.detail_focus);
+        }
+    }
+
+    #[test]
     fn exec_input_owns_control_keys_and_ctrl_bracket_returns_to_navigation() {
         let mut app = app();
         let (tx, _) = watch::channel(0);
@@ -2680,6 +2739,7 @@ mod tests {
         app.exec_input = true;
         for code in [
             KeyCode::Char('p'),
+            KeyCode::Char('z'),
             KeyCode::Char('4'),
             KeyCode::Esc,
             KeyCode::Char('q'),
@@ -2692,6 +2752,7 @@ mod tests {
                 &tx
             ));
             assert!(app.exec_input);
+            assert_eq!(app.detail_zoom, None);
             assert!(!app.performance_open);
         }
         assert!(!handle_key(
@@ -3807,6 +3868,121 @@ mod tests {
         );
         assert!(app.picker.is_none());
         assert!(app.action_confirmation.is_some());
+        assert!(app.action_request.is_none());
+    }
+
+    #[test]
+    fn configurable_zoom_views_metrics_and_command_actions_use_normal_routing() {
+        use tha::app::OverviewMode as O;
+        let mut app = app();
+        let (tx, _) = watch::channel(0);
+        app.keymap = tha::keymap::Keymap::parse(&std::collections::BTreeMap::from([
+            ("x".into(), "zoom".into()),
+            ("z".into(), "none".into()),
+            ("alt-left".into(), "previous-view".into()),
+            ("alt-right".into(), "next-view".into()),
+            ("alt-n".into(), "focus-next".into()),
+            ("alt-m".into(), "monochrome".into()),
+            ("alt-r".into(), "next-range".into()),
+        ]))
+        .unwrap();
+        app.detail_focus = true;
+        app.tab = Tab::Logs;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('z')), 20, &tx);
+        assert_eq!(app.detail_zoom, None);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('x')), 20, &tx);
+        assert_eq!(app.detail_zoom, Some(Tab::Logs));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('x')), 20, &tx);
+        assert_eq!(app.detail_zoom, None);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+            20,
+            &tx,
+        );
+        assert_eq!(app.overview_mode, O::Images);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            20,
+            &tx,
+        );
+        assert_eq!(app.overview_mode, O::Volumes);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            20,
+            &tx,
+        );
+        assert_eq!(app.overview_mode, O::Images);
+        let colors = app.monochrome;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
+            20,
+            &tx,
+        );
+        assert_eq!(app.monochrome, !colors);
+        app.overview_mode = O::Security;
+        app.security.enabled = true;
+        app.detail_focus = false;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT),
+            20,
+            &tx,
+        );
+        assert!(app.detail_focus);
+        app.overview_mode = O::Containers;
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, tha::app::Scope::Container(_)))
+            .unwrap();
+        app.tab = Tab::History;
+        let range = app.history_view.range;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+            20,
+            &tx,
+        );
+        assert_eq!(app.history_view.range, range + 1);
+        app.input_mode = InputMode::Search;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('x')), 20, &tx);
+        assert_eq!(app.input, "x");
+        assert!(!app.history_view.expanded);
+    }
+
+    #[test]
+    fn rebound_lifecycle_keys_still_require_visible_confirmation_and_normal_scope() {
+        let mut app = lifecycle_app("running");
+        let (tx, _) = watch::channel(0);
+        app.keymap = tha::keymap::Keymap::parse(&std::collections::BTreeMap::from([(
+            "alt-s".into(),
+            "stop".into(),
+        )]))
+        .unwrap();
+        let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT);
+        handle_key(
+            &mut app,
+            KeyEvent {
+                kind: KeyEventKind::Repeat,
+                ..key
+            },
+            20,
+            &tx,
+        );
+        assert!(app.action_confirmation.is_none());
+        handle_key(&mut app, key, 20, &tx);
+        assert!(app.action_confirmation.is_some());
+        assert!(app.action_request.is_none());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('n')), 20, &tx);
+        assert!(app.action_confirmation.is_none());
+        app.detail_focus = true;
+        app.tab = Tab::Logs;
+        handle_key(&mut app, key, 20, &tx);
+        assert!(app.action_confirmation.is_none());
         assert!(app.action_request.is_none());
     }
 

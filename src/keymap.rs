@@ -56,6 +56,44 @@ impl Keymap {
 mod tests {
     use super::*;
     #[test]
+    fn every_catalog_action_has_a_unique_documented_config_binding() {
+        let reference = include_str!("../docs/keybindings.md");
+        let mut names = std::collections::HashSet::new();
+        for info in crate::shortcuts::ACTIONS {
+            let name = info.id.config_name();
+            assert!(names.insert(name), "Duplicate action name {name}");
+            assert!(
+                reference.contains(&format!("`{name}`")),
+                "Undocumented action {name}"
+            );
+            let map = Keymap::parse(&BTreeMap::from([("alt-j".into(), name.into())])).unwrap();
+            assert_eq!(
+                map.action(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT)),
+                Some(info.id)
+            );
+        }
+    }
+
+    #[test]
+    fn example_configuration_contains_valid_editable_defaults() {
+        let config: crate::config::Config =
+            toml::from_str(include_str!("../tha.example.toml")).unwrap();
+        let map = Keymap::parse(&config.bindings).unwrap();
+        assert_eq!(
+            map.action(KeyEvent::from(KeyCode::Char('z'))),
+            Some(ActionId::Zoom)
+        );
+        assert_eq!(
+            map.action(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)),
+            Some(ActionId::PreviousView)
+        );
+        assert_eq!(
+            map.action(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)),
+            Some(ActionId::NextView)
+        );
+    }
+
+    #[test]
     fn parser_normalizes_and_rejects_ambiguous_or_reserved_bindings() {
         let bindings = BTreeMap::from([("alt-j".into(), "down".into())]);
         let map = Keymap::parse(&bindings).unwrap();

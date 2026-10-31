@@ -40,6 +40,33 @@ pub fn lock() -> Result<File> {
 }
 
 pub async fn ensure(connection: &Connection, force: bool, update_name: &str) -> Result<String> {
+    ensure_with_progress(connection, force, update_name, &|_| {}).await
+}
+
+pub async fn stage<T>(
+    progress: &(impl Fn(&str) + Sync),
+    message: &str,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    progress(message);
+    let started = tokio::time::Instant::now();
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            result = &mut work => return result.with_context(|| message.trim_end_matches('…').to_owned()),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                progress(&format!("{message} still running ({}s elapsed)", started.elapsed().as_secs()));
+            }
+        }
+    }
+}
+
+pub async fn ensure_with_progress(
+    connection: &Connection,
+    force: bool,
+    update_name: &str,
+    progress: &(impl Fn(&str) + Sync),
+) -> Result<String> {
     let root = root()?;
     std::fs::create_dir_all(&root)?;
     let path = root.join("updates.json");
@@ -68,7 +95,13 @@ pub async fn ensure(connection: &Connection, force: bool, update_name: &str) -> 
             return Ok(entry.scanner.clone());
         }
     }
-    grype::command(connection, &["pull", "anchore/grype:latest"], 600).await?;
+    stage(
+        progress,
+        "Pulling scanner image anchore/grype:latest…",
+        grype::command(connection, &["pull", "anchore/grype:latest"], 600),
+    )
+    .await?;
+    progress("Checking scanner image identity…");
     let output = grype::command(
         connection,
         &[
@@ -86,7 +119,12 @@ pub async fn ensure(connection: &Connection, force: bool, update_name: &str) -> 
         crate::platform::immutable_image_id(&scanner),
         "Scanner image identity unavailable"
     );
-    grype::update_database(connection, &scanner, update_name).await?;
+    stage(
+        progress,
+        "Updating vulnerability database (first download may take several minutes)…",
+        grype::update_database(connection, &scanner, update_name, progress),
+    )
+    .await?;
     if let Some(previous) = entries.get(&connection.endpoint)
         && previous.scanner != scanner
     {
@@ -95,6 +133,7 @@ pub async fn ensure(connection: &Connection, force: bool, update_name: &str) -> 
             "Invalid previous scanner identity; refusing image removal"
         );
         // Only the previously tracked scanner; never prune shared parent layers or force removal.
+        progress("Removing previously tracked scanner image…");
         grype::remove_image(connection, &previous.scanner)
             .await.context("New scanner is ready, but old scanner removal failed (it may still be in use); no forced deletion was attempted")?;
     }
@@ -105,9 +144,55 @@ pub async fn ensure(connection: &Connection, force: bool, update_name: &str) -> 
             scanner: scanner.clone(),
         },
     );
+    progress("Saving security update metadata…");
     let mut file = tempfile::NamedTempFile::new_in(&root)?;
     serde_json::to_writer(file.as_file_mut(), &entries)?;
     file.persist(path)
         .context("Cannot save security update metadata")?;
     Ok(scanner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn install_stage_reports_activity_before_work_finishes() {
+        let messages = Mutex::new(Vec::new());
+        let finished = tokio::sync::Notify::new();
+        let progress = |message: &str| {
+            messages.lock().unwrap().push(message.to_owned());
+            if message.contains("still running") {
+                finished.notify_one();
+            }
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            stage(&progress, "Downloading…", async {
+                finished.notified().await;
+                Ok(())
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let messages = messages.into_inner().unwrap();
+        assert_eq!(messages[0], "Downloading…");
+        assert!(messages[1].starts_with("Downloading… still running ("));
+        assert!(messages[1].ends_with("s elapsed)"));
+    }
+
+    #[tokio::test]
+    async fn install_stage_errors_include_the_stage_and_underlying_cause() {
+        let error = stage::<()>(&|_| {}, "Pulling scanner…", async {
+            anyhow::bail!("fixture registry unavailable")
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "Pulling scanner: fixture registry unavailable"
+        );
+    }
 }
