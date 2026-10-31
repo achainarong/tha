@@ -382,6 +382,15 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let (removal_tx, mut removal_rx) = mpsc::channel::<tha::backend::RemovalReport>(1);
     let mut removal_task: Option<AbortTask> = None;
     let mut export_task: Option<AbortTask> = None;
+    let (compose_tx, mut compose_rx) = mpsc::channel::<tha::compose::Event>(64);
+    let mut compose_task: Option<AbortTask> = None;
+    let (event_tx, mut event_rx) = mpsc::channel::<tha::events::Update>(64);
+    let mut event_watchers = std::collections::HashMap::<String, AbortTask>::new();
+    let mut event_read: Option<AbortTask> = None;
+    let mut event_read_at = std::time::Instant::now() - Duration::from_secs(60);
+    let (image_tx, mut image_rx) = mpsc::channel::<tha::images::Event>(32);
+    let mut image_check_task: Option<AbortTask> = None;
+    let mut image_pull_task: Option<AbortTask> = None;
     let (action_tx, mut action_rx) = mpsc::channel::<tha::actions::Update>(64);
     let mut action_tasks = std::collections::BTreeMap::<u64, AbortTask>::new();
     let mut metric_targets = Vec::new();
@@ -469,6 +478,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 if !workers.get(event.engine).is_some_and(|slot| slot.accepts(event.generation)) { continue; }
                 app.update_engine(event.engine, event.result);
                 publish_metric_targets(&mut app, &metric_targets);
+                sync_event_watchers(&app, &mut event_watchers, &event_tx);
                 redraw_now = true;
             },
             Some(discovery) = discovery_rx.recv() => {
@@ -485,6 +495,49 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                     match event.data { Ok(data) => { app.history_view.data = data; app.history_view.error=None; }, Err(error) => app.history_view.error=Some(error) }
                     history_task=None;
                     redraw_now=true;
+                }
+            },
+            Some(event) = compose_rx.recv() => {
+                redraw_now = true;
+                if let Some(job) = &mut app.compose_job {
+                    match event {
+                        tha::compose::Event::Line(line) => job.push(line),
+                        tha::compose::Event::Finished(outcome) => {
+                            app.notice = match &outcome {
+                                Ok(()) => format!("Finished: {}", job.title),
+                                Err(error) => format!("Failed: {} · {error} · :compose-output shows details", job.title),
+                            };
+                            job.outcome = Some(outcome);
+                            compose_task = None;
+                            refresh_tx.send_modify(|value| *value = value.wrapping_add(1));
+                        }
+                    }
+                }
+            },
+            Some(update) = event_rx.recv() => {
+                if let Some(engine) = app.engines.iter_mut().find(|engine| engine.connection.endpoint == update.endpoint) {
+                    for event in update.events { engine.events.add(event); }
+                }
+                redraw_now = matches!(app.tab, Tab::Events | Tab::History);
+            },
+            Some(event) = image_rx.recv() => {
+                redraw_now = true;
+                match event {
+                    tha::images::Event::Checked { engine, image, status } => {
+                        app.image_updates.insert((engine, image), status);
+                    }
+                    tha::images::Event::CheckFinished(summary) => {
+                        app.notice = summary;
+                        image_check_task = None;
+                    }
+                    tha::images::Event::PullProgress(text) => app.notice = text,
+                    tha::images::Event::PullFinished { engine, image, result } => {
+                        app.image_pull_active = false;
+                        app.notice = result;
+                        app.image_updates.remove(&(engine, image));
+                        image_pull_task = None;
+                        refresh_tx.send_modify(|value| *value = value.wrapping_add(1));
+                    }
                 }
             },
             Some(result) = export_rx.recv() => { app.log_export_busy = false; app.notice = result; export_task = None; redraw_now = true; },
@@ -665,6 +718,31 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                     let _ = sender.send(report).await;
                 })));
             }
+            if let Some(request) = app.compose_request.take() {
+                compose_task = Some(AbortTask(tokio::spawn(tha::compose::run(
+                    request,
+                    compose_tx.clone(),
+                ))));
+            }
+            if matches!(app.tab, Tab::Events | Tab::History)
+                && event_read_at.elapsed() >= Duration::from_secs(5)
+            {
+                event_read_at = std::time::Instant::now();
+                event_read = read_saved_events(&app, &event_tx);
+            }
+            if let Some(targets) = app.image_check_request.take() {
+                // A newer check replaces any earlier one for this session.
+                image_check_task = Some(AbortTask(tokio::spawn(tha::images::check(
+                    targets,
+                    image_tx.clone(),
+                ))));
+            }
+            if let Some(request) = app.image_pull_request.take() {
+                image_pull_task = Some(AbortTask(tokio::spawn(tha::images::pull(
+                    request,
+                    image_tx.clone(),
+                ))));
+            }
             update_layers(&mut app, &mut layers_task, &layers_tx);
             if app.security.cancel {
                 app.security.cancel = false;
@@ -720,6 +798,11 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     drop(layers_task);
     drop(removal_task);
     drop(export_task);
+    drop(compose_task);
+    drop(event_watchers);
+    drop(event_read);
+    drop(image_check_task);
+    drop(image_pull_task);
     drop(terminal);
     drop(_restore);
     if let Some(path) = &app.preferences_path
@@ -858,6 +941,59 @@ fn publish_metric_targets(app: &mut App, targets: &[watch::Sender<Option<metrics
     }
 }
 
+/// One watcher per connected, primary Docker-compatible endpoint, for as long as Tha is open.
+fn sync_event_watchers(
+    app: &App,
+    watchers: &mut std::collections::HashMap<String, AbortTask>,
+    tx: &mpsc::Sender<tha::events::Update>,
+) {
+    if app.demo {
+        return;
+    }
+    let wanted: std::collections::HashMap<_, _> = app
+        .engines
+        .iter()
+        .filter(|engine| {
+            engine.alias.is_none()
+                && engine.snapshot.is_some()
+                && engine.connection.kind == tha::config::BackendKind::Docker
+        })
+        .map(|engine| (engine.connection.endpoint.clone(), &engine.connection))
+        .collect();
+    watchers.retain(|endpoint, _| wanted.contains_key(endpoint));
+    for (endpoint, connection) in wanted {
+        watchers.entry(endpoint).or_insert_with(|| {
+            AbortTask(tokio::spawn(tha::events::watch(
+                connection.clone(),
+                tx.clone(),
+            )))
+        });
+    }
+}
+
+/// Add what the service recorded while Tha was closed for the selected runtime.
+fn read_saved_events(app: &App, tx: &mpsc::Sender<tha::events::Update>) -> Option<AbortTask> {
+    let path = tha::events::database_path(app.history_database.as_ref()?)?;
+    let engine = &app.engines[app.current()?.engine];
+    let runtime = tha::history::runtime_key(
+        &engine.connection,
+        &engine.snapshot.as_ref()?.engine_id.clone(),
+    );
+    let endpoint = engine.connection.endpoint.clone();
+    let tx = tx.clone();
+    Some(AbortTask(tokio::spawn(async move {
+        let since = tha::history::now_ms() - tha::history::RETENTION_MS;
+        let events = tokio::task::spawn_blocking(move || {
+            tha::events::read(&path, &runtime, since, tha::events::MAX_IN_MEMORY)
+        })
+        .await;
+        // An unreadable events file leaves the live timeline working.
+        if let Ok(Ok(events)) = events {
+            let _ = tx.send(tha::events::Update { endpoint, events }).await;
+        }
+    })))
+}
+
 fn update_logs(
     app: &mut App,
     task: &mut Option<AbortTask>,
@@ -875,14 +1011,16 @@ fn update_logs(
     };
     let containers = app.selected_containers();
     let engine = &app.engines[row.engine];
-    let scope = log_scope_key(&row, engine, &containers);
+    let scope = log_scope_key(&row, engine, &containers, app.log_since);
     if app.log_scope.as_deref() == Some(&scope) {
         return;
     }
     *task = None;
     app.log_generation += 1;
     app.log_scope = Some(scope);
+    let pretty_json = app.logs.pretty_json;
     app.logs = logs::LogBuffer::new(capacity);
+    app.logs.pretty_json = pretty_json;
     app.log_view.reset_content();
     if engine.error.is_some() || engine.alias.is_some() {
         app.logs.push(
@@ -936,6 +1074,8 @@ fn update_logs(
             engine.connection.clone(),
             containers,
             app.log_generation,
+            app.log_since,
+            capacity,
             tx.clone(),
         )));
     }
@@ -945,12 +1085,14 @@ fn log_scope_key(
     row: &tha::app::Row,
     engine: &tha::app::Engine,
     containers: &[tha::model::Container],
+    since: Option<i64>,
 ) -> String {
     format!(
-        "{}:{:?}:{:?}:{:?}",
+        "{}:{:?}:{:?}:{:?}:{:?}",
         row.key,
         engine.connection.endpoint,
         engine.error,
+        since,
         containers
             .iter()
             .map(|container| container.key())
@@ -967,7 +1109,7 @@ fn queue_log_export(app: &mut App, path: &str) -> Result<()> {
     }
     let row = app.current().context("Log selection disappeared")?;
     let engine = &app.engines[row.engine];
-    let key = log_scope_key(row, engine, &app.selected_containers());
+    let key = log_scope_key(row, engine, &app.selected_containers(), app.log_since);
     if app.tab != Tab::Logs
         || engine.error.is_some()
         || engine.alias.is_some()
@@ -1123,6 +1265,53 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                     .min(u16::MAX as usize)
             }
             _ => {}
+        }
+        return false;
+    }
+    if app.compose_confirmation.is_some() {
+        let typing = app
+            .compose_confirmation
+            .as_ref()
+            .unwrap()
+            .request
+            .action
+            .requires_typing();
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => app.compose_confirmation = None,
+            KeyCode::Enter if key.kind == KeyEventKind::Press && plain => app.confirm_compose(),
+            KeyCode::Char('n') if !typing => app.compose_confirmation = None,
+            KeyCode::Char('y') if !typing && plain => app.confirm_compose(),
+            KeyCode::Backspace if typing => {
+                app.compose_confirmation.as_mut().unwrap().typed.pop();
+            }
+            KeyCode::Char(ch) if typing && plain => {
+                let confirmation = app.compose_confirmation.as_mut().unwrap();
+                if !ch.is_control() && confirmation.typed.len() + ch.len_utf8() <= 1024 {
+                    confirmation.typed.push(ch);
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
+    if app.compose_output_visible {
+        if let Some(job) = &mut app.compose_job {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    app.compose_output_visible = false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => job.scroll = job.scroll.saturating_add(1),
+                KeyCode::Down | KeyCode::Char('j') => job.scroll = job.scroll.saturating_sub(1),
+                KeyCode::PageUp => job.scroll = job.scroll.saturating_add(height.max(1)),
+                KeyCode::PageDown => job.scroll = job.scroll.saturating_sub(height.max(1)),
+                KeyCode::End | KeyCode::Char('G') => job.scroll = 0,
+                _ => {}
+            }
+        } else {
+            app.compose_output_visible = false;
         }
         return false;
     }
@@ -1341,11 +1530,31 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                         app.input = input;
                     }
                 } else if app.detail_focus && app.tab == Tab::Logs {
-                    app.log_view.set_query(input, &mut app.logs);
+                    if let Err(error) = app.log_view.check_query(&input) {
+                        app.notice = tha::model::safe_text(&format!("Invalid regex: {error}"))
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        app.input_mode = mode;
+                        app.input = input;
+                    } else {
+                        if app.notice.starts_with("Invalid regex") {
+                            app.notice.clear();
+                        }
+                        app.log_view.set_query(input, &mut app.logs);
+                    }
                 } else {
                     app.tree_query = input;
                     app.refresh_tree();
                 }
+            }
+            KeyCode::Char('r')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && app.input_mode == InputMode::Search
+                    && app.detail_focus
+                    && app.tab == Tab::Logs =>
+            {
+                app.log_view.regex_search = !app.log_view.regex_search;
             }
             KeyCode::Tab if app.input_mode == InputMode::Command => {
                 if let Some((command, _)) = ui::COMMANDS
@@ -1411,6 +1620,16 @@ fn dispatch_navigation(
             | A::ClearLogFilter
             | A::ExportLogs
             | A::ReconnectLogs
+            | A::LogsSince
+            | A::ComposeUpdate
+            | A::ComposePull
+            | A::ComposeUp
+            | A::ComposeRecreate
+            | A::ComposeDown
+            | A::ComposeOutput
+            | A::PrettyJson
+            | A::CheckUpdates
+            | A::PullImage
             | A::CloseExec
             | A::UpdateSecurity
             | A::ReloadLayers
@@ -1475,7 +1694,7 @@ fn dispatch_navigation(
     // Detail shortcuts explicitly return from an inventory to workload details.
     if matches!(
         action,
-        A::Overview | A::Logs | A::Networks | A::Exec | A::Metrics | A::Layers
+        A::Overview | A::Logs | A::Networks | A::Exec | A::Metrics | A::Layers | A::Events
     ) {
         switch_overview(app, tha::app::OverviewMode::Containers);
     }
@@ -1830,6 +2049,12 @@ fn dispatch_navigation(
             app.tab = Tab::Overview;
             app.detail_scroll = 0;
         }
+        A::Events => {
+            app.tab = Tab::Events;
+            app.detail_focus = true;
+            app.performance_focus = false;
+            app.detail_scroll = 0;
+        }
         A::Logs => {
             app.tab = Tab::Logs;
             app.detail_scroll = 0;
@@ -2027,16 +2252,65 @@ fn switch_overview(app: &mut App, mode: tha::app::OverviewMode) {
 fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
     if matches!(
         command,
-        "overview" | "logs" | "networks" | "layers" | "history" | "metrics" | "exec"
+        "overview" | "logs" | "networks" | "layers" | "history" | "metrics" | "exec" | "events"
     ) {
         switch_overview(app, tha::app::OverviewMode::Containers);
     }
     app.notice.clear();
+    if let Some(argument) = command.strip_prefix("logs-since ") {
+        match logs::parse_since(argument, time::OffsetDateTime::now_utc()) {
+            Ok(since) => {
+                app.log_since = since;
+                app.tab = Tab::Logs;
+                app.detail_focus = true;
+                app.performance_focus = false;
+                if app.demo {
+                    app.notice = "Demo mode: fixture logs ignore the start time.".into();
+                }
+            }
+            Err(error) => {
+                app.notice = format!("{error:#}");
+                app.input_mode = InputMode::Command;
+                app.input = command.into();
+            }
+        }
+        return false;
+    }
     match command {
+        "events" => {
+            app.tab = Tab::Events;
+            app.detail_focus = true;
+            app.performance_focus = false;
+            app.detail_scroll = 0;
+        }
+        "compose-update" => app.request_compose(tha::compose::Action::Update),
+        "compose-pull" => app.request_compose(tha::compose::Action::Pull),
+        "compose-up" => app.request_compose(tha::compose::Action::Up),
+        "compose-recreate" => app.request_compose(tha::compose::Action::Recreate),
+        "compose-down" => app.request_compose(tha::compose::Action::Down),
+        "compose-output" => {
+            if app.compose_job.is_some() {
+                app.compose_output_visible = true;
+            } else {
+                app.notice = "No Compose operation has run in this session".into();
+            }
+        }
+        "logs-since" => {
+            app.input_mode = InputMode::Command;
+            app.input = "logs-since ".into();
+        }
+        "json" => {
+            app.log_view.toggle_pretty_json(&mut app.logs);
+        }
+        "check-updates" => ui::inventory::begin_update_check(app),
+        "pull-image" => ui::inventory::begin_image_pull(app),
         "security" => app.open_security(),
         "scan-image" => app.request_security_scan(false),
         "scan-images" => app.request_security_scan(true),
         "prune" => ui::inventory::begin_prune(app),
+        "cancel-scan" if app.overview_mode == tha::app::OverviewMode::Containers => {
+            app.notice = "Scans run from the Security view (Ctrl+→ or Alt+4)".into();
+        }
         "cancel-scan" => {
             app.security.cancel = true;
             app.notice = "Cancelling security queue and removing scanner…".into();
@@ -2217,14 +2491,14 @@ mod tests {
         let mut app = app();
         let (tx, _) = watch::channel(0);
         app.selected = 0;
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('5')), 20, &tx);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('6')), 20, &tx);
         assert_eq!(app.tab, Tab::Overview);
         app.selected = app
             .rows
             .iter()
             .position(|row| matches!(row.scope, tha::app::Scope::Container(_)))
             .unwrap();
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('5')), 20, &tx);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('6')), 20, &tx);
         assert_eq!(app.tab, Tab::History);
         assert!(app.detail_focus);
         handle_key(&mut app, KeyEvent::from(KeyCode::Char(']')), 20, &tx);
@@ -2333,6 +2607,38 @@ mod tests {
     }
 
     #[test]
+    fn invalid_log_regex_keeps_the_prompt_and_current_search_and_says_why() {
+        let (tx, _) = watch::channel(0);
+        let mut app = App::new(tha::demo::connections(), 100, true, true);
+        tha::demo::populate(&mut app);
+        app.tab = Tab::Logs;
+        app.detail_focus = true;
+        app.logs.push("api", "status=500", false);
+        app.input_mode = InputMode::Search;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            20,
+            &tx,
+        );
+        assert!(app.log_view.regex_search);
+        app.input = r"5\d\d".into();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+        assert_eq!(app.log_view.query(), r"5\d\d");
+        assert_eq!(app.input_mode, InputMode::Normal);
+        app.input_mode = InputMode::Search;
+        app.input = "(bad".into();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+        assert_eq!(app.input_mode, InputMode::Search);
+        assert_eq!(app.input, "(bad");
+        assert!(app.notice.starts_with("Invalid regex"), "{}", app.notice);
+        assert_eq!(app.log_view.query(), r"5\d\d", "The current search stays");
+        app.input = "ok".into();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+        assert!(app.notice.is_empty());
+    }
+
+    #[test]
     fn wrap_shortcut_toggles_only_in_logs_and_does_not_fire_while_typing() {
         let mut app = app();
         let (tx, _) = watch::channel(0);
@@ -2369,6 +2675,7 @@ mod tests {
                         id: format!("sha256:{}", ch.to_string().repeat(64)),
                         tags: vec![format!("image-{ch}:latest")],
                         size: None,
+                        ..Default::default()
                     })
                     .collect(),
             );
@@ -2429,6 +2736,73 @@ mod tests {
         assert!(app.detail_focus);
         assert_eq!(app.security.target, Some(target));
         assert!(app.security.queue.is_empty());
+    }
+
+    #[test]
+    fn container_security_tab_stays_in_place_and_cannot_start_or_cancel_scans() {
+        let (tx, _) = watch::channel(0);
+        let mut app = app();
+        app.security.enabled = true;
+        app.engines[0].snapshot.as_mut().unwrap().engine_id = Some("engine".into());
+        for container in &mut app.engines[0].snapshot.as_mut().unwrap().containers {
+            container.image_id = Some(format!("sha256:{}", container.id));
+        }
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, tha::app::Scope::Container(_)))
+            .unwrap();
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('8')), 20, &tx);
+        assert_eq!(
+            app.overview_mode,
+            tha::app::OverviewMode::Containers,
+            "No view change"
+        );
+        assert_eq!(app.tab, Tab::Security);
+        assert!(app.detail_focus);
+        assert!(
+            app.security.target.is_some(),
+            "Shows this container's image"
+        );
+        for key in ['s', 'S', 'x', 'm', 'M'] {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char(key)), 20, &tx);
+        }
+        for command in [
+            "scan-image",
+            "scan-images",
+            "update-security-db",
+            "cancel-scan",
+        ] {
+            execute(&mut app, command, &tx);
+            assert!(
+                app.notice.contains("Security view"),
+                "{command}: {}",
+                app.notice
+            );
+        }
+        assert!(!app.security.request);
+        assert!(!app.security.update);
+        assert!(!app.security.cancel);
+        assert!(app.security.queue.is_empty());
+        assert_eq!(app.overview_mode, tha::app::OverviewMode::Containers);
+        // The tab follows the selection and leaves when no single image is selected.
+        let image = app.security.target.clone();
+        app.selected = app
+            .rows
+            .iter()
+            .rposition(|row| matches!(row.scope, tha::app::Scope::Container(_)))
+            .unwrap();
+        app.reconcile_detail_tab();
+        assert_eq!(app.tab, Tab::Security);
+        assert_ne!(app.security.target, image);
+        app.selected = 0;
+        app.reconcile_detail_tab();
+        assert_eq!(app.tab, Tab::Overview);
+        // Scanning still works from the Security view's own keys.
+        app.demo = false;
+        assert!(tha::shortcuts::unavailable(&app, A::ScanImage).is_some());
+        app.overview_mode = tha::app::OverviewMode::Security;
+        assert!(tha::shortcuts::unavailable(&app, A::ScanImage).is_none());
     }
 
     #[test]
@@ -3427,6 +3801,7 @@ mod tests {
             alias: None,
             metrics: Default::default(),
             metrics_revision: 0,
+            events: Default::default(),
         };
         other.connection.name = "other runtime".into();
         other.connection.endpoint = "unix:///other-fixture".into();
@@ -3779,11 +4154,12 @@ mod tests {
             assert_eq!(app.selected, selected);
             assert_eq!(app.detail_scroll, 99);
         }
-        for key in ['7', '8'] {
-            handle_key(&mut app, KeyEvent::from(KeyCode::Char(key)), 20, &refresh);
-            assert_eq!(app.overview_mode, OverviewMode::Containers);
-            assert_eq!(app.tab, tab);
-        }
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('8')), 20, &refresh);
+        assert_eq!(app.overview_mode, OverviewMode::Containers);
+        assert_eq!(app.tab, tab, "Security is hidden without its module");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('5')), 20, &refresh);
+        assert_eq!(app.overview_mode, OverviewMode::Containers);
+        assert_eq!(app.tab, Tab::Events);
         execute(&mut app, "images", &refresh);
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('3')), 20, &refresh);
         assert_eq!(app.overview_mode, OverviewMode::Containers);
@@ -3796,7 +4172,7 @@ mod tests {
         let (refresh, _) = watch::channel(0);
         app.selected = 0;
         assert!(!app.layers_available());
-        handle_key(&mut app, KeyEvent::from(KeyCode::Char('6')), 20, &refresh);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('7')), 20, &refresh);
         assert_eq!(app.tab, Tab::Overview);
         execute(&mut app, "layers", &refresh);
         assert_eq!(app.tab, Tab::Overview);
@@ -3823,7 +4199,7 @@ mod tests {
             .unwrap();
         handle_key(
             &mut app,
-            KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE),
             20,
             &tx,
         );
@@ -4087,6 +4463,7 @@ mod tests {
             row,
             &app.engines[row.engine],
             &app.selected_containers(),
+            app.log_since,
         ));
         execute(&mut app, "export-logs", &tx);
         assert_eq!(app.input_mode, InputMode::ExportLogs);

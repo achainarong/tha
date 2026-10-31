@@ -17,6 +17,8 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+mod compose;
+mod events;
 mod history;
 pub mod inventory;
 mod security;
@@ -37,7 +39,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "metrics",
-        "Analyze the selected container's CPU, RAM, disk and network metrics (5)",
+        "Analyze the selected container's CPU, RAM, disk and network metrics (6)",
     ),
     (
         "images",
@@ -49,22 +51,30 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "history",
-        "Alias for metrics: live and historical container readings (5)",
+        "Alias for metrics: live and historical container readings (6)",
     ),
     ("logs", "Open logs for the selected workload"),
     ("networks", "Show network membership"),
     ("refresh", "Refresh all engine snapshots"),
-    ("reconnect-logs", "Reconnect the current log streams"),
+    (
+        "reconnect-logs",
+        "Reload the current logs now; streams also reconnect automatically",
+    ),
+    (
+        "logs-since",
+        "Load logs from a start time: 15m, 2h, 1d, RFC 3339, or off",
+    ),
     ("wrap", "Toggle log wrapping (w in logs)"),
+    ("json", "Pretty-print or restore JSON logs (J in logs)"),
     ("exec", "Open a shell in the selected container"),
     (
         "layers",
-        "Inspect resolved image filesystem layers and build history (6)",
+        "Inspect resolved image filesystem layers and build history (7)",
     ),
     ("reload-layers", "Retry image layers lookup (read-only)"),
     (
         "security",
-        "Open selected image security findings (7; z expands)",
+        "Show the selected image's saved security report (8; z expands)",
     ),
     (
         "scan-image",
@@ -103,6 +113,36 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "export-logs",
         "Export matching retained logs to a new private JSONL file",
     ),
+    (
+        "check-updates",
+        "Compare visible tagged images with their registries (U in Images)",
+    ),
+    (
+        "pull-image",
+        "Pull the selected image's tags; running containers are unchanged",
+    ),
+    (
+        "events",
+        "Show container starts, exits, OOM kills and health changes (5)",
+    ),
+    (
+        "compose-update",
+        "Pull newer images, then apply them with up -d (confirmed)",
+    ),
+    ("compose-pull", "Pull the project's images (confirmed)"),
+    (
+        "compose-up",
+        "Apply Compose configuration with up -d (confirmed)",
+    ),
+    (
+        "compose-recreate",
+        "Recreate every container with --force-recreate (confirmed)",
+    ),
+    (
+        "compose-down",
+        "Remove containers and networks, keeping volumes (type name)",
+    ),
+    ("compose-output", "Show the last Compose operation's output"),
     ("performance", "Expand/collapse global performance (p)"),
     (
         "sort-contexts",
@@ -318,6 +358,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.action_confirmation.is_some() || app.action_results_visible {
         draw_action(frame, app, area);
     }
+    compose::draw(frame, app, area);
     inventory::draw_removal(frame, app, area);
     inventory::draw_removal_results(frame, app, area);
     if app.inventory_removal_results_visible
@@ -991,9 +1032,10 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::Logs => "2 Logs",
         Tab::Networks => "3 Networks",
         Tab::Exec => "4 Exec",
-        Tab::Layers => "6 Layers",
-        Tab::History => "5 Metrics",
-        Tab::Security => "7 Security",
+        Tab::Events => "5 Events",
+        Tab::History => "6 Metrics",
+        Tab::Layers => "7 Layers",
+        Tab::Security => "8 Security",
     };
     let exec_context = if app.tab == Tab::Exec {
         app.sessions
@@ -1028,21 +1070,29 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         vec!["1", "2", "3", "4"]
     };
+    names.push(if inner.width >= 56 { "5 Events" } else { "5" });
+    let events_index = names.len() - 1;
+    let metrics_index = names.len();
     if app.performance_container().is_some() {
-        names.push(if inner.width >= 44 { "5 Metrics" } else { "5" });
+        names.push(if inner.width >= 44 { "6 Metrics" } else { "6" });
     }
+    let layers_index = names.len();
     if app.layers_available() {
-        names.push(if inner.width >= 44 { "6 Layers" } else { "6" });
+        names.push(if inner.width >= 44 { "7 Layers" } else { "7" });
     }
-    let layers_index = names.len().saturating_sub(1);
+    let security_index = names.len();
+    if app.security_tab_available() {
+        names.push(if inner.width >= 44 { "8 Security" } else { "8" });
+    }
     let active = match app.tab {
         Tab::Overview => 0,
         Tab::Logs => 1,
         Tab::Networks => 2,
         Tab::Exec => 3,
         Tab::Layers => layers_index,
-        Tab::History => 4,
-        Tab::Security => 0,
+        Tab::History => metrics_index,
+        Tab::Security => security_index,
+        Tab::Events => events_index,
     };
     frame.render_widget(
         Tabs::new(names)
@@ -1110,7 +1160,8 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         Tab::Exec => draw_exec(frame, app, body),
         Tab::Layers => draw_layers(frame, app, body),
         Tab::History => history::draw(frame, app, body),
-        Tab::Security => security::draw(frame, app, body),
+        Tab::Events => events::draw(frame, app, body),
+        Tab::Security => security::draw_report(frame, app, body),
         Tab::Overview | Tab::Networks => {
             let lines = if app.tab == Tab::Networks {
                 network_lines(app)
@@ -2190,9 +2241,23 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
         "Rows {}–{end} / {total}",
         if total == 0 { 0 } else { start + 1 }
     );
+    let since = app
+        .log_since
+        .and_then(|at| time::OffsetDateTime::from_unix_timestamp(at).ok())
+        .and_then(|at| {
+            at.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .map(|at| format!(" · Since {at}"))
+        .unwrap_or_default();
     let status = format!(
-        "Wrap: {} · {} · {position}",
+        "Wrap: {} · JSON: {} · {} · {position}{since}",
         if app.log_view.wrap { "on" } else { "off" },
+        if app.logs.pretty_json {
+            "pretty"
+        } else {
+            "raw"
+        },
         if app.logs.follow {
             "Following"
         } else {
@@ -2217,9 +2282,14 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
         )
     } else {
         format!(
-            "{}/{} matches /{} · Filter: {}",
+            "{}/{} matches {}/{} · Filter: {}",
             app.log_view.match_index.unwrap_or(0),
             app.log_view.match_count,
+            if app.log_view.query_is_regex() {
+                "regex "
+            } else {
+                ""
+            },
             safe_text(app.log_view.query()),
             if app.log_view.filter.active() {
                 "on"
@@ -2300,10 +2370,11 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
         let range = if app.log_view.wrap {
             row.range
         } else {
-            log_view::byte_at_column(&entry.text, app.log_view.horizontal)..entry.text.len()
+            let line = &entry.display()[row.range.clone()];
+            row.range.start + log_view::byte_at_column(line, app.log_view.horizontal)..row.range.end
         };
         let text = highlighted(
-            &entry.text,
+            entry.display(),
             range,
             app.log_view.regex(),
             app.log_view
@@ -2372,6 +2443,26 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 muted(),
             ),
         ]
+    } else if app.input_mode == InputMode::Search && app.detail_focus && app.tab == Tab::Logs {
+        let regex = app.log_view.regex_search;
+        vec![
+            Line::from(format!(
+                "{}/{}▏",
+                if regex { "regex " } else { "" },
+                safe_text(&app.input)
+            )),
+            if notice.starts_with("Invalid regex") {
+                Line::styled(safe_text(notice), accent(app, Color::Red))
+            } else {
+                Line::styled(
+                    format!(
+                        "Enter Apply · Esc Cancel · Ctrl-R {} · Case-insensitive",
+                        if regex { "Literal" } else { "Regex" }
+                    ),
+                    muted(),
+                )
+            },
+        ]
     } else if app.input_mode == InputMode::Search {
         vec![
             Line::from(format!("/{}▏", safe_text(&app.input))),
@@ -2389,14 +2480,16 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             "Ctrl-] Navigate · SHELL INPUT · Keys go to the selected container session"
         } else if app.performance_focus {
             "Performance · P Scope  z Zoom  j/k Select  Enter Inspect  p Close  Tab Pane  ? Keys"
+        } else if app.detail_focus && app.tab == Tab::Security {
+            "Security · j/k Select  Enter Details  z Zoom  Tab Explorer · Scans run in the Security view"
         } else if app.detail_focus && app.tab == Tab::History {
             "Metrics · [/ ] Range  ←/→ Pan  c Cursor  h/l Inspect  f Live  z Enlarge  Esc Restore"
         } else if app.detail_focus && app.tab == Tab::Exec {
             "F6 Sessions · Enter Input · :close-exec Close slot · j/k Scroll · Tab Explorer · ? Keys"
         } else if app.detail_focus && app.tab == Tab::Logs {
-            "? Keys  F3 Filter  :export-logs  w Wrap  / Search  n/N Match  j/k Scroll  f Follow  Tab Explorer"
+            "? Keys  F3 Filter  :logs-since  J JSON  w Wrap  / Search  n/N Match  j/k Scroll  f Follow  Tab Explorer"
         } else {
-            "Ctrl+←/→ Overview  ? Keys  a Actions  p Performance  Enter Open  e Exec  Tab Pane  1..7 Details  : Commands"
+            "Ctrl+←/→ Overview  ? Keys  a Actions  p Performance  Enter Open  e Exec  Tab Pane  1..8 Details  : Commands"
         };
         vec![Line::styled(hints, muted()), Line::from(safe_text(notice))]
     };
@@ -2481,7 +2574,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         "                  Container or Compose rows only; confirmation required\n",
         "                  y/Enter confirms; n/Esc cancels; Delete: type name + Enter\n",
         "                  Delete stopped containers only; keep networks/volumes/images\n",
-        "1..6              Overview / Logs / Net / Exec / Metrics / Layers\n",
+        "1..8              Info Logs Net Exec Events Metrics Layers Security\n",
         "Ctrl+←/→, F7/F8    Cycle overviews · Alt+1/2/3 direct\n",
         "a                 Contextual actions with disabled reasons (Explorer)\n",
         "Enter in Layers   Expand details; Esc returns; no image pulls\n",
@@ -2612,6 +2705,12 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     if actions {
         let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(4)]).split(inner);
         inner = parts[0];
+        if let Some(Choice::Compose(action)) = picker.choices.get(picker.selected) {
+            frame.render_widget(
+                Paragraph::new(action.effect()).wrap(Wrap { trim: false }),
+                parts[1],
+            );
+        }
         if let Some(Choice::Action { action, row }) = picker.choices.get(picker.selected) {
             let explanation = app.action_availability(*action, row).map(|count| format!("{count} existing container(s). Enter opens confirmation; nothing is sent now.")).unwrap_or_else(|reason| format!("Disabled: {reason}"));
             frame.render_widget(
@@ -2669,6 +2768,7 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
                         .map(|count| format!("{count} target(s)"))
                         .unwrap_or_else(|_| "disabled".into())
                 ),
+                Choice::Compose(action) => action.label().into(),
                 Choice::ContextSort(mode) => mode.label().into(),
                 Choice::Project(project) => format!(
                     "{} / {}{}",
@@ -2773,7 +2873,7 @@ mod tests {
                     Tab::Logs => "2 Logs",
                     Tab::Networks => "3 Networks",
                     Tab::Exec => "4 Exec",
-                    Tab::Layers => "6 Layers",
+                    Tab::Layers => "7 Layers",
                     _ => unreachable!(),
                 };
                 assert!(row.contains(label), "{tab:?}: {row}");
@@ -2872,7 +2972,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("6 Layers"));
+        assert!(text.contains("7 Layers"));
         let unsupported: Vec<_> = app
             .rows
             .iter()
@@ -2894,7 +2994,7 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect();
-            assert!(!text.contains("6 Layers"));
+            assert!(!text.contains("7 Layers"));
         }
     }
 
@@ -3828,7 +3928,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("6 Layers"));
+        assert!(text.contains("7 Layers"));
         assert!(text.contains("Filesystem layers (1)"));
         assert!(text.contains("Build history (1)"));
         app.layers.selected = 1;

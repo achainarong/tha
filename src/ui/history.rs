@@ -133,6 +133,19 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         });
     let scale = app.history_view.chart_scale(runtime, container.key());
     let view = &app.history_view;
+    let marks: Vec<_> = {
+        let (start, end) = if view.data.end_ms > view.data.start_ms {
+            (view.data.start_ms, view.data.end_ms)
+        } else {
+            view.bounds()
+        };
+        app.engines[engine_index]
+            .events
+            .for_container(&container.key(), start, end)
+            .into_iter()
+            .cloned()
+            .collect()
+    };
     let block = pane(
         app,
         format!(" Metrics · {} ", safe_text(&container.name)),
@@ -161,7 +174,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let notice = history_notice(view);
     let parts = Layout::vertical([
         Constraint::Length(legend_height),
-        Constraint::Length(2 + u16::from(notice.is_some())),
+        Constraint::Length(2 + u16::from(notice.is_some()) + u16::from(!marks.is_empty())),
         Constraint::Min(1),
         Constraint::Length(2),
     ])
@@ -215,6 +228,17 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some(notice) = notice {
         header.push(Line::styled(safe_text(notice), accent(app, Color::Yellow)));
     }
+    if let Some(latest) = marks.last() {
+        header.push(Line::styled(
+            format!(
+                "┊ {} events in range · latest {} {} · 5 Events",
+                marks.len(),
+                clock(latest.at_ms),
+                latest.label()
+            ),
+            super::events::tone_style(app, latest.tone()),
+        ));
+    }
     frame.render_widget(Paragraph::new(header), parts[1]);
     frame.render_widget(legend, parts[0]);
     frame.render_widget(
@@ -258,6 +282,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             chart,
             (start, end),
             &scale,
+            &marks,
         );
     }
 }
@@ -303,6 +328,7 @@ fn draw_chart(
     area: Rect,
     bounds: (i64, i64),
     scale: &crate::history::ChartScale,
+    marks: &[crate::events::Event],
 ) {
     let (start, end) = bounds;
     let (name, metrics, color): (&str, &[usize], Color) = match group {
@@ -471,6 +497,19 @@ fn draw_chart(
             }),
         graph,
     );
+    let column = |at: i64| {
+        (((at - start).clamp(0, (end - start).max(0)) as f64 / (end - start).max(1) as f64)
+            * (graph.width - 1) as f64)
+            .round() as u16
+    };
+    for mark in marks {
+        let x = column(mark.at_ms);
+        for y in graph.y..graph.bottom() {
+            frame.buffer_mut()[(graph.x + x, y)]
+                .set_symbol("┊")
+                .set_style(super::events::tone_style(app, mark.tone()));
+        }
+    }
     if let Some(point) = cursor {
         let x = (((point.at_ms - start).clamp(0, (end - start).max(0)) as f64
             / (end - start).max(1) as f64)

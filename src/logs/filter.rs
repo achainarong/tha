@@ -36,6 +36,79 @@ impl Level {
     }
 }
 
+/// Split a leading RFC 3339 timestamp, as engines add it, from the rest of a line.
+fn split_timestamp(text: &str) -> (Option<OffsetDateTime>, &str) {
+    if let Some((prefix, remaining)) = text.split_once(char::is_whitespace)
+        && let Ok(value) = OffsetDateTime::parse(prefix, &Rfc3339)
+    {
+        return (Some(value), remaining.trim_start());
+    }
+    (None, text)
+}
+
+pub fn line_timestamp(text: &str) -> Option<OffsetDateTime> {
+    split_timestamp(text).0
+}
+
+/// Indent a JSON object or array, keeping any timestamp prefix. This reformats the source
+/// text rather than a parsed value, so key order and exact numbers are preserved.
+pub fn pretty_json(text: &str, metadata: &Metadata) -> Option<String> {
+    let json = metadata.json.as_ref()?;
+    if !json.is_object() && !json.is_array() {
+        return None;
+    }
+    let payload = split_timestamp(text).1;
+    let mut output = String::with_capacity(text.len() + text.len() / 2);
+    output.push_str(&text[..text.len() - payload.len()]);
+    let newline = |output: &mut String, depth: usize| {
+        output.push('\n');
+        output.extend(std::iter::repeat_n("  ", depth));
+    };
+    let mut depth = 0usize;
+    let mut chars = payload.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                output.push(ch);
+                let mut escaped = false;
+                for ch in chars.by_ref() {
+                    output.push(ch);
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        break;
+                    }
+                }
+            }
+            '{' | '[' => {
+                output.push(ch);
+                while chars.next_if(|next| next.is_whitespace()).is_some() {}
+                if let Some(close) = chars.next_if(|next| matches!(next, '}' | ']')) {
+                    output.push(close);
+                } else {
+                    depth += 1;
+                    newline(&mut output, depth);
+                }
+            }
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                newline(&mut output, depth);
+                output.push(ch);
+            }
+            ',' => {
+                output.push(ch);
+                newline(&mut output, depth);
+            }
+            ':' => output.push_str(": "),
+            ch if ch.is_whitespace() => {}
+            ch => output.push(ch),
+        }
+    }
+    Some(output)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Metadata {
     pub json: Option<Arc<Value>>,
@@ -44,14 +117,7 @@ pub struct Metadata {
 }
 impl Metadata {
     pub fn parse(text: &str, error: bool) -> Self {
-        let mut payload = text;
-        let mut timestamp = None;
-        if let Some((prefix, remaining)) = text.split_once(char::is_whitespace)
-            && let Ok(value) = OffsetDateTime::parse(prefix, &Rfc3339)
-        {
-            timestamp = Some(value);
-            payload = remaining.trim_start();
-        }
+        let (mut timestamp, payload) = split_timestamp(text);
         let json: Option<Value> = serde_json::from_str(payload).ok();
         let mut level;
         if let Some(json) = &json {

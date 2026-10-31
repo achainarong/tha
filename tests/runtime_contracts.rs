@@ -565,7 +565,7 @@ async fn docker_log_subscription_decodes_frames_and_keeps_scope_generation() {
         name: "shop-api-1".into(),
         ..Default::default()
     };
-    let task = tha::logs::subscribe(engine.connection(), vec![container], 7, tx);
+    let task = tha::logs::subscribe(engine.connection(), vec![container], 7, None, 100, tx);
     let event = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
         .await
         .unwrap()
@@ -868,7 +868,7 @@ async fn live_podman_inventory_platform_metrics_and_logs() {
             .is_ok_and(|reading| reading.usage.memory_bytes.is_some())
     }));
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    let task = tha::logs::subscribe(connection, vec![compose.clone()], 42, tx);
+    let task = tha::logs::subscribe(connection, vec![compose.clone()], 42, None, 100, tx);
     let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
         .await
         .unwrap()
@@ -876,4 +876,166 @@ async fn live_podman_inventory_platform_metrics_and_logs() {
     task.abort();
     assert_eq!(event.generation, 42);
     assert!(!event.error, "{}", event.text);
+}
+
+#[tokio::test]
+#[ignore = "Requires THA_TEST_DOCKER_SOCKET and THA_TEST_LOG_CONTAINERS (id,id) that print numbered lines and get restarted externally during the test"]
+async fn live_logs_resume_after_a_restart_without_repeats_and_merge_in_time_order() {
+    let socket = std::env::var("THA_TEST_DOCKER_SOCKET").unwrap();
+    let ids = std::env::var("THA_TEST_LOG_CONTAINERS").unwrap();
+    let connection = Connection {
+        name: "live".into(),
+        kind: BackendKind::Docker,
+        endpoint: format!("unix://{socket}"),
+    };
+    let containers: Vec<_> = ids
+        .split(',')
+        .map(|id| tha::model::Container {
+            id: id.into(),
+            name: id.chars().take(6).collect(),
+            ..Default::default()
+        })
+        .collect();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(512);
+    let task = tha::logs::subscribe(connection, containers, 1, None, 5000, tx);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (mut lines, mut ended, mut reconnected) = (Vec::new(), 0, 0);
+    while std::time::Instant::now() < deadline && reconnected == 0 {
+        let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await
+        else {
+            continue;
+        };
+        if event.text.starts_with("Stream ended") {
+            ended += 1;
+        } else if event.text == "Log stream reconnected." {
+            reconnected += 1;
+        } else {
+            lines.push(format!("{} {}", event.source, event.text));
+        }
+    }
+    for _ in 0..30 {
+        if let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await
+        {
+            lines.push(format!("{} {}", event.source, event.text));
+        }
+    }
+    task.abort();
+    assert!(ended >= 1, "The restart ended a stream");
+    assert!(reconnected >= 1, "The stream came back by itself");
+    let times: Vec<_> = lines
+        .iter()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter_map(|at| {
+            time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
+        })
+        .collect();
+    assert!(times.len() > 10);
+    let inversions = times.windows(2).filter(|pair| pair[0] > pair[1]).count();
+    // The restarted container's first line can arrive after the reorder window closed.
+    assert!(
+        inversions <= 2,
+        "{inversions} lines were out of order: {lines:#?}"
+    );
+    let unique: std::collections::HashSet<_> = lines.iter().collect();
+    assert_eq!(unique.len(), lines.len(), "A replayed line was shown twice");
+    println!(
+        "received {} lines; ended {ended}; reconnected {reconnected}",
+        lines.len()
+    );
+}
+
+#[tokio::test]
+#[ignore = "Contacts Docker Hub; requires THA_TEST_DOCKER_SOCKET and pulls THA_TEST_PULL_IMAGE"]
+async fn live_update_check_and_pull_agree_with_the_registry() {
+    let socket = std::env::var("THA_TEST_DOCKER_SOCKET").unwrap();
+    let tag = std::env::var("THA_TEST_PULL_IMAGE").unwrap();
+    let connection = Connection {
+        name: "live".into(),
+        kind: BackendKind::Docker,
+        endpoint: format!("unix://{socket}"),
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    tha::images::pull(
+        tha::images::PullRequest {
+            connection: connection.clone(),
+            engine: 0,
+            image: "before".into(),
+            tags: vec![tag.clone()],
+        },
+        tx,
+    )
+    .await;
+    let mut finished = None;
+    while let Some(event) = rx.recv().await {
+        if let tha::images::Event::PullFinished { result, .. } = event {
+            finished = Some(result);
+        }
+    }
+    let finished = finished.unwrap();
+    assert!(finished.starts_with("Pulled"), "{finished}");
+    let snapshot = backend::snapshot(&connection).await.unwrap();
+    let image = snapshot
+        .images
+        .unwrap()
+        .into_iter()
+        .find(|image| image.tags.contains(&tag))
+        .expect("The pulled tag is listed");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    tha::images::check(
+        vec![tha::images::Target {
+            connection,
+            engine: 0,
+            image,
+        }],
+        tx,
+    )
+    .await;
+    let Some(tha::images::Event::Checked { status, .. }) = rx.recv().await else {
+        panic!("No check result");
+    };
+    assert_eq!(status, tha::images::UpdateStatus::Current, "{status:?}");
+}
+
+#[tokio::test]
+#[ignore = "Requires THA_TEST_DOCKER_SOCKET and THA_TEST_EVENT_CONTAINER, restarted externally during the test"]
+async fn live_events_report_a_restart_with_its_exit_and_start() {
+    let socket = std::env::var("THA_TEST_DOCKER_SOCKET").unwrap();
+    let id = std::env::var("THA_TEST_EVENT_CONTAINER").unwrap();
+    let connection = Connection {
+        name: "live".into(),
+        kind: BackendKind::Docker,
+        endpoint: format!("unix://{socket}"),
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let task = tokio::spawn(tha::events::watch(connection, tx));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut seen = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let Ok(Some(update)) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await
+        else {
+            continue;
+        };
+        seen.extend(
+            update
+                .events
+                .into_iter()
+                .filter(|event| event.key == format!("/{id}")),
+        );
+        if seen.iter().any(|event| event.action == "restart") {
+            break;
+        }
+    }
+    task.abort();
+    for event in &seen {
+        println!("{} {} {}", event.at_ms, event.name, event.label());
+    }
+    assert!(seen.iter().any(|event| event.action == "die"), "{seen:?}");
+    assert!(seen.iter().any(|event| event.action == "start"), "{seen:?}");
+    assert!(
+        seen.iter().any(|event| event.action == "restart"),
+        "{seen:?}"
+    );
 }

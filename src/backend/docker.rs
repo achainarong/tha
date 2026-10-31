@@ -373,6 +373,14 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
             project: model::project(&labels),
             service: model::service(&labels),
             compose_working_dir: model::compose_working_dir(&labels),
+            compose_config_files: model::compose_paths(
+                &labels,
+                "com.docker.compose.project.config_files",
+            ),
+            compose_env_files: model::compose_paths(
+                &labels,
+                "com.docker.compose.project.environment_file",
+            ),
             managed: labels.keys().any(|key| key.starts_with("io.kubernetes.")),
             ports,
             port_bindings,
@@ -400,6 +408,11 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
                         .repo_tags
                         .into_iter()
                         .filter(|tag| tag != "<none>:<none>")
+                        .collect(),
+                    digests: image
+                        .repo_digests
+                        .into_iter()
+                        .filter(|digest| digest != "<none>@<none>")
                         .collect(),
                     size: u64::try_from(image.size).ok(),
                 })

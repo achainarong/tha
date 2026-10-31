@@ -54,8 +54,8 @@ def main():
 
     try:
         expect("Tha")
-        keys(b"/shop-api-1\rG6")
-        expect("6 Layers")
+        keys(b"/shop-api-1\rG7")
+        expect("7 Layers")
         expect("Filesystem layers (2)")
         expect("Build history (2)")
         keys(b"G\r")
@@ -136,12 +136,12 @@ def main():
         expect("Filter: Running")
         expect("Sort: Name")
         keys(b"\x1b[18~")  # F7 -> Containers
-        keys(b"6")
+        keys(b"7")
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 15, 50, 0, 0))
         screen.resize(15, 50)
         os.kill(process.pid, signal.SIGWINCH)
         drain()
-        expect("6 Layers")
+        expect("7 Layers")
         keys(b"\x03")
         process.wait(timeout=5)
         assert process.returncode == 0

@@ -185,6 +185,9 @@ pub async fn run(config: Config, initial: Vec<Connection>) -> Result<()> {
         store.maintenance()?;
         Ok(())
     });
+    let events = crate::events::spawn_writer(
+        crate::events::database_path(&path).context("History path has no directory")?,
+    );
     let claims: collector::Claims = Arc::new(Mutex::new(HashMap::new()));
     let budget = Arc::new(Semaphore::new(2));
     let mut tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
@@ -208,7 +211,7 @@ pub async fn run(config: Config, initial: Vec<Connection>) -> Result<()> {
                 let keys: std::collections::HashSet<_> = connections.iter().map(Connection::key).collect();
                 tasks.retain(|key,task| { if !keys.contains(key) { task.abort(); false } else { true } });
                 for connection in connections {
-                    tasks.entry(connection.key()).or_insert_with(|| tokio::spawn(collector::run(connection, config.refresh_seconds, sender.clone(), dropped.clone(), claims.clone(), budget.clone(),live.clone())));
+                    tasks.entry(connection.key()).or_insert_with(|| tokio::spawn(collector::run(connection, config.refresh_seconds, sender.clone(), dropped.clone(), claims.clone(), budget.clone(),live.clone(),events.clone())));
                 }
                 // Wake writer for heartbeat and expiry, even with zero running containers.
                 let _ = sender.try_send(collector::WriteBatch { runtime: String::new(), samples: vec![],flush:false });

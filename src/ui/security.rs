@@ -44,6 +44,11 @@ pub fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// The Containers view's report tab has no scan controls, so its hints must offer none.
+fn read_only(app: &App) -> bool {
+    app.overview_mode == OverviewMode::Containers
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = pane(
         app,
@@ -62,6 +67,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    draw_report(frame, app, inner);
+}
+
+/// Report component shared by the Security view and the Containers tab.
+pub fn draw_report(frame: &mut Frame, app: &mut App, inner: Rect) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -88,11 +98,17 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         ));
     }
     match &app.security.state {
-        State::Idle => lines.push(Line::from(if app.security.enabled {
-            "No saved report yet · s Scan checked/selected images"
-        } else {
-            "Module not installed. Run: tha module install security"
-        })),
+        State::Idle => lines.push(Line::from(
+            if read_only(app) && app.security.target.is_none() {
+                "This container's image ID is unknown, so no report can be matched."
+            } else if read_only(app) {
+                "No saved report yet. Scan this image from the Security view (Ctrl+→ or Alt+4)."
+            } else if app.security.enabled {
+                "No saved report yet · s Scan checked/selected images"
+            } else {
+                "Module not installed. Run: tha module install security"
+            },
+        )),
         State::Failed(error) => {
             lines.push(Line::styled(
                 "Image scan failed; this is NOT a clean scan.",
@@ -252,7 +268,9 @@ fn scan_status_line(app: &App, now: std::time::Instant, width: u16) -> Line<'sta
         .unwrap_or(0);
     let spinner = ["⠋", "⠙", "⠹", "⠸"][(seconds % 4) as usize];
     let elapsed = format!("{:02}:{:02}", seconds / 60, seconds % 60);
-    let suffix = if width >= 28 {
+    let suffix = if read_only(app) {
+        format!(" {elapsed}")
+    } else if width >= 28 {
         format!(" {elapsed} · x Cancel")
     } else {
         format!(" {elapsed} · x")
@@ -679,6 +697,7 @@ mod tests {
     fn scan_status_animates_and_shows_elapsed_time_without_fabricating_progress() {
         let mut app = App::new(crate::demo::connections(), 100, false, true);
         let started = std::time::Instant::now();
+        app.overview_mode = OverviewMode::Security;
         app.security.start(3);
         app.security.started = Some(started);
         app.security.progress = "Image 1/3 · Waiting for Grype".into();
@@ -702,6 +721,54 @@ mod tests {
             scan_status_line(&app, started, 100),
             scan_status_line(&app, started + std::time::Duration::from_secs(99), 100)
         );
+    }
+
+    #[test]
+    fn containers_tab_reuses_the_report_inside_details_without_scan_controls() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let render = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(170, 40)).unwrap();
+            terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.security.enabled = true;
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, Scope::Container(_)))
+            .unwrap();
+        for container in &mut app.engines[app.rows[app.selected].engine]
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .containers
+        {
+            container.image_id = Some("sha256:fixture".into());
+        }
+        app.tab = Tab::Security;
+        app.detail_focus = true;
+        let idle = render(&mut app);
+        assert!(idle.contains("8 Security"), "{idle}");
+        assert!(idle.contains("Explorer"), "Stays in the Containers layout");
+        assert!(idle.contains("from the Security view"), "{idle}");
+        assert!(!idle.contains("s Scan"), "{idle}");
+        assert!(
+            !idle.contains("Vulnerabilities ·"),
+            "No second pane: {idle}"
+        );
+        app.security.start(1);
+        app.security.progress = "Scanning".into();
+        let busy = render(&mut app);
+        assert!(busy.contains("Scanning"), "{busy}");
+        assert!(!busy.contains("x Cancel"), "{busy}");
     }
 
     #[test]
@@ -744,7 +811,7 @@ mod tests {
                 assert!(text.contains("CVE-fixture"));
                 assert!(text.contains("9.8"));
                 assert!(
-                    !text.contains("6 Layers"),
+                    !text.contains("7 Layers"),
                     "Zoom must replace the explorer/details split"
                 );
             }

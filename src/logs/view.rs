@@ -55,12 +55,15 @@ pub struct LogView {
     width: usize,
     anchor: Option<Position>,
     query: String,
+    query_is_regex: bool,
+    /// Search syntax for the next query; literal by default.
+    pub regex_search: bool,
     regex: Option<Regex>,
     pub active: Option<SearchMatch>,
     pub match_count: usize,
     pub match_index: Option<usize>,
     layouts: VecDeque<EntryLayout>,
-    layout_mode: Option<(usize, bool, super::filter::Filter)>,
+    layout_mode: Option<(usize, bool, bool, super::filter::Filter)>,
     search_stamp: Option<(u64, u64, usize)>,
     search_filter: Option<super::filter::Filter>,
     search_counts: VecDeque<SearchCount>,
@@ -79,6 +82,8 @@ impl LogView {
             width: 1,
             anchor: None,
             query: String::new(),
+            query_is_regex: false,
+            regex_search: false,
             regex: None,
             active: None,
             match_count: 0,
@@ -97,6 +102,9 @@ impl LogView {
     pub fn query(&self) -> &str {
         &self.query
     }
+    pub fn query_is_regex(&self) -> bool {
+        self.query_is_regex
+    }
     pub fn regex(&self) -> Option<&Regex> {
         self.regex.as_ref()
     }
@@ -111,16 +119,28 @@ impl LogView {
         self.horizontal = 0;
     }
 
+    /// Report an invalid pattern before it replaces the current search.
+    pub fn check_query(&self, query: &str) -> Result<(), regex::Error> {
+        self.compile(query).map(|_| ())
+    }
+
+    fn compile(&self, query: &str) -> Result<Regex, regex::Error> {
+        let pattern = if self.regex_search {
+            query.to_owned()
+        } else {
+            regex::escape(query)
+        };
+        RegexBuilder::new(&pattern).case_insensitive(true).build()
+    }
+
     pub fn set_query(&mut self, query: String, buffer: &mut LogBuffer) {
-        self.query = query;
-        self.regex = if self.query.is_empty() {
+        self.regex = if query.is_empty() {
             None
         } else {
-            RegexBuilder::new(&regex::escape(&self.query))
-                .case_insensitive(true)
-                .build()
-                .ok()
+            self.compile(&query).ok()
         };
+        self.query_is_regex = self.regex_search && self.regex.is_some();
+        self.query = query;
         self.active = None;
         self.reset_search_counts();
         self.sync(buffer, self.width, self.height);
@@ -210,10 +230,16 @@ impl LogView {
     pub fn sync(&mut self, buffer: &LogBuffer, width: usize, height: usize) {
         self.width = width.max(1);
         self.height = height.max(1);
-        if self.layout_mode != Some((self.width, self.wrap, self.filter.clone())) {
+        let mode = (
+            self.width,
+            self.wrap,
+            buffer.pretty_json,
+            self.filter.clone(),
+        );
+        if self.layout_mode.as_ref() != Some(&mode) {
             self.layouts.clear();
             self.search_stamp = None;
-            self.layout_mode = Some((self.width, self.wrap, self.filter.clone()));
+            self.layout_mode = Some(mode);
         }
         let first = buffer.entries.front().map(|e| e.sequence).unwrap_or(0);
         while self
@@ -229,11 +255,7 @@ impl LogView {
         }) {
             self.layouts.push_back(EntryLayout {
                 sequence: entry.sequence,
-                ranges: if self.wrap {
-                    wrap_ranges(&entry.text, self.width)
-                } else {
-                    std::iter::once(0..entry.text.len()).collect()
-                },
+                ranges: row_ranges(entry.display(), self.width, self.wrap),
             });
         }
         let stamp = buffer
@@ -337,15 +359,35 @@ impl LogView {
                     .iter()
                     .find(|entry| entry.sequence == anchor.sequence)
             {
+                let text = entry.display();
+                let line = line_start(text, anchor.byte);
                 if self.wrap {
-                    self.horizontal = entry.text[..anchor.byte].width();
+                    self.horizontal = text[line..anchor.byte].width();
                 } else {
-                    anchor.byte = byte_at_column(&entry.text, self.horizontal);
+                    let end = text[line..].find('\n').map_or(text.len(), |at| line + at);
+                    anchor.byte = line + byte_at_column(&text[line..end], self.horizontal);
                 }
             }
             self.anchor = position;
         }
         self.wrap = !self.wrap;
+        self.sync(buffer, self.width, self.height);
+    }
+
+    /// Keep the top entry in place across modes. Byte offsets differ between the two
+    /// texts, so the position is the start of that entry and a current match is dropped.
+    pub fn toggle_pretty_json(&mut self, buffer: &mut LogBuffer) {
+        self.sync(buffer, self.width, self.height);
+        let top = self.position_at(self.start(buffer));
+        buffer.set_pretty_json(!buffer.pretty_json);
+        self.anchor = top.map(|position| Position {
+            sequence: position.sequence,
+            byte: 0,
+        });
+        self.horizontal = 0;
+        self.active = None;
+        self.match_index = None;
+        self.reset_search_counts();
         self.sync(buffer, self.width, self.height);
     }
 
@@ -377,7 +419,8 @@ impl LogView {
                     .find(|entry| entry.sequence == found.sequence)
             {
                 self.horizontal = if found.field == Field::Payload {
-                    entry.text[..found.range.start].width()
+                    let text = entry.display();
+                    text[line_start(text, found.range.start)..found.range.start].width()
                 } else {
                     0
                 };
@@ -393,15 +436,19 @@ impl LogView {
 fn entry_matches<'a>(entry: &'a Entry, regex: &'a Regex) -> impl Iterator<Item = SearchMatch> + 'a {
     [
         (Field::Source, entry.source.as_str()),
-        (Field::Payload, entry.text.as_str()),
+        (Field::Payload, entry.display()),
     ]
     .into_iter()
     .flat_map(move |(field, text)| {
-        regex.find_iter(text).map(move |found| SearchMatch {
-            sequence: entry.sequence,
-            field,
-            range: found.range(),
-        })
+        // A pattern such as `a*` also matches nothing, which cannot be shown or navigated.
+        regex
+            .find_iter(text)
+            .filter(|found| !found.is_empty())
+            .map(move |found| SearchMatch {
+                sequence: entry.sequence,
+                field,
+                range: found.range(),
+            })
     })
 }
 
@@ -419,6 +466,30 @@ pub fn byte_at_column(text: &str, column: usize) -> usize {
         width += grapheme.width();
     }
     text.len()
+}
+
+fn line_start(text: &str, byte: usize) -> usize {
+    text[..byte].rfind('\n').map_or(0, |at| at + 1)
+}
+
+/// Rows of one entry. Newlines exist only in pretty-printed JSON and never appear in a row.
+fn row_ranges(text: &str, width: usize, wrap: bool) -> Vec<Range<usize>> {
+    let mut rows = Vec::new();
+    let mut start = 0;
+    for line in text.split('\n') {
+        let end = start + line.len();
+        if wrap {
+            rows.extend(
+                wrap_ranges(line, width)
+                    .into_iter()
+                    .map(|range| start + range.start..start + range.end),
+            );
+        } else {
+            rows.push(start..end);
+        }
+        start = end + 1;
+    }
+    rows
 }
 
 pub fn wrap_ranges(text: &str, width: usize) -> Vec<Range<usize>> {
@@ -681,5 +752,93 @@ mod tests {
         buffer.follow = true;
         view.toggle_wrap(&buffer);
         assert_eq!(view.scroll_position(&buffer), (2, 4));
+    }
+
+    fn row_text(view: &LogView, buffer: &LogBuffer) -> Vec<String> {
+        view.visible(buffer)
+            .into_iter()
+            .map(|row| entry(buffer, row.sequence).unwrap().display()[row.range].to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn regex_search_is_opt_in_case_insensitive_and_ignores_empty_matches() {
+        let mut buffer = LogBuffer::new(4);
+        buffer.push("api", "status=500 failed", false);
+        buffer.push("api", "status=200 a.c", false);
+        let mut view = LogView::new(true);
+        view.sync(&buffer, 80, 4);
+        view.set_query("a.c".into(), &mut buffer);
+        assert_eq!(view.match_count, 1, "Literal by default");
+        assert!(!view.query_is_regex());
+        view.regex_search = true;
+        view.set_query(r"STATUS=5\d\d".into(), &mut buffer);
+        assert_eq!(view.match_count, 1);
+        assert!(view.query_is_regex());
+        view.set_query("z*".into(), &mut buffer);
+        assert_eq!(view.match_count, 0);
+        assert!(view.active.is_none());
+        assert!(view.check_query("(unclosed").is_err());
+        assert_eq!(view.query(), "z*", "Checking does not replace the search");
+        view.regex_search = false;
+        assert!(view.check_query("(unclosed").is_ok());
+    }
+
+    #[test]
+    fn pretty_json_uses_one_row_per_line_and_search_targets_what_is_shown() {
+        let mut buffer = LogBuffer::new(4);
+        buffer.push("api", "before", false);
+        buffer.push("api", r#"{"level":"warn","message":"retry"}"#, false);
+        let mut view = LogView::new(false);
+        view.sync(&buffer, 40, 10);
+        view.set_query("level".into(), &mut buffer);
+        assert_eq!(view.match_index, Some(1));
+        view.toggle_pretty_json(&mut buffer);
+        assert!(buffer.pretty_json);
+        assert!(view.active.is_none(), "Old byte offsets are not reused");
+        assert_eq!(view.match_count, 1);
+        view.first(&mut buffer);
+        assert_eq!(
+            row_text(&view, &buffer),
+            [
+                "before",
+                "{",
+                "  \"level\": \"warn\",",
+                "  \"message\": \"retry\"",
+                "}"
+            ]
+        );
+        assert!(view.visible(&buffer)[2].continuation);
+        view.set_query("message".into(), &mut buffer);
+        assert_eq!(view.visible(&buffer)[0].range.start, 21);
+        assert_eq!(
+            view.horizontal, 3,
+            "Columns count from the start of the line"
+        );
+        view.toggle_wrap(&buffer);
+        assert_eq!(row_text(&view, &buffer)[0], "  \"message\": \"retry\"");
+        view.toggle_wrap(&buffer);
+        assert_eq!(row_text(&view, &buffer)[0], "  \"message\": \"retry\"");
+        view.toggle_pretty_json(&mut buffer);
+        assert_eq!(
+            row_text(&view, &buffer)[0],
+            r#"{"level":"warn","message":"retry"}"#,
+            "Turning it off keeps the same entry at the top"
+        );
+    }
+
+    #[test]
+    fn pretty_json_wraps_each_line_and_keeps_every_character() {
+        let mut buffer = LogBuffer::new(2);
+        buffer.push("api", r#"{"message":"abcdefghij"}"#, false);
+        buffer.set_pretty_json(true);
+        let mut view = LogView::new(true);
+        view.sync(&buffer, 8, 10);
+        let rows = row_text(&view, &buffer);
+        assert!(
+            rows.iter()
+                .all(|row| row.width() <= 8 && !row.contains('\n'))
+        );
+        assert_eq!(rows.concat(), buffer.entries[0].display().replace('\n', ""));
     }
 }

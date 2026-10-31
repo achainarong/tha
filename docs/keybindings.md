@@ -65,7 +65,7 @@ configured keys take precedence.
 | `focus-next`, `focus-previous` | Cycle panes; also switch images/findings in the Security overview |
 | `previous-view`, `next-view` | Cycle top-level overviews |
 | `containers-view`, `images-view`, `volumes-view`, `security-view` | Open a top-level overview |
-| `overview`, `logs`, `networks`, `exec`, `metrics`, `layers`, `security` | Select an inner workload tab; `exec` selects navigation, not shell input |
+| `overview`, `logs`, `networks`, `exec`, `metrics`, `layers`, `security`, `events` | Select an inner workload tab; `exec` selects navigation, not shell input |
 | `zoom` | Expand/restore the focused detail tab, Performance, or inventory view |
 | `toggle-branch` | Toggle an Explorer branch |
 | `next-match`, `previous-match` | Navigate tree/log search matches |
@@ -86,10 +86,11 @@ configured keys take precedence.
 
 | Action names | Behavior |
 | --- | --- |
-| `wrap`, `follow` | Toggle log wrapping or following |
+| `wrap`, `follow`, `json` | Toggle log wrapping, following, or pretty-printed JSON |
 | `filter-logs`, `clear-log-filter` | Edit or clear retained-log filters |
 | `export-logs` | Open the reviewed export dialog; never exports immediately |
-| `reconnect-logs` | Reconnect the current log streams |
+| `logs-since` | Prompt for a log start time (`15m`, `2h`, `1d`, RFC 3339, or `off`) |
+| `reconnect-logs` | Reload the current logs now; streams also reconnect automatically |
 | `open-exec`, `exec-sessions`, `close-exec` | Open container shell, choose retained session, close active session |
 | `reload-layers` | Retry the read-only image layer lookup |
 
@@ -99,12 +100,15 @@ configured keys take precedence.
 | --- | --- |
 | `actions`, `action-results` | Open contextual actions or background lifecycle results |
 | `start`, `stop`, `restart`, `delete-container` | Request a confirmed workload operation (Explorer/Performance only) |
+| `compose-update`, `compose-pull`, `compose-up`, `compose-recreate`, `compose-down` | Request a confirmed Compose operation on the selected project or service |
+| `compose-output` | Show the last Compose operation's output |
 | `previous-runtime`, `next-runtime` | Select an inventory runtime |
 | `mark`, `mark-unused`, `clear-marks` | Manage inventory cleanup marks |
 | `remove-resources` | Open unused-resource removal confirmation |
 | `prune-resources` | Confirm pruning all unreferenced images or volumes in the selected runtime (`p` / `:prune`; ignores search/filter) |
 | `inventory-filter`, `inventory-sort`, `refresh-inventory` | Filter, sort, or refresh inventory |
 | `removal-results` | Review the last cleanup results |
+| `check-updates`, `pull-image` | Compare visible images with their registries; pull the selected image's tags |
 
 ### Security
 

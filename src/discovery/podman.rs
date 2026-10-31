@@ -248,15 +248,13 @@ mod tests {
     struct Fixture(std::path::PathBuf);
     impl Fixture {
         fn new(script: &str) -> Self {
-            use std::os::unix::fs::PermissionsExt;
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
                 "tha-podman-command-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
-            std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            crate::test_support::write_executable(&path, &format!("#!/bin/sh\n{script}\n"), 0o700);
             Self(path)
         }
     }

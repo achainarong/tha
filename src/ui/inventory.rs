@@ -215,6 +215,16 @@ fn entries(snapshot: &Snapshot, mode: OverviewMode, binds: bool) -> Vec<Entry> {
         .collect()
 }
 
+fn update_available(
+    updates: &std::collections::HashMap<(usize, String), crate::images::UpdateStatus>,
+    engine: usize,
+    image: &str,
+) -> bool {
+    updates
+        .get(&(engine, image.to_owned()))
+        .is_some_and(|status| matches!(status, crate::images::UpdateStatus::Available(_)))
+}
+
 fn rank(entry: &Entry) -> usize {
     match entry.status {
         "running" => 0,
@@ -661,6 +671,115 @@ pub fn navigate(app: &mut App, code: KeyCode, height: usize) {
     app.inventory_views.insert(key, view);
 }
 
+/// The connected runtime whose images the Images view is showing.
+fn image_runtime(app: &App) -> Result<(&crate::app::Engine, &Snapshot), String> {
+    if app.demo {
+        return Err("Demo mode does not contact registries".into());
+    }
+    let engine = app
+        .engines
+        .get(app.inventory_engine)
+        .filter(|engine| engine.error.is_none() && engine.alias.is_none())
+        .ok_or("Select a connected runtime first")?;
+    if engine.connection.kind != crate::config::BackendKind::Docker {
+        return Err("Registry updates require a Docker-compatible runtime".into());
+    }
+    let snapshot = engine
+        .snapshot
+        .as_ref()
+        .filter(|snapshot| snapshot.images.is_some())
+        .ok_or("Image inventory is unavailable for this runtime")?;
+    Ok((engine, snapshot))
+}
+
+/// Compare what the Images list shows now. Only this explicit request contacts a registry.
+pub fn begin_update_check(app: &mut App) {
+    let (engine, snapshot) = match image_runtime(app) {
+        Ok(runtime) => runtime,
+        Err(notice) => {
+            app.notice = notice;
+            return;
+        }
+    };
+    let key = (app.inventory_engine, OverviewMode::Images);
+    let view = app.inventory_views.get(&key).cloned().unwrap_or_default();
+    let rows = visible(entries(snapshot, key.1, false), &view, key.1, &view.query);
+    let targets: Vec<_> = snapshot
+        .images
+        .iter()
+        .flatten()
+        .filter(|image| !image.tags.is_empty() && rows.iter().any(|row| row.key == image.id))
+        .map(|image| crate::images::Target {
+            connection: engine.connection.clone(),
+            engine: key.0,
+            image: image.clone(),
+        })
+        .collect();
+    if targets.is_empty() {
+        app.notice = "No tagged images are visible to check".into();
+        return;
+    }
+    app.notice = format!(
+        "Checking {} images against their registries…",
+        targets.len()
+    );
+    app.image_check_request = Some(targets);
+}
+
+/// Pull every tag of the selected image. Containers keep the image they already use.
+pub fn begin_image_pull(app: &mut App) {
+    if app.image_pull_active {
+        app.notice = "Another image pull is still running".into();
+        return;
+    }
+    let (engine, snapshot) = match image_runtime(app) {
+        Ok(runtime) => runtime,
+        Err(notice) => {
+            app.notice = notice;
+            return;
+        }
+    };
+    let key = (app.inventory_engine, OverviewMode::Images);
+    let view = app.inventory_views.get(&key).cloned().unwrap_or_default();
+    let rows = visible(entries(snapshot, key.1, false), &view, key.1, &view.query);
+    let selected = view
+        .selected
+        .as_ref()
+        .and_then(|id| rows.iter().find(|row| &row.key == id))
+        .or_else(|| rows.get(view.index));
+    let image = selected.and_then(|row| {
+        snapshot
+            .images
+            .iter()
+            .flatten()
+            .find(|image| image.id == row.key)
+    });
+    let Some(image) = image else {
+        app.notice = "Select an image in the Images view to pull".into();
+        return;
+    };
+    let tags: Vec<_> = image
+        .tags
+        .iter()
+        .filter(|tag| crate::images::pullable(tag))
+        .cloned()
+        .collect();
+    if tags.is_empty() {
+        app.notice = "This image has no tag to pull".into();
+        return;
+    }
+    let notice = format!("Pulling {}…", safe_text(&tags.join(", ")));
+    let request = crate::images::PullRequest {
+        connection: engine.connection.clone(),
+        engine: key.0,
+        image: image.id.clone(),
+        tags,
+    };
+    app.notice = notice;
+    app.image_pull_request = Some(request);
+    app.image_pull_active = true;
+}
+
 /// Resolve only currently available images in the chosen engine, including unused ones.
 pub fn security_targets(app: &App, checked: bool) -> Vec<crate::security::Target> {
     let key = (app.inventory_engine, OverviewMode::Images);
@@ -713,6 +832,15 @@ pub fn draw_security_images(frame: &mut Frame, app: &mut App, area: Rect) {
         .or_default()
         .details = false;
     draw_overview_inner(frame, app, area, true);
+}
+
+fn all_update_count(app: &App, engine: usize, snapshot: &Snapshot) -> usize {
+    snapshot
+        .images
+        .iter()
+        .flatten()
+        .filter(|image| update_available(&app.image_updates, engine, &image.id))
+        .count()
 }
 
 fn draw_overview_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
@@ -820,6 +948,14 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
         .style(muted()),
         parts[0],
     );
+    let updates = if key.1 == OverviewMode::Images {
+        match all_update_count(app, key.0, snapshot) {
+            0 => String::new(),
+            count => format!(" · {count} ↑ update available"),
+        }
+    } else {
+        String::new()
+    };
     let marks = if scan_only {
         format!("{} checked for scan", view.scan_marked.len())
     } else if app.security.enabled && key.1 == OverviewMode::Images {
@@ -833,7 +969,7 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
     };
     frame.render_widget(
         Paragraph::new(format!(
-            "{} / {total} shown · {used} used · {unused} unreferenced · {marks}{}",
+            "{} / {total} shown · {used} used · {unused} unreferenced · {marks}{updates}{}",
             rows.len(),
             if query.is_empty() {
                 String::new()
@@ -845,10 +981,10 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
     );
     frame.render_widget(
         Paragraph::new(if scan_only { "Space/m Check · M All · s/S Scan · Enter Findings · Tab Focus · z Zoom".into() } else if app.security.enabled && key.1 == OverviewMode::Images { format!(
-            "Row {} / {} · m/M Check scan/all · 7 Security · :scan-images · z Zoom · Space Cleanup · d Delete · p Prune all unused · Enter Details",
+            "Row {} / {} · U Check updates · :pull-image · m/M Check scan/all · 7 Security · :scan-images · z Zoom · Space Cleanup · d Delete · p Prune all unused · Enter Details",
             if rows.is_empty() { 0 } else { view.index + 1 },
             rows.len()
-        ) } else { format!("Row {} / {} · Space Mark  u Mark unused  c Clear  d Delete  p Prune all unused · / Search  f Filter  s Sort  Enter Details", if rows.is_empty() { 0 } else { view.index + 1 }, rows.len()) })
+        ) } else { format!("Row {} / {} · Space Mark  u Mark unused  c Clear  d Delete  p Prune all unused{} · / Search  f Filter  s Sort  Enter Details", if rows.is_empty() { 0 } else { view.index + 1 }, rows.len(), if key.1 == OverviewMode::Images { "  U Check updates  :pull-image" } else { "" }) })
         .style(muted()),
         parts[3],
     );
@@ -975,8 +1111,13 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
                 } else {
                     "    "
                 };
+                let update = if images && update_available(&app.image_updates, key.0, &row.key) {
+                    "↑ "
+                } else {
+                    ""
+                };
                 let mut cells = vec![Cell::from(ellipsize_line(
-                    Line::from(format!("{mark}{name}")),
+                    Line::from(format!("{mark}{update}{name}")),
                     name_width,
                 ))];
                 if wide {
@@ -1048,8 +1189,19 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
                             .map(metrics::bytes)
                             .unwrap_or_else(|| "unknown (no filesystem scan)".into())
                     )),
-                    Line::from("Container references:"),
                 ];
+                if key.1 == OverviewMode::Images {
+                    lines.push(Line::from(format!(
+                        "Update: {}",
+                        app.image_updates
+                            .get(&(key.0, row.key.clone()))
+                            .map_or_else(
+                                || "not checked · U compares with the registry".to_owned(),
+                                |status| safe_text(&status.describe())
+                            )
+                    )));
+                }
+                lines.push(Line::from("Container references:"));
                 lines.extend(
                     row.containers
                         .iter()
@@ -1108,6 +1260,7 @@ mod tests {
                         .map(|id| Image {
                             id: id.into(),
                             tags: vec![format!("{id}:latest")],
+                            digests: vec![],
                             size: None,
                         })
                         .collect(),
@@ -1313,6 +1466,7 @@ mod tests {
         let image = Image {
             id: "sha256:old".into(),
             tags: vec!["app:latest".into()],
+            digests: vec![],
             size: None,
         };
         let containers = vec![
@@ -1351,11 +1505,13 @@ mod tests {
             Image {
                 id: "sha256:used".into(),
                 tags: vec!["used:latest".into()],
+                digests: vec![],
                 size: None,
             },
             Image {
                 id: "sha256:unused".into(),
                 tags: vec!["unused:latest".into()],
+                digests: vec![],
                 size: None,
             },
         ]);
@@ -1443,6 +1599,7 @@ mod tests {
             .map(|i| Image {
                 id: format!("id-{i}"),
                 tags: vec![format!("image{i:03}:latest")],
+                digests: vec![],
                 size: Some(i),
             })
             .collect();
@@ -1476,6 +1633,7 @@ mod tests {
             .push(Image {
                 id: "inserted".into(),
                 tags: vec!["aaa:new".into()],
+                digests: vec![],
                 size: None,
             });
         terminal
@@ -1634,6 +1792,7 @@ mod tests {
         app.engines[0].snapshot.as_mut().unwrap().images = Some(vec![Image {
             id: format!("sha256:{}", "a".repeat(64)),
             tags: vec![format!("registry.example/{}:latest", "x".repeat(100))],
+            digests: vec![],
             size: Some(1024),
         }]);
         for width in [92, 120, 150, 220] {

@@ -17,6 +17,7 @@ pub struct Engine {
     pub alias: Option<String>,
     pub metrics: crate::metrics::Store,
     pub metrics_revision: u64,
+    pub events: crate::events::Timeline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +98,7 @@ pub enum Tab {
     Layers,
     History,
     Security,
+    Events,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -173,6 +175,7 @@ pub enum Choice {
         engine: usize,
         container: Box<Container>,
     },
+    Compose(crate::compose::Action),
 }
 
 pub struct Picker {
@@ -303,6 +306,17 @@ pub struct App {
     pub logs: LogBuffer,
     pub log_scope: Option<String>,
     pub log_generation: u64,
+    /// Unix second the logs start from; None shows recent lines.
+    pub log_since: Option<i64>,
+    pub compose_confirmation: Option<crate::compose::Confirmation>,
+    pub compose_request: Option<crate::compose::Request>,
+    pub compose_job: Option<crate::compose::Job>,
+    pub compose_output_visible: bool,
+    /// Registry comparison results by runtime and image ID, from this session only.
+    pub image_updates: HashMap<(usize, String), crate::images::UpdateStatus>,
+    pub image_check_request: Option<Vec<crate::images::Target>>,
+    pub image_pull_request: Option<crate::images::PullRequest>,
+    pub image_pull_active: bool,
     pub notice: String,
     pub pending_g: bool,
     pub demo: bool,
@@ -372,6 +386,7 @@ impl App {
                     alias: None,
                     metrics: Default::default(),
                     metrics_revision: 0,
+                    events: Default::default(),
                 })
                 .collect(),
             expanded: HashSet::new(),
@@ -411,6 +426,15 @@ impl App {
             logs: LogBuffer::new(log_capacity),
             log_scope: None,
             log_generation: 0,
+            log_since: None,
+            compose_confirmation: None,
+            compose_request: None,
+            compose_job: None,
+            compose_output_visible: false,
+            image_updates: HashMap::new(),
+            image_check_request: None,
+            image_pull_request: None,
+            image_pull_active: false,
             notice: String::new(),
             pending_g: false,
             demo,
@@ -574,6 +598,7 @@ impl App {
                     alias: None,
                     metrics: Default::default(),
                     metrics_revision: 0,
+                    events: Default::default(),
                 });
                 let pin_rank = |engine: usize| {
                     self.context_pins
@@ -710,6 +735,9 @@ impl App {
         if self.demo {
             anyhow::bail!("Demo mode: lifecycle mutations are disabled");
         }
+        if self.compose_busy() {
+            anyhow::bail!("Wait for the running Compose operation to finish first");
+        }
         let row = self.action_row().ok_or_else(|| {
             anyhow::anyhow!(if self.performance_focus {
                 "Select a target in Performance before requesting an action"
@@ -792,6 +820,19 @@ impl App {
         let Some(row) = self.action_row() else {
             return;
         };
+        let compose = matches!(
+            row.scope,
+            Scope::Project {
+                namespace: None,
+                ..
+            } | Scope::Services {
+                namespace: None,
+                ..
+            } | Scope::Service {
+                namespace: None,
+                ..
+            }
+        );
         self.picker = Some(Picker {
             title: format!("Actions · {}", row.title),
             choices: [
@@ -805,9 +846,126 @@ impl App {
                 action,
                 row: row.key.clone(),
             })
+            .chain(
+                crate::compose::Action::ALL
+                    .into_iter()
+                    .filter(|_| compose)
+                    .map(Choice::Compose),
+            )
             .collect(),
             selected: 0,
         });
+    }
+
+    pub fn compose_busy(&self) -> bool {
+        self.compose_job
+            .as_ref()
+            .is_some_and(crate::compose::Job::running)
+    }
+
+    fn plan_compose(
+        &self,
+        action: crate::compose::Action,
+    ) -> anyhow::Result<crate::compose::Request> {
+        if self.demo {
+            anyhow::bail!("Demo mode: Compose operations are disabled");
+        }
+        if self.compose_busy() {
+            anyhow::bail!("Another Compose operation is still running; :compose-output shows it");
+        }
+        if self.has_active_actions() {
+            anyhow::bail!("Wait for running lifecycle actions to finish first");
+        }
+        let row = self
+            .action_row()
+            .ok_or_else(|| anyhow::anyhow!("Select a Compose project or service"))?;
+        let engine = &self.engines[row.engine];
+        if engine.error.is_some() || engine.alias.is_some() {
+            anyhow::bail!("Select a connected runtime, not an offline engine or alias");
+        }
+        let project = match &row.scope {
+            Scope::Project { project, .. }
+            | Scope::Services { project, .. }
+            | Scope::Service { project, .. } => project.clone(),
+            _ => anyhow::bail!("Select a Compose project or service"),
+        };
+        // A selected service still needs its project's labels, so resolve against them all.
+        let members: Vec<_> = engine
+            .snapshot
+            .iter()
+            .flat_map(|snapshot| &snapshot.containers)
+            .filter(|container| container.project.as_deref() == Some(project.as_str()))
+            .cloned()
+            .collect();
+        crate::compose::Request::build(&engine.connection, &row.scope, &members, action)
+    }
+
+    pub fn request_compose(&mut self, action: crate::compose::Action) {
+        match self.plan_compose(action) {
+            Ok(request) => {
+                self.compose_confirmation = Some(crate::compose::Confirmation {
+                    request,
+                    typed: String::new(),
+                    error: None,
+                });
+            }
+            Err(error) => self.notice = format!("{error:#}"),
+        }
+    }
+
+    pub fn confirm_compose(&mut self) {
+        let Some(mut confirmation) = self.compose_confirmation.take() else {
+            return;
+        };
+        let request = confirmation.request.clone();
+        if request.action.requires_typing() && confirmation.typed != request.target.project {
+            confirmation.error = Some("Type the exact project name to confirm".into());
+            self.compose_confirmation = Some(confirmation);
+            return;
+        }
+        // The dialog may have stayed open while something else started.
+        if self.compose_busy() || self.has_active_actions() {
+            self.notice = "Another operation started; nothing was sent".into();
+            return;
+        }
+        self.compose_job = Some(crate::compose::Job::new(format!(
+            "{} · {}",
+            request.action.label(),
+            request.target.name()
+        )));
+        self.compose_output_visible = true;
+        self.compose_request = Some(request);
+    }
+
+    /// Events for the selected row. Project and service rows also match by label, so a
+    /// container that was recreated or removed stays in its project's timeline.
+    pub fn visible_events(&self) -> Vec<&crate::events::Event> {
+        let Some(row) = self.current() else {
+            return Vec::new();
+        };
+        let keys: HashSet<String> = self
+            .containers_for(row)
+            .iter()
+            .map(Container::key)
+            .collect();
+        self.engines[row.engine]
+            .events
+            .newest_first()
+            .filter(|event| match &row.scope {
+                Scope::Engine => true,
+                Scope::Project { project, .. } | Scope::Services { project, .. } => {
+                    event.project.as_ref() == Some(project)
+                }
+                Scope::Service {
+                    project, service, ..
+                } => {
+                    event.project.as_ref() == Some(project)
+                        && event.service.as_ref() == Some(service)
+                }
+                Scope::Standalone(_) => event.project.is_none(),
+                _ => keys.contains(&event.key),
+            })
+            .collect()
     }
 
     pub fn layers_target(&self) -> Option<(crate::layers::Key, Connection, Container)> {
@@ -821,9 +979,42 @@ impl App {
         self.available_layers_target().is_some()
     }
 
+    /// The saved report for the selected container's image, if there is exactly one image.
+    fn container_security_target(&self) -> Option<crate::security::Target> {
+        let (_, connection, container) = self.available_layers_target()?;
+        let runtime = self
+            .current()
+            .and_then(|row| self.engines[row.engine].snapshot.as_ref())?
+            .engine_id
+            .clone()?;
+        Some(crate::security::Target {
+            connection,
+            runtime,
+            image: container.image_id?,
+            label: container.image,
+        })
+    }
+
+    pub fn security_tab_available(&self) -> bool {
+        self.security.enabled && self.layers_available()
+    }
+
     pub fn open_security(&mut self) {
         if !self.security.enabled {
             self.notice = "Install the security module first: tha module install security".into();
+            return;
+        }
+        // Containers shows the report in place. Scanning belongs to the Security view.
+        if self.overview_mode == OverviewMode::Containers {
+            if !self.security_tab_available() {
+                self.notice = "Select a container or single-container service".into();
+                return;
+            }
+            self.tab = Tab::Security;
+            self.detail_focus = true;
+            self.performance_focus = false;
+            self.detail_scroll = 0;
+            self.reconcile_detail_tab();
             return;
         }
         if self.security.busy {
@@ -840,26 +1031,9 @@ impl App {
         } else {
             Vec::new()
         };
-        let target = if self.overview_mode != OverviewMode::Containers {
-            crate::ui::inventory::security_targets(self, false)
-                .into_iter()
-                .next()
-        } else {
-            self.available_layers_target()
-                .and_then(|(_, connection, container)| {
-                    let runtime = self
-                        .current()
-                        .and_then(|row| self.engines[row.engine].snapshot.as_ref())?
-                        .engine_id
-                        .clone()?;
-                    Some(crate::security::Target {
-                        connection,
-                        runtime,
-                        image: container.image_id?,
-                        label: container.image,
-                    })
-                })
-        };
+        let target = crate::ui::inventory::security_targets(self, false)
+            .into_iter()
+            .next();
         let Some(target) = target else {
             self.overview_mode = OverviewMode::Security;
             self.detail_focus = false;
@@ -877,11 +1051,6 @@ impl App {
                 .entry((engine, OverviewMode::Images))
                 .or_default();
             view.selected = Some(target.image.clone());
-            if self.overview_mode == OverviewMode::Containers {
-                view.filter = 0;
-                view.query.clear();
-                view.details = false;
-            }
         }
         self.security.select(Some(target));
         self.security.queue = checked;
@@ -893,6 +1062,10 @@ impl App {
     }
 
     pub fn request_security_scan(&mut self, checked: bool) {
+        if self.overview_mode == OverviewMode::Containers {
+            self.notice = "Scans run from the Security view (Ctrl+→ or Alt+4)".into();
+            return;
+        }
         let detail_focus = self.detail_focus;
         // Either shortcut honors checked images, even when filters hide them.
         let checked = checked
@@ -940,7 +1113,14 @@ impl App {
 
     pub fn reconcile_detail_tab(&mut self) {
         if self.tab == Tab::Security && self.overview_mode == OverviewMode::Containers {
-            self.tab = Tab::Overview;
+            if self.security_tab_available() {
+                let target = self.container_security_target();
+                self.security.select(target);
+            } else {
+                self.tab = Tab::Overview;
+                self.security.expanded = false;
+                self.security.zoom = false;
+            }
         }
         if self.tab == Tab::History && self.performance_container().is_none() {
             self.tab = Tab::Overview;
@@ -1967,6 +2147,7 @@ impl App {
                     alias: None,
                     metrics: Default::default(),
                     metrics_revision: 0,
+                    events: Default::default(),
                 });
                 if let crate::runtime::Target::Podman { machine } = &saved.target {
                     self.podman_machines.insert(machine.clone(), index);
@@ -2251,6 +2432,7 @@ impl App {
                     self.request_action(action);
                 }
             }
+            Choice::Compose(action) => self.request_compose(action),
             Choice::ContextSort(mode) => {
                 self.context_sort = mode;
                 self.reorder_contexts();
@@ -3565,6 +3747,7 @@ mod tests {
             alias: None,
             metrics: Default::default(),
             metrics_revision: 0,
+            events: Default::default(),
         });
         let snapshot = Snapshot {
             engine_id: Some("same".into()),

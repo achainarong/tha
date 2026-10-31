@@ -32,28 +32,39 @@ pub fn prepare(request: &Request) -> Result<Command> {
             find_program("nerdctl").context("Install nerdctl and add it to PATH to use exec")?,
         )
     } else {
-        let prefer_podman = request.connection.name.to_lowercase().contains("podman");
-        let choices = if prefer_podman {
-            ["podman", "docker"]
-        } else {
-            ["docker", "podman"]
-        };
-        choices.into_iter().find_map(|name| find_program(name).map(|path| (name, path)))
+        runtime_cli(&request.connection)
             .context("Install the Docker or Podman CLI and add it to PATH to use exec; API browsing does not require a CLI")?
     };
     Ok(command_for(request, program, path))
 }
 
-fn command_for(request: &Request, program: &str, path: PathBuf) -> Command {
-    let socket = request
-        .connection
+/// The installed CLI for a Docker-compatible connection, preferring the one it is named for.
+pub fn runtime_cli(connection: &Connection) -> Option<(&'static str, PathBuf)> {
+    let prefer_podman = connection.name.to_lowercase().contains("podman");
+    let choices = if prefer_podman {
+        ["podman", "docker"]
+    } else {
+        ["docker", "podman"]
+    };
+    choices
+        .into_iter()
+        .find_map(|name| find_program(name).map(|path| (name, path)))
+}
+
+/// Point a CLI at exactly this connection, whatever context the shell has selected.
+pub fn pin_endpoint(
+    command: &mut Command,
+    program: &str,
+    connection: &Connection,
+    namespace: Option<&str>,
+) {
+    let socket = connection
         .endpoint
         .strip_prefix("unix://")
-        .unwrap_or(&request.connection.endpoint);
-    let mut command = Command::new(path);
+        .unwrap_or(&connection.endpoint);
     if program == "nerdctl" {
         command.arg("--address").arg(socket);
-        if let Some(namespace) = &request.container.namespace {
+        if let Some(namespace) = namespace {
             command.arg("--namespace").arg(namespace);
         }
     } else if program == "podman" {
@@ -63,11 +74,11 @@ fn command_for(request: &Request, program: &str, path: PathBuf) -> Command {
     } else {
         command.arg("--host").arg(format!("unix://{socket}"));
     }
-    command
-        .args(["exec", "--interactive", "--tty", "--"])
-        .arg(&request.container.id)
-        .args(&request.command);
-    // Explicit endpoints must not be overridden by an ambient context/TLS setting.
+    clear_endpoint_environment(command);
+}
+
+/// Explicit endpoints must not be overridden by an ambient context/TLS setting.
+pub fn clear_endpoint_environment(command: &mut Command) {
     for name in [
         "DOCKER_CONTEXT",
         "DOCKER_HOST",
@@ -81,10 +92,24 @@ fn command_for(request: &Request, program: &str, path: PathBuf) -> Command {
     ] {
         command.env_remove(name);
     }
+}
+
+fn command_for(request: &Request, program: &str, path: PathBuf) -> Command {
+    let mut command = Command::new(path);
+    pin_endpoint(
+        &mut command,
+        program,
+        &request.connection,
+        request.container.namespace.as_deref(),
+    );
+    command
+        .args(["exec", "--interactive", "--tty", "--"])
+        .arg(&request.container.id)
+        .args(&request.command);
     command
 }
 
-fn find_program(name: &str) -> Option<PathBuf> {
+pub fn find_program(name: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|path| path.join(name))

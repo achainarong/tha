@@ -42,6 +42,27 @@ impl Drop for Tasks {
     }
 }
 
+fn watch_events(
+    connection: &Connection,
+    runtime: &str,
+    events: &mpsc::Sender<(String, Vec<crate::events::Event>)>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let (tx, mut rx) = mpsc::channel(64);
+    let runtime = runtime.to_owned();
+    let events = events.clone();
+    vec![
+        tokio::spawn(crate::events::watch(connection.clone(), tx)),
+        tokio::spawn(async move {
+            while let Some(update) = rx.recv().await {
+                if events.send((runtime.clone(), update.events)).await.is_err() {
+                    break;
+                }
+            }
+        }),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     connection: Connection,
     refresh: u64,
@@ -50,6 +71,7 @@ pub async fn run(
     claims: Claims,
     budget: Arc<Semaphore>,
     live: crate::live::Shared,
+    events: mpsc::Sender<(String, Vec<crate::events::Event>)>,
 ) {
     let (inventory_tx, mut inventory_rx) = mpsc::channel(1);
     let (target_tx, target_rx) = watch::channel(None);
@@ -79,10 +101,11 @@ pub async fn run(
     let mut snapshot: Option<Snapshot> = None;
     let mut claim: Option<Claim> = None;
     let mut revision = 0u64;
+    let mut watcher: Option<(String, Tasks)> = None;
     loop {
         tokio::select! {
             Some(result) = inventory_rx.recv() => {
-                let Ok(next) = result else { revision=revision.wrapping_add(1); target_tx.send_replace(None); claim = None; snapshot = None; continue; };
+                let Ok(next) = result else { revision=revision.wrapping_add(1); target_tx.send_replace(None); claim = None; snapshot = None; watcher = None; continue; };
                 let key = history::runtime_key(&connection, &next.engine_id);
                 if claim.as_ref().is_none_or(|claim| claim.key != key) {
                     claim = None;
@@ -91,6 +114,10 @@ pub async fn run(
                             registry.insert(key.clone(), connection.key());
                             claim = Some(Claim { key, owner: connection.key(), claims: claims.clone() });
                     }
+                }
+                // Only the connection that owns a runtime records it, as with metrics.
+                if watcher.as_ref().map(|(key, _)| key) != claim.as_ref().map(|claim| &claim.key) {
+                    watcher = claim.as_ref().map(|claim| (claim.key.clone(), Tasks(watch_events(&connection, &claim.key, &events))));
                 }
                 if claim.is_some() {
                     let changed=target_tx.borrow().as_ref().is_none_or(|target| !target.same_workload(&next.engine_id,&next.containers));

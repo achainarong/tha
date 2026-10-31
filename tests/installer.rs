@@ -1,9 +1,11 @@
 //! Offline installer contracts; no downloads or engine mutations.
 use std::{fs, os::unix::fs::PermissionsExt, process::Command};
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 fn script(path: &std::path::Path, text: &str) {
-    fs::write(path, text).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    test_support::write_executable(path, text, 0o755);
 }
 
 fn run(modules: &str, module_exit: &str) -> (tempfile::TempDir, std::process::Output) {

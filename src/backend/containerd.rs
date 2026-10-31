@@ -449,7 +449,6 @@ mod tests {
 
     #[tokio::test]
     async fn layer_commands_pin_the_namespace_and_resolved_image_without_shell_interpolation() {
-        use std::os::unix::fs::PermissionsExt;
         let path = std::env::temp_dir().join(format!("tha-nerdctl-layers-{}", std::process::id()));
         let id = format!("sha256:{}", "a".repeat(64));
         let script = r##"#!/bin/sh
@@ -461,8 +460,7 @@ case "$*" in
   *) echo 'unexpected or mutating command' >&2; exit 33;;
 esac
 "##.replace("$IMAGE", &id);
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_executable(&path, &script, 0o700);
         let connection = Connection {
             name: "fixture".into(),
             kind: crate::config::BackendKind::Containerd,

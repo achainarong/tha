@@ -106,6 +106,8 @@ pub struct Container {
     pub project: Option<String>,
     pub service: Option<String>,
     pub compose_working_dir: Option<std::path::PathBuf>,
+    pub compose_config_files: Vec<std::path::PathBuf>,
+    pub compose_env_files: Vec<std::path::PathBuf>,
     pub ports: Vec<String>,
     pub port_bindings: Vec<PortBinding>,
     pub networks: Vec<String>,
@@ -297,6 +299,8 @@ pub struct Snapshot {
 pub struct Image {
     pub id: String,
     pub tags: Vec<String>,
+    /// Registry references such as `nginx@sha256:…`; empty for local builds.
+    pub digests: Vec<String>,
     pub size: Option<u64>,
 }
 
@@ -310,6 +314,13 @@ pub fn service(labels: &Labels) -> Option<String> {
     label(labels, "com.docker.compose.service")
         .or_else(|| label(labels, "io.podman.compose.service"))
         .or_else(|| label(labels, "nerdctl/compose/service"))
+}
+
+/// Compose records comma-separated absolute paths for these project settings.
+pub fn compose_paths(labels: &Labels, key: &str) -> Vec<std::path::PathBuf> {
+    label(labels, key)
+        .map(|value| value.split(',').map(std::path::PathBuf::from).collect())
+        .unwrap_or_default()
 }
 
 pub fn compose_working_dir(labels: &Labels) -> Option<std::path::PathBuf> {

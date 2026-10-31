@@ -81,16 +81,19 @@ pub fn populate(app: &mut App) {
                 crate::model::Image {
                     id: "sha256:demo-api".into(),
                     tags: vec!["api:latest".into()],
+                    digests: vec![],
                     size: Some(80 * 1024 * 1024),
                 },
                 crate::model::Image {
                     id: "sha256:demo-redis".into(),
                     tags: vec!["redis:7".into()],
+                    digests: vec![],
                     size: Some(32 * 1024 * 1024),
                 },
                 crate::model::Image {
                     id: "sha256:unused".into(),
                     tags: vec![],
+                    digests: vec![],
                     size: Some(16 * 1024 * 1024),
                 },
             ]),
@@ -155,6 +158,31 @@ pub fn populate(app: &mut App) {
             ..Default::default()
         }),
     );
+    let now = crate::history::now_ms();
+    for (ago, key, name, service, action, detail) in [
+        (2_400_000, "/api-1", "shop-api-1", "api", "start", ""),
+        (540_000, "/api-1", "shop-api-1", "api", "oom", ""),
+        (539_000, "/api-1", "shop-api-1", "api", "die", "exit 137"),
+        (537_000, "/api-1", "shop-api-1", "api", "start", ""),
+        (
+            120_000,
+            "/db-1",
+            "shop-postgres-1",
+            "postgres",
+            "health_status",
+            "healthy",
+        ),
+    ] {
+        app.engines[0].events.add(crate::events::Event {
+            at_ms: now - ago,
+            key: key.into(),
+            name: name.into(),
+            project: Some("shop".into()),
+            service: Some(service.into()),
+            action: action.into(),
+            detail: detail.into(),
+        });
+    }
     app.update_engine(
         3,
         Err(

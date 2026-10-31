@@ -345,7 +345,6 @@ mod tests {
     use super::*;
     use std::{
         fs,
-        os::unix::fs::PermissionsExt,
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -361,7 +360,7 @@ mod tests {
             fs::create_dir(&path).unwrap();
             for program in ["colima", "podman", "docker", "orbctl"] {
                 let executable = path.join(program);
-                fs::write(
+                crate::test_support::write_executable(
                     &executable,
                     r#"#!/bin/sh
 case "$*" in
@@ -374,9 +373,8 @@ if [ -f "$(dirname "$0")/fail" ]; then printf 'fixture denied' >&2; exit 42; fi
 if [ -f "$(dirname "$0")/hang" ]; then exec sleep 5; fi
 exit 0
 "#,
-                )
-                .unwrap();
-                fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+                    0o700,
+                );
             }
             Self(path)
         }
@@ -489,7 +487,11 @@ exit 0
             Status::Failed(_)
         ));
         let executable = fixture.0.join("orbctl");
-        fs::write(&executable, "#!/bin/sh\nhead -c 1048577 /dev/zero\n").unwrap();
+        crate::test_support::write_executable(
+            &executable,
+            "#!/bin/sh\nhead -c 1048577 /dev/zero\n",
+            0o700,
+        );
         let error = output(
             "orbctl",
             &["version".into()],

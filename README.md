@@ -111,11 +111,13 @@ all visible images, then **`:scan-images`**. Checks are separate from the existi
 Space/`u` cleanup marks; scanning works on used and unused images. The queue includes
 checked images still present in that runtime, even if a filter hides them. With no
 checks, it scans the selected image. A vanished checked image is skipped; no image is
-pulled as a replacement. Press **7** or **`:security`** on an image to browse its saved
+pulled as a replacement. Press **8** or **`:security`** on an image to browse its saved
 report, then **`:scan-image`** to scan/rescan it (clear checks first for just that image).
 **Tab** switches between Security's
 image list and findings; **Enter** on an image focuses its findings. A single container
-can also open its image in Security. Merely opening Security never scans or downloads anything.
+shows its image's saved report in its own **8 Security** tab, without leaving Containers. That tab
+is read-only: **j/k**, **Enter** and **z** browse findings, and scans only start from the Security
+view or Images. Merely opening either never scans or downloads anything.
 Within Security, **s** or **S** scans checked images (or the selected image if none are checked),
 and **x** cancels the service's active queue. These shortcuts never delete images.
 **Space** also toggles scan checks in Security; **c** clears scan checks without
@@ -196,7 +198,8 @@ No runtime state or user configuration is migrated by installation.
 
 Requires macOS or Linux, Rust 1.88+ (current stable recommended), and an
 interactive terminal. No Docker CLI is required for Docker API browsing;
-interactive exec requires an installed runtime CLI.
+interactive exec and `:pull-image` require an installed runtime CLI, and the
+`:compose-*` actions also require [Compose](#compose-update-actions).
 
 ```sh
 make demo       # Try the UI without contacting any runtime
@@ -343,7 +346,7 @@ your navigation. Demo mode never auto-opens a project.
 | `Esc` (Performance expanded) | Restore compact view first |
 | `o` / `:sort-contexts` | Choose connected-first, name, CPU, or memory context order |
 | `S` / `s` / `r` / `d` in Explorer | Start / Stop / Restart / Delete selected container or Compose workload |
-| `1` / `2` / `3` / `4` / `5` / `6` | Overview / Logs / Networks / Exec / Metrics / Layers on the right |
+| `1` … `8` | Overview / Logs / Networks / Exec / Events / Metrics / Layers / Security on the right |
 | `a` / `:actions` | Contextual lifecycle menu with eligibility counts and disabled reasons |
 | `F3` in Logs / `:filter-logs` | Edit structured retained-log filters |
 | `:clear-log-filter` | Clear filters without clearing highlighted search |
@@ -352,6 +355,13 @@ your navigation. Demo mode never auto-opens a project.
 | `n` / `N` | Next / previous match; logs navigate individual occurrences |
 | `f` | Toggle follow in the focused log pane |
 | `w` | Toggle wrapping immediately in the focused log pane |
+| `5` / `:events` | Timeline of container starts, exits, OOM kills and health changes for the selection |
+| `a`, then a Compose entry, or `:compose-update` | Pull newer images and apply them to the selected project or service; also `:compose-pull`, `:compose-up`, `:compose-recreate`, `:compose-down`, `:compose-output` |
+| `J` / `:json` | Pretty-print JSON log entries; press again for the original text |
+| `Ctrl-R` while searching logs | Switch between literal and regex search |
+| `:logs-since 15m` | Load logs from a start time (`30s`, `2h`, `1d`, RFC 3339); `off` returns to recent lines |
+| `U` / `:check-updates` in Images | Compare visible tagged images with their registries |
+| `:pull-image` in Images | Pull the selected image's tags; running containers are unchanged |
 | `e` / `:exec` | Open an interactive shell in a selected container/service |
 | `Enter` in Exec | Focus the existing shell, or start one if no session exists |
 | `Ctrl-]` in Exec | Return keyboard focus to Tha without closing the shell |
@@ -368,6 +378,43 @@ fire while typing. Toggling a search-expanded branch with `Space` clears the tre
 filter and collapses that branch, keeping it selected. Shortcuts can be customized
 in the config's `[bindings]` table; see [keybindings](docs/keybindings.md).
 
+### Events
+
+**5** or **`:events`** lists what happened to the selected container, service, project
+or runtime, newest first: created, started, restarted, signalled, stopped, exited (with its
+exit code), out of memory, health changes and removal. Project and service rows keep
+containers that have since been recreated or removed. The Metrics tab marks the same
+events on its charts with `┊`, colored by severity, so a memory climb can be read against
+the OOM kill that ended it.
+
+In service mode the collector saves events for 24 hours in a separate
+`events.sqlite3` next to the metrics history (private to you, at most 16 MiB and
+50,000 events). In standalone mode Tha shows what the engine still retains plus anything
+that happens while it is open, and nothing is saved. Native containerd is not supported.
+
+### Compose update actions
+
+Select a Compose project or service, then press **`a`** or use a command:
+
+| Command | Runs | Effect |
+| --- | --- | --- |
+| `:compose-update` | `pull`, then `up --detach` | Download newer images and apply them |
+| `:compose-pull` | `pull` | Download only; running containers are unchanged |
+| `:compose-up` | `up --detach` | Apply configuration changes |
+| `:compose-recreate` | `up --detach --force-recreate` | Recreate every container |
+| `:compose-down` | `down` (project only) | Remove containers and networks; **type the project name** to confirm |
+
+Tha never passes `--volumes`, `--rmi` or `--remove-orphans`. Each operation shows its
+directory and files before running, because they come from the labels Compose set on the
+containers and Compose executes what those files say. Output streams into a dialog; **Esc**
+hides it while the operation continues, and **`:compose-output`** reopens it. Only one
+operation runs at a time, and quitting Tha stops it where it is. A failure stops at that
+step with no retry or rollback.
+
+This needs the `docker compose` plugin, `podman compose`, or `docker-compose` on `PATH`, and
+the project's files on this machine. Projects started elsewhere are refused with the path
+that is missing. Native containerd is not supported.
+
 ### Logs
 
 Streams fetch up to 300 historical entries per container, then follow live output.
@@ -380,11 +427,25 @@ entry is evicted, the viewport advances to the earliest retained entry. Search
 matches source labels and payload text case-insensitively, **without filtering
 away surrounding entries**. Every occurrence is highlighted using reverse video;
 the current occurrence is also bold/underlined. `n`/`N` navigate with wraparound,
-and the status bar displays the current/total occurrence count. Search is literal,
-not regex syntax. `Esc` clears highlights. Changing scope or
-leaving/reopening the log view starts a fresh subscription. Use
-`:reconnect-logs` after a stream ends or disconnects; automatic log reconnection
-is not implemented yet.
+and the status bar displays the current/total occurrence count. Search is literal
+by default; **Ctrl-R** in the search prompt switches to case-insensitive regex
+(`(?-i)` makes a pattern case-sensitive). An invalid pattern keeps the prompt open and
+your current search in place. `Esc` clears highlights. Changing scope or leaving/reopening
+the log view starts a fresh subscription.
+
+Streams reconnect automatically when a container restarts or the engine connection
+drops. Tha resumes from the last line it received, skips anything replayed, and retries
+at most every 5 seconds while a container is stopped. `:reconnect-logs` reloads
+immediately and starts from an empty buffer.
+
+**`:logs-since 15m`** asks the engine for everything from that time, instead of the last
+300 entries, and stays in effect across selections until **`:logs-since off`**. The retained
+history limit still applies: the newest entries are kept and evictions are reported, so
+raise `log_capacity` for long ranges. Each container's initial read is limited to 8 MiB and
+15 seconds. The F3 filter's `since`/`until` differ: they only narrow what is already retained.
+
+**`J`** indents JSON objects and arrays, keeping key order and exact numbers. Search then
+matches the text on screen. The original text is what filters and `:export-logs` use.
 
 Wrapping defaults to on. Press **`w`** in the log pane or use **`:wrap`** to switch
 it at any time. `log_wrap = false` changes only the initial configuration;
@@ -400,13 +461,23 @@ than container log records. With wrapping off, each entry occupies one row.
 Follow keeps the thumb at the bottom; pausing, searching, and resizing update
 its position. This is a keyboard-driven indicator, not a mouse-drag scrollbar.
 
-Merged logs show **arrival order**, not a guaranteed cross-container timeline.
-Timestamped payloads are preserved. JSON expansion, time-range retrieval,
-semantic multiline grouping, and export are follow-up work.
+Merged logs are ordered by engine timestamp. History is fully sorted before it is shown;
+live lines are held for 150 ms so concurrent containers interleave correctly, and a line
+arriving later than that appears where it arrived. Single-container logs have no delay.
+Semantic multiline grouping is follow-up work.
 
 ## CPU and memory
 
 ### Runtime Images and Volumes
+
+**U** or **`:check-updates`** in Images compares each visible tagged image with its registry
+and marks the ones that differ with `↑`; **Enter** shows the result for an image. It only
+reads digests, happens only when you ask, and results last for the session. A locally built
+image or a private registry reports *unknown*, never *up to date*, because the check is
+anonymous. **`:pull-image`** pulls every tag of the selected image with the Docker or
+Podman CLI, using your existing logins. It needs no confirmation because it changes no
+container: running containers keep their current image until you recreate them, and the old
+image stays listed, untagged, until you clean it up.
 
 Use **F7 / F8** to cycle backward/forward through Containers, Images and Volumes.
 **Ctrl+Left / Ctrl+Right** cycles these three overview screens. Shift+arrows remain compatibility aliases.
@@ -428,8 +499,7 @@ offers Untagged, and Volumes offers a separate Bind mounts filter.
 **Enter** opens full details alongside the table on wide terminals, or in place
 of the table on smaller terminals; j/k and paging scroll details. **Esc** closes
 details first, then returns to Containers. **Alt+1** returns without changing its selection or detail
-tab. Plain **1–6** retain their existing container detail-tab shortcuts; **7/8**
-are not assigned. Both inventories include resources outside the current workspace.
+tab. Plain **1–8** select container detail tabs and return to Containers; **8** instead opens the selected image's report in the Security view. Both inventories include resources outside the current workspace.
 Selection, search, filter and sort are kept independently for each runtime/view
 during the session. Selection follows resource identity across refreshes.
 
@@ -475,7 +545,7 @@ empty inventory; native containerd inventory is currently unavailable.
 
 ### Background collection and container Metrics
 
-Press **`5`** on a container (or `:metrics`; `:history` remains an alias) for CPU, RAM, disk read/write and
+Press **`6`** on a container (or `:metrics`; `:history` remains an alias) for CPU, RAM, disk read/write and
 network receive/transmit charts. The range legend highlights the selected window.
 **`[`** selects a shorter range; **`]`** selects a longer range: 1 minute, 3 minutes,
 5 minutes, 15 minutes, 30 minutes, 1 hour, 3 hours, 6 hours, 12 hours or 24 hours.
@@ -801,7 +871,7 @@ a partial **new** export file, never a truncated existing file.
 
 ## Image layers
 
-Press **`6`** (or `:layers`) with one container selected, including a one-container
+Press **`7`** (or `:layers`) with one container selected, including a one-container
 service. Tha asynchronously inspects the container's resolved image, never a mutable
 tag. The view separates **uncompressed filesystem diff IDs** (base → top) from
 **build history** (base → top). `j`/`k`, paging, and `gg`/`G` select rows; Enter opens

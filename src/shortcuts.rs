@@ -17,6 +17,7 @@ pub enum NavigationContext {
     Exec,
     Metrics,
     Layers,
+    Events,
     ContainerSecurity,
     Images,
     ImageDetails,
@@ -28,7 +29,7 @@ pub enum NavigationContext {
 }
 
 impl NavigationContext {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Explorer,
         Self::Performance,
         Self::Overview,
@@ -37,6 +38,7 @@ impl NavigationContext {
         Self::Exec,
         Self::Metrics,
         Self::Layers,
+        Self::Events,
         Self::ContainerSecurity,
         Self::Images,
         Self::ImageDetails,
@@ -73,6 +75,7 @@ impl NavigationContext {
                 Tab::Exec => Self::Exec,
                 Tab::History => Self::Metrics,
                 Tab::Layers => Self::Layers,
+                Tab::Events => Self::Events,
                 Tab::Security => Self::ContainerSecurity,
             },
         }
@@ -88,6 +91,7 @@ impl NavigationContext {
             Self::Exec => "Exec navigation",
             Self::Metrics => "Metrics",
             Self::Layers => "Layers",
+            Self::Events => "Events",
             Self::ContainerSecurity => "Container Security",
             Self::Images => "Images",
             Self::ImageDetails => "Image details",
@@ -110,6 +114,7 @@ impl NavigationContext {
                 | Self::Exec
                 | Self::Metrics
                 | Self::Layers
+                | Self::Events
                 | Self::ContainerSecurity
         )
     }
@@ -179,6 +184,7 @@ impl Scope {
                         | C::Networks
                         | C::Exec
                         | C::Layers
+                        | C::Events
                         | C::Metrics
                         | C::Images
                         | C::ImageDetails
@@ -196,6 +202,7 @@ impl Scope {
                     | C::Exec
                     | C::Metrics
                     | C::Layers
+                    | C::Events
                     | C::ContainerSecurity
             ),
             Self::FocusedPerformance => context == C::Performance,
@@ -263,9 +270,10 @@ catalog! {
     Logs, "Logs", ["logs"], Global, 30, false, ["2"], [];
     Networks, "Network membership", ["networks"], Global, 30, false, ["3"], [];
     Exec, "Exec tab (Enter resumes input)", [], Global, 30, false, ["4"], [];
-    Metrics, "Container metrics", ["metrics", "history"], Global, 30, false, ["5"], [];
-    Layers, "Image layers (read-only)", ["layers"], Global, 30, false, ["6"], [];
-    Security, "Selected image security", ["security"], Global, 30, true, ["7"], [];
+    Metrics, "Container metrics", ["metrics", "history"], Global, 30, false, ["6"], [];
+    Layers, "Image layers (read-only)", ["layers"], Global, 30, false, ["7"], [];
+    Security, "Selected image security", ["security"], Global, 30, true, ["8"], [];
+    Events, "Container events timeline", ["events"], Global, 30, false, ["5"], [];
     Search, "Search", [], Global, 6, false, ["/"], [];
     Left, "Collapse / parent; scroll unwrapped logs", [], TreeOrLogs, 40, false, ["h"], ["left"];
     Right, "Expand / child; scroll unwrapped logs", [], TreeOrLogs, 40, false, ["l"], ["right"];
@@ -296,7 +304,15 @@ catalog! {
     FilterLogs, "Structured retained-log filters", ["filter-logs"], Logs, 9, false, ["F3"], [];
     ClearLogFilter, "Clear retained-log filters", ["clear-log-filter"], Logs, 40, false, [], [];
     ExportLogs, "Export retained logs (may contain secrets)", ["export-logs"], Logs, 40, false, [], [];
-    ReconnectLogs, "Reconnect log streams", ["reconnect-logs"], Logs, 40, false, [], [];
+    ReconnectLogs, "Reload logs now (streams also reconnect automatically)", ["reconnect-logs"], Logs, 40, false, [], [];
+    LogsSince, "Load logs from a start time", ["logs-since"], Logs, 12, false, [], [];
+    ComposeUpdate, "Compose pull, then up -d (confirmation required)", ["compose-update"], Workloads, 40, false, [], [];
+    ComposePull, "Compose pull (confirmation required)", ["compose-pull"], Workloads, 40, false, [], [];
+    ComposeUp, "Compose up -d (confirmation required)", ["compose-up"], Workloads, 40, false, [], [];
+    ComposeRecreate, "Compose force recreate (confirmation required)", ["compose-recreate"], Workloads, 40, false, [], [];
+    ComposeDown, "Compose down, keeping volumes (type name to confirm)", ["compose-down"], Workloads, 40, false, [], [];
+    ComposeOutput, "Last Compose output", ["compose-output"], Global, 40, false, [], [];
+    PrettyJson, "Pretty-print JSON logs", ["json"], Logs, 8, false, ["shift-j"], [];
     ExecSessions, "Retained shell sessions", ["exec-sessions"], Containers, 12, false, ["F6"], [];
     CloseExec, "Close shell session, not container", ["close-exec"], Containers, 40, false, [], [];
     PreviousRange, "Shorter metrics time range", [], Metrics, 12, false, ["["], [];
@@ -313,6 +329,8 @@ catalog! {
     InventoryFilter, "Filter inventory", [], Inventory, 8, false, ["f"], [];
     InventorySort, "Sort inventory", [], Inventory, 9, false, ["s"], [];
     RefreshInventory, "Refresh all engines", [], Inventory, 25, false, ["r"], [];
+    CheckUpdates, "Compare visible images with their registries", ["check-updates"], Images, 12, false, ["shift-u"], [];
+    PullImage, "Pull the selected image's tags", ["pull-image"], Images, 13, false, [], [];
     CheckImage, "Check image for scanning", [], Images, 10, true, ["m"], [];
     CheckImages, "Check all visible images for scanning", [], Images, 15, true, ["shift-m"], [];
     CheckSecurityImage, "Check image for scanning", [], SecurityImages, 10, true, ["space"], [];
@@ -412,6 +430,17 @@ impl ActionId {
             Self::ClearLogFilter => "clear-log-filter",
             Self::ExportLogs => "export-logs",
             Self::ReconnectLogs => "reconnect-logs",
+            Self::LogsSince => "logs-since",
+            Self::PrettyJson => "json",
+            Self::Events => "events",
+            Self::ComposeUpdate => "compose-update",
+            Self::ComposePull => "compose-pull",
+            Self::ComposeUp => "compose-up",
+            Self::ComposeRecreate => "compose-recreate",
+            Self::ComposeDown => "compose-down",
+            Self::ComposeOutput => "compose-output",
+            Self::CheckUpdates => "check-updates",
+            Self::PullImage => "pull-image",
             Self::ExecSessions => "exec-sessions",
             Self::CloseExec => "close-exec",
             Self::PreviousRange => "previous-range",
@@ -550,6 +579,11 @@ pub fn unavailable(app: &App, action: ActionId) -> Option<String> {
     }
     match action {
         A::Metrics if app.performance_container().is_none() => Some("Select a container".into()),
+        A::ScanImage | A::ScanImages | A::UpdateSecurity | A::CancelScan
+            if app.overview_mode == crate::app::OverviewMode::Containers =>
+        {
+            Some("Scans run from the Security view".into())
+        }
         A::Layers if !app.layers_available() => {
             Some("Select a container or single-container service".into())
         }

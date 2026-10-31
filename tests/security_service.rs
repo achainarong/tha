@@ -11,6 +11,9 @@ use tokio::{
     process::Command,
 };
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 async fn wait_for(mut condition: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(10), async {
         while !condition() {
@@ -27,7 +30,7 @@ async fn module_install_preserves_symlinked_docker_invocation_with_relative_path
     let bin = temp.path().join("bin");
     fs::create_dir(&bin).unwrap();
     let tools = bin.join("docker-tools");
-    fs::write(
+    test_support::write_executable(
         &tools,
         r#"#!/bin/sh
 case "$0" in
@@ -55,9 +58,8 @@ case "$1" in
     *) echo "unexpected command" >&2; exit 1 ;;
 esac
 "#,
-    )
-    .unwrap();
-    fs::set_permissions(&tools, fs::Permissions::from_mode(0o755)).unwrap();
+        0o755,
+    );
     std::os::unix::fs::symlink("docker-tools", bin.join("docker")).unwrap();
 
     // Installing requires a running collector. Use a fixture daemon on a private
@@ -328,7 +330,9 @@ async fn disconnected_ui_queue_persists_reports_uses_selected_endpoint_and_conti
         }
     });
     let launcher = temp.path().join("fake-docker");
-    fs::write(&launcher, r##"#!/bin/sh
+    test_support::write_executable(
+        &launcher,
+        r##"#!/bin/sh
 set -eu
 docker-credential-fixture
 printf '%s\n' "$*" >> "$FIXTURE_ROOT/calls"
@@ -349,14 +353,14 @@ case "$1" in
   ;;
  *) exit 91 ;;
 esac
-"##).unwrap();
-    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+"##,
+        0o700,
+    );
     fs::write(root.join("docker-path"), launcher.to_str().unwrap()).unwrap();
     let helpers = temp.path().join("helpers");
     fs::create_dir(&helpers).unwrap();
     let helper = helpers.join("docker-credential-fixture");
-    fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    test_support::write_executable(&helper, "#!/bin/sh\nexit 0\n", 0o700);
     fs::write(
         root.join("docker-env-path"),
         format!("{}:/usr/bin:/bin", helpers.display()),
