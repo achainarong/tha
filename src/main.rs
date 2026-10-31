@@ -2226,7 +2226,7 @@ fn dispatch_navigation(
         A::Left => {
             if !app.detail_focus && !app.performance_focus {
                 app.collapse();
-            } else if app.tab == Tab::Logs && !app.log_view.wrap {
+            } else if app.tab == Tab::Logs && !app.log_view.wrap && key.code != KeyCode::Left {
                 app.log_view.horizontal = app.log_view.horizontal.saturating_sub(8);
             } else if app.detail_focus {
                 return cycle_tab(app, false, key, height, refresh);
@@ -2235,7 +2235,7 @@ fn dispatch_navigation(
         A::Right => {
             if !app.detail_focus && !app.performance_focus {
                 app.expand();
-            } else if app.tab == Tab::Logs && !app.log_view.wrap {
+            } else if app.tab == Tab::Logs && !app.log_view.wrap && key.code != KeyCode::Right {
                 app.log_view.horizontal = (app.log_view.horizontal + 8).min(16_384);
             } else if app.detail_focus {
                 return cycle_tab(app, true, key, height, refresh);
@@ -5182,7 +5182,7 @@ mod tests {
             assert_eq!(text_at(area), expected);
         }
         let screen: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
-        assert!(screen.contains("laufend]"), "tree titles were rebuilt");
+        assert!(screen.contains("läuft]"), "tree titles were rebuilt");
         assert!(!screen.contains("running]"));
         app.set_language(Language::English);
     }
@@ -5399,9 +5399,12 @@ mod tests {
         app.detail_focus = true;
         app.tab = Tab::Logs;
         app.log_view.wrap = false;
-        handle_key(&mut app, KeyEvent::from(KeyCode::Right), 20, &refresh);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('l')), 20, &refresh);
         assert_eq!(app.tab, Tab::Logs);
         assert_eq!(app.log_view.horizontal, 8);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Right), 20, &refresh);
+        assert_eq!(app.tab, Tab::Networks, "arrows always switch tabs in Logs");
+        app.tab = Tab::Logs;
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('L')), 20, &refresh);
         assert_eq!(app.tab, Tab::Networks);
 

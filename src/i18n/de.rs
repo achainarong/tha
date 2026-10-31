@@ -252,7 +252,7 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ),
     (
         "{a0} running{issues} · {summary} · :action-results",
-        "{a0} laufend{issues} · {summary} · :action-results",
+        "{a0} läuft{issues} · {summary} · :action-results",
     ),
     (
         "{a0} runtimes finished{issues} · :action-results",
@@ -351,12 +351,12 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("Standalone ({a0})", "Einzelcontainer ({a0})"),
     ("Networks", "Netzwerke"),
     ("Volumes", "Volumes"),
-    (" [shared/external]", " [gemeinsam/extern]"),
-    ("Shared ", "Gemeinsame "),
+    (" [shared/external]", " [geteilt/extern]"),
+    ("Shared ", "Geteilte "),
     ("{name} [stopped]", "{name} [gestoppt]"),
     (
         "{name} [{running}/{total} running]",
-        "{name} [{running}/{total} laufend]",
+        "{name} [{running}/{total} läuft]",
     ),
     (
         "Compose update (pull, then up -d)",
@@ -1018,7 +1018,7 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ),
     (
         "Image sizes include shared layers; they are NOT reclaimable-space estimates.",
-        "Image-Größen enthalten gemeinsam genutzte Layer; sie zeigen NICHT den freiwerdenden Speicher.",
+        "Image-Größen enthalten geteilte Layer; sie zeigen NICHT den freiwerdenden Speicher.",
     ),
     (
         "Resize wider/taller to review the complete deletion confirmation. Esc cancels.",
@@ -1157,7 +1157,7 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("ID / key: {a0}", "ID / Schlüssel: {a0}"),
     (
         "Status: {a0} · {a1} running / {a2} stopped",
-        "Status: {a0} · {a1} laufend / {a2} gestoppt",
+        "Status: {a0} · {a1} läuft / {a2} gestoppt",
     ),
     ("Size: {a0}", "Größe: {a0}"),
     (
@@ -1173,7 +1173,7 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("  None reported", "  Keine gemeldet"),
     (
         "Sizes may include shared layers, not reclaimable space. Untagged does not imply unused.",
-        "Größen können gemeinsam genutzte Layer enthalten und zeigen nicht den freiwerdenden Speicher. Ohne Tag heißt nicht ungenutzt.",
+        "Größen können geteilte Layer enthalten und zeigen nicht den freiwerdenden Speicher. Ohne Tag heißt nicht ungenutzt.",
     ),
     (
         "Unreferenced does not mean safe to delete. Bind mounts are not managed volumes.",
@@ -1535,7 +1535,7 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("No project label", "Kein Projekt-Label"),
     (
         "Shared/external resource; not exclusive to this project.",
-        "Gemeinsame/externe Ressource; nicht exklusiv für dieses Projekt.",
+        "Geteilte/externe Ressource; nicht exklusiv für dieses Projekt.",
     ),
     ("Attached containers", "Angebundene Container"),
     (
@@ -1548,7 +1548,7 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ),
     (
         "{a0} containers · {a1} running",
-        "{a0} Container · {a1} laufend",
+        "{a0} Container · {a1} läuft",
     ),
     ("Workload CPU     {a0}", "Workload-CPU      {a0}"),
     ("Workload memory  {a0}", "Workload-Speicher {a0}"),
@@ -1581,7 +1581,7 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ),
     (
         "  Ports      No port mappings reported",
-        "  Ports      Keine Port-Zuordnungen gemeldet",
+        "  Ports      Kein Port zugeordnet",
     ),
     (
         "  Port       {a0} (reported)",

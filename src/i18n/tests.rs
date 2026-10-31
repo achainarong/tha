@@ -145,7 +145,7 @@ fn german_follows_established_terminology() {
             r"^Containers$|Containers-|Ansicht Containers",
             "the German plural is Container",
         ),
-        (r"\blaufen\]|\d laufen\b| aktiv\]", "counts say laufend"),
+        (r"\blaufen\]|\d laufen\b| aktiv\]", "counts say läuft"),
         (
             r"\bgesund\b|\bungesund\b",
             "health stays healthy/unhealthy, as the engine prints it",
