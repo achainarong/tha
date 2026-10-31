@@ -39,7 +39,7 @@ fn value(metric: usize, number: Option<f64>) -> String {
             metrics::bytes(number.max(0.0) as u64),
             if metric > 1 { "/s" } else { "" }
         ),
-        None => "unavailable".into(),
+        None => crate::i18n::t("unavailable").into(),
     }
 }
 fn time_axis(width: usize, start: i64, end: i64) -> String {
@@ -82,7 +82,15 @@ fn axis_value(metric: usize, number: f64, maximum: f64) -> String {
             format!("{number:.1}%")
         };
     }
-    let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    let units = [
+        "B",
+        crate::i18n::t("KiB"),
+        crate::i18n::t("MiB"),
+        crate::i18n::t("GiB"),
+        crate::i18n::t("TiB"),
+        crate::i18n::t("PiB"),
+        crate::i18n::t("EiB"),
+    ];
     let unit = ((maximum.max(1.0).log2() / 10.0).floor() as usize).min(units.len() - 1);
     let value = number / 1024f64.powi(unit as i32);
     let number = if value >= 100.0 {
@@ -110,7 +118,7 @@ fn history_notice(view: &crate::history::View) -> Option<&str> {
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some((engine_index, container)) = app.performance_container() else {
         frame.render_widget(
-            Paragraph::new("Select a container to analyze its metrics"),
+            Paragraph::new(crate::i18n::t("Select a container to analyze its metrics")),
             area,
         );
         return;
@@ -148,7 +156,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     let block = pane(
         app,
-        format!(" Metrics · {} ", safe_text(&container.name)),
+        crate::tf!(" Metrics · {a0} ", a0 = safe_text(&container.name)),
         app.detail_focus,
     );
     let inner = block.inner(area);
@@ -156,7 +164,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     if inner.width < 12 || inner.height < 5 {
         return;
     }
-    let mut ranges = vec![Span::styled("Range: ", muted())];
+    let mut ranges = vec![Span::styled(crate::i18n::t("Range: "), muted())];
     for (index, label) in RANGE_LABELS.iter().enumerate() {
         ranges.push(if index == view.range {
             Span::styled(
@@ -168,7 +176,14 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         });
         ranges.push(Span::raw(" "));
     }
-    ranges.push(Span::styled("· [ shorter / ] longer", muted()));
+    ranges.push(Span::styled(
+        crate::tf!(
+            "· {a0} shorter / {a1} longer",
+            a0 = app.key_hint(crate::shortcuts::ActionId::PreviousRange),
+            a1 = app.key_hint(crate::shortcuts::ActionId::NextRange)
+        ),
+        muted(),
+    ));
     let legend = Paragraph::new(Line::from(ranges)).wrap(Wrap { trim: true });
     let legend_height = legend.line_count(inner.width) as u16;
     let notice = history_notice(view);
@@ -192,36 +207,40 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             let bytes =
                 |number: Option<u64>| number.map(metrics::bytes).unwrap_or_else(|| "--".into());
             let u = &sample.usage;
-            format!(
-                "Latest counters ({}s old): Disk R/W {} / {} · Net Rx/Tx {} / {}",
-                sample.sampled_at.elapsed().as_secs(),
-                bytes(u.disk_read_bytes),
-                bytes(u.disk_write_bytes),
-                bytes(u.network_rx_bytes),
-                bytes(u.network_tx_bytes)
+            crate::tf!(
+                "Latest counters ({a0}s old): Disk R/W {a1} / {a2} · Net Rx/Tx {a3} / {a4}",
+                a0 = sample.sampled_at.elapsed().as_secs(),
+                a1 = bytes(u.disk_read_bytes),
+                a2 = bytes(u.disk_write_bytes),
+                a3 = bytes(u.network_rx_bytes),
+                a4 = bytes(u.network_tx_bytes)
             )
         })
-        .unwrap_or_else(|| "Latest I/O counters unavailable".into());
+        .unwrap_or_else(|| crate::i18n::t("Latest I/O counters unavailable").into());
     let mut header = vec![
-        Line::from(format!(
-            "{} · {} → {} UTC · {}{}",
-            RANGE_NAMES[view.range],
-            if RANGES[view.range] >= 3_600_000 {
+        Line::from(crate::tf!(
+            "{a0} · {a1} → {a2} UTC · {a3}{a4}",
+            a0 = crate::i18n::dynamic(RANGE_NAMES[view.range]),
+            a1 = if RANGES[view.range] >= 3_600_000 {
                 stamp(start)
             } else {
                 clock(start)
             },
-            if RANGES[view.range] >= 3_600_000 {
+            a2 = if RANGES[view.range] >= 3_600_000 {
                 stamp(end)
             } else {
                 clock(end)
             },
-            if view.end_ms.is_some() {
-                "Paused"
+            a3 = if view.end_ms.is_some() {
+                crate::i18n::t("Paused")
             } else {
-                "Live"
+                crate::i18n::t("Live")
             },
-            if view.loading { " · Loading…" } else { "" }
+            a4 = if view.loading {
+                crate::i18n::t(" · Loading…")
+            } else {
+                ""
+            }
         )),
         Line::styled(counters, muted()),
     ];
@@ -230,11 +249,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     if let Some(latest) = marks.last() {
         header.push(Line::styled(
-            format!(
-                "┊ {} events in range · latest {} {} · 5 Events",
-                marks.len(),
-                clock(latest.at_ms),
-                latest.label()
+            crate::tf!(
+                "┊ {a0} events in range · latest {a1} {a2} · 5 Events",
+                a0 = marks.len(),
+                a1 = clock(latest.at_ms),
+                a2 = latest.label()
             ),
             super::events::tone_style(app, latest.tone()),
         ));
@@ -244,18 +263,26 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
-                "←/→ Pan · c Cursor · h/l Inspect · f Live · z Enlarge",
+                crate::i18n::t("←/→ Pan · c Cursor · h/l Inspect · f Live · z Enlarge"),
                 muted(),
             ),
             Line::styled(
-                "j/k Metric (small terminal) · Esc Restore · gaps = missing · 100% CPU = 1 core · auto scale",
+                crate::i18n::t("j/k Metric (small terminal) · Esc Restore · gaps = missing · 100% CPU = 1 core · auto scale"),
                 muted(),
             ),
         ]),
         parts[3],
     );
     if view.data.points.is_empty() {
-        frame.render_widget(Paragraph::new(view.error.as_deref().unwrap_or("No readings in this time range. Collection begins when Tha/daemon observes this container. [ selects a shorter range; f returns to live.")).wrap(Wrap{trim:false}),parts[2]);
+        let no_readings = crate::tf!(
+            "No readings in this time range. Collection begins when Tha/daemon observes this container. {shorter} selects a shorter range; f returns to live.",
+            shorter = app.key_hint(crate::shortcuts::ActionId::PreviousRange)
+        );
+        frame.render_widget(
+            Paragraph::new(view.error.as_deref().unwrap_or(&no_readings))
+                .wrap(Wrap { trim: false }),
+            parts[2],
+        );
         return;
     }
     let all = parts[2].height >= 24;
@@ -333,9 +360,13 @@ fn draw_chart(
     let (start, end) = bounds;
     let (name, metrics, color): (&str, &[usize], Color) = match group {
         0 => ("CPU", &[0], Color::Cyan),
-        1 => ("Memory", &[1], Color::Green),
-        2 => ("Disk read / write", &[2, 3], Color::Magenta),
-        _ => ("Network receive / transmit", &[4, 5], Color::Yellow),
+        1 => (crate::i18n::t("Memory"), &[1], Color::Green),
+        2 => (crate::i18n::t("Disk read / write"), &[2, 3], Color::Magenta),
+        _ => (
+            crate::i18n::t("Network receive / transmit"),
+            &[4, 5],
+            Color::Yellow,
+        ),
     };
     let selected = cursor.or_else(|| points.last());
     let labels = metrics
@@ -346,10 +377,10 @@ fn draw_chart(
     let summary = metrics
         .iter()
         .map(|&metric| {
-            format!(
-                "avg {} / peak {}",
-                value(metric, scale.averages[metric]),
-                value(metric, scale.peaks[metric])
+            crate::tf!(
+                "avg {a0} / peak {a1}",
+                a0 = value(metric, scale.averages[metric]),
+                a1 = value(metric, scale.peaks[metric])
             )
         })
         .collect::<Vec<_>>()
@@ -360,7 +391,9 @@ fn draw_chart(
             if group == 0 {
                 selected
                     .and_then(|point| point.values[0])
-                    .map(|cpu| format!(" · {:.4} cores", cpu / 100.0))
+                    .map(|cpu| {
+                        crate::tf!(" · {cores} cores", cores = format!("{:.4}", cpu / 100.0))
+                    })
                     .unwrap_or_default()
             } else {
                 String::new()
@@ -376,13 +409,14 @@ fn draw_chart(
                 ))
                 .unwrap_or_default()
         ))
-        .title_bottom(format!(
-            " {} · {summary} · auto ",
-            match group {
-                2 => "read blue / write magenta",
-                3 => "Rx blue / Tx yellow",
-                _ => "dotted = average",
-            }
+        .title_bottom(crate::tf!(
+            " {a0} · {summary} · auto ",
+            a0 = match group {
+                2 => crate::i18n::t("read blue / write magenta"),
+                3 => crate::i18n::t("Rx blue / Tx yellow"),
+                _ => crate::i18n::t("dotted = average"),
+            },
+            summary = summary
         ))
         .border_style(muted());
     let inner = block.inner(area);
@@ -470,7 +504,7 @@ fn draw_chart(
                 if metrics.len() == 1 && scale.averages[metrics[0]].is_some() {
                     context.draw(&Points {
                         coords: &average,
-                        color: Color::DarkGray,
+                        color: app.theme.color(Color::DarkGray),
                     });
                 }
                 for (index, runs) in series.iter().enumerate() {
@@ -541,6 +575,36 @@ mod tests {
         assert_eq!(history_notice(&view), Some("Disk budget reached"));
         view.error = Some("Cannot read history".into());
         assert_eq!(history_notice(&view), Some("Cannot read history"));
+    }
+
+    #[test]
+    fn range_hint_names_the_keys_of_the_active_keyboard_layout() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, Scope::Container(_)))
+            .unwrap();
+        let mut hints = |preset| {
+            app.set_keyboard(preset);
+            let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    draw(frame, &mut app, area);
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        assert!(hints(crate::keyboard::KeyboardPreset::Us).contains("[ shorter / ] longer"));
+        assert!(hints(crate::keyboard::KeyboardPreset::German).contains("- shorter / + longer"));
     }
 
     #[test]

@@ -14,12 +14,12 @@ pub enum ContextSort {
 impl ContextSort {
     pub const ALL: [Self; 4] = [Self::ConnectedFirst, Self::Name, Self::Cpu, Self::Memory];
 
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::ConnectedFirst => "Connected first",
-            Self::Name => "Name",
-            Self::Cpu => "CPU usage (snapshot)",
-            Self::Memory => "Memory usage (snapshot)",
+            Self::ConnectedFirst => crate::i18n::t("Connected first"),
+            Self::Name => crate::i18n::t("Name"),
+            Self::Cpu => crate::i18n::t("CPU usage (snapshot)"),
+            Self::Memory => crate::i18n::t("Memory usage (snapshot)"),
         }
     }
 }

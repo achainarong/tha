@@ -40,6 +40,18 @@ impl Keymap {
         }
         Ok(Self(mapped))
     }
+    /// Adds a layout preset's keys beneath the user's own bindings.
+    pub fn with_preset(mut self, preset: crate::keyboard::KeyboardPreset) -> Self {
+        for &(key, action) in preset.keys() {
+            let combination =
+                KeyCombination::one_key(KeyCode::Char(key), KeyModifiers::NONE).normalized();
+            if !self.0.iter().any(|(existing, _)| *existing == combination) {
+                self.0.push((combination, action));
+            }
+        }
+        self
+    }
+
     pub fn action(&self, event: KeyEvent) -> Option<ActionId> {
         self.0
             .iter()

@@ -19,10 +19,10 @@ pub enum Action {
 impl Action {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Start => "Start",
-            Self::Stop => "Stop",
-            Self::Restart => "Restart",
-            Self::Delete => "Delete",
+            Self::Start => crate::i18n::t("Start"),
+            Self::Stop => crate::i18n::t("Stop"),
+            Self::Restart => crate::i18n::t("Restart"),
+            Self::Delete => crate::i18n::t("Delete"),
         }
     }
     pub fn eligible(self, container: &Container) -> bool {
@@ -59,19 +59,22 @@ impl Request {
         action: Action,
     ) -> Result<Self> {
         if connection.kind != BackendKind::Docker {
-            bail!("Lifecycle actions support Docker and Podman API connections only");
+            bail!(
+                "{}",
+                crate::i18n::t("Lifecycle actions support Docker and Podman API connections only")
+            );
         }
         if *scope == Scope::Engine {
-            bail!(
+            bail!(crate::i18n::t(
                 "Runtime rows control the runtime itself; runtime control is unsupported for this endpoint"
-            );
+            ));
         }
         if action == Action::Delete
             && matches!(scope, Scope::Services { .. } | Scope::Standalone(_))
         {
-            bail!(
+            bail!(crate::i18n::t(
                 "Delete is disabled on runtime and grouping rows; select a container, Compose service, or Compose project"
-            );
+            ));
         }
         let name = match scope {
             Scope::Container(_) => containers
@@ -83,17 +86,25 @@ impl Request {
             Scope::Services {
                 namespace: None,
                 project,
-            } => format!("{project} / Services"),
-            Scope::Standalone(None) => "Standalone containers".into(),
-            _ => bail!(
+            } => crate::tf!("{project} / Services", project = project),
+            Scope::Standalone(None) => crate::i18n::t("Standalone containers").into(),
+            _ => bail!(crate::i18n::t(
                 "Select a container, Compose workload, Services group, or Standalone group; namespace and resource actions are disabled"
-            ),
+            )),
         };
         let Some(identity) = identity.filter(|identity| !identity.is_empty()) else {
-            bail!("Runtime identity is unavailable; refresh before attempting lifecycle actions");
+            bail!(
+                "{}",
+                crate::i18n::t(
+                    "Runtime identity is unavailable; refresh before attempting lifecycle actions"
+                )
+            );
         };
         if name.is_empty() || name.len() > 1024 || crate::model::safe_text(&name) != name {
-            bail!("This target name cannot be safely confirmed");
+            bail!(
+                "{}",
+                crate::i18n::t("This target name cannot be safely confirmed")
+            );
         }
         if containers.iter().any(|container| {
             container.managed
@@ -104,21 +115,34 @@ impl Request {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
         }) {
-            bail!("Kubernetes-managed or unidentified containers cannot be changed");
+            bail!(
+                "{}",
+                crate::i18n::t("Kubernetes-managed or unidentified containers cannot be changed")
+            );
         }
         let mut ids = std::collections::HashSet::new();
         if containers
             .iter()
             .any(|container| !ids.insert(&container.id))
         {
-            bail!("Duplicate container IDs in inventory; refresh before changing anything");
+            bail!(
+                "{}",
+                crate::i18n::t(
+                    "Duplicate container IDs in inventory; refresh before changing anything"
+                )
+            );
         }
         if action == Action::Delete
             && containers
                 .iter()
                 .any(|container| !action.eligible(container))
         {
-            bail!("Stop all selected containers before deleting; force deletion is disabled");
+            bail!(
+                "{}",
+                crate::i18n::t(
+                    "Stop all selected containers before deleting; force deletion is disabled"
+                )
+            );
         }
         let total = containers.len();
         let mut containers: Vec<_> = containers
@@ -127,10 +151,10 @@ impl Request {
             .collect();
         containers.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
         if containers.is_empty() {
-            bail!(
-                "No eligible containers for {} in this selection",
-                action.label()
-            );
+            bail!(crate::tf!(
+                "No eligible containers for {action} in this selection",
+                action = action.label()
+            ));
         }
         let skipped = total - containers.len();
         Ok(Self {
@@ -201,12 +225,15 @@ impl Request {
             || current.managed
             || current.namespace.is_some()
         {
-            bail!(
+            bail!(crate::i18n::t(
                 "Container identity, ownership, or Compose labels changed; cancel and select it again"
-            );
+            ));
         }
         if !self.action.eligible(current) {
-            bail!("Container state changed; refresh and confirm a new operation");
+            bail!(
+                "{}",
+                crate::i18n::t("Container state changed; refresh and confirm a new operation")
+            );
         }
         Ok(())
     }
@@ -229,12 +256,15 @@ pub enum Status {
 impl Status {
     pub fn text(&self) -> String {
         match self {
-            Self::Succeeded => "Succeeded".into(),
-            Self::Failed(error) => format!("Failed: {error}"),
+            Self::Succeeded => crate::i18n::t("Succeeded").into(),
+            Self::Failed(error) => crate::tf!("Failed: {error}", error = error),
             Self::Unknown(error) => {
-                format!("Outcome unknown: {error} · inspect state before retrying")
+                crate::tf!(
+                    "Outcome unknown: {error} · inspect state before retrying",
+                    error = error
+                )
             }
-            Self::Skipped(reason) => format!("Not attempted: {reason}"),
+            Self::Skipped(reason) => crate::tf!("Not attempted: {reason}", reason = reason),
         }
     }
 }
@@ -248,10 +278,10 @@ pub struct Progress {
 impl Progress {
     pub fn summary(&self) -> String {
         if !self.finished {
-            return format!(
-                "{}/{} completed",
-                self.results.iter().flatten().count(),
-                self.results.len()
+            return crate::tf!(
+                "{a0}/{a1} completed",
+                a0 = self.results.iter().flatten().count(),
+                a1 = self.results.len()
             );
         }
         let count = |predicate: fn(&Status) -> bool| {
@@ -261,12 +291,12 @@ impl Progress {
                 .filter(|status| predicate(status))
                 .count()
         };
-        format!(
-            "finished · {} succeeded, {} failed, {} unknown, {} skipped",
-            count(|status| matches!(status, Status::Succeeded)),
-            count(|status| matches!(status, Status::Failed(_))),
-            count(|status| matches!(status, Status::Unknown(_))),
-            count(|status| matches!(status, Status::Skipped(_)))
+        crate::tf!(
+            "finished · {a0} succeeded, {a1} failed, {a2} unknown, {a3} skipped",
+            a0 = count(|status| matches!(status, Status::Succeeded)),
+            a1 = count(|status| matches!(status, Status::Failed(_))),
+            a2 = count(|status| matches!(status, Status::Unknown(_))),
+            a3 = count(|status| matches!(status, Status::Skipped(_)))
         )
     }
 }
@@ -310,7 +340,7 @@ pub async fn run(request: Request, tx: mpsc::Sender<Event>) {
             .map_err(Into::into)
     })
     .await
-    .map_err(|_| anyhow::anyhow!("Lifecycle connection timed out"))
+    .map_err(|_| anyhow::anyhow!("{}", crate::i18n::t("Lifecycle connection timed out")))
     .and_then(|result: Result<_>| result);
     match client {
         Err(error) => {
@@ -342,7 +372,8 @@ pub async fn run(request: Request, tx: mpsc::Sender<Event>) {
                     let status = error.map_or_else(
                         || {
                             Status::Skipped(
-                                "confirmed set failed preflight; no mutations sent".into(),
+                                crate::i18n::t("confirmed set failed preflight; no mutations sent")
+                                    .into(),
                             )
                         },
                         |error| Status::Failed(format!("{error:#}")),
@@ -358,7 +389,7 @@ pub async fn run(request: Request, tx: mpsc::Sender<Event>) {
                         return;
                     }
                     let status = if uncertain {
-                        Status::Skipped("previous outcome is unknown".into())
+                        Status::Skipped(crate::i18n::t("previous outcome is unknown").into())
                     } else {
                         crate::backend::docker::apply_action(&client, &request, container).await
                     };

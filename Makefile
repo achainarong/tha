@@ -1,6 +1,15 @@
 .DEFAULT_GOAL := help
 .PHONY: help build release run demo install install\:full uninstall fmt lint test check clean
 
+# Locally, tests and lint leave the rest of the machine free. Override with: make check CPUS=8
+# CI runners set CI, and there the job can use the whole machine.
+ifeq ($(CI),)
+CPUS ?= 4
+# Pinning covers everything the tests start, but needs Linux and those cores to be available.
+PIN := $(shell taskset -c 0-$$(($(CPUS) - 1)) true 2>/dev/null && echo taskset -c 0-$$(($(CPUS) - 1)))
+LIMIT := CARGO_BUILD_JOBS=$(CPUS) RUST_TEST_THREADS=$(CPUS) $(PIN)
+endif
+
 help: ## Show available commands
 	@awk '/^[a-z][a-z\\:-]*:.*## / {name = $$0; sub(/: .*/, "", name); gsub(/\\/, "", name); printf "  %-14s %s\n", name, substr($$0, index($$0, "## ") + 3)}' $(MAKEFILE_LIST)
 
@@ -39,10 +48,10 @@ fmt: ## Format Rust source
 	cargo fmt --all
 
 lint: ## Run Clippy with warnings denied
-	cargo clippy --locked --all-targets -- -D warnings
+	$(LIMIT) cargo clippy --locked --all-targets -- -D warnings
 
-test: ## Run all tests
-	cargo test --locked --all-targets
+test: ## Run all tests (locally on at most CPUS cores, default 4)
+	$(LIMIT) cargo test --locked --all-targets
 
 check: ## Check formatting, lint, and tests
 	cargo fmt --all -- --check

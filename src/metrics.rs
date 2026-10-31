@@ -176,7 +176,7 @@ impl Store {
             .collect();
         crate::history::Data {
             points,
-            source: "Standalone session · last 60 sampling batches only".into(),
+            source: crate::i18n::t("Standalone session · last 60 sampling batches only").into(),
             start_ms: start,
             bucket_ms: 1,
             end_ms: end,
@@ -422,9 +422,9 @@ impl Summary {
                     ""
                 }
             ),
-            None if self.running == 0 && self.stopped > 0 => "stopped".into(),
-            None if self.stale > 0 => "stale".into(),
-            None if self.warming > 0 => "warm".into(),
+            None if self.running == 0 && self.stopped > 0 => crate::i18n::t("stopped").into(),
+            None if self.stale > 0 => crate::i18n::t("stale").into(),
+            None if self.warming > 0 => crate::i18n::t("warm").into(),
             _ => "--".into(),
         }
     }
@@ -440,26 +440,26 @@ impl Summary {
                     ""
                 }
             ),
-            None if self.running == 0 && self.stopped > 0 => "stopped".into(),
-            None if self.stale > 0 => "stale".into(),
+            None if self.running == 0 && self.stopped > 0 => crate::i18n::t("stopped").into(),
+            None if self.stale > 0 => crate::i18n::t("stale").into(),
             _ => "--".into(),
         }
     }
 
     pub fn detail(&self) -> String {
-        format!(
-            "CPU {}/{} · memory {}/{} live running samples{}{}",
-            self.cpu_samples,
-            self.running,
-            self.memory_samples,
-            self.running,
-            if self.warming > 0 {
-                format!(" · {} CPU warming up", self.warming)
+        crate::tf!(
+            "CPU {a0}/{a1} · memory {a2}/{a3} live running samples{a4}{a5}",
+            a0 = self.cpu_samples,
+            a1 = self.running,
+            a2 = self.memory_samples,
+            a3 = self.running,
+            a4 = if self.warming > 0 {
+                crate::tf!(" · {a0} CPU warming up", a0 = self.warming)
             } else {
                 String::new()
             },
-            if self.stale > 0 {
-                format!(" · {} stale", self.stale)
+            a5 = if self.stale > 0 {
+                crate::tf!(" · {a0} stale", a0 = self.stale)
             } else {
                 String::new()
             }

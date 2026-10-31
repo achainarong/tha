@@ -132,7 +132,8 @@ pub fn parse_since(input: &str, now: OffsetDateTime) -> anyhow::Result<Option<i6
     let at = if let Ok(at) = OffsetDateTime::parse(input, &Rfc3339) {
         at.unix_timestamp()
     } else {
-        let usage = "Use a duration such as 15m, 2h, 30s or 1d, an RFC 3339 time, or off";
+        let usage =
+            crate::i18n::t("Use a duration such as 15m, 2h, 30s or 1d, an RFC 3339 time, or off");
         let split = input.len().saturating_sub(1);
         anyhow::ensure!(input.is_ascii() && split > 0, "{usage}");
         let (amount, unit) = input.split_at(split);
@@ -150,11 +151,11 @@ pub fn parse_since(input: &str, now: OffsetDateTime) -> anyhow::Result<Option<i6
     };
     anyhow::ensure!(
         at <= now.unix_timestamp(),
-        "The log range must start in the past"
+        crate::i18n::t("The log range must start in the past")
     );
     anyhow::ensure!(
         (1..=i64::from(i32::MAX)).contains(&at),
-        "That time is outside the range the Docker API accepts"
+        crate::i18n::t("That time is outside the range the Docker API accepts")
     );
     Ok(Some(at))
 }
@@ -278,7 +279,8 @@ impl Stream {
         if self.interrupted {
             self.interrupted = false;
             self.last_problem = None;
-            self.send("Log stream reconnected.".into(), true).await;
+            self.send(crate::i18n::t("Log stream reconnected.").into(), true)
+                .await;
         }
         self.send(text.to_owned(), error).await
     }
@@ -295,8 +297,9 @@ pub fn subscribe(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if containers.len() > MAX_STREAMS {
-            let text = format!(
-                "Showing the first {MAX_STREAMS} containers. Select a service for a smaller scope."
+            let text = crate::tf!(
+                "Showing the first {MAX_STREAMS} containers. Select a service for a smaller scope.",
+                MAX_STREAMS = MAX_STREAMS
             );
             let _ = tx
                 .send(LogEvent {
@@ -355,9 +358,9 @@ pub fn subscribe(
         for ((_, mut stream), container) in streams.into_iter().zip(containers) {
             let history = stream.history.take().expect("history is read first");
             if history.trimmed {
-                let notice = format!(
-                    "Earlier lines were dropped to stay within the {} MiB per-container history limit.",
-                    MAX_HISTORY_BYTES / (1024 * 1024)
+                let notice = crate::tf!(
+                    "Earlier lines were dropped to stay within the {a0} MiB per-container history limit.",
+                    a0 = MAX_HISTORY_BYTES / (1024 * 1024)
                 );
                 histories.push((stream.source.clone(), vec![(notice, true)]));
             }
@@ -492,13 +495,18 @@ async fn follow(connection: Connection, container: Container, mut stream: Stream
         match result {
             Err(error) if container_gone(&error) => {
                 stream
-                    .send("Container no longer exists; stream closed.".into(), true)
+                    .send(
+                        crate::i18n::t("Container no longer exists; stream closed.").into(),
+                        true,
+                    )
                     .await;
                 return;
             }
             Err(error) => {
-                let problem =
-                    format!("Logs unavailable: {error:#}. Tha keeps retrying automatically.");
+                let problem = crate::tf!(
+                    "Logs unavailable: {error}. Tha keeps retrying automatically.",
+                    error = format!("{error:#}")
+                );
                 if stream.last_problem.as_ref() != Some(&problem) {
                     stream.send(problem.clone(), true).await;
                     stream.last_problem = Some(problem);
@@ -508,7 +516,7 @@ async fn follow(connection: Connection, container: Container, mut stream: Stream
             Ok(()) if !stream.interrupted => {
                 stream
                     .send(
-                        "Stream ended (container stopped or restarting). Tha resumes automatically when new output appears."
+                        crate::i18n::t("Stream ended (container stopped or restarting). Tha resumes automatically when new output appears.")
                             .into(),
                         true,
                     )

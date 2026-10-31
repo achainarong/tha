@@ -40,7 +40,9 @@ fn valid_name(name: &str) -> bool {
 impl Target {
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::Colima { profile } if !valid_name(profile) => bail!("Invalid Colima profile"),
+            Self::Colima { profile } if !valid_name(profile) => {
+                bail!(crate::i18n::t("Invalid Colima profile"))
+            }
             Self::Podman { machine } if !valid_name(machine) => bail!("Invalid Podman machine"),
             _ => Ok(()),
         }
@@ -48,10 +50,10 @@ impl Target {
 
     pub fn label(&self) -> String {
         match self {
-            Self::Colima { profile } => format!("Colima profile {profile}"),
-            Self::Podman { machine } => format!("Podman machine {machine}"),
-            Self::DockerDesktop => "Docker Desktop".into(),
-            Self::OrbStack => "OrbStack (Docker and all Linux machines)".into(),
+            Self::Colima { profile } => crate::tf!("Colima profile {profile}", profile = profile),
+            Self::Podman { machine } => crate::tf!("Podman machine {machine}", machine = machine),
+            Self::DockerDesktop => crate::i18n::t("Docker Desktop").into(),
+            Self::OrbStack => crate::i18n::t("OrbStack (Docker and all Linux machines)").into(),
         }
     }
 
@@ -134,7 +136,7 @@ impl Target {
             Action::Start => "start",
             Action::Stop => "stop",
             Action::Restart => "restart",
-            Action::Delete => bail!("Runtime deletion is disabled"),
+            Action::Delete => bail!(crate::i18n::t("Runtime deletion is disabled")),
         };
         Ok(match self {
             Self::Colima { profile } => vec![(
@@ -167,9 +169,9 @@ impl Target {
                 endpoint: self.endpoint(home),
             };
             if Self::from_connection(&connection, home).as_ref() != Some(self) {
-                bail!(
+                bail!(crate::i18n::t(
                     "Runtime socket mapping changed or is ambiguous; refresh and select the correct provider"
-                );
+                ));
             }
         }
         match self {
@@ -186,7 +188,9 @@ impl Target {
                     .iter()
                     .any(|row| row.get("name").and_then(|v| v.as_str()) == Some(profile))
                 {
-                    bail!("Colima profile no longer exists; no VM was created");
+                    bail!(crate::i18n::t(
+                        "Colima profile no longer exists; no VM was created"
+                    ));
                 }
             }
             Self::Podman { machine } => {
@@ -302,7 +306,10 @@ async fn output(
             command.env_remove(key);
         }
         let mut child = command.spawn().with_context(|| {
-            format!("Cannot run {program}; install its CLI and ensure it is on PATH")
+            crate::tf!(
+                "Cannot run {program}; install its CLI and ensure it is on PATH",
+                program = program
+            )
         })?;
         let read = |pipe: Box<dyn tokio::io::AsyncRead + Unpin + Send>| async move {
             let mut bytes = Vec::new();

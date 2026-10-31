@@ -29,12 +29,12 @@ pub enum UpdateStatus {
 impl UpdateStatus {
     pub fn describe(&self) -> String {
         match self {
-            Self::Current => "up to date with the registry".into(),
-            Self::Available(tags) => format!(
-                "registry digest differs for {} · :pull-image",
-                tags.join(", ")
+            Self::Current => crate::i18n::t("up to date with the registry").into(),
+            Self::Available(tags) => crate::tf!(
+                "registry digest differs for {a0} · :pull-image",
+                a0 = tags.join(", ")
             ),
-            Self::Unknown(reason) => format!("unknown · {reason}"),
+            Self::Unknown(reason) => crate::tf!("unknown · {reason}", reason = reason),
         }
     }
 }
@@ -123,7 +123,7 @@ fn summarize(results: Vec<(String, Result<Option<bool>, String>)>) -> UpdateStat
             Ok(Some(false)) => available.push(tag),
             Ok(None) => {
                 unknown.get_or_insert_with(|| {
-                    "no registry digest locally; it may be a local build".to_owned()
+                    crate::i18n::t("no registry digest locally; it may be a local build").to_owned()
                 });
             }
             Err(error) => {
@@ -145,10 +145,10 @@ fn registry_error(error: &bollard::errors::Error) -> String {
         bollard::errors::Error::DockerResponseServerError {
             status_code: 401 | 403,
             ..
-        } => "the registry needs a login, or the image is private".into(),
+        } => crate::i18n::t("the registry needs a login, or the image is private").into(),
         bollard::errors::Error::DockerResponseServerError {
             status_code: 404, ..
-        } => "not found in a registry, or the engine lacks this API".into(),
+        } => crate::i18n::t("not found in a registry, or the engine lacks this API").into(),
         error => safe_text(&error.to_string()),
     }
 }
@@ -166,14 +166,16 @@ async fn check_image(docker: &bollard::Docker, image: &Image) -> UpdateStatus {
                     .digest
                     .as_deref()
                     .map(|digest| compare_tag(tag, &image.digests, digest))
-                    .ok_or_else(|| "the registry reported no digest".to_owned()),
+                    .ok_or_else(|| crate::i18n::t("the registry reported no digest").to_owned()),
                 Ok(Err(error)) => Err(registry_error(&error)),
-                Err(_) => Err("the registry did not answer in time".to_owned()),
+                Err(_) => Err(crate::i18n::t("the registry did not answer in time").to_owned()),
             },
         ));
     }
     if results.is_empty() {
-        return UpdateStatus::Unknown("only digest references, which do not move".into());
+        return UpdateStatus::Unknown(
+            crate::i18n::t("only digest references, which do not move").into(),
+        );
     }
     summarize(results)
 }
@@ -189,7 +191,10 @@ pub async fn check(targets: Vec<Target>, tx: mpsc::Sender<Event>) {
                         Ok(docker) => check_image(&docker, &target.image).await,
                         Err(error) => UpdateStatus::Unknown(safe_text(&error.to_string())),
                     },
-                    Err(error) => UpdateStatus::Unknown(safe_text(&format!("{error:#}"))),
+                    Err(error) => UpdateStatus::Unknown(safe_text(&crate::tf!(
+                        "{error}",
+                        error = format!("{error:#}")
+                    ))),
                 };
                 let _ = tx
                     .send(Event::Checked {
@@ -213,15 +218,14 @@ pub async fn check(targets: Vec<Target>, tx: mpsc::Sender<Event>) {
         .filter(|status| matches!(status, UpdateStatus::Unknown(_)))
         .count();
     let _ = tx
-        .send(Event::CheckFinished(format!(
-            "Checked {total} images: {available} with updates, {unknown} unknown. Enter shows details."
-        )))
+        .send(Event::CheckFinished(crate::tf!("Checked {total} images: {available} with updates, {unknown} unknown. Enter shows details.", total = total, available = available, unknown = unknown)))
         .await;
 }
 
 async fn pull_tag(request: &PullRequest, tag: &str, tx: &mpsc::Sender<Event>) -> Result<()> {
-    let (program, path) = crate::exec::runtime_cli(&request.connection)
-        .context("Install the Docker or Podman CLI and add it to PATH to pull images")?;
+    let (program, path) = crate::exec::runtime_cli(&request.connection).context(crate::i18n::t(
+        "Install the Docker or Podman CLI and add it to PATH to pull images",
+    ))?;
     let mut command = std::process::Command::new(path);
     crate::exec::pin_endpoint(&mut command, program, &request.connection, None);
     command.args(["pull", "--", tag]);
@@ -232,7 +236,7 @@ async fn pull_tag(request: &PullRequest, tag: &str, tx: &mpsc::Sender<Event>) ->
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("Cannot start {program}"))?;
+        .with_context(|| crate::tf!("Cannot start {program}", program = program))?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let progress = async {
@@ -241,7 +245,11 @@ async fn pull_tag(request: &PullRequest, tag: &str, tx: &mpsc::Sender<Event>) ->
             let line = safe_text(line.trim());
             if !line.is_empty() {
                 let _ = tx
-                    .send(Event::PullProgress(format!("Pulling {tag}: {line}")))
+                    .send(Event::PullProgress(crate::tf!(
+                        "Pulling {tag}: {line}",
+                        tag = tag,
+                        line = line
+                    )))
                     .await;
             }
         }
@@ -263,7 +271,11 @@ async fn pull_tag(request: &PullRequest, tag: &str, tx: &mpsc::Sender<Event>) ->
         status.success(),
         "{}",
         if last_error.is_empty() {
-            format!("{program} pull exited with {status}")
+            crate::tf!(
+                "{program} pull exited with {status}",
+                program = program,
+                status = status
+            )
         } else {
             last_error
         }
@@ -272,13 +284,17 @@ async fn pull_tag(request: &PullRequest, tag: &str, tx: &mpsc::Sender<Event>) ->
 }
 
 pub async fn pull(request: PullRequest, tx: mpsc::Sender<Event>) {
-    let mut result = format!(
-        "Pulled {}. Recreate containers to use the new image.",
-        safe_text(&request.tags.join(", "))
+    let mut result = crate::tf!(
+        "Pulled {a0}. Recreate containers to use the new image.",
+        a0 = safe_text(&request.tags.join(", "))
     );
     for tag in &request.tags {
         if let Err(error) = pull_tag(&request, tag, &tx).await {
-            result = format!("Pull failed for {}: {error:#}", safe_text(tag));
+            result = crate::tf!(
+                "Pull failed for {a0}: {error}",
+                error = format!("{error:#}"),
+                a0 = safe_text(tag)
+            );
             break;
         }
     }

@@ -363,6 +363,7 @@ catalog! {
     ActionResults, "Background lifecycle progress and results", ["action-results"], Global, 40, false, [], [];
     RemovalResults, "Last cleanup results", ["removal-results"], Global, 40, false, [], [];
     Monochrome, "Toggle terminal colors", ["monochrome"], Global, 40, false, [], [];
+    Settings, "Settings: theme, language, keyboard layout, mouse", ["settings"], Global, 25, false, [","], [];
     Quit, "Quit Tha", ["quit", "q"], Global, 40, false, ["ctrl-c"], [];
 }
 
@@ -491,6 +492,7 @@ impl ActionId {
             Self::ActionResults => "action-results",
             Self::RemovalResults => "removal-results",
             Self::Monochrome => "monochrome",
+            Self::Settings => "settings",
             Self::Quit => "quit",
         }
     }
@@ -590,43 +592,51 @@ pub fn resolve(
 pub fn unavailable(app: &App, action: ActionId) -> Option<String> {
     use ActionId as A;
     if action.info().security_module && !app.security.enabled {
-        return Some("Security module is disabled".into());
+        return Some(crate::i18n::t("Security module is disabled").into());
     }
     if let Some(lifecycle) = action.lifecycle() {
         return app.current().map_or_else(
-            || Some("Select a workload".into()),
+            || Some(crate::i18n::t("Select a workload").into()),
             |row| app.action_availability(lifecycle, &row.key).err(),
         );
     }
     match action {
-        A::Metrics if app.performance_container().is_none() => Some("Select a container".into()),
+        A::Metrics if app.performance_container().is_none() => {
+            Some(crate::i18n::t("Select a container").into())
+        }
         A::ScanImage | A::ScanImages | A::UpdateSecurity | A::CancelScan
             if app.overview_mode == crate::app::OverviewMode::Containers =>
         {
-            Some("Scans run from the Security view".into())
+            Some(crate::i18n::t("Scans run from the Security view").into())
         }
         A::Exec if !app.exec_tab_available() => {
-            Some("Select a running container or service".into())
+            Some(crate::i18n::t("Select a running container or service").into())
         }
         A::Layers if !app.layers_available() => {
-            Some("Select a container or single-container service".into())
+            Some(crate::i18n::t("Select a container or single-container service").into())
         }
-        A::Actions if app.current().is_none() => Some("Select a workload".into()),
+        A::Actions if app.current().is_none() => Some(crate::i18n::t("Select a workload").into()),
         A::ScanImage | A::ScanImages | A::UpdateSecurity if app.demo => {
-            Some("Scans are disabled in demo mode".into())
+            Some(crate::i18n::t("Scans are disabled in demo mode").into())
         }
         A::ScanImage | A::ScanImages | A::UpdateSecurity if app.security.busy => {
-            Some("A security queue is already running".into())
+            Some(crate::i18n::t("A security queue is already running").into())
         }
-        A::CancelScan if !app.security.busy => Some("No active security queue".into()),
+        A::CancelScan if !app.security.busy => {
+            Some(crate::i18n::t("No active security queue").into())
+        }
         A::ExportLogs if app.tab != Tab::Logs || app.log_scope.is_none() => {
-            Some("Open and review Logs before exporting".into())
+            Some(crate::i18n::t("Open and review Logs before exporting").into())
         }
-        A::ExportLogs if app.log_export_busy => Some("Another export is running".into()),
+        A::ExportLogs if app.log_export_busy => {
+            Some(crate::i18n::t("Another export is running").into())
+        }
         A::RemovalResults if app.inventory_removal_report.is_none() => {
-            Some("No cleanup results yet".into())
+            Some(crate::i18n::t("No cleanup results yet").into())
         }
-        A::ActionResults if app.action_jobs.is_empty() => Some("No lifecycle results yet".into()),
+        A::ActionResults if app.action_jobs.is_empty() => {
+            Some(crate::i18n::t("No lifecycle results yet").into())
+        }
         _ => None,
     }
 }

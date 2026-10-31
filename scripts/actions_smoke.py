@@ -206,7 +206,7 @@ else:
             keys(b"\x1b")
             assert not server.writes
             confirmed(b"s", "Stop", confirm=b"\r")
-            expect("fixture-project [0/2 running]")
+            expect("fixture-project [stopped]")
             confirmed(b"S", "Start")
             expect("fixture-project [2/2 running]")
             confirmed(b"r", "Restart", confirm=b"\r")
@@ -214,7 +214,7 @@ else:
             expect("Stop all selected containers before deleting")
             assert len(server.writes) == 6
             confirmed(b"s", "Stop")
-            expect("fixture-project [0/2 running]")
+            expect("fixture-project [stopped]")
             keys(b"d")
             expect("Delete fixture-project?")
             expect("Runtime: Mock lifecycle")

@@ -7,7 +7,7 @@ use crate::{
 use crossterm::event::KeyCode;
 use ratatui::widgets::TableState;
 
-const IMAGE_FILTERS: &[&str] = &[
+pub const IMAGE_FILTERS: &[&str] = &[
     "All",
     "Running",
     "Stopped-only",
@@ -15,7 +15,7 @@ const IMAGE_FILTERS: &[&str] = &[
     "Untagged",
     "Unknown",
 ];
-const VOLUME_FILTERS: &[&str] = &[
+pub const VOLUME_FILTERS: &[&str] = &[
     "Managed",
     "Running",
     "Stopped-only",
@@ -23,7 +23,7 @@ const VOLUME_FILTERS: &[&str] = &[
     "Unknown",
     "Bind mounts",
 ];
-const SORTS: &[&str] = &["Usage ↓", "Name ↑", "Size ↓"];
+pub const SORTS: &[&str] = &["Usage ↓", "Name ↑", "Size ↓"];
 const MAX_NAME_CELLS: usize = 82;
 
 #[derive(Debug)]
@@ -86,7 +86,7 @@ fn image_name(tag: &str) -> (&str, &str) {
     }
     match tag.rsplit_once(':') {
         Some((name, tag)) if !tag.contains('/') => (name, tag),
-        _ => (tag, "latest"),
+        _ => (tag, crate::i18n::t("latest")),
     }
 }
 
@@ -123,9 +123,9 @@ fn entries(snapshot: &Snapshot, mode: OverviewMode, binds: bool) -> Vec<Entry> {
                     running,
                     stopped,
                     project: String::new(),
-                    extra: format!(
-                        "Tags: {}",
-                        image
+                    extra: crate::tf!(
+                        "Tags: {a0}",
+                        a0 = image
                             .tags
                             .iter()
                             .map(|tag| safe_text(tag))
@@ -164,7 +164,10 @@ fn entries(snapshot: &Snapshot, mode: OverviewMode, binds: bool) -> Vec<Entry> {
                     running,
                     stopped,
                     project: String::new(),
-                    extra: "Host path → container destination; not a managed volume".into(),
+                    extra: crate::i18n::t(
+                        "Host path → container destination; not a managed volume",
+                    )
+                    .into(),
                     containers: refs
                         .iter()
                         .map(|c| format!("{} ({})", safe_text(&c.name), safe_text(&c.state)))
@@ -313,22 +316,24 @@ fn begin_cleanup(app: &mut App, selection: CleanupSelection) {
         app.overview_mode,
         OverviewMode::Images | OverviewMode::Volumes
     ) {
-        app.notice = "Open Images or Volumes to prune unreferenced resources".into();
+        app.notice =
+            crate::i18n::t("Open Images or Volumes to prune unreferenced resources").into();
         return;
     }
     if app.inventory_removal.is_some() {
-        app.notice = "Resource cleanup is already awaiting confirmation or running".into();
+        app.notice =
+            crate::i18n::t("Resource cleanup is already awaiting confirmation or running").into();
         return;
     }
     if app.demo {
-        app.notice = "Demo mode: resource deletion is disabled".into();
+        app.notice = crate::i18n::t("Demo mode: resource deletion is disabled").into();
         return;
     }
     let key = (app.inventory_engine, app.overview_mode);
     let view = app.inventory_views.get(&key).cloned().unwrap_or_default();
     if selection == CleanupSelection::Selected && key.1 == OverviewMode::Volumes && view.filter == 5
     {
-        app.notice = "Bind mounts cannot be deleted from Tha".into();
+        app.notice = crate::i18n::t("Bind mounts cannot be deleted from Tha").into();
         return;
     }
     let Some(engine) = app
@@ -336,14 +341,14 @@ fn begin_cleanup(app: &mut App, selection: CleanupSelection) {
         .get(key.0)
         .filter(|engine| engine.error.is_none() && engine.alias.is_none())
     else {
-        app.notice = "Select a connected primary runtime".into();
+        app.notice = crate::i18n::t("Select a connected primary runtime").into();
         return;
     };
     let Some(snapshot) = &engine.snapshot else {
         return;
     };
     if engine.connection.kind != crate::config::BackendKind::Docker {
-        app.notice = "Resource removal is unsupported for this backend".into();
+        app.notice = crate::i18n::t("Resource removal is unsupported for this backend").into();
         return;
     }
     let all = entries(snapshot, key.1, false);
@@ -373,14 +378,14 @@ fn begin_cleanup(app: &mut App, selection: CleanupSelection) {
     };
     if chosen.is_empty() {
         app.notice = if selection == CleanupSelection::AllUnreferenced {
-            "No unreferenced resources to prune; running/stopped references and unknown usage are protected"
+            crate::i18n::t("No unreferenced resources to prune; running/stopped references and unknown usage are protected")
         } else {
-            "Select unreferenced resources first; running/stopped references and unknown usage are protected"
+            crate::i18n::t("Select unreferenced resources first; running/stopped references and unknown usage are protected")
         }.into();
         return;
     }
     let Some(identity) = snapshot.engine_id.clone().filter(|id| !id.is_empty()) else {
-        app.notice = "Runtime identity unavailable; deletion refused".into();
+        app.notice = crate::i18n::t("Runtime identity unavailable; deletion refused").into();
         return;
     };
     let mut targets = Vec::new();
@@ -437,13 +442,15 @@ pub fn draw_removal(frame: &mut Frame, app: &mut App, area: Rect) {
         .clamp(19, 26) as u16;
     let dialog = centered(area, 100, height);
     frame.render_widget(Clear, dialog);
-    let block = Block::bordered().title(" Confirm resource deletion ");
+    let block = Block::bordered().title(crate::i18n::t(" Confirm resource deletion "));
     let inner = block.inner(dialog);
     frame.render_widget(block, dialog);
     if area.width < 70 || area.height < 19 {
         frame.render_widget(
-            Paragraph::new("Resize to at least 70 × 19 to review deletion. Esc cancels.")
-                .wrap(Wrap { trim: false }),
+            Paragraph::new(crate::i18n::t(
+                "Resize to at least 70 × 19 to review deletion. Esc cancels.",
+            ))
+            .wrap(Wrap { trim: false }),
             inner,
         );
         return;
@@ -454,12 +461,12 @@ pub fn draw_removal(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(3),
     ])
     .split(inner);
-    let header=Paragraph::new(format!("Runtime: {}\nRemove {} {}?\n{}\nRunning AND stopped references rechecked before EACH deletion.\nNo force deletion or parent-image pruning.",safe_text(&first.request.connection.name),removal.targets.len(),if first.request.volume {"managed volumes"} else {"images"},if first.request.volume {"WARNING: this permanently destroys all data in the listed volumes."} else {"Image sizes include shared layers; they are NOT reclaimable-space estimates."})).wrap(Wrap {trim:false});
+    let header=Paragraph::new(crate::tf!("Runtime: {a0}\nRemove {a1} {a2}?\n{a3}\nRunning AND stopped references rechecked before EACH deletion.\nNo force deletion or parent-image pruning.", a0 = safe_text(&first.request.connection.name), a1 = removal.targets.len(), a2 = if first.request.volume {crate::i18n::t("managed volumes")} else {"images"}, a3 = if first.request.volume {crate::i18n::t("WARNING: this permanently destroys all data in the listed volumes.")} else {crate::i18n::t("Image sizes include shared layers; they are NOT reclaimable-space estimates.")})).wrap(Wrap {trim:false});
     if header.line_count(parts[0].width) > parts[0].height as usize {
         frame.render_widget(
-            Paragraph::new(
+            Paragraph::new(crate::i18n::t(
                 "Resize wider/taller to review the complete deletion confirmation. Esc cancels.",
-            )
+            ))
             .wrap(Wrap { trim: false }),
             inner,
         );
@@ -492,7 +499,7 @@ pub fn draw_removal(frame: &mut Frame, app: &mut App, area: Rect) {
         )
         .min(u16::MAX as usize);
     frame.render_widget(list.scroll((removal.scroll as u16, 0)), parts[1]);
-    frame.render_widget(Paragraph::new(if removal.pending {"Cleanup running · Esc Hide (does not undo or cancel sent requests)\n↑/↓ or PgUp/PgDn Review names"} else {"y / Enter Confirm · n / Esc Cancel\n↑/↓ or PgUp/PgDn Review names"}).style(muted()).wrap(Wrap {trim:false}),parts[2]);
+    frame.render_widget(Paragraph::new(if removal.pending {crate::i18n::t("Cleanup running · Esc Hide (does not undo or cancel sent requests)\n↑/↓ or PgUp/PgDn Review names")} else {crate::i18n::t("y / Enter Confirm · n / Esc Cancel\n↑/↓ or PgUp/PgDn Review names")}).style(muted()).wrap(Wrap {trim:false}),parts[2]);
     removal.visible = true;
 }
 
@@ -505,7 +512,7 @@ pub fn draw_removal_results(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     let dialog = centered(area, 110, 28);
     frame.render_widget(Clear, dialog);
-    let block = Block::bordered().title(" Resource cleanup results ");
+    let block = Block::bordered().title(crate::i18n::t(" Resource cleanup results "));
     let inner = block.inner(dialog);
     frame.render_widget(block, dialog);
     if inner.width == 0 || inner.height < 3 {
@@ -526,11 +533,11 @@ pub fn draw_removal_results(frame: &mut Frame, app: &mut App, area: Rect) {
                 "{} · {}",
                 safe_text(key),
                 match status {
-                    crate::backend::RemovalStatus::Removed => "Removed".into(),
+                    crate::backend::RemovalStatus::Removed => crate::i18n::t("Removed").into(),
                     crate::backend::RemovalStatus::Skipped(reason) =>
-                        format!("Skipped: {}", safe_text(reason)),
+                        crate::tf!("Skipped: {a0}", a0 = safe_text(reason)),
                     crate::backend::RemovalStatus::Failed(reason) =>
-                        format!("Failed: {}", safe_text(reason)),
+                        crate::tf!("Failed: {a0}", a0 = safe_text(reason)),
                 }
             ))
         })
@@ -549,7 +556,7 @@ pub fn draw_removal_results(frame: &mut Frame, app: &mut App, area: Rect) {
         parts[1],
     );
     frame.render_widget(
-        Paragraph::new("j/k PgUp/PgDn Scroll · Enter/Esc Close").style(muted()),
+        Paragraph::new(crate::i18n::t("j/k PgUp/PgDn Scroll · Enter/Esc Close")).style(muted()),
         parts[2],
     );
 }
@@ -621,7 +628,9 @@ pub fn navigate(app: &mut App, code: KeyCode, height: usize) {
                             view.marked.insert(row.key.clone());
                         }
                     } else {
-                        app.notice = "Only unreferenced resources can be marked for cleanup".into();
+                        app.notice =
+                            crate::i18n::t("Only unreferenced resources can be marked for cleanup")
+                                .into();
                     }
                 }
             }
@@ -674,21 +683,23 @@ pub fn navigate(app: &mut App, code: KeyCode, height: usize) {
 /// The connected runtime whose images the Images view is showing.
 fn image_runtime(app: &App) -> Result<(&crate::app::Engine, &Snapshot), String> {
     if app.demo {
-        return Err("Demo mode does not contact registries".into());
+        return Err(crate::i18n::t("Demo mode does not contact registries").into());
     }
     let engine = app
         .engines
         .get(app.inventory_engine)
         .filter(|engine| engine.error.is_none() && engine.alias.is_none())
-        .ok_or("Select a connected runtime first")?;
+        .ok_or(crate::i18n::t("Select a connected runtime first"))?;
     if engine.connection.kind != crate::config::BackendKind::Docker {
-        return Err("Registry updates require a Docker-compatible runtime".into());
+        return Err(crate::i18n::t("Registry updates require a Docker-compatible runtime").into());
     }
     let snapshot = engine
         .snapshot
         .as_ref()
         .filter(|snapshot| snapshot.images.is_some())
-        .ok_or("Image inventory is unavailable for this runtime")?;
+        .ok_or(crate::i18n::t(
+            "Image inventory is unavailable for this runtime",
+        ))?;
     Ok((engine, snapshot))
 }
 
@@ -716,12 +727,12 @@ pub fn begin_update_check(app: &mut App) {
         })
         .collect();
     if targets.is_empty() {
-        app.notice = "No tagged images are visible to check".into();
+        app.notice = crate::i18n::t("No tagged images are visible to check").into();
         return;
     }
-    app.notice = format!(
-        "Checking {} images against their registries…",
-        targets.len()
+    app.notice = crate::tf!(
+        "Checking {a0} images against their registries…",
+        a0 = targets.len()
     );
     app.image_check_request = Some(targets);
 }
@@ -729,7 +740,7 @@ pub fn begin_update_check(app: &mut App) {
 /// Pull every tag of the selected image. Containers keep the image they already use.
 pub fn begin_image_pull(app: &mut App) {
     if app.image_pull_active {
-        app.notice = "Another image pull is still running".into();
+        app.notice = crate::i18n::t("Another image pull is still running").into();
         return;
     }
     let (engine, snapshot) = match image_runtime(app) {
@@ -755,7 +766,7 @@ pub fn begin_image_pull(app: &mut App) {
             .find(|image| image.id == row.key)
     });
     let Some(image) = image else {
-        app.notice = "Select an image in the Images view to pull".into();
+        app.notice = crate::i18n::t("Select an image in the Images view to pull").into();
         return;
     };
     let tags: Vec<_> = image
@@ -765,10 +776,10 @@ pub fn begin_image_pull(app: &mut App) {
         .cloned()
         .collect();
     if tags.is_empty() {
-        app.notice = "This image has no tag to pull".into();
+        app.notice = crate::i18n::t("This image has no tag to pull").into();
         return;
     }
-    let notice = format!("Pulling {}…", safe_text(&tags.join(", ")));
+    let notice = crate::tf!("Pulling {a0}…", a0 = safe_text(&tags.join(", ")));
     let request = crate::images::PullRequest {
         connection: engine.connection.clone(),
         engine: key.0,
@@ -869,11 +880,11 @@ fn draw_overview_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: 
     let block = pane(
         app,
         if scan_only {
-            " Security images · m/M Check · Enter/Tab Findings ".into()
+            crate::i18n::t(" Security images · m/M Check · Enter/Tab Findings ").into()
         } else if app.overview_mode == OverviewMode::Images {
-            " Images overview ".into()
+            crate::i18n::t(" Images overview ").into()
         } else {
-            " Volumes overview ".into()
+            crate::i18n::t(" Volumes overview ").into()
         },
         if scan_only { !app.detail_focus } else { true },
     );
@@ -893,12 +904,14 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
     let key = (app.inventory_engine, app.overview_mode);
     let mut view = app.inventory_views.get(&key).cloned().unwrap_or_default();
     let Some(engine) = app.engines.get(key.0) else {
-        frame.render_widget(Paragraph::new("Select a runtime."), area);
+        frame.render_widget(Paragraph::new(crate::i18n::t("Select a runtime.")), area);
         return;
     };
     let Some(snapshot) = engine.snapshot.as_ref() else {
         frame.render_widget(
-            Paragraph::new("Runtime unavailable; inventory cannot be read."),
+            Paragraph::new(crate::i18n::t(
+                "Runtime unavailable; inventory cannot be read.",
+            )),
             area,
         );
         return;
@@ -940,14 +953,18 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
     ])
     .split(area);
     frame.render_widget(
-        Paragraph::new(format!(
-            "{}  ·  {}  ·  Filter: {}  ·  Sort: {}{}",
-            safe_text(&engine.connection.name),
-            if binds { "Bind mounts" } else { "inventory" },
-            filters(key.1)[view.filter % filters(key.1).len()],
-            SORTS[view.sort % SORTS.len()],
-            if engine.error.is_some() {
-                "  ·  STALE snapshot"
+        Paragraph::new(crate::tf!(
+            "{a0}  ·  {a1}  ·  Filter: {a2}  ·  Sort: {a3}{a4}",
+            a0 = safe_text(&engine.connection.name),
+            a1 = if binds {
+                crate::i18n::t("Bind mounts")
+            } else {
+                crate::i18n::t("inventory")
+            },
+            a2 = crate::i18n::dynamic(filters(key.1)[view.filter % filters(key.1).len()]),
+            a3 = crate::i18n::dynamic(SORTS[view.sort % SORTS.len()]),
+            a4 = if engine.error.is_some() {
+                crate::i18n::t("  ·  STALE snapshot")
             } else {
                 ""
             }
@@ -958,27 +975,32 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
     let updates = if key.1 == OverviewMode::Images {
         match all_update_count(app, key.0, snapshot) {
             0 => String::new(),
-            count => format!(" · {count} ↑ update available"),
+            count => crate::tf!(" · {count} ↑ update available", count = count),
         }
     } else {
         String::new()
     };
     let marks = if scan_only {
-        format!("{} checked for scan", view.scan_marked.len())
+        crate::tf!("{a0} checked for scan", a0 = view.scan_marked.len())
     } else if app.security.enabled && key.1 == OverviewMode::Images {
-        format!(
-            "{} cleanup / {} scan checked",
-            view.marked.len(),
-            view.scan_marked.len()
+        crate::tf!(
+            "{a0} cleanup / {a1} scan checked",
+            a0 = view.marked.len(),
+            a1 = view.scan_marked.len()
         )
     } else {
-        format!("{} marked", view.marked.len())
+        crate::tf!("{count} marked", count = view.marked.len())
     };
     frame.render_widget(
-        Paragraph::new(format!(
-            "{} / {total} shown · {used} used · {unused} unreferenced · {marks}{updates}{}",
-            rows.len(),
-            if query.is_empty() {
+        Paragraph::new(crate::tf!(
+            "{a0} / {total} shown · {used} used · {unused} unreferenced · {marks}{updates}{a1}",
+            a0 = rows.len(),
+            total = total,
+            used = used,
+            unused = unused,
+            marks = marks,
+            updates = updates,
+            a1 = if query.is_empty() {
                 String::new()
             } else {
                 format!(" · /{}", safe_text(&query))
@@ -987,11 +1009,31 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
         parts[1],
     );
     frame.render_widget(
-        Paragraph::new(if scan_only { "Space/m Check · M All · s/S Scan · Enter Findings · Tab Focus · z Zoom".into() } else if app.security.enabled && key.1 == OverviewMode::Images { format!(
-            "Row {} / {} · U Check updates · :pull-image · m/M Check scan/all · 7 Security · :scan-images · z Zoom · Space Cleanup · d Delete · p Prune all unused · Enter Details",
-            if rows.is_empty() { 0 } else { view.index + 1 },
-            rows.len()
-        ) } else { format!("Row {} / {} · Space Mark  u Mark unused  c Clear  d Delete  p Prune all unused{} · / Search  f Filter  s Sort  Enter Details", if rows.is_empty() { 0 } else { view.index + 1 }, rows.len(), if key.1 == OverviewMode::Images { "  U Check updates  :pull-image" } else { "" }) })
+        Paragraph::new({
+            let row = if rows.is_empty() { 0 } else { view.index + 1 };
+            let total = rows.len();
+            if scan_only {
+                t("Space/m Check · M All · s/S Scan · Enter Findings · Tab Focus · z Zoom").to_owned()
+            } else if app.security.enabled && key.1 == OverviewMode::Images {
+                crate::tf!(
+                    "Row {row} / {total} · U Check updates · :pull-image · m/M Check scan/all · 7 Security · :scan-images · z Zoom · Space Cleanup · d Delete · p Prune all unused · Enter Details",
+                    row = row,
+                    total = total
+                )
+            } else if key.1 == OverviewMode::Images {
+                crate::tf!(
+                    "Row {row} / {total} · Space Mark  u Mark unused  c Clear  d Delete  p Prune all unused  U Check updates  :pull-image · / Search  f Filter  s Sort  Enter Details",
+                    row = row,
+                    total = total
+                )
+            } else {
+                crate::tf!(
+                    "Row {row} / {total} · Space Mark  u Mark unused  c Clear  d Delete  p Prune all unused · / Search  f Filter  s Sort  Enter Details",
+                    row = row,
+                    total = total
+                )
+            }
+        })
         .style(muted()),
         parts[3],
     );
@@ -999,11 +1041,13 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
     if unavailable || rows.is_empty() {
         frame.render_widget(
             Paragraph::new(if unavailable {
-                "Inventory unavailable for this runtime. See Containers overview warnings."
+                crate::i18n::t(
+                    "Inventory unavailable for this runtime. See Containers overview warnings.",
+                )
             } else if total == 0 {
-                "No resources reported by this runtime."
+                crate::i18n::t("No resources reported by this runtime.")
             } else {
-                "No matches. / edits search; f changes the status filter."
+                crate::i18n::t("No matches. / edits search; f changes the status filter.")
             })
             .wrap(Wrap { trim: false }),
             body,
@@ -1024,26 +1068,38 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
             let wide = table_area.width >= 92;
             let headers = if wide {
                 vec![
-                    if images { "Image" } else { "Volume / source" },
-                    if images { "Tags" } else { "Driver" },
-                    "Size",
-                    "Status",
-                    "Refs",
-                    if images { "ID" } else { "Project" },
+                    if images {
+                        crate::i18n::t("Image")
+                    } else {
+                        crate::i18n::t("Volume / source")
+                    },
+                    if images {
+                        crate::i18n::t("Tags")
+                    } else {
+                        crate::i18n::t("Driver")
+                    },
+                    crate::i18n::t("Size"),
+                    crate::i18n::t("Status"),
+                    crate::i18n::t("Refs"),
+                    if images {
+                        "ID"
+                    } else {
+                        crate::i18n::t("Project")
+                    },
                 ]
             } else if table_area.width >= 50 {
                 vec![
                     if images {
-                        "Image / tags"
+                        crate::i18n::t("Image / tags")
                     } else {
-                        "Volume / source"
+                        crate::i18n::t("Volume / source")
                     },
-                    "Size",
-                    "Status",
-                    "Refs",
+                    crate::i18n::t("Size"),
+                    crate::i18n::t("Status"),
+                    crate::i18n::t("Refs"),
                 ]
             } else {
-                vec!["Name", "Status"]
+                vec![crate::i18n::t("Name"), crate::i18n::t("Status")]
             };
             let available_name_width = table_area.width.saturating_sub(if wide {
                 68
@@ -1131,9 +1187,12 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
                     cells.push(Cell::from(ellipsize_line(Line::from(row.tags.clone()), 14)));
                 }
                 if table_area.width >= 50 {
-                    cells.push(Cell::from(Line::from(size).alignment(Alignment::Right)));
+                    cells.push(Cell::from(
+                        Line::from(crate::i18n::dynamic(&size).to_owned())
+                            .alignment(Alignment::Right),
+                    ));
                 }
-                cells.push(Cell::from(row.status).style(status_style));
+                cells.push(Cell::from(crate::i18n::dynamic(row.status)).style(status_style));
                 if table_area.width >= 50 {
                     cells.push(Cell::from(
                         Line::from((row.running + row.stopped).to_string())
@@ -1184,7 +1243,7 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
         if let Some(details_area) = details_area {
             let row = &rows[view.index];
             let block = Block::bordered()
-                .title(" Details · Esc Back ")
+                .title(crate::i18n::t(" Details · Esc Back "))
                 .border_style(muted());
             let inner = block.inner(details_area);
             frame.render_widget(block, details_area);
@@ -1194,40 +1253,47 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
                         row.name.clone(),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
-                    Line::from(format!("ID / key: {}", safe_text(&row.key))),
+                    Line::from(crate::tf!("ID / key: {a0}", a0 = safe_text(&row.key))),
                     Line::from(row.extra.clone()),
-                    Line::from(format!(
-                        "Status: {} · {} running / {} stopped",
-                        row.status, row.running, row.stopped
+                    Line::from(crate::tf!(
+                        "Status: {a0} · {a1} running / {a2} stopped",
+                        a0 = row.status,
+                        a1 = row.running,
+                        a2 = row.stopped
                     )),
-                    Line::from(format!(
-                        "Size: {}",
-                        row.size
+                    Line::from(crate::tf!(
+                        "Size: {a0}",
+                        a0 = row
+                            .size
                             .map(metrics::bytes)
-                            .unwrap_or_else(|| "unknown (no filesystem scan)".into())
+                            .unwrap_or_else(
+                                || crate::i18n::t("unknown (no filesystem scan)").into()
+                            )
                     )),
                 ];
                 if key.1 == OverviewMode::Images {
-                    lines.push(Line::from(format!(
-                        "Update: {}",
-                        app.image_updates
+                    lines.push(Line::from(crate::tf!(
+                        "Update: {a0}",
+                        a0 = app
+                            .image_updates
                             .get(&(key.0, row.key.clone()))
                             .map_or_else(
-                                || "not checked · U compares with the registry".to_owned(),
+                                || crate::i18n::t("not checked · U compares with the registry")
+                                    .to_owned(),
                                 |status| safe_text(&status.describe())
                             )
                     )));
                 }
-                lines.push(Line::from("Container references:"));
+                lines.push(Line::from(crate::i18n::t("Container references:")));
                 lines.extend(
                     row.containers
                         .iter()
                         .map(|name| Line::from(format!("  {name}"))),
                 );
                 if row.containers.is_empty() {
-                    lines.push(Line::from("  None reported"));
+                    lines.push(Line::from(crate::i18n::t("  None reported")));
                 }
-                lines.push(Line::styled(if key.1 == OverviewMode::Images { "Sizes may include shared layers, not reclaimable space. Untagged does not imply unused." } else { "Unreferenced does not mean safe to delete. Bind mounts are not managed volumes." }, muted()));
+                lines.push(Line::styled(if key.1 == OverviewMode::Images { crate::i18n::t("Sizes may include shared layers, not reclaimable space. Untagged does not imply unused.") } else { crate::i18n::t("Unreferenced does not mean safe to delete. Bind mounts are not managed volumes.") }, muted()));
                 let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
                 view.details_scroll = view
                     .details_scroll

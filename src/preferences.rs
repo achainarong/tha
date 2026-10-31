@@ -27,6 +27,7 @@ pub struct Preferences {
     pub selected: Option<Row>,
     pub project: Option<Row>,
     pub runtimes: Vec<crate::runtime::Saved>,
+    pub settings: crate::settings::SavedSettings,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -40,6 +41,7 @@ impl Default for Preferences {
             selected: None,
             project: None,
             runtimes: Vec::new(),
+            settings: Default::default(),
         }
     }
 }

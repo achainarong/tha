@@ -5,7 +5,9 @@ use crate::security::State;
 pub fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
     if !app.security.enabled {
         frame.render_widget(
-            Paragraph::new("Install the security module: tha module install security"),
+            Paragraph::new(crate::i18n::t(
+                "Install the security module: tha module install security",
+            )),
             area,
         );
         return;
@@ -54,15 +56,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = pane(
         app,
         if app.security.expanded {
-            " Advisory details · Esc Back ".into()
+            crate::i18n::t(" Advisory details · Esc Back ").into()
         } else if matches!(app.security.state, State::Ready(_)) {
             if area.width < 50 {
-                " CVEs · saved report ".into()
+                crate::i18n::t(" CVEs · saved report ").into()
             } else {
-                " Vulnerabilities · saved report · z Expand/restore ".into()
+                crate::i18n::t(" Vulnerabilities · saved report · z Expand/restore ").into()
             }
         } else {
-            " Vulnerabilities · z Expand/restore ".into()
+            crate::i18n::t(" Vulnerabilities · z Expand/restore ").into()
         },
         app.detail_focus,
     );
@@ -94,25 +96,25 @@ pub fn draw_report(frame: &mut Frame, app: &mut App, inner: Rect) {
     }
     if !compact {
         lines.push(Line::styled(
-            "Image only; excludes live container changes and mounted files.",
+            crate::i18n::t("Image only; excludes live container changes and mounted files."),
             muted(),
         ));
     }
     match &app.security.state {
         State::Idle => lines.push(Line::from(
             if read_only(app) && app.security.target.is_none() {
-                "This container's image ID is unknown, so no report can be matched."
+                crate::i18n::t("This container's image ID is unknown, so no report can be matched.")
             } else if read_only(app) {
-                "No saved report yet. Scan this image from the Security view (Ctrl+→ or Alt+4)."
+                crate::i18n::t("No saved report yet. Scan this image from the Security view (Ctrl+→ or Alt+4).")
             } else if app.security.enabled {
-                "No saved report yet · s Scan checked/selected images"
+                crate::i18n::t("No saved report yet · s Scan checked/selected images")
             } else {
-                "Module not installed. Run: tha module install security"
+                crate::i18n::t("Module not installed. Run: tha module install security")
             },
         )),
         State::Failed(error) => {
             lines.push(Line::styled(
-                "Image scan failed; this is NOT a clean scan.",
+                crate::i18n::t("Image scan failed; this is NOT a clean scan."),
                 accent(app, Color::Red),
             ));
             lines.push(Line::from(safe_text(error)));
@@ -123,7 +125,7 @@ pub fn draw_report(frame: &mut Frame, app: &mut App, inner: Rect) {
                 counts[crate::security::severity_rank(&finding.severity)] += 1;
             }
             let names = if inner.width >= 90 {
-                ["Critical", "High", "Medium", "Low", "Negligible", "Unknown"]
+                [crate::i18n::t("Critical"), crate::i18n::t("High"), crate::i18n::t("Medium"), crate::i18n::t("Low"), crate::i18n::t("Negligible"), crate::i18n::t("Unknown")]
             } else {
                 ["C", "H", "M", "L", "N", "U"]
             };
@@ -142,29 +144,21 @@ pub fn draw_report(frame: &mut Frame, app: &mut App, inner: Rect) {
             if !compact {
                 let scanned = time::OffsetDateTime::from_unix_timestamp(report.scanned as i64)
                     .map(|date| date.to_string())
-                    .unwrap_or_else(|_| "unknown time".into());
-                lines.push(Line::styled(format!("Grype {} · scanned {scanned} · saved report, not a live security guarantee", safe_text(&report.scanner)), muted()));
+                    .unwrap_or_else(|_| crate::i18n::t("unknown time").into());
+                lines.push(Line::styled(crate::tf!("Grype {a0} · scanned {scanned} · saved report, not a live security guarantee", a0 = safe_text(&report.scanner), scanned = scanned), muted()));
             }
             if app.security.expanded {
                 if let Some(finding) = report.findings.get(app.security.selected) {
-                    lines.push(Line::from(format!(
-                        "{} · {} · CVSS {} (highest reported base score)",
-                        finding.id,
-                        finding.severity,
-                        score(finding.score)
-                    )));
+                    lines.push(Line::from(crate::tf!("{a0} · {a1} · CVSS {a2} (highest reported base score)", a0 = finding.id, a1 = finding.severity, a2 = score(finding.score))));
                     lines.push(Line::from(""));
                     lines.push(Line::styled("PACKAGE", muted()));
                     lines.push(Line::from(finding.package.clone()));
-                    lines.push(Line::from(format!("Installed  {}", finding.installed)));
-                    lines.push(Line::from(format!(
-                        "Fixed in   {}",
-                        if finding.fixed.is_empty() {
-                            "No fix reported"
+                    lines.push(Line::from(crate::tf!("Installed  {a0}", a0 = finding.installed)));
+                    lines.push(Line::from(crate::tf!("Fixed in   {a0}", a0 = if finding.fixed.is_empty() {
+                            crate::i18n::t("No fix reported")
                         } else {
                             &finding.fixed
-                        }
-                    )));
+                        })));
                     lines.push(Line::from(""));
                     lines.push(Line::styled("DESCRIPTION", muted()));
                     lines.push(Line::from(finding.description.clone()));
@@ -175,23 +169,19 @@ pub fn draw_report(frame: &mut Frame, app: &mut App, inner: Rect) {
                     let database: serde_json::Value =
                         serde_json::from_str(&report.database).unwrap_or_default();
                     lines.push(Line::styled("SCANNER", muted()));
-                    lines.push(Line::from(format!(
-                        "Grype {} · database built {}",
-                        report.scanner,
-                        database
+                    lines.push(Line::from(crate::tf!("Grype {a0} · database built {a1}", a0 = report.scanner, a1 = database
                             .get("built")
                             .and_then(serde_json::Value::as_str)
-                            .unwrap_or("not reported")
-                    )));
+                            .unwrap_or(crate::i18n::t("not reported")))));
                 }
                 lines.push(Line::styled(
-                    "Esc/Enter Back to findings · j/k Scroll · z Expand/restore",
+                    crate::i18n::t("Esc/Enter Back to findings · j/k Scroll · z Expand/restore"),
                     muted(),
                 ));
             } else {
                 if report.findings.is_empty() {
                     lines.push(Line::from(
-                        "No known matching vulnerabilities found within scanner coverage.",
+                        crate::i18n::t("No known matching vulnerabilities found within scanner coverage."),
                     ));
                 } else {
                     let header_height = (lines.len() as u16).min(inner.height.saturating_sub(3));
@@ -205,11 +195,7 @@ pub fn draw_report(frame: &mut Frame, app: &mut App, inner: Rect) {
                         .into_iter()
                         .map(|line| ellipsize_line(line, inner.width as usize))
                         .collect();
-                    let footer = format!(
-                        "{} / {} · j/k Select · Enter Details · z Zoom",
-                        app.security.selected + 1,
-                        report.findings.len()
-                    );
+                    let footer = crate::tf!("{a0} / {a1} · j/k Select · Enter Details · z Zoom", a0 = app.security.selected + 1, a1 = report.findings.len());
                     frame.render_widget(Paragraph::new(header), parts[0]);
                     draw_findings(frame, app, parts[1]);
                     frame.render_widget(Paragraph::new(footer).style(muted()), parts[2]);
@@ -272,7 +258,7 @@ fn scan_status_line(app: &App, now: std::time::Instant, width: u16) -> Line<'sta
     let suffix = if read_only(app) {
         format!(" {elapsed}")
     } else if width >= 28 {
-        format!(" {elapsed} · x Cancel")
+        crate::tf!(" {elapsed} · x Cancel", elapsed = elapsed)
     } else {
         format!(" {elapsed} · x")
     };
@@ -312,12 +298,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 .scan_target
                 .as_ref()
                 .map(|target| {
-                    format!(
-                        "Target {} · saved CVEs remain browsable",
-                        safe_text(&target.label)
+                    crate::tf!(
+                        "Target {a0} · saved CVEs remain browsable",
+                        a0 = safe_text(&target.label)
                     )
                 })
-                .unwrap_or_else(|| "Service-owned queue · safe to close the UI".into()),
+                .unwrap_or_else(|| {
+                    crate::i18n::t("Service-owned queue · safe to close the UI").into()
+                }),
             muted(),
         ));
     }
@@ -353,12 +341,12 @@ fn draw_findings(frame: &mut Frame, app: &mut App, area: Rect) {
     let (headers, widths) = if area.width >= 100 {
         (
             vec![
-                "Severity",
+                crate::i18n::t("Severity"),
                 "CVSS",
-                "Advisory",
-                "Package",
-                "Installed",
-                "Fixed in",
+                crate::i18n::t("Advisory"),
+                crate::i18n::t("Package"),
+                crate::i18n::t("Installed"),
+                crate::i18n::t("Fixed in"),
             ],
             vec![
                 Constraint::Length(10),
@@ -371,7 +359,13 @@ fn draw_findings(frame: &mut Frame, app: &mut App, area: Rect) {
         )
     } else if area.width >= 72 {
         (
-            vec!["Severity", "CVSS", "Advisory", "Package", "Fixed in"],
+            vec![
+                crate::i18n::t("Severity"),
+                "CVSS",
+                crate::i18n::t("Advisory"),
+                crate::i18n::t("Package"),
+                crate::i18n::t("Fixed in"),
+            ],
             vec![
                 Constraint::Length(10),
                 Constraint::Length(5),
@@ -382,7 +376,12 @@ fn draw_findings(frame: &mut Frame, app: &mut App, area: Rect) {
         )
     } else if area.width >= 48 {
         (
-            vec!["Severity", "CVSS", "Advisory", "Package"],
+            vec![
+                crate::i18n::t("Severity"),
+                "CVSS",
+                crate::i18n::t("Advisory"),
+                crate::i18n::t("Package"),
+            ],
             vec![
                 Constraint::Length(10),
                 Constraint::Length(5),
@@ -392,7 +391,7 @@ fn draw_findings(frame: &mut Frame, app: &mut App, area: Rect) {
         )
     } else {
         (
-            vec!["Sev", "CVSS", "Advisory"],
+            vec![crate::i18n::t("Sev"), "CVSS", crate::i18n::t("Advisory")],
             vec![
                 Constraint::Length(4),
                 Constraint::Length(5),
@@ -408,7 +407,14 @@ fn draw_findings(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|finding| {
             let rank = crate::security::severity_rank(&finding.severity);
             let severity = if area.width < 48 {
-                ["Crit", "High", "Med", "Low", "Neg", "Unk"][rank]
+                [
+                    crate::i18n::t("Crit"),
+                    crate::i18n::t("High"),
+                    crate::i18n::t("Med"),
+                    crate::i18n::t("Low"),
+                    crate::i18n::t("Neg"),
+                    crate::i18n::t("Unk"),
+                ][rank]
             } else {
                 finding.severity.as_str()
             };

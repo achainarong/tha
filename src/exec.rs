@@ -16,24 +16,30 @@ pub struct Request {
 pub fn prepare(request: &Request) -> Result<Command> {
     if !request.container.running() || request.container.managed || request.container.id.is_empty()
     {
-        bail!("Exec requires a running, non-Kubernetes-managed container with an ID");
+        bail!(crate::i18n::t(
+            "Exec requires a running, non-Kubernetes-managed container with an ID"
+        ));
     }
     if request.command.is_empty() || request.command[0].is_empty() {
-        bail!("exec_command must contain an executable");
+        bail!(crate::i18n::t("exec_command must contain an executable"));
     }
     let endpoint = &request.connection.endpoint;
     let socket = endpoint.strip_prefix("unix://").unwrap_or(endpoint);
     if !socket.starts_with('/') {
-        bail!("Exec currently requires a local Unix socket");
+        bail!(crate::i18n::t(
+            "Exec currently requires a local Unix socket"
+        ));
     }
     let (program, path) = if request.connection.kind == BackendKind::Containerd {
         (
             "nerdctl",
-            find_program("nerdctl").context("Install nerdctl and add it to PATH to use exec")?,
+            find_program("nerdctl").context(crate::i18n::t(
+                "Install nerdctl and add it to PATH to use exec",
+            ))?,
         )
     } else {
         runtime_cli(&request.connection)
-            .context("Install the Docker or Podman CLI and add it to PATH to use exec; API browsing does not require a CLI")?
+            .context(crate::i18n::t("Install the Docker or Podman CLI and add it to PATH to use exec; API browsing does not require a CLI"))?
     };
     Ok(command_for(request, program, path))
 }

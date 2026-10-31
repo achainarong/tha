@@ -51,12 +51,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let scroll = app.detail_scroll.min(total.saturating_sub(height));
     app.detail_scroll = scroll;
     frame.render_widget(
-        Paragraph::new(format!(
-            "{total} events · newest first · UTC · {}",
-            if persisted {
-                "last 24 hours, saved by the service"
+        Paragraph::new(crate::tf!(
+            "{total} events · newest first · UTC · {a0}",
+            total = total,
+            a0 = if persisted {
+                crate::i18n::t("last 24 hours, saved by the service")
             } else {
-                "from the engine while Tha is open"
+                crate::i18n::t("from the engine while Tha is open")
             }
         ))
         .style(muted()),
@@ -65,9 +66,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     if lines.is_empty() {
         frame.render_widget(
             Paragraph::new(if native {
-                "Events are not available for native containerd connections."
+                crate::i18n::t("Events are not available for native containerd connections.")
             } else {
-                "No events for this selection yet. Starts, exits, OOM kills and health changes appear here as they happen."
+                crate::i18n::t("No events for this selection yet. Starts, exits, OOM kills and health changes appear here as they happen.")
             })
             .wrap(Wrap { trim: false }),
             parts[1],

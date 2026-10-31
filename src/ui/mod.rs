@@ -1,3 +1,4 @@
+use crate::i18n::t;
 use crate::{
     app::{
         App, Choice, InputMode, MouseTarget, NetworkTarget, OverviewMode, PerformanceScope,
@@ -25,6 +26,7 @@ mod events;
 mod history;
 pub mod inventory;
 mod security;
+mod settings;
 
 pub const COMMANDS: &[(&str, &str)] = &[
     (
@@ -154,6 +156,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("back", "Return to the previous workspace"),
     ("all", "Return to all runtimes"),
     ("monochrome", "Toggle terminal colors"),
+    (
+        "settings",
+        "Theme, language, keyboard layout, mouse, log wrapping (,)",
+    ),
     ("help", "Show keyboard shortcuts"),
     ("quit", "Exit Tha"),
 ];
@@ -162,7 +168,7 @@ fn accent(app: &App, color: Color) -> Style {
     if app.monochrome {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(color)
+        Style::default().fg(app.theme.color(color))
     }
 }
 
@@ -209,6 +215,14 @@ fn tab_regions(area: Rect, titles: &[&str]) -> Vec<Rect> {
         .collect()
 }
 
+fn overview_label(app: &App, mode: OverviewMode, label: &str) -> String {
+    if app.overview_mode == mode {
+        format!("[{label}]")
+    } else {
+        label.to_owned()
+    }
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.mouse_regions.clear();
     app.reconcile_detail_tab();
@@ -220,9 +234,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     if area.width < 32 || area.height < 10 {
         frame.render_widget(
-            Paragraph::new(
+            Paragraph::new(crate::i18n::t(
                 "Tha\nTerminal too small. Resize to at least 32 × 10.\nPress q to quit.",
-            ),
+            )),
             area,
         );
         return;
@@ -247,10 +261,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .count();
     let mut overview_x = layout[0].x + if app.demo { 15 } else { 8 };
     for (mode, label, available) in [
-        (OverviewMode::Containers, "Containers", true),
-        (OverviewMode::Images, "Images", true),
-        (OverviewMode::Volumes, "Volumes", true),
-        (OverviewMode::Security, "Security", app.security.enabled),
+        (OverviewMode::Containers, crate::i18n::t("Containers"), true),
+        (OverviewMode::Images, crate::i18n::t("Images"), true),
+        (OverviewMode::Volumes, crate::i18n::t("Volumes"), true),
+        (
+            OverviewMode::Security,
+            crate::i18n::t("Security"),
+            app.security.enabled,
+        ),
     ] {
         if !available || layout[0].height == 0 {
             continue;
@@ -263,58 +281,59 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         overview_x += width + 3;
     }
     let header = Line::from(vec![
-        Span::styled(" ⊤ Tha ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(if app.demo { " Demo · " } else { " " }),
+        Span::styled(
+            crate::i18n::t(" ⊤ Tha "),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(if app.demo {
+            crate::i18n::t(" Demo · ")
+        } else {
+            " "
+        }),
         Span::styled(
             format!(
                 "{} · {} · {}{}  ",
-                if app.overview_mode == OverviewMode::Containers {
-                    "[Containers]"
-                } else {
-                    "Containers"
-                },
-                if app.overview_mode == OverviewMode::Images {
-                    "[Images]"
-                } else {
-                    "Images"
-                },
-                if app.overview_mode == OverviewMode::Volumes {
-                    "[Volumes]"
-                } else {
-                    "Volumes"
-                },
+                overview_label(app, OverviewMode::Containers, t("Containers")),
+                overview_label(app, OverviewMode::Images, t("Images")),
+                overview_label(app, OverviewMode::Volumes, t("Volumes")),
                 if app.security.enabled {
-                    if app.overview_mode == OverviewMode::Security {
-                        " · [Security]"
-                    } else {
-                        " · Security"
-                    }
+                    format!(
+                        " · {}",
+                        overview_label(app, OverviewMode::Security, t("Security"))
+                    )
                 } else {
-                    ""
+                    String::new()
                 }
             ),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("{connected} connected / {} configured", app.engines.len()),
+            crate::tf!(
+                "{connected} connected / {a0} configured",
+                connected = connected,
+                a0 = app.engines.len()
+            ),
             muted(),
         ),
     ]);
     let breadcrumb = if app.overview_mode != OverviewMode::Containers {
-        " Ctrl+←/→ or F7/F8 Overview · ←/→ Runtime · ↑/↓ Select · / Search · Enter Details".into()
+        crate::i18n::t(
+            " Ctrl+←/→ or F7/F8 Overview · ←/→ Runtime · ↑/↓ Select · / Search · Enter Details",
+        )
+        .into()
     } else if let Some(project) = &app.project {
-        format!(
-            " All runtimes › {}{} › {}  · Backspace Back",
-            safe_text(&app.engines[project.engine].connection.name),
-            project
+        crate::tf!(
+            " All runtimes › {a0}{a1} › {a2}  · Backspace Back",
+            a0 = safe_text(&app.engines[project.engine].connection.name),
+            a1 = project
                 .namespace
                 .as_ref()
                 .map(|ns| format!(" › {}", safe_text(ns)))
                 .unwrap_or_default(),
-            safe_text(&project.name)
+            a2 = safe_text(&project.name)
         )
     } else {
-        " All runtimes · Enter a Compose project to focus it".into()
+        crate::i18n::t(" All runtimes · Enter a Compose project to focus it").into()
     };
     frame.render_widget(
         Paragraph::new(vec![header, Line::styled(breadcrumb, muted())]),
@@ -385,6 +404,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.help {
         draw_help(frame, app, area);
     }
+    if app.settings.is_some() {
+        settings::draw(frame, app, area);
+    }
     if app.input_mode == InputMode::Command {
         draw_palette(frame, app, area);
     }
@@ -417,16 +439,18 @@ fn draw_log_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     let area = centered(area, 100, 20);
     frame.render_widget(Clear, area);
     let block = Block::bordered().title(if exporting {
-        " Export retained logs "
+        crate::i18n::t(" Export retained logs ")
     } else {
-        " Filter retained logs · JSON "
+        crate::i18n::t(" Filter retained logs · JSON ")
     });
     let inner = padded(block.inner(area));
     frame.render_widget(block, area);
     if !review_visible {
         frame.render_widget(
-            Paragraph::new("Resize to review this dialog (at least 60 × 18). Esc cancels.")
-                .wrap(Wrap { trim: false }),
+            Paragraph::new(crate::i18n::t(
+                "Resize to review this dialog (at least 60 × 18). Esc cancels.",
+            ))
+            .wrap(Wrap { trim: false }),
             inner,
         );
         return;
@@ -446,12 +470,13 @@ fn draw_log_editor(frame: &mut Frame, app: &mut App, area: Rect) {
             .iter()
             .filter(|entry| app.log_view.filter.matches(entry))
             .count();
-        format!(
-            "{matched} matching / {} retained entries in the current scope.\nLogs may contain SECRETS. Choose an explicit destination filename.\nNew JSONL file only; mode 0600; existing files/symlinks refused.\nNo history fetch, no automatic redaction, no silent truncation.\nSnapshot limit: 16 MiB; destination directory must already exist.",
-            app.logs.entries.len()
+        crate::tf!(
+            "{matched} matching / {a0} retained entries in the current scope.\nLogs may contain SECRETS. Choose an explicit destination filename.\nNew JSONL file only; mode 0600; existing files/symlinks refused.\nNo history fetch, no automatic redaction, no silent truncation.\nSnapshot limit: 16 MiB; destination directory must already exist.",
+            matched = matched,
+            a0 = app.logs.entries.len()
         )
     } else {
-        "{} clears filters. Supported keys: source, level, min_level, fields, since, until.\nExample: {\"source\":\"api\",\"min_level\":\"warn\",\"fields\":{\"/http/status\":500}}\nTime bounds: RFC3339, e.g. \"since\":\"2026-10-29T10:00:00Z\".\nMissing required metadata does not match. Search remains separate.\nOnly retained entries are filtered; no older logs are fetched.".into()
+        t("{} clears filters. Supported keys: source, level, min_level, fields, since, until.\nExample: {\"source\":\"api\",\"min_level\":\"warn\",\"fields\":{\"/http/status\":500}}\nTime bounds: RFC3339, e.g. \"since\":\"2026-10-29T10:00:00Z\".\nMissing required metadata does not match. Search remains separate.\nOnly retained entries are filtered; no older logs are fetched.").into()
     };
     frame.render_widget(Paragraph::new(hint).wrap(Wrap { trim: false }), parts[0]);
     let input = Paragraph::new(format!("> {}▏", safe_text(&app.input))).wrap(Wrap { trim: false });
@@ -468,9 +493,9 @@ fn draw_log_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(if exporting {
-            "Enter Export snapshot · Esc Cancel · Ctrl-u Clear"
+            crate::i18n::t("Enter Export snapshot · Esc Cancel · Ctrl-u Clear")
         } else {
-            "Enter Apply · Esc Cancel · Ctrl-u Clear; paste appends JSON"
+            crate::i18n::t("Enter Apply · Esc Cancel · Ctrl-u Clear; paste appends JSON")
         })
         .wrap(Wrap { trim: false }),
         parts[3],
@@ -486,7 +511,7 @@ fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
     let dialog = centered(area, 100, area.height.saturating_sub(2).min(28));
     frame.render_widget(Clear, dialog);
     if area.width < 60 || area.height < 18 {
-        frame.render_widget(Paragraph::new("Resize to at least 60 × 18 to review lifecycle targets.\nEsc cancels confirmation; running actions continue.").wrap(Wrap { trim: false }).block(Block::bordered().title(" Lifecycle ")), dialog);
+        frame.render_widget(Paragraph::new(crate::i18n::t("Resize to at least 60 × 18 to review lifecycle targets.\nEsc cancels confirmation; running actions continue.")).wrap(Wrap { trim: false }).block(Block::bordered().title(crate::i18n::t(" Lifecycle "))), dialog);
         return;
     }
     let Some(progress) = app.action_progress() else {
@@ -498,14 +523,14 @@ fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
         " {} · {} ",
         request.action.label(),
         if progress.finished {
-            "Results"
+            crate::i18n::t("Results")
         } else {
-            "Running"
+            crate::i18n::t("Running")
         }
     );
     let block = Block::bordered()
         .title(title)
-        .title_bottom(" ↑/↓ PgUp/PgDn Review targets ");
+        .title_bottom(crate::i18n::t(" ↑/↓ PgUp/PgDn Review targets "));
     let inner = padded(block.inner(dialog));
     frame.render_widget(block, dialog);
     let parts = Layout::vertical([
@@ -516,26 +541,29 @@ fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
     .split(inner);
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(format!("Runtime: {}", safe_text(&request.connection.name))),
+            Line::from(crate::tf!(
+                "Runtime: {a0}",
+                a0 = safe_text(&request.connection.name)
+            )),
             Line::from(if request.runtime.is_some() {
-                format!("{} RUNTIME · ALL workloads", request.action.label())
+                crate::tf!("{a0} RUNTIME · ALL workloads", a0 = request.action.label())
             } else {
-                format!(
-                    "{}: {} · {} target(s), {} skipped",
-                    request.action.label(),
-                    safe_text(&request.name),
-                    request.target_count(),
-                    request.skipped
+                crate::tf!(
+                    "{a0}: {a1} · {a2} target(s), {a3} skipped",
+                    a0 = request.action.label(),
+                    a1 = safe_text(&request.name),
+                    a2 = request.target_count(),
+                    a3 = request.skipped
                 )
             }),
         ]),
         parts[0],
     );
     let mut lines = vec![
-        Line::from(format!(
-            "Endpoint: {}",
-            if request.connection.endpoint.is_empty() {
-                "not currently available".into()
+        Line::from(crate::tf!(
+            "Endpoint: {a0}",
+            a0 = if request.connection.endpoint.is_empty() {
+                crate::i18n::t("not currently available").into()
             } else {
                 safe_text(&request.connection.endpoint)
             }
@@ -543,47 +571,55 @@ fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(format!(
             "{}: {}",
             if request.runtime.is_some() {
-                "Provider target"
+                crate::i18n::t("Provider target")
             } else {
-                "Runtime ID"
+                crate::i18n::t("Runtime ID")
             },
             safe_text(&request.identity)
         )),
     ];
     if let Some(target) = &request.runtime {
         lines.push(Line::styled(
-            "RUNTIME-WIDE: affects ALL workloads, including outside the focused project.",
+            crate::i18n::t(
+                "RUNTIME-WIDE: affects ALL workloads, including outside the focused project.",
+            ),
             accent(app, Color::Yellow),
         ));
         if let Ok(commands) = target.commands(request.action) {
             for (program, args) in commands {
-                lines.push(Line::from(format!("Command: {program} {}", args.join(" "))));
+                lines.push(Line::from(crate::tf!(
+                    "Command: {program} {a0}",
+                    program = program,
+                    a0 = args.join(" ")
+                )));
             }
         }
-        lines.push(Line::from(
+        lines.push(Line::from(crate::i18n::t(
             "Runtime configuration is retained; stopped runtimes remain (offline).",
-        ));
+        )));
         lines.push(Line::from(safe_text(
             &progress.results[0]
                 .as_ref()
                 .map(Status::text)
-                .unwrap_or_else(|| "Pending / checking runtime".into()),
+                .unwrap_or_else(|| crate::i18n::t("Pending / checking runtime").into()),
         )));
     } else {
         lines.push(Line::styled(
-            "Existing containers only; no Compose dependency orchestration.",
+            crate::i18n::t("Existing containers only; no Compose dependency orchestration."),
             muted(),
         ));
     }
     if request.action == Action::Delete {
         lines.push(Line::styled(
-            "Container writable data is lost. Networks, ALL volumes and images stay.",
+            crate::i18n::t(
+                "Container writable data is lost. Networks, ALL volumes and images stay.",
+            ),
             accent(app, Color::Yellow),
         ));
     } else if request.runtime.is_none() && matches!(request.action, Action::Stop | Action::Restart)
     {
         lines.push(Line::styled(
-            "10s stop grace period, then runtime may kill the process.",
+            crate::i18n::t("10s stop grace period, then runtime may kill the process."),
             accent(app, Color::Yellow),
         ));
     }
@@ -598,10 +634,13 @@ fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
             muted(),
         ));
         let (text, style) = match &progress.results[index] {
-            Some(Status::Succeeded) => ("Succeeded".into(), accent(app, Color::Green)),
+            Some(Status::Succeeded) => (
+                crate::i18n::t("Succeeded").into(),
+                accent(app, Color::Green),
+            ),
             Some(status @ Status::Failed(_)) => (status.text(), accent(app, Color::Red)),
             Some(status) => (status.text(), accent(app, Color::Yellow)),
-            None => ("Pending / checking safety".into(), muted()),
+            None => (crate::i18n::t("Pending / checking safety").into(), muted()),
         };
         lines.push(Line::styled(safe_text(&text), style));
         lines.push(Line::from(""));
@@ -613,9 +652,13 @@ fn draw_action(frame: &mut Frame, app: &mut App, area: Rect) {
     let scroll = scroll.min(max_scroll).min(u16::MAX as usize);
     frame.render_widget(paragraph.scroll((scroll as u16, 0)), parts[1]);
     let prompt = if progress.finished {
-        "Enter/Esc Close · Inventory refresh requested\nNo automatic retry or rollback; inspect unknown outcomes."
+        crate::i18n::t(
+            "Enter/Esc Close · Inventory refresh requested\nNo automatic retry or rollback; inspect unknown outcomes.",
+        )
     } else {
-        "Enter/Esc Close · Actions continue in the background.\nQuitting cannot undo a request already sent to the runtime."
+        crate::i18n::t(
+            "Enter/Esc Close · Actions continue in the background.\nQuitting cannot undo a request already sent to the runtime.",
+        )
     };
     frame.render_widget(Paragraph::new(prompt).wrap(Wrap { trim: false }), parts[2]);
     app.action_progress_mut().unwrap().scroll = scroll;
@@ -627,42 +670,49 @@ fn draw_action_confirmation(frame: &mut Frame, app: &mut App, area: Rect) {
         let dialog = centered(area, 56, 5);
         frame.render_widget(Clear, dialog);
         frame.render_widget(
-            Paragraph::new("Resize to at least 44 × 10 to confirm.\nEsc Cancel")
-                .wrap(Wrap { trim: false })
-                .block(Block::bordered().title(" Confirm action ")),
+            Paragraph::new(crate::i18n::t(
+                "Resize to at least 44 × 10 to confirm.\nEsc Cancel",
+            ))
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title(crate::i18n::t(" Confirm action "))),
             dialog,
         );
         return;
     }
     let confirmation = app.action_confirmation.as_ref().unwrap();
     let request = &confirmation.request;
-    let runtime_name = Line::from(format!("Runtime: {}", safe_text(&request.connection.name)));
+    let runtime_name = Line::from(crate::tf!(
+        "Runtime: {a0}",
+        a0 = safe_text(&request.connection.name)
+    ));
     let mut lines = Vec::new();
     if request.runtime.is_some() {
         lines.push(Line::styled(
             match request.action {
-                Action::Start => "Starts this runtime; workloads may auto-start.",
-                Action::Stop => "Stops this runtime and all workloads.",
-                _ => "Restarts this runtime and all workloads.",
+                Action::Start => crate::i18n::t("Starts this runtime; workloads may auto-start."),
+                Action::Stop => crate::i18n::t("Stops this runtime and all workloads."),
+                _ => crate::i18n::t("Restarts this runtime and all workloads."),
             },
             accent(app, Color::Yellow),
         ));
         if matches!(request.runtime, Some(crate::runtime::Target::OrbStack)) {
-            lines.push(Line::from("Includes all OrbStack Linux machines."));
+            lines.push(Line::from(crate::i18n::t(
+                "Includes all OrbStack Linux machines.",
+            )));
         }
         lines.push(runtime_name);
     } else {
         if request.action == Action::Delete {
             lines.push(Line::styled(
-                "Writable data is lost; all volumes/images stay.",
+                crate::i18n::t("Writable data is lost; all volumes/images stay."),
                 accent(app, Color::Yellow),
             ));
         }
         lines.push(runtime_name);
-        lines.push(Line::from(format!(
-            "{} target(s), {} skipped",
-            request.target_count(),
-            request.skipped
+        lines.push(Line::from(crate::tf!(
+            "{a0} target(s), {a1} skipped",
+            a0 = request.target_count(),
+            a1 = request.skipped
         )));
         for container in &request.containers {
             lines.push(Line::from(format!("• {}", safe_text(&container.name))));
@@ -670,13 +720,13 @@ fn draw_action_confirmation(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let title = format!(" {} {}? ", request.action.label(), safe_text(&request.name));
     let hint = if request.action == Action::Delete {
-        format!(
-            "Type {} then Enter to DELETE\n> {} · Esc Cancel",
-            safe_text(&request.name),
-            safe_text(&confirmation.typed)
+        crate::tf!(
+            "Type {a0} then Enter to DELETE\n> {a1} · Esc Cancel",
+            a0 = safe_text(&request.name),
+            a1 = safe_text(&confirmation.typed)
         )
     } else {
-        "y / Enter Confirm    n / Esc Cancel".into()
+        crate::i18n::t("y / Enter Confirm    n / Esc Cancel").into()
     };
     let mut prompt = hint;
     if let Some(error) = &confirmation.error {
@@ -685,7 +735,10 @@ fn draw_action_confirmation(frame: &mut Frame, app: &mut App, area: Rect) {
     let width = area.width.saturating_sub(2).min(56);
     let content_width = width.saturating_sub(4);
     if UnicodeWidthStr::width(title.as_str()) > width.saturating_sub(2) as usize {
-        lines.push(Line::from(format!("Target: {}", safe_text(&request.name))));
+        lines.push(Line::from(crate::tf!(
+            "Target: {a0}",
+            a0 = safe_text(&request.name)
+        )));
     }
     let body = Paragraph::new(lines).wrap(Wrap { trim: false });
     let footer = Paragraph::new(prompt).wrap(Wrap { trim: false });
@@ -720,7 +773,7 @@ fn draw_action_confirmation(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(body.scroll((scroll as u16, 0)), parts[0]);
     if max_scroll > 0 {
         frame.render_widget(
-            Paragraph::new("↑/↓ Review targets").style(muted()),
+            Paragraph::new(crate::i18n::t("↑/↓ Review targets")).style(muted()),
             parts[1],
         );
     }
@@ -755,9 +808,9 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             .push((parts[1], MouseTarget::CollapsedPerformance));
         frame.render_widget(
             Paragraph::new(if app.performance_scope == PerformanceScope::Container {
-                " ▸ Performance · Selected container (p/P)"
+                crate::i18n::t(" ▸ Performance · Selected container (p/P)")
             } else {
-                " ▸ Performance · Connected runtimes (p/P)"
+                crate::i18n::t(" ▸ Performance · Connected runtimes (p/P)")
             })
             .style(if app.performance_focus {
                 selected()
@@ -775,13 +828,15 @@ fn draw_performance_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = pane(
         app,
         if app.performance_scope == PerformanceScope::Container {
-            " ▾ Performance · Selected container · P Runtime ".into()
+            crate::i18n::t(" ▾ Performance · Selected container · P Runtime ").into()
         } else {
-            " ▾ Performance · Connected runtimes · P Container ".into()
+            crate::i18n::t(" ▾ Performance · Connected runtimes · P Container ").into()
         },
         app.performance_focus,
     )
-    .title_bottom(" j/k Select · Enter Inspect · z Zoom · p Close ");
+    .title_bottom(crate::i18n::t(
+        " j/k Select · Enter Inspect · z Zoom · p Close ",
+    ));
     let inner = padded(block.inner(area));
     frame.render_widget(block, area);
     app.mouse_regions.push((area, MouseTarget::Performance));
@@ -790,7 +845,7 @@ fn draw_performance_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             draw_performance_history(frame, app, index, inner);
         } else {
             frame.render_widget(
-                Paragraph::new("Select a container in Explorer · P Runtime")
+                Paragraph::new(crate::i18n::t("Select a container in Explorer · P Runtime"))
                     .style(muted())
                     .wrap(Wrap { trim: false }),
                 inner,
@@ -803,7 +858,7 @@ fn draw_performance_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     if engines.is_empty() {
         app.performance_offset = 0;
         frame.render_widget(
-            Paragraph::new("No connected runtimes")
+            Paragraph::new(crate::i18n::t("No connected runtimes"))
                 .style(muted())
                 .wrap(Wrap { trim: false }),
             inner,
@@ -948,9 +1003,9 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = pane(
         app,
         if app.tree_query.is_empty() {
-            " Explorer ".into()
+            crate::i18n::t(" Explorer ").into()
         } else {
-            format!(" Explorer / {} ", safe_text(&app.tree_query))
+            crate::tf!(" Explorer / {a0} ", a0 = safe_text(&app.tree_query))
         },
         !app.detail_focus && !app.performance_focus,
     );
@@ -1025,7 +1080,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                             && app.engines[row.engine].snapshot.is_some())
             }) {
                 name.push(Span::styled(
-                    format!(" [{}]", condition.label),
+                    format!(" [{}]", crate::i18n::dynamic(condition.label)),
                     condition_style(app, condition),
                 ));
             }
@@ -1050,7 +1105,10 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             let mut cells = vec![Cell::from(label)];
             if show_metrics {
-                let (cpu, memory) = (presentation.cpu.clone(), presentation.memory.clone());
+                let (cpu, memory) = (
+                    crate::i18n::dynamic(&presentation.cpu).to_owned(),
+                    crate::i18n::dynamic(&presentation.memory).to_owned(),
+                );
                 cells.push(Cell::from(Line::from(cpu).alignment(Alignment::Right)));
                 cells.push(Cell::from(Line::from(memory).alignment(Alignment::Right)));
             }
@@ -1080,16 +1138,16 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     if app.rows.is_empty() {
         frame.render_widget(
-            Paragraph::new("No matching workloads. Esc clears search."),
+            Paragraph::new(crate::i18n::t("No matching workloads. Esc clears search.")),
             inner,
         );
         return;
     }
     if show_metrics {
         let header = TableRow::new([
-            Cell::from("Workload"),
+            Cell::from(crate::i18n::t("Workload")),
             Cell::from(Line::from("CPU").alignment(Alignment::Right)),
-            Cell::from(Line::from("Mem").alignment(Alignment::Right)),
+            Cell::from(Line::from(crate::i18n::t("Mem")).alignment(Alignment::Right)),
         ])
         .style(muted());
         frame.render_widget(
@@ -1112,14 +1170,14 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
     let label = match app.tab {
-        Tab::Overview => "1 Overview",
-        Tab::Logs => "2 Logs",
-        Tab::Networks => "3 Networks",
-        Tab::Exec => "4 Exec",
-        Tab::Events => "5 Events",
-        Tab::History => "6 Metrics",
-        Tab::Layers => "7 Layers",
-        Tab::Security => "8 Security",
+        Tab::Overview => crate::i18n::t("1 Overview"),
+        Tab::Logs => crate::i18n::t("2 Logs"),
+        Tab::Networks => crate::i18n::t("3 Networks"),
+        Tab::Exec => crate::i18n::t("4 Exec"),
+        Tab::Events => crate::i18n::t("5 Events"),
+        Tab::History => crate::i18n::t("6 Metrics"),
+        Tab::Layers => crate::i18n::t("7 Layers"),
+        Tab::Security => crate::i18n::t("8 Security"),
     };
     let exec_context = if app.tab == Tab::Exec {
         app.sessions
@@ -1148,10 +1206,30 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Min(1),
     ])
     .split(inner);
-    let (mut names, exec_name) = if inner.width >= 82 {
-        (vec!["1 Overview", "2 Logs", "3 Networks"], "4 Exec")
+    // German tab names are longer, so each width step needs more room.
+    let extra = if crate::i18n::language() == crate::i18n::Language::German {
+        16
+    } else {
+        0
+    };
+    let (mut names, exec_name) = if inner.width >= 82 + extra {
+        (
+            vec![
+                crate::i18n::t("1 Overview"),
+                crate::i18n::t("2 Logs"),
+                crate::i18n::t("3 Networks"),
+            ],
+            crate::i18n::t("4 Exec"),
+        )
     } else if inner.width >= 70 {
-        (vec!["1 Info", "2 Logs", "3 Net"], "4 Exec")
+        (
+            vec![
+                crate::i18n::t("1 Info"),
+                crate::i18n::t("2 Logs"),
+                crate::i18n::t("3 Net"),
+            ],
+            crate::i18n::t("4 Exec"),
+        )
     } else {
         (vec!["1", "2", "3"], "4")
     };
@@ -1162,21 +1240,37 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
         bar_tabs.push(Tab::Exec);
     }
     bar_tabs.push(Tab::Events);
-    names.push(if inner.width >= 56 { "5 Events" } else { "5" });
+    names.push(if inner.width >= 56 {
+        crate::i18n::t("5 Events")
+    } else {
+        "5"
+    });
     let events_index = names.len() - 1;
     let metrics_index = names.len();
     if app.performance_container().is_some() {
-        names.push(if inner.width >= 44 { "6 Metrics" } else { "6" });
+        names.push(if inner.width >= 44 {
+            crate::i18n::t("6 Metrics")
+        } else {
+            "6"
+        });
         bar_tabs.push(Tab::History);
     }
     let layers_index = names.len();
     if app.layers_available() {
-        names.push(if inner.width >= 44 { "7 Layers" } else { "7" });
+        names.push(if inner.width >= 44 {
+            crate::i18n::t("7 Layers")
+        } else {
+            "7"
+        });
         bar_tabs.push(Tab::Layers);
     }
     let security_index = names.len();
     if app.security_tab_available() {
-        names.push(if inner.width >= 44 { "8 Security" } else { "8" });
+        names.push(if inner.width >= 44 {
+            crate::i18n::t("8 Security")
+        } else {
+            "8"
+        });
         bar_tabs.push(Tab::Security);
     }
     for (region, tab) in tab_regions(sections[0], &names).into_iter().zip(bar_tabs) {
@@ -1214,26 +1308,28 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
                         .unwrap_or_default(),
                     safe_text(&session.request.container.name),
                     if app.exec_input {
-                        "SHELL INPUT"
+                        crate::i18n::t("SHELL INPUT")
                     } else if session.running() {
                         "NAVIGATION"
                     } else {
-                        "OUTPUT RETAINED"
+                        crate::i18n::t("OUTPUT RETAINED")
                     },
                     safe_text(&session.status()),
                 )
             })
-            .unwrap_or_else(|| "No session\nNAVIGATION · Select a container and press e".into())
+            .unwrap_or_else(|| {
+                crate::i18n::t("No session\nNAVIGATION · Select a container and press e").into()
+            })
     } else {
         format!(
             "{} · {}",
             app.current()
                 .map(|row| safe_text(&row.title))
-                .unwrap_or_else(|| "No selection".into()),
+                .unwrap_or_else(|| crate::i18n::t("No selection").into()),
             if app.detail_focus {
-                "Focused"
+                crate::i18n::t("Focused")
             } else {
-                "Navigation"
+                crate::i18n::t("Navigation")
             }
         )
     };
@@ -1252,7 +1348,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some(session) = app.sessions.active_mut()
         && let Err(error) = session.resize(body.height, body.width)
     {
-        app.notice = format!("Exec resize failed: {error:#}");
+        app.notice = crate::tf!("Exec resize failed: {error}", error = format!("{error:#}"));
     }
     match app.tab {
         Tab::Logs => draw_logs(frame, app, body),
@@ -1277,21 +1373,21 @@ fn draw_layers(frame: &mut Frame, app: &mut App, area: Rect) {
     use crate::layers::State;
     let image = match &app.layers.state {
         State::Idle => {
-            frame.render_widget(Paragraph::new("Select one connected container or a one-container service.\nRead-only image metadata; no pulls, extraction, or builds.").wrap(Wrap { trim:false }), area);
+            frame.render_widget(Paragraph::new(crate::i18n::t("Select one connected container or a one-container service.\nRead-only image metadata; no pulls, extraction, or builds.")).wrap(Wrap { trim:false }), area);
             return;
         }
         State::Loading => {
             frame.render_widget(
-                Paragraph::new("Loading resolved image layers… (read-only)"),
+                Paragraph::new(crate::i18n::t("Loading resolved image layers… (read-only)")),
                 area,
             );
             return;
         }
         State::Failed(error) => {
             frame.render_widget(
-                Paragraph::new(format!(
-                    "Layers unavailable: {}\n:reload-layers retries; no image will be pulled.",
-                    safe_text(error)
+                Paragraph::new(crate::tf!(
+                    "Layers unavailable: {a0}\n:reload-layers retries; no image will be pulled.",
+                    a0 = safe_text(error)
                 ))
                 .wrap(Wrap { trim: false }),
                 area,
@@ -1310,19 +1406,19 @@ fn draw_layers(frame: &mut Frame, app: &mut App, area: Rect) {
         .split(area);
         frame.render_widget(
             Paragraph::new(ellipsize_line(
-                Line::from(format!("Image: {}", image.id)),
+                Line::from(crate::tf!("Image: {a0}", a0 = image.id)),
                 area.width as usize,
             ))
             .style(muted()),
             parts[0],
         );
-        frame.render_widget(Paragraph::new(format!("Filesystem layers ({}) · Build history ({})\nBase → top · separate sections, not a guessed layer/step mapping",image.filesystem.len(),image.history.len())).style(muted()),parts[1]);
+        frame.render_widget(Paragraph::new(crate::tf!("Filesystem layers ({a0}) · Build history ({a1})\nBase → top · separate sections, not a guessed layer/step mapping", a0 = image.filesystem.len(), a1 = image.history.len())).style(muted()),parts[1]);
         let mut rows = Vec::new();
         for (index, id) in image.filesystem.iter().enumerate() {
             rows.push(TableRow::new(vec![
                 Cell::from((index + 1).to_string()),
-                Cell::from("Filesystem"),
-                Cell::from("unknown"),
+                Cell::from(crate::i18n::t("Filesystem")),
+                Cell::from(t("unknown")),
                 Cell::from(ellipsize_line(
                     Line::from(safe_text(id)),
                     parts[2].width.saturating_sub(32) as usize,
@@ -1333,16 +1429,16 @@ fn draw_layers(frame: &mut Frame, app: &mut App, area: Rect) {
             rows.push(TableRow::new(vec![
                 Cell::from((index + 1).to_string()),
                 Cell::from(if step.empty_layer == Some(true) {
-                    "Metadata"
+                    crate::i18n::t("Metadata")
                 } else {
-                    "Build step"
+                    crate::i18n::t("Build step")
                 }),
                 Cell::from(
                     step.size
                         .map(metrics::bytes)
-                        .unwrap_or_else(|| "unknown".into()),
+                        .unwrap_or_else(|| t("unknown").into()),
                 ),
-                Cell::from("instruction hidden · Enter details"),
+                Cell::from(crate::i18n::t("instruction hidden · Enter details")),
             ]));
         }
         app.layers.selected = app.layers.selected.min(image.rows().saturating_sub(1));
@@ -1354,14 +1450,20 @@ fn draw_layers(frame: &mut Frame, app: &mut App, area: Rect) {
                 rows,
                 [
                     Constraint::Length(3),
-                    Constraint::Length(10),
+                    // Room for the longest translated kind.
+                    Constraint::Length(13),
                     Constraint::Length(10),
                     Constraint::Min(1),
                 ],
             )
             .header(
-                TableRow::new(["#", "Kind", "Size", "Diff ID / instruction"])
-                    .style(Style::default().add_modifier(Modifier::BOLD)),
+                TableRow::new([
+                    "#",
+                    crate::i18n::t("Kind"),
+                    crate::i18n::t("Size"),
+                    crate::i18n::t("Diff ID / instruction"),
+                ])
+                .style(Style::default().add_modifier(Modifier::BOLD)),
             )
             .column_spacing(1)
             .row_highlight_style(selected())
@@ -1380,51 +1482,59 @@ fn draw_layers(frame: &mut Frame, app: &mut App, area: Rect) {
             }
         }
         frame.render_widget(
-            Paragraph::new("j/k Select · Enter Details · :reload-layers Retry").style(muted()),
+            Paragraph::new(crate::i18n::t(
+                "j/k Select · Enter Details · :reload-layers Retry",
+            ))
+            .style(muted()),
             parts[3],
         );
         return;
     }
     let mut lines = vec![
         Line::styled(
-            "Layer details",
+            crate::i18n::t("Layer details"),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Line::from(format!("Resolved image: {}", image.id)),
+        Line::from(crate::tf!("Resolved image: {a0}", a0 = image.id)),
     ];
     if app.layers.expanded {
         lines.push(Line::styled(
-            "Enter/Esc Back · j/k/PgUp/PgDn Scroll",
+            crate::i18n::t("Enter/Esc Back · j/k/PgUp/PgDn Scroll"),
             muted(),
         ));
         if let Some(id) = image.filesystem.get(app.layers.selected) {
-            lines.push(Line::from(format!("Filesystem diff ID: {id}")));
-            lines.push(Line::from(
+            lines.push(Line::from(crate::tf!("Filesystem diff ID: {id}", id = id)));
+            lines.push(Line::from(crate::i18n::t(
                 "Uncompressed diff ID; size and build-step association are unavailable.",
-            ));
+            )));
         } else if let Some(step) = image
             .history
             .get(app.layers.selected.saturating_sub(image.filesystem.len()))
         {
             lines.push(Line::styled(
-                "Build history may contain secrets. Instructions are never executed.",
+                crate::i18n::t(
+                    "Build history may contain secrets. Instructions are never executed.",
+                ),
                 accent(app, Color::Yellow),
             ));
             lines.push(Line::from(match step.empty_layer {
-                Some(true) => "Explicit metadata-only step",
-                Some(false) => "Explicit filesystem-producing step",
-                None => "Filesystem association unavailable (not inferred from size)",
+                Some(true) => crate::i18n::t("Explicit metadata-only step"),
+                Some(false) => crate::i18n::t("Explicit filesystem-producing step"),
+                None => {
+                    crate::i18n::t("Filesystem association unavailable (not inferred from size)")
+                }
             }));
-            lines.push(Line::from(format!(
-                "Reported history size: {}",
-                step.size
+            lines.push(Line::from(crate::tf!(
+                "Reported history size: {a0}",
+                a0 = step
+                    .size
                     .map(metrics::bytes)
-                    .unwrap_or_else(|| "unavailable".into())
+                    .unwrap_or_else(|| crate::i18n::t("unavailable").into())
             )));
-            lines.push(Line::from("Instruction:"));
+            lines.push(Line::from(crate::i18n::t("Instruction:")));
             lines.push(Line::from(step.instruction.clone()));
             if !step.comment.is_empty() {
-                lines.push(Line::from("Comment:"));
+                lines.push(Line::from(crate::i18n::t("Comment:")));
                 lines.push(Line::from(step.comment.clone()));
             }
         }
@@ -1446,7 +1556,7 @@ fn draw_layers(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_exec(frame: &mut Frame, app: &App, area: Rect) {
     let Some(session) = app.sessions.active() else {
-        frame.render_widget(Paragraph::new("Embedded container shell\n\nSelect a running container or service and press e.\nCtrl-] returns keyboard focus to Tha without closing the shell.\nThe session target stays fixed when you browse other containers.").wrap(Wrap { trim:false }), area);
+        frame.render_widget(Paragraph::new(crate::tf!("Embedded container shell\n\nSelect a running container or service and press e.\n{a0} returns keyboard focus to Tha without closing the shell.\nThe session target stays fixed when you browse other containers.", a0 = crate::i18n::dynamic(app.keyboard.exec_escape_hint()))).wrap(Wrap { trim:false }), area);
         return;
     };
     let screen = session.screen();
@@ -1503,10 +1613,10 @@ fn draw_performance_history(frame: &mut Frame, app: &App, index: usize, area: Re
         app.engine_metrics(index)
     };
     let title = if let Some(container) = &container {
-        format!(
-            "Container · {} · {}",
-            safe_text(&container.name),
-            safe_text(&engine.connection.name)
+        crate::tf!(
+            "Container · {a0} · {a1}",
+            a0 = safe_text(&container.name),
+            a1 = safe_text(&engine.connection.name)
         )
     } else {
         safe_text(&engine.connection.name)
@@ -1541,12 +1651,12 @@ fn draw_performance_history(frame: &mut Frame, app: &App, index: usize, area: Re
     if area.height < 8 {
         let lines = vec![
             Line::from(title),
-            Line::from(format!(
-                "CPU {} · RAM {}",
-                summary.cpu_label(),
-                summary.memory_label()
+            Line::from(crate::tf!(
+                "CPU {a0} · RAM {a1}",
+                a0 = summary.cpu_label(),
+                a1 = summary.memory_label()
             )),
-            Line::styled("z Zoom · more room for history", muted()),
+            Line::styled(crate::i18n::t("z Zoom · more room for history"), muted()),
         ];
         frame.render_widget(Paragraph::new(lines), area);
         return;
@@ -1563,30 +1673,33 @@ fn draw_performance_history(frame: &mut Frame, app: &App, index: usize, area: Re
     ])
     .split(area);
     frame.render_widget(
-        Paragraph::new(format!("{} · CPU {}", title, summary.cpu_label())).style(
-            if app.performance_focus {
-                selected()
-            } else {
-                Style::default().add_modifier(Modifier::BOLD)
-            },
-        ),
+        Paragraph::new(crate::tf!(
+            "{a0} · CPU {a1}",
+            a0 = title,
+            a1 = summary.cpu_label()
+        ))
+        .style(if app.performance_focus {
+            selected()
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        }),
         parts[0],
     );
     let cpu_max = cpu.iter().flatten().copied().max().unwrap_or(0).max(10_000);
     frame.render_widget(
-        Paragraph::new(format!(
-            "CPU {} · scale {:.0}%",
-            summary.cpu_label(),
-            cpu_max as f64 / 100.0
+        Paragraph::new(crate::tf!(
+            "CPU {cpu} · scale {scale}%",
+            cpu = summary.cpu_label(),
+            scale = format!("{:.0}", cpu_max as f64 / 100.0)
         ))
         .style(accent(app, Color::Cyan)),
         parts[1],
     );
     frame.render_widget(
-        Paragraph::new(format!(
-            "Memory {}{}",
-            summary.memory_label(),
-            capacity
+        Paragraph::new(crate::tf!(
+            "Memory {a0}{a1}",
+            a0 = summary.memory_label(),
+            a1 = capacity
                 .map(|limit| format!(" / {}", metrics::bytes(limit)))
                 .unwrap_or_default()
         ))
@@ -1598,16 +1711,16 @@ fn draw_performance_history(frame: &mut Frame, app: &App, index: usize, area: Re
             Gauge::default()
                 .ratio((used as f64 / limit as f64).clamp(0.0, 1.0))
                 .label(if container.is_some() {
-                    "Container usage / memory limit"
+                    crate::i18n::t("Container usage / memory limit")
                 } else {
-                    "Container usage / runtime capacity"
+                    crate::i18n::t("Container usage / runtime capacity")
                 })
                 .gauge_style(accent(app, Color::Green)),
             parts[4],
         );
     } else {
         frame.render_widget(
-            Paragraph::new("Capacity or live usage unavailable").style(muted()),
+            Paragraph::new(crate::i18n::t("Capacity or live usage unavailable")).style(muted()),
             parts[4],
         );
     }
@@ -1638,17 +1751,17 @@ fn draw_performance_history(frame: &mut Frame, app: &App, index: usize, area: Re
         parts[6],
     );
     frame.render_widget(
-        Paragraph::new(format!(
-            "{} · {}s target · latest {}s ago · · gap{}",
-            if container.is_some() {
-                "Container"
+        Paragraph::new(crate::tf!(
+            "{a0} · {a1}s target · latest {a2}s ago · · gap{a3}",
+            a0 = if container.is_some() {
+                crate::i18n::t("Container")
             } else {
-                "Container totals"
+                crate::i18n::t("Container totals")
             },
-            app.metrics_refresh_seconds,
-            now.saturating_duration_since(end).as_secs(),
-            if engine.error.is_some() {
-                " · offline"
+            a1 = app.metrics_refresh_seconds,
+            a2 = now.saturating_duration_since(end).as_secs(),
+            a3 = if engine.error.is_some() {
+                crate::i18n::t(" · offline")
             } else {
                 ""
             }
@@ -1692,7 +1805,7 @@ fn history_axis(width: usize, span: std::time::Duration) -> String {
     let ticks = if width >= 48 { 4 } else { 2 };
     for tick in 0..=ticks {
         let label = if tick == ticks {
-            "latest".into()
+            crate::i18n::t("latest").into()
         } else {
             format!("−{}s", seconds * (ticks - tick) / ticks)
         };
@@ -1723,7 +1836,7 @@ fn draw_usage(frame: &mut Frame, app: &App, index: usize, area: Rect) {
     let engine = &app.engines[index];
     let line = |offset| Rect::new(area.x, area.y + offset, area.width, 1);
     let condition = if engine.error.is_some() {
-        Condition::new(Tone::Warning, "unavailable")
+        Condition::new(Tone::Warning, crate::i18n::t("unavailable"))
     } else if engine.alias.is_some() {
         Condition::new(Tone::Neutral, "alias")
     } else if let Some(snapshot) = &engine.snapshot {
@@ -1737,12 +1850,12 @@ fn draw_usage(frame: &mut Frame, app: &App, index: usize, area: Rect) {
             format!("{} ", condition.symbol()),
             condition_style(app, condition),
         ),
-        Span::raw(format!(
-            "{} · CPU {}{}",
-            safe_text(&engine.connection.name),
-            summary.cpu_label(),
-            if area.height < 4 {
-                format!(" · Mem {}", summary.memory_label())
+        Span::raw(crate::tf!(
+            "{a0} · CPU {a1}{a2}",
+            a0 = safe_text(&engine.connection.name),
+            a1 = summary.cpu_label(),
+            a2 = if area.height < 4 {
+                crate::tf!(" · Mem {a0}", a0 = summary.memory_label())
             } else {
                 String::new()
             }
@@ -1763,22 +1876,28 @@ fn draw_usage(frame: &mut Frame, app: &App, index: usize, area: Rect) {
     }
     if let Some(alias) = &engine.alias {
         frame.render_widget(
-            Paragraph::new(format!("Alias of {} · not counted twice", safe_text(alias)))
-                .style(muted()),
+            Paragraph::new(crate::tf!(
+                "Alias of {a0} · not counted twice",
+                a0 = safe_text(alias)
+            ))
+            .style(muted()),
             line(1),
         );
         return;
     }
     if engine.error.is_some() {
         frame.render_widget(
-            Paragraph::new("Unavailable · no live measurements")
+            Paragraph::new(crate::i18n::t("Unavailable · no live measurements"))
                 .style(condition_style(app, condition)),
             line(1),
         );
         return;
     }
     let Some(snapshot) = &engine.snapshot else {
-        frame.render_widget(Paragraph::new("Connecting…").style(muted()), line(1));
+        frame.render_widget(
+            Paragraph::new(crate::i18n::t("Connecting…")).style(muted()),
+            line(1),
+        );
         return;
     };
     let history = engine.metrics.cpu_history(&snapshot.containers);
@@ -1800,10 +1919,10 @@ fn draw_usage(frame: &mut Frame, app: &App, index: usize, area: Rect) {
         line(1),
     );
     let capacity = snapshot.memory_capacity_bytes;
-    let memory = format!(
-        "Memory {}{}",
-        summary.memory_label(),
-        capacity
+    let memory = crate::tf!(
+        "Memory {a0}{a1}",
+        a0 = summary.memory_label(),
+        a1 = capacity
             .map(|bytes| format!(" / {}", metrics::bytes(bytes)))
             .unwrap_or_default()
     );
@@ -1830,19 +1949,22 @@ fn draw_usage(frame: &mut Frame, app: &App, index: usize, area: Rect) {
         );
     } else {
         frame.render_widget(
-            Paragraph::new(format!("{memory} · capacity unavailable")).style(muted()),
+            Paragraph::new(crate::tf!(
+                "{memory} · capacity unavailable",
+                memory = memory
+            ))
+            .style(muted()),
             line(2),
         );
     }
     frame.render_widget(
-        Paragraph::new(format!(
-            "{}s target · CPU {}/{} Mem {}/{} · scale {:.0}%",
-            app.metrics_refresh_seconds,
-            summary.cpu_samples,
-            summary.running,
-            summary.memory_samples,
-            summary.running,
-            maximum as f64 / 100.0
+        Paragraph::new(crate::tf!(
+            "{target}s target · CPU {cpu}/{running} Mem {memory}/{running} · scale {scale}%",
+            target = app.metrics_refresh_seconds,
+            cpu = summary.cpu_samples,
+            running = summary.running,
+            memory = summary.memory_samples,
+            scale = format!("{:.0}", maximum as f64 / 100.0)
         ))
         .style(muted()),
         line(3),
@@ -1851,7 +1973,9 @@ fn draw_usage(frame: &mut Frame, app: &App, index: usize, area: Rect) {
 
 fn overview_lines(app: &App) -> Vec<Line<'static>> {
     let Some(row) = app.current() else {
-        return vec![Line::from("Select a runtime or workload in the explorer.")];
+        return vec![Line::from(crate::i18n::t(
+            "Select a runtime or workload in the explorer.",
+        ))];
     };
     let engine = &app.engines[row.engine];
     let mut lines = vec![
@@ -1863,21 +1987,21 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
         Line::from(""),
     ];
     if let Some(alias) = &engine.alias {
-        lines.push(Line::from(format!(
-            "Same engine as {}. Browse that connection to avoid duplicates.",
-            safe_text(alias)
+        lines.push(Line::from(crate::tf!(
+            "Same engine as {a0}. Browse that connection to avoid duplicates.",
+            a0 = safe_text(alias)
         )));
         return lines;
     }
     if let Some(error) = &engine.error {
         lines.push(Line::styled(
-            "Connection unavailable",
+            crate::i18n::t("Connection unavailable"),
             accent(app, Color::Yellow),
         ));
         lines.push(Line::from(safe_text(error)));
         if engine.snapshot.is_some() {
             lines.push(Line::styled(
-                "Showing stale, last-known data below.",
+                crate::i18n::t("Showing stale, last-known data below."),
                 accent(app, Color::Yellow),
             ));
         }
@@ -1885,17 +2009,21 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
     }
     if row.scope == Scope::Engine {
         if let Some(target) = &engine.runtime {
-            lines.push(Line::from(format!(
-                "Runtime control: {}",
-                safe_text(&target.label())
+            lines.push(Line::from(crate::tf!(
+                "Runtime control: {a0}",
+                a0 = safe_text(&target.label())
             )));
             lines.push(Line::styled(
-                "S Start runtime · s Stop runtime · r Restart runtime (ALL workloads)",
+                crate::i18n::t(
+                    "S Start runtime · s Stop runtime · r Restart runtime (ALL workloads)",
+                ),
                 muted(),
             ));
         } else {
             lines.push(Line::styled(
-                "Runtime control unsupported; select a workload for container actions.",
+                crate::i18n::t(
+                    "Runtime control unsupported; select a workload for container actions.",
+                ),
                 muted(),
             ));
         }
@@ -1903,26 +2031,28 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
     }
     let Some(snapshot) = &engine.snapshot else {
         if engine.error.is_none() {
-            lines.push(Line::from("Connecting… Other engines remain usable."));
+            lines.push(Line::from(crate::i18n::t(
+                "Connecting… Other engines remain usable.",
+            )));
         }
         return lines;
     };
     if row.scope == Scope::Engine {
-        lines.push(Line::from(format!(
-            "Version      {}",
-            safe_text(&snapshot.version)
+        lines.push(Line::from(crate::tf!(
+            "Version      {a0}",
+            a0 = safe_text(&snapshot.version)
         )));
-        lines.push(Line::from(format!(
-            "Endpoint     {}",
-            safe_text(&engine.connection.endpoint)
+        lines.push(Line::from(crate::tf!(
+            "Endpoint     {a0}",
+            a0 = safe_text(&engine.connection.endpoint)
         )));
-        lines.push(Line::from(format!(
-            "Capacity     {} CPUs · {} memory (not current host usage)",
-            snapshot
+        lines.push(Line::from(crate::tf!(
+            "Capacity     {a0} CPUs · {a1} memory (not current host usage)",
+            a0 = snapshot
                 .cpu_count
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "--".into()),
-            snapshot
+            a1 = snapshot
                 .memory_capacity_bytes
                 .map(metrics::bytes)
                 .unwrap_or_else(|| "--".into())
@@ -1934,13 +2064,13 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
             ResourceKind::Volume => &snapshot.volumes,
         };
         if let Some(resource) = resources.iter().find(|r| &r.name == name) {
-            lines.push(Line::from(format!(
-                "Ownership    {}",
-                resource
+            lines.push(Line::from(crate::tf!(
+                "Ownership    {a0}",
+                a0 = resource
                     .project
                     .as_deref()
                     .map(safe_text)
-                    .unwrap_or_else(|| "No project label".into())
+                    .unwrap_or_else(|| crate::i18n::t("No project label").into())
             )));
             if resource.external
                 || app
@@ -1949,14 +2079,14 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
                     .is_some_and(|project| resource.project.as_ref() != Some(&project.name))
             {
                 lines.push(Line::styled(
-                    "Shared/external resource; not exclusive to this project.",
+                    crate::i18n::t("Shared/external resource; not exclusive to this project."),
                     accent(app, Color::Yellow),
                 ));
             }
             lines.push(Line::from(safe_text(&resource.details)));
             lines.push(Line::from(""));
             lines.push(Line::styled(
-                "Attached containers",
+                crate::i18n::t("Attached containers"),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
             let members: Vec<_> = resource
@@ -1972,16 +2102,16 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
                 })
                 .collect();
             if resource.containers.is_empty() {
-                lines.push(Line::from("No attachments reported."));
+                lines.push(Line::from(crate::i18n::t("No attachments reported.")));
             }
             for container in &members {
                 lines.push(Line::from(format!("  {}", safe_text(container))));
             }
             if members.len() < resource.containers.len() {
                 lines.push(Line::styled(
-                    format!(
-                        "{} attachments outside this project (hidden)",
-                        resource.containers.len() - members.len()
+                    crate::tf!(
+                        "{a0} attachments outside this project (hidden)",
+                        a0 = resource.containers.len() - members.len()
                     ),
                     muted(),
                 ));
@@ -1989,21 +2119,21 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
         }
     } else {
         let containers = app.selected_containers();
-        lines.push(Line::from(format!(
-            "{} containers · {} running",
-            containers.len(),
-            containers.iter().filter(|c| c.running()).count()
+        lines.push(Line::from(crate::tf!(
+            "{a0} containers · {a1} running",
+            a0 = containers.len(),
+            a1 = containers.iter().filter(|c| c.running()).count()
         )));
         lines.push(Line::from(""));
         let summary = app.metrics_for(row);
         if containers.len() != 1 {
-            lines.push(Line::from(format!(
-                "Workload CPU     {}",
-                summary.cpu_label()
+            lines.push(Line::from(crate::tf!(
+                "Workload CPU     {a0}",
+                a0 = summary.cpu_label()
             )));
-            lines.push(Line::from(format!(
-                "Workload memory  {}",
-                summary.memory_label()
+            lines.push(Line::from(crate::tf!(
+                "Workload memory  {a0}",
+                a0 = summary.memory_label()
             )));
             lines.push(Line::styled(summary.detail(), muted()));
             lines.push(Line::from(""));
@@ -2015,7 +2145,7 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
                     "{}  {} · {}",
                     condition.symbol(),
                     safe_text(&container.name),
-                    condition.label,
+                    crate::i18n::dynamic(condition.label),
                 ),
                 condition_style(app, condition),
             ));
@@ -2027,17 +2157,17 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
                 engine.error.is_none(),
             );
             lines.push(Line::from(format!("  CPU        {}", usage.cpu_label())));
-            lines.push(Line::from(format!(
-                "  Memory     {}{}",
-                usage.memory_label(),
-                usage
+            lines.push(Line::from(crate::tf!(
+                "  Memory     {a0}{a1}",
+                a0 = usage.memory_label(),
+                a1 = usage
                     .memory_limit_bytes
-                    .map(|limit| format!(" / {} reported limit", metrics::bytes(limit)))
+                    .map(|limit| crate::tf!(" / {a0} reported limit", a0 = metrics::bytes(limit)))
                     .unwrap_or_default()
             )));
             if let Some(error) = engine.metrics.errors.get(&container.key()) {
                 lines.push(Line::styled(
-                    format!("  Stats      {}", safe_text(error)),
+                    crate::tf!("  Stats      {a0}", a0 = safe_text(error)),
                     accent(app, Color::Yellow),
                 ));
             }
@@ -2045,26 +2175,21 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
                 && let Some(sample) = engine.metrics.samples.get(&container.key())
             {
                 lines.push(Line::styled(
-                    format!(
-                        "  Last sample {}s ago · CPU {} · memory {} (stale, excluded from totals)",
-                        sample.sampled_at.elapsed().as_secs(),
-                        sample
+                    crate::tf!("  Last sample {a0}s ago · CPU {a1} · memory {a2} (stale, excluded from totals)", a0 = sample.sampled_at.elapsed().as_secs(), a1 = sample
                             .usage
                             .cpu_percent
                             .map(|cpu| format!("{cpu:.1}%"))
-                            .unwrap_or_else(|| "--".into()),
-                        sample
+                            .unwrap_or_else(|| "--".into()), a2 = sample
                             .usage
                             .memory_bytes
                             .map(metrics::bytes)
-                            .unwrap_or_else(|| "--".into())
-                    ),
+                            .unwrap_or_else(|| "--".into())),
                     muted(),
                 ));
             }
-            lines.push(Line::from(format!(
-                "  Image      {}",
-                safe_text(&container.image)
+            lines.push(Line::from(crate::tf!(
+                "  Image      {a0}",
+                a0 = safe_text(&container.image)
             )));
             if containers.len() == 1 {
                 let key =
@@ -2075,75 +2200,92 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
                     match app.platforms.get(&key) {
                         Some(crate::platform::State::Ready(platform)) => platform.label(),
                         Some(crate::platform::State::Unavailable(error)) => {
-                            format!("unavailable · {error}")
+                            crate::tf!("unavailable · {error}", error = error)
                         }
                         Some(crate::platform::State::Loading) | None => {
                             if engine.error.is_some() {
-                                "unavailable (disconnected)".into()
+                                crate::i18n::t("unavailable (disconnected)").into()
                             } else {
-                                "loading image metadata…".into()
+                                crate::i18n::t("loading image metadata…").into()
                             }
                         }
                     }
                 };
-                lines.push(Line::from(format!("  Platform   {}", safe_text(&platform))));
+                lines.push(Line::from(crate::tf!(
+                    "  Platform   {a0}",
+                    a0 = safe_text(&platform)
+                )));
                 lines.push(Line::from(format!(
                     "  ID         {}",
                     safe_text(&container.id)
                 )));
                 if let Some(project) = &container.project {
-                    lines.push(Line::from(format!("  Project    {}", safe_text(project))));
+                    lines.push(Line::from(crate::tf!(
+                        "  Project    {a0}",
+                        a0 = safe_text(project)
+                    )));
                 }
                 if let Some(service) = &container.service {
-                    lines.push(Line::from(format!("  Service    {}", safe_text(service))));
+                    lines.push(Line::from(crate::tf!(
+                        "  Service    {a0}",
+                        a0 = safe_text(service)
+                    )));
                 }
             }
             if !container.port_bindings.is_empty() {
                 for port in &container.port_bindings {
-                    lines.push(Line::from(format!(
-                        "  Port       {}",
-                        safe_text(&port.overview())
+                    lines.push(Line::from(crate::tf!(
+                        "  Port       {a0}",
+                        a0 = safe_text(&port.overview())
                     )));
                 }
                 lines.push(Line::styled(
                     if engine.error.is_some() {
-                        "  Last-known bindings (offline); localhost reachability not verified."
+                        crate::i18n::t("  Last-known bindings (offline); localhost reachability not verified.")
                     } else if !container.running() {
-                        "  Container is stopped; published ports are not active."
+                        crate::i18n::t("  Container is stopped; published ports are not active.")
                     } else {
-                        "  Reported bindings; localhost/VM forwarding reachability not verified."
+                        crate::i18n::t("  Reported bindings; localhost/VM forwarding reachability not verified.")
                     },
                     muted(),
                 ));
             } else if container.ports.is_empty() {
                 lines.push(Line::styled(
-                    "  Ports      No port mappings reported",
+                    crate::i18n::t("  Ports      No port mappings reported"),
                     muted(),
                 ));
             } else {
                 for port in &container.ports {
-                    lines.push(Line::from(format!(
-                        "  Port       {} (reported)",
-                        safe_text(port)
+                    lines.push(Line::from(crate::tf!(
+                        "  Port       {a0} (reported)",
+                        a0 = safe_text(port)
                     )));
                 }
             }
             for network in &container.networks {
-                lines.push(Line::from(format!("  Network    {}", safe_text(network))));
+                lines.push(Line::from(crate::tf!(
+                    "  Network    {a0}",
+                    a0 = safe_text(network)
+                )));
             }
             for volume in &container.volumes {
-                lines.push(Line::from(format!("  Volume     {}", safe_text(volume))));
+                lines.push(Line::from(crate::tf!(
+                    "  Volume     {a0}",
+                    a0 = safe_text(volume)
+                )));
             }
             if container.managed {
                 lines.push(Line::styled(
-                    "  Kubernetes-managed · inspection only",
+                    crate::i18n::t("  Kubernetes-managed · inspection only"),
                     accent(app, Color::Yellow),
                 ));
             }
             lines.push(Line::from(""));
         }
         if containers.is_empty() {
-            lines.push(Line::from("No containers reported in this scope."));
+            lines.push(Line::from(crate::i18n::t(
+                "No containers reported in this scope.",
+            )));
         }
     }
     for warning in &snapshot.warnings {
@@ -2157,7 +2299,7 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
     {
         lines.push(Line::from(""));
         lines.push(Line::styled(
-            format!("Images ({})", images.len()),
+            crate::tf!("Images ({a0})", a0 = images.len()),
             Style::default().add_modifier(Modifier::BOLD),
         ));
         for image in images {
@@ -2172,7 +2314,7 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
                 image
                     .size
                     .map(metrics::bytes)
-                    .unwrap_or_else(|| "size unavailable".into())
+                    .unwrap_or_else(|| crate::i18n::t("size unavailable").into())
             )));
             lines.push(Line::styled(
                 format!("    {}", safe_text(&image.id)),
@@ -2182,7 +2324,7 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
     }
     lines.push(Line::from(""));
     lines.push(Line::styled(
-        "S Start · s Stop · r Restart · d Delete (Explorer; confirmation required)",
+        crate::i18n::t("S Start · s Stop · r Restart · d Delete (Explorer; confirmation required)"),
         muted(),
     ));
     lines
@@ -2262,35 +2404,37 @@ fn network_view(app: &App) -> (Vec<Line<'static>>, Vec<NetworkTarget>) {
     let engine = &app.engines[row.engine];
     let mut lines = vec![
         Line::styled(
-            "Network membership",
+            crate::i18n::t("Network membership"),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Line::from(""),
     ];
     if let Some(alias) = &engine.alias {
-        lines.push(Line::from(format!(
-            "Browse {} for this engine's resources.",
-            safe_text(alias)
+        lines.push(Line::from(crate::tf!(
+            "Browse {a0} for this engine's resources.",
+            a0 = safe_text(alias)
         )));
         return (lines, vec![]);
     }
     if engine.error.is_some() {
         lines.push(Line::styled(
-            "Connection unavailable / stale · see Overview for details",
+            crate::i18n::t("Connection unavailable / stale · see Overview for details"),
             accent(app, Color::Yellow),
         ));
     }
     if engine.connection.kind == BackendKind::Containerd {
-        lines.push(Line::from(
+        lines.push(Line::from(crate::i18n::t(
             "Native containerd network inventory is not supported by this MVP adapter.",
-        ));
-        lines.push(Line::from(
+        )));
+        lines.push(Line::from(crate::i18n::t(
             "Networks depend on the launcher and its CNI configuration.",
-        ));
+        )));
         return (lines, vec![]);
     }
     let Some(snapshot) = &engine.snapshot else {
-        lines.push(Line::from("Engine has not returned an inventory."));
+        lines.push(Line::from(crate::i18n::t(
+            "Engine has not returned an inventory.",
+        )));
         return (lines, vec![]);
     };
     let containers = app.selected_containers();
@@ -2335,7 +2479,7 @@ fn network_view(app: &App) -> (Vec<Line<'static>>, Vec<NetworkTarget>) {
                         .as_ref()
                         .is_some_and(|project| network.project.as_ref() != Some(&project.name))
                 {
-                    " [shared/external]"
+                    t(" [shared/external]")
                 } else {
                     ""
                 }
@@ -2358,7 +2502,7 @@ fn network_view(app: &App) -> (Vec<Line<'static>>, Vec<NetworkTarget>) {
             let container = snapshot.containers.iter().find(|c| &c.name == name);
             let project = container
                 .and_then(|c| c.project.as_deref())
-                .unwrap_or("Standalone");
+                .unwrap_or(crate::i18n::t("Standalone"));
             if let Some(container) = container {
                 targets.push(NetworkTarget {
                     line: lines.len(),
@@ -2372,7 +2516,10 @@ fn network_view(app: &App) -> (Vec<Line<'static>>, Vec<NetworkTarget>) {
             )));
         }
         if network.containers.is_empty() {
-            lines.push(Line::styled("  No attachments reported", muted()));
+            lines.push(Line::styled(
+                crate::i18n::t("  No attachments reported"),
+                muted(),
+            ));
         }
         if let Some(project) = &app.project {
             let hidden = network
@@ -2387,7 +2534,10 @@ fn network_view(app: &App) -> (Vec<Line<'static>>, Vec<NetworkTarget>) {
                 .count();
             if hidden > 0 {
                 lines.push(Line::styled(
-                    format!("  {hidden} attachments outside this project (hidden)"),
+                    crate::tf!(
+                        "  {hidden} attachments outside this project (hidden)",
+                        hidden = hidden
+                    ),
                     muted(),
                 ));
             }
@@ -2395,7 +2545,9 @@ fn network_view(app: &App) -> (Vec<Line<'static>>, Vec<NetworkTarget>) {
         lines.push(Line::from(""));
     }
     if count == 0 {
-        lines.push(Line::from("No networks reported for this selection."));
+        lines.push(Line::from(crate::i18n::t(
+            "No networks reported for this selection.",
+        )));
     }
     for warning in &snapshot.warnings {
         lines.push(Line::styled(safe_text(warning), accent(app, Color::Yellow)));
@@ -2420,9 +2572,11 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
         .sync(&app.logs, payload_width as usize, areas[1].height as usize);
     let (start, total) = app.log_view.scroll_position(&app.logs);
     let end = (start + areas[1].height as usize).min(total);
-    let position = format!(
-        "Rows {}–{end} / {total}",
-        if total == 0 { 0 } else { start + 1 }
+    let position = crate::tf!(
+        "Rows {a0}–{end} / {total}",
+        a0 = if total == 0 { 0 } else { start + 1 },
+        end = end,
+        total = total
     );
     let since = app
         .log_since
@@ -2431,54 +2585,61 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
             at.format(&time::format_description::well_known::Rfc3339)
                 .ok()
         })
-        .map(|at| format!(" · Since {at}"))
+        .map(|at| crate::tf!(" · Since {at}", at = at))
         .unwrap_or_default();
-    let status = format!(
-        "Wrap: {} · JSON: {} · {} · {position}{since}",
-        if app.log_view.wrap { "on" } else { "off" },
-        if app.logs.pretty_json {
-            "pretty"
+    let status = crate::tf!(
+        "Wrap: {a0} · JSON: {a1} · {a2} · {position}{since}",
+        a0 = if app.log_view.wrap {
+            crate::i18n::t("on")
         } else {
-            "raw"
+            crate::i18n::t("off")
         },
-        if app.logs.follow {
-            "Following"
+        a1 = if app.logs.pretty_json {
+            crate::i18n::t("pretty")
         } else {
-            "Paused"
+            crate::i18n::t("raw")
         },
+        a2 = if app.logs.follow {
+            crate::i18n::t("Following")
+        } else {
+            crate::i18n::t("Paused")
+        },
+        position = position,
+        since = since
     );
     let search = if app.log_view.query().is_empty() {
-        format!(
-            "{}/{} entries retained · Filter: {} · {} evicted",
-            app.logs
+        crate::tf!(
+            "{a0}/{a1} entries retained · Filter: {a2} · {a3} evicted",
+            a0 = app
+                .logs
                 .entries
                 .iter()
                 .filter(|entry| app.log_view.filter.matches(entry))
                 .count(),
-            app.logs.entries.len(),
-            if app.log_view.filter.active() {
-                "on"
+            a1 = app.logs.entries.len(),
+            a2 = if app.log_view.filter.active() {
+                crate::i18n::t("on")
             } else {
-                "off"
+                crate::i18n::t("off")
             },
-            app.logs.evicted
+            a3 = app.logs.evicted
         )
     } else {
-        format!(
-            "{}/{} matches {}/{} · Filter: {}",
-            app.log_view.match_index.unwrap_or(0),
-            app.log_view.match_count,
-            if app.log_view.query_is_regex() {
-                "regex "
+        crate::tf!(
+            "{a0}/{a1} matches {a2}/{a3} · Filter: {a4}",
+            a0 = app.log_view.match_index.unwrap_or(0),
+            a1 = app.log_view.match_count,
+            a2 = if app.log_view.query_is_regex() {
+                crate::i18n::t("regex ")
             } else {
                 ""
             },
-            safe_text(app.log_view.query()),
-            if app.log_view.filter.active() {
-                "on"
+            a3 = safe_text(app.log_view.query()),
+            a4 = if app.log_view.filter.active() {
+                crate::i18n::t("on")
             } else {
-                "off"
-            },
+                crate::i18n::t("off")
+            }
         )
     };
     frame.render_widget(
@@ -2513,9 +2674,9 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
     if visible.is_empty() {
         frame.render_widget(
             Paragraph::new(if app.log_view.filter.active() {
-                "No matching retained logs. F3 edits; :clear-log-filter resets."
+                crate::i18n::t("No matching retained logs. F3 edits; :clear-log-filter resets.")
             } else {
-                "Waiting for logs. Select a container, service, or project."
+                crate::i18n::t("Waiting for logs. Select a container, service, or project.")
             }),
             content,
         );
@@ -2622,16 +2783,26 @@ pub fn footer_height(app: &App) -> u16 {
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let notice = &app.notice;
+    let metrics_hint = crate::tf!(
+        "Metrics · {shorter}/{longer} Range  ←/→ Pan  c Cursor  h/l Inspect  f Live  z Enlarge  Esc Restore",
+        shorter = app.key_hint(crate::shortcuts::ActionId::PreviousRange),
+        longer = app.key_hint(crate::shortcuts::ActionId::NextRange)
+    );
     let mut lines = if matches!(app.input_mode, InputMode::LogFilter | InputMode::ExportLogs) {
         vec![
-            Line::styled("Log dialog · Enter Apply/Export · Esc Cancel", muted()),
+            Line::styled(
+                crate::i18n::t("Log dialog · Enter Apply/Export · Esc Cancel"),
+                muted(),
+            ),
             Line::from(safe_text(notice)),
         ]
     } else if app.input_mode == InputMode::InventorySearch {
         vec![
             Line::from(format!("/{}▏", safe_text(&app.input))),
             Line::styled(
-                "Search names, tags, IDs, projects and container references · Enter Apply · Esc Cancel · Ctrl-U Clear",
+                crate::i18n::t(
+                    "Search names, tags, IDs, projects and container references · Enter Apply · Esc Cancel · Ctrl-U Clear",
+                ),
                 muted(),
             ),
         ]
@@ -2640,16 +2811,20 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         vec![
             Line::from(format!(
                 "{}/{}▏",
-                if regex { "regex " } else { "" },
+                if regex { crate::i18n::t("regex ") } else { "" },
                 safe_text(&app.input)
             )),
-            if notice.starts_with("Invalid regex") {
+            if notice.starts_with(t("Invalid regex")) {
                 Line::styled(safe_text(notice), accent(app, Color::Red))
             } else {
                 Line::styled(
-                    format!(
-                        "Enter Apply · Esc Cancel · Ctrl-R {} · Case-insensitive",
-                        if regex { "Literal" } else { "Regex" }
+                    crate::tf!(
+                        "Enter Apply · Esc Cancel · Ctrl-R {a0} · Case-insensitive",
+                        a0 = if regex {
+                            crate::i18n::t("Literal")
+                        } else {
+                            crate::i18n::t("Regex")
+                        }
                     ),
                     muted(),
                 )
@@ -2659,29 +2834,50 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         vec![
             Line::from(format!("/{}▏", safe_text(&app.input))),
             Line::styled(
-                "Enter Apply · Esc Cancel · Searches the focused view",
+                crate::i18n::t("Enter Apply · Esc Cancel · Searches the focused view"),
                 muted(),
             ),
         ]
     } else {
         let hints = if app.overview_mode == OverviewMode::Security {
-            "Security · s Scan · S Scan checked · x Cancel · Space/m Check · Tab Images/Findings · Enter Details · z Zoom"
+            crate::i18n::t(
+                "Security · s Scan · S Scan checked · x Cancel · Space/m Check · Tab Images/Findings · Enter Details · z Zoom",
+            )
         } else if app.overview_mode != OverviewMode::Containers {
-            "Space Mark · u Unused · c Clear · d Delete · / Search · f Filter · s Sort · Enter Details · Esc Back"
+            crate::i18n::t(
+                "Space Mark · u Unused · c Clear · d Delete · / Search · f Filter · s Sort · Enter Details · Esc Back",
+            )
         } else if app.exec_input && app.tab == Tab::Exec {
-            "Ctrl-] Navigate · SHELL INPUT · Keys go to the selected container session"
+            match app.keyboard {
+                crate::keyboard::KeyboardPreset::Us => crate::i18n::t(
+                    "Ctrl-] Navigate · SHELL INPUT · Keys go to the selected container session",
+                ),
+                crate::keyboard::KeyboardPreset::German => crate::i18n::t(
+                    "F12 Navigate · SHELL INPUT · Keys go to the selected container session",
+                ),
+            }
         } else if app.performance_focus {
-            "Performance · P Scope  z Zoom  j/k Select  Enter Inspect  p Close  Tab Pane  ? Keys"
+            crate::i18n::t(
+                "Performance · P Scope  z Zoom  j/k Select  Enter Inspect  p Close  Tab Pane  ? Keys",
+            )
         } else if app.detail_focus && app.tab == Tab::Security {
-            "Security · j/k Select  Enter Details  z Zoom  Tab Explorer · Scans run in the Security view"
+            crate::i18n::t(
+                "Security · j/k Select  Enter Details  z Zoom  Tab Explorer · Scans run in the Security view",
+            )
         } else if app.detail_focus && app.tab == Tab::History {
-            "Metrics · [/ ] Range  ←/→ Pan  c Cursor  h/l Inspect  f Live  z Enlarge  Esc Restore"
+            metrics_hint.as_str()
         } else if app.detail_focus && app.tab == Tab::Exec {
-            "F6 Sessions · Enter Input · :close-exec Close slot · j/k Scroll · Tab Explorer · ? Keys"
+            crate::i18n::t(
+                "F6 Sessions · Enter Input · :close-exec Close slot · j/k Scroll · Tab Explorer · ? Keys",
+            )
         } else if app.detail_focus && app.tab == Tab::Logs {
-            "? Keys  F3 Filter  :logs-since  J JSON  w Wrap  / Search  n/N Match  j/k Scroll  f Follow  Tab Explorer"
+            crate::i18n::t(
+                "? Keys  F3 Filter  :logs-since  J JSON  w Wrap  / Search  n/N Match  j/k Scroll  f Follow  Tab Explorer",
+            )
         } else {
-            "Ctrl+←/→ Overview  ? Keys  a Actions  p Performance  Enter Open  e Exec  Tab Pane  z Zoom  1..8 Details  : Commands"
+            crate::i18n::t(
+                "Ctrl+←/→ Overview  ? Keys  a Actions  p Performance  Enter Open  e Exec  Tab Pane  z Zoom  1..8 Details  : Commands",
+            )
         };
         vec![Line::styled(hints, muted()), Line::from(safe_text(notice))]
     };
@@ -2707,7 +2903,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         };
         lines.insert(
             0,
-            Line::styled(safe_text(&format!("Activity · {status}")), style),
+            Line::styled(
+                safe_text(&crate::tf!("Activity · {status}", status = status)),
+                style,
+            ),
         );
     }
     const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
@@ -2744,97 +2943,115 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+pub const HELP_LINES: &[&str] = &[
+    "Navigation\n",
+    "j / k, arrows     Move in the focused pane\n",
+    "h / l             Collapse/parent, expand/child (tree)\n",
+    "Space             Toggle the selected explorer branch\n",
+    "Enter             Enter a Compose workspace; otherwise open details\n",
+    "Backspace         Return to the previous workspace\n",
+    "Esc               Clear search, return to explorer, then go back\n",
+    "q                 Back through panes/workspaces; quit from home\n",
+    "Tab / Shift-Tab   Cycle Explorer / Performance (open) / Details\n",
+    "p                 Open/close Performance (compact by default)\n",
+    "P (Shift-p)       Switch Runtime / Selected container; open Performance\n",
+    "z                 Expand / restore the focused detail tab or Performance\n",
+    "Esc               Restore compact Performance before other navigation\n",
+    "o                 Sort contexts (pins first; usage is a snapshot)\n",
+    "S / s / r / d     Start / Stop / Restart / Delete in Explorer\n",
+    "                  Container or Compose rows only; confirmation required\n",
+    "                  y/Enter confirms; n/Esc cancels; Delete: type name + Enter\n",
+    "                  Delete stopped containers only; keep networks/volumes/images\n",
+    "1..8              Info Logs Net Exec Events Metrics Layers Security\n",
+    "Ctrl+←/→, F7/F8    Cycle overviews · Alt+1/2/3 direct\n",
+    "a                 Contextual actions with disabled reasons (Explorer)\n",
+    "Enter in Layers   Expand details; Esc returns; no image pulls\n",
+    "F6 / :exec-sessions Switch retained shells (navigation mode only)\n",
+    "F3 in Logs        JSON/source/severity/time filters on retained entries\n",
+    ":export-logs      Explicit new private JSONL file; may contain secrets\n",
+    "gg / G            First / last; G resumes log following\n",
+    "Ctrl-u / Ctrl-d   Half-page up / down\n",
+    "\nLogs (focus the log pane with Tab)\n",
+    "w                 Toggle wrapping on/off immediately\n",
+    "h / l             Horizontal scroll when wrapping is off\n",
+    "/                 Search; Enter applies, Esc cancels input\n",
+    "n / N             Next / previous highlighted occurrence\n",
+    "f                 Toggle follow; scrolling pauses it\n",
+    "Mouse             Click selects, click again opens; right-click back; wheel scrolls; drag log scrollbar\n",
+    "                  Scrollbar + Rows readout track wrapped display lines\n",
+    "Esc               Clear highlights without hiding log context\n",
+    "\nSecurity (optional module)\n",
+    "7 / :security     Open the selected image's Security view\n",
+    "Images m/M        Check image/all for :scan-images; 7 opens Security\n",
+    "Security Enter    Open advisory details; z enlarge; :cancel-scan stops queue\n",
+    "\nActions\n",
+    "e / :exec         Embedded shell in the right pane\n",
+    "                  Services with replicas open a container picker\n",
+    "4 then Enter      Focus Exec input; start if no session exists\n",
+    "Ctrl-]            Return from shell input to Tha navigation\n",
+    "                  Esc, Ctrl-C, arrows, numbers go to the shell\n",
+    "exit              End shell; output stays in the Exec view\n",
+    ":close-exec       Close session, not the container\n",
+    ":                 Command palette; Tab completes a command\n",
+    ":all / :back      All runtimes / previous workspace\n",
+    ":wrap             Toggle wrapping through the command palette\n",
+    "? / F1 / :help    Open this cheatsheet\n",
+    "Ctrl-c            Quit Tha in navigation; inside Exec send interrupt\n",
+    "\nPicker: j/k select, Enter chooses, Esc cancels.\n",
+    ", / :settings     Theme, language, keyboard layout, mouse, log wrapping\n",
+    "The default theme inherits your terminal's ANSI palette.\n",
+    "Green circle: running/healthy; yellow: starting/paused/restarting.\n",
+    "Red circle: unhealthy/failed; neutral: completed/stopped/unknown.\n",
+    "Exec and lifecycle actions can change workloads. Confirmations remain required.",
+];
+
 fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     let area = centered(area, 80, 36);
     frame.render_widget(Clear, area);
-    let defaults = concat!(
-        "Navigation\n",
-        "j / k, arrows     Move in the focused pane\n",
-        "h / l             Collapse/parent, expand/child (tree)\n",
-        "Space             Toggle the selected explorer branch\n",
-        "Enter             Enter a Compose workspace; otherwise open details\n",
-        "Backspace         Return to the previous workspace\n",
-        "Esc               Clear search, return to explorer, then go back\n",
-        "q                 Back through panes/workspaces; quit from home\n",
-        "Tab / Shift-Tab   Cycle Explorer / Performance (open) / Details\n",
-        "p                 Open/close Performance (compact by default)\n",
-        "P (Shift-p)       Switch Runtime / Selected container; open Performance\n",
-        "z                 Expand / restore the focused detail tab or Performance\n",
-        "Esc               Restore compact Performance before other navigation\n",
-        "o                 Sort contexts (pins first; usage is a snapshot)\n",
-        "S / s / r / d     Start / Stop / Restart / Delete in Explorer\n",
-        "                  Container or Compose rows only; confirmation required\n",
-        "                  y/Enter confirms; n/Esc cancels; Delete: type name + Enter\n",
-        "                  Delete stopped containers only; keep networks/volumes/images\n",
-        "1..8              Info Logs Net Exec Events Metrics Layers Security\n",
-        "Ctrl+←/→, F7/F8    Cycle overviews · Alt+1/2/3 direct\n",
-        "a                 Contextual actions with disabled reasons (Explorer)\n",
-        "Enter in Layers   Expand details; Esc returns; no image pulls\n",
-        "F6 / :exec-sessions Switch retained shells (navigation mode only)\n",
-        "F3 in Logs        JSON/source/severity/time filters on retained entries\n",
-        ":export-logs      Explicit new private JSONL file; may contain secrets\n",
-        "gg / G            First / last; G resumes log following\n",
-        "Ctrl-u / Ctrl-d   Half-page up / down\n",
-        "\nLogs (focus the log pane with Tab)\n",
-        "w                 Toggle wrapping on/off immediately\n",
-        "h / l             Horizontal scroll when wrapping is off\n",
-        "/                 Search; Enter applies, Esc cancels input\n",
-        "n / N             Next / previous highlighted occurrence\n",
-        "f                 Toggle follow; scrolling pauses it\n",
-        "Mouse             Click selects, click again opens; right-click back; wheel scrolls; drag log scrollbar\n",
-        "                  Scrollbar + Rows readout track wrapped display lines\n",
-        "Esc               Clear highlights without hiding log context\n",
-        "\nSecurity (optional module)\n",
-        "7 / :security     Open the selected image's Security view\n",
-        "Images m/M        Check image/all for :scan-images; 7 opens Security\n",
-        "Security Enter    Open advisory details; z enlarge; :cancel-scan stops queue\n",
-        "\nActions\n",
-        "e / :exec         Embedded shell in the right pane\n",
-        "                  Services with replicas open a container picker\n",
-        "4 then Enter      Focus Exec input; start if no session exists\n",
-        "Ctrl-]            Return from shell input to Tha navigation\n",
-        "                  Esc, Ctrl-C, arrows, numbers go to the shell\n",
-        "exit              End shell; output stays in the Exec view\n",
-        ":close-exec       Close session, not the container\n",
-        ":                 Command palette; Tab completes a command\n",
-        ":all / :back      All runtimes / previous workspace\n",
-        ":wrap             Toggle wrapping through the command palette\n",
-        "? / F1 / :help    Open this cheatsheet\n",
-        "Ctrl-c            Quit Tha in navigation; inside Exec send interrupt\n",
-        "\nPicker: j/k select, Enter chooses, Esc cancels.\n",
-        "Colors inherit your terminal's ANSI palette.\n",
-        "Green circle: running/healthy; yellow: starting/paused/restarting.\n",
-        "Red circle: unhealthy/failed; neutral: completed/stopped/unknown.\n",
-        "Exec and lifecycle actions can change workloads. Confirmations remain required."
-    );
+    let defaults: String = HELP_LINES
+        .iter()
+        .map(|line| crate::i18n::dynamic(line))
+        .collect();
     let custom = app
         .custom_bindings
         .iter()
         .map(|(key, action)| format!("{} → {}\n", safe_text(key), safe_text(action)))
         .collect::<String>();
+    let actions = crate::shortcuts::ACTIONS
+        .iter()
+        .map(|info| {
+            let keys = info
+                .bindings
+                .iter()
+                .map(|binding| binding.key)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{} — {} [{}]\n",
+                info.id.config_name(),
+                crate::i18n::dynamic(info.label),
+                if keys.is_empty() {
+                    crate::i18n::t("unbound")
+                } else {
+                    &keys
+                }
+            )
+        })
+        .collect::<String>();
     let text = format!(
-        "{defaults}\n\nSet a key to 'none' to disable it. Restart after editing config.toml.\n\nConfigurable action names (built-in defaults; custom keys below take precedence)\n{}\nCustom navigation bindings (override defaults only in navigation)\n{custom}\nExec and lifecycle actions can change workloads. Confirmations remain required.",
-        crate::shortcuts::ACTIONS
-            .iter()
-            .map(|info| {
-                let keys = info
-                    .bindings
-                    .iter()
-                    .map(|binding| binding.key)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(
-                    "{} — {} [{}]\n",
-                    info.id.config_name(),
-                    info.label,
-                    if keys.is_empty() { "unbound" } else { &keys }
-                )
-            })
-            .collect::<String>()
+        "{defaults}\n\n{}\n\n{}\n{actions}\n{}\n{custom}\n{}",
+        crate::i18n::t("Set a key to 'none' to disable it. Restart after editing config.toml."),
+        crate::i18n::t(
+            "Configurable action names (built-in defaults; custom keys below take precedence)"
+        ),
+        crate::i18n::t("Custom navigation bindings (override defaults only in navigation)"),
+        crate::i18n::t(
+            "Exec and lifecycle actions can change workloads. Confirmations remain required."
+        ),
     );
     let block = Block::bordered()
-        .title(" Tha · Shortcuts / Cheatsheet ")
-        .title_bottom(" j/k Scroll · ? / Esc Close ");
+        .title(crate::i18n::t(" Tha · Shortcuts / Cheatsheet "))
+        .title_bottom(crate::i18n::t(" j/k Scroll · ? / Esc Close "));
     let inner = padded(block.inner(area));
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
     app.help_scroll = app.help_scroll.min(
@@ -2860,13 +3077,14 @@ fn draw_palette(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .filter(|(command, _)| command.starts_with(&app.input))
     {
+        let description = crate::i18n::dynamic(description);
         lines.push(Line::from(format!("{command:<18} {description}")));
     }
     lines.push(Line::styled(
-        "Enter Execute · Tab Complete · Esc Cancel",
+        crate::i18n::t("Enter Execute · Tab Complete · Esc Cancel"),
         muted(),
     ));
-    let block = Block::bordered().title(" Commands ");
+    let block = Block::bordered().title(crate::i18n::t(" Commands "));
     let inner = padded(block.inner(area));
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines), inner);
@@ -2892,7 +3110,7 @@ fn draw_picker(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, area);
     let block = Block::bordered()
         .title(format!(" {} ", safe_text(&picker.title)))
-        .title_bottom(" j/k Select · Enter Choose · Esc Cancel ");
+        .title_bottom(crate::i18n::t(" j/k Select · Enter Choose · Esc Cancel "));
     let mut inner = padded(block.inner(area));
     frame.render_widget(block, area);
     if actions {
@@ -2905,7 +3123,7 @@ fn draw_picker(frame: &mut Frame, app: &mut App, area: Rect) {
             );
         }
         if let Some(Choice::Action { action, row }) = picker.choices.get(picker.selected) {
-            let explanation = app.action_availability(*action, row).map(|count| format!("{count} existing container(s). Enter opens confirmation; nothing is sent now.")).unwrap_or_else(|reason| format!("Disabled: {reason}"));
+            let explanation = app.action_availability(*action, row).map(|count| crate::tf!("{count} existing container(s). Enter opens confirmation; nothing is sent now.", count = count)).unwrap_or_else(|reason| crate::tf!("Disabled: {reason}", reason = reason));
             frame.render_widget(
                 Paragraph::new(safe_text(&explanation)).wrap(Wrap { trim: false }),
                 parts[1],
@@ -2943,7 +3161,7 @@ fn draw_picker(frame: &mut Frame, app: &mut App, area: Rect) {
                             job.summary()
                         )
                     })
-                    .unwrap_or_else(|| "Result no longer available".into()),
+                    .unwrap_or_else(|| crate::i18n::t("Result no longer available").into()),
                 Choice::Session(id) => app
                     .sessions
                     .iter()
@@ -2962,13 +3180,13 @@ fn draw_picker(frame: &mut Frame, app: &mut App, area: Rect) {
                             session.status()
                         )
                     })
-                    .unwrap_or_else(|| format!("#{id} · closed")),
+                    .unwrap_or_else(|| crate::tf!("#{id} · closed", id = id)),
                 Choice::Action { action, row } => format!(
                     "{} · {}",
                     action.label(),
                     app.action_availability(*action, row)
-                        .map(|count| format!("{count} target(s)"))
-                        .unwrap_or_else(|_| "disabled".into())
+                        .map(|count| crate::tf!("{count} target(s)", count = count))
+                        .unwrap_or_else(|_| crate::i18n::t("disabled").into())
                 ),
                 Choice::Compose(action) => action.label().into(),
                 Choice::ContextSort(mode) => mode.label().into(),

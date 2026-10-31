@@ -49,8 +49,9 @@ pub fn text(value: &str) -> String {
 impl Image {
     pub fn bound(mut self) -> Self {
         if self.filesystem.len() > MAX_ROWS || self.history.len() > MAX_ROWS {
-            self.warnings.push(format!(
-                "Only the first {MAX_ROWS} rows in each section are retained"
+            self.warnings.push(crate::tf!(
+                "Only the first {MAX_ROWS} rows in each section are retained",
+                MAX_ROWS = MAX_ROWS
             ));
         }
         self.filesystem.truncate(MAX_ROWS);
@@ -141,7 +142,7 @@ pub async fn lookup(connection: &Connection, container: &Container) -> Result<Im
         }
     })
     .await
-    .context("Image layers lookup timed out after 6s")?
+    .context(crate::i18n::t("Image layers lookup timed out after 6s"))?
     .map(Image::bound)
 }
 

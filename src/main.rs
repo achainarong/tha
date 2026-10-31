@@ -190,8 +190,6 @@ async fn start() -> Result<()> {
             app.metrics_database = Some(path);
         }
     }
-    app.log_view.wrap = config.log_wrap;
-    app.mouse_enabled = config.mouse;
     app.exec_command = config.exec_command;
     app.sessions.set_limit(config.max_exec_sessions)?;
     app.local_metrics_refresh_seconds = config.metrics_refresh_seconds;
@@ -211,8 +209,15 @@ async fn start() -> Result<()> {
             app.wait_for_machine_discovery();
         }
     }
-    app.keymap = tha::keymap::Keymap::parse(&config.bindings)?;
+    tha::keymap::Keymap::parse(&config.bindings)?;
     app.custom_bindings = config.bindings;
+    app.apply_base_settings(tha::settings::BaseSettings {
+        theme: config.theme,
+        keyboard: config.keyboard,
+        mouse: config.mouse,
+        log_wrap: config.log_wrap,
+        language: config.language,
+    });
     if config.save_preferences && !cli.demo {
         app.preferences_path = tha::preferences::default_path();
         if let Some(path) = &app.preferences_path {
@@ -372,7 +377,8 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let mut terminal = ratatui::try_init().context("Cannot initialize terminal")?;
     let _restore = TerminalRestore;
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
-    if app.mouse_enabled {
+    let mut mouse_captured = app.mouse_enabled;
+    if mouse_captured {
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
     }
     let mut events = EventStream::new();
@@ -475,11 +481,11 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                     if let Some(confirmation) = &mut app.action_confirmation {
                         if confirmation.request.action == tha::actions::Action::Delete {
                             if text.chars().any(char::is_control) || confirmation.typed.len() + text.len() > 1024 {
-                                confirmation.error = Some("Paste contains control characters or exceeds 1024 bytes; nothing pasted".into());
+                                confirmation.error = Some(tha::i18n::t("Paste contains control characters or exceeds 1024 bytes; nothing pasted").into());
                             } else { confirmation.typed.push_str(&text); }
                         }
                     } else if app.exec_input && app.tab == Tab::Exec {
-                        if let Some(session) = app.sessions.active_mut() && let Err(error) = session.paste(&text) { app.notice = format!("{error:#}"); }
+                        if let Some(session) = app.sessions.active_mut() && let Err(error) = session.paste(&text) { app.notice = tha::tf!("{error}", error = format!("{error:#}")); }
                     } else if app.input_mode != InputMode::Normal {
                         let text = tha::model::safe_text(&text);
                         for ch in text.chars() { if app.input.len() + ch.len_utf8() > 1024 { break; } app.input.push(ch); }
@@ -520,8 +526,8 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                         tha::compose::Event::Line(line) => job.push(line),
                         tha::compose::Event::Finished(outcome) => {
                             app.notice = match &outcome {
-                                Ok(()) => format!("Finished: {}", job.title),
-                                Err(error) => format!("Failed: {} · {error} · :compose-output shows details", job.title),
+                                Ok(()) => tha::tf!("Finished: {a0}", a0 = job.title),
+                                Err(error) => tha::tf!("Failed: {a0} · {error} · :compose-output shows details", a0 = job.title, error = error),
                             };
                             job.outcome = Some(outcome);
                             compose_task = None;
@@ -586,7 +592,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
             },
             Some(event) = security_rx.recv() => {
                 if let tha::security::Outcome::Finished(Err(error)) = &event.result {
-                    app.notice = format!("Security scan failed for {}: {}", tha::model::safe_text(&event.target.label), tha::model::safe_text(error));
+                    app.notice = tha::tf!("Security scan failed for {a0}: {a1}", a0 = tha::model::safe_text(&event.target.label), a1 = tha::model::safe_text(error));
                 }
                 app.security.complete(event);
                 redraw_now = true;
@@ -607,9 +613,9 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                                 let available: Vec<_>=(0..app.engines.len()).map(|index|(index,true)).collect();
                                 sync_workers(&mut app,&available,&mut workers,&mut metric_targets,&channels,refresh_seconds);
                                 publish_metric_targets(&mut app,&metric_targets);
-                                app.notice=if running { "Connected to daemon metrics; local stats polling stopped" } else { "Daemon stopped; local stats sampling resumed" }.into();
+                                app.notice=if running { tha::i18n::t("Connected to daemon metrics; local stats polling stopped") } else { tha::i18n::t("Daemon stopped; local stats sampling resumed") }.into();
                             }
-                            Err(error)=>app.notice=format!("Cannot check daemon: {error:#}"),
+                            Err(error)=>app.notice=tha::tf!("Cannot check daemon: {error}", error = format!("{error:#}")),
                             _=>{}
                         }
                     }
@@ -620,7 +626,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 for notice in app.sessions.poll() {
                     redraw_now = true;
                     if Some(notice.id) == app.sessions.active_id() { app.exec_input = false; }
-                    app.notice = format!("Exec #{} {} · container was not stopped. F6 switches retained sessions.", notice.id, notice.status);
+                    app.notice = tha::tf!("Exec #{a0} {a1} · container was not stopped. F6 switches retained sessions.", a0 = notice.id, a1 = notice.status);
                 }
                 // Batch log updates so a noisy container cannot trigger unlimited redraws.
                 for _ in 0..512 {
@@ -650,8 +656,10 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 let result = tokio::task::spawn_blocking(move || request.write()).await;
                 let message = match result {
                     Ok(Ok(message)) => message,
-                    Ok(Err(error)) => format!("Log export failed: {error:#}"),
-                    Err(error) => format!("Log export worker failed: {error}"),
+                    Ok(Err(error)) => {
+                        tha::tf!("Log export failed: {error}", error = format!("{error:#}"))
+                    }
+                    Err(error) => tha::tf!("Log export worker failed: {error}", error = error),
                 };
                 let _ = sender.send(message).await;
             })));
@@ -711,7 +719,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                                     session,
                                 )
                                 .await
-                                .map_err(|error| format!("{error:#}"));
+                                .map_err(|error| tha::tf!("{error}", error = format!("{error:#}")));
                                 let _ = sender.send(tha::history::Event { generation, data }).await;
                             })));
                         } else {
@@ -765,8 +773,11 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 let sender = security_notice_tx.clone();
                 tokio::spawn(async move {
                     let notice = match tha::security::cancel_remote().await {
-                        Ok(()) => "Security queue cancellation requested".into(),
-                        Err(error) => format!("Cannot cancel security queue: {error:#}"),
+                        Ok(()) => tha::i18n::t("Security queue cancellation requested").into(),
+                        Err(error) => tha::tf!(
+                            "Cannot cancel security queue: {error}",
+                            error = format!("{error:#}")
+                        ),
                     };
                     let _ = sender.send(notice).await;
                 });
@@ -776,7 +787,8 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                     .as_ref()
                     .is_some_and(|task| !task.is_finished())
                 {
-                    app.notice = "Security queue is still running or cleaning up".into();
+                    app.notice =
+                        tha::i18n::t("Security queue is still running or cleaning up").into();
                 } else if let Some(target) = app.security.target.clone() {
                     let mut targets = std::mem::take(&mut app.security.queue);
                     if targets.is_empty() {
@@ -798,6 +810,14 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
             }
             update_platform(&mut app, &mut platform_task, &platform_tx);
             update_logs(&mut app, &mut log_task, &log_tx, log_capacity);
+            if mouse_captured != app.mouse_enabled {
+                mouse_captured = app.mouse_enabled;
+                if mouse_captured {
+                    crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+                } else {
+                    crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
+                }
+            }
             let frame_started = std::time::Instant::now();
             terminal.draw(|frame| ui::draw(frame, &mut app))?;
             visual_deadline = app.next_visual_deadline(frame_started);
@@ -883,7 +903,7 @@ fn update_layers(
     *task = Some(AbortTask(tokio::spawn(async move {
         let result = tha::layers::lookup(&connection, &container)
             .await
-            .map_err(|error| tha::layers::text(&format!("{error:#}")));
+            .map_err(|error| tha::layers::text(&tha::tf!("{error}", error = format!("{error:#}"))));
         let _ = sender
             .send(tha::layers::Event {
                 key,
@@ -922,7 +942,7 @@ fn update_platform(
     let handle = tokio::spawn(async move {
         let result = tha::platform::lookup(&connection, &container)
             .await
-            .map_err(|error| format!("{error:#}"));
+            .map_err(|error| tha::tf!("{error}", error = format!("{error:#}")));
         let _ = sender
             .send(tha::platform::Event {
                 key: event_key,
@@ -1041,13 +1061,16 @@ fn update_logs(
     if engine.error.is_some() || engine.alias.is_some() {
         app.logs.push(
             "Tha",
-            "Connection unavailable or aliased. Browse a connected engine to view logs.",
+            tha::i18n::t(
+                "Connection unavailable or aliased. Browse a connected engine to view logs.",
+            ),
             true,
         );
         return;
     }
     if containers.is_empty() {
-        app.logs.push("Tha", "No containers in this scope.", true);
+        app.logs
+            .push("Tha", tha::i18n::t("No containers in this scope."), true);
         return;
     }
     if app.demo {
@@ -1118,12 +1141,16 @@ fn log_scope_key(
 
 fn queue_log_export(app: &mut App, path: &str) -> Result<()> {
     if !app.log_export_review_visible {
-        bail!("Review the export dialog in a terminal at least 60 × 18 first");
+        bail!(tha::i18n::t(
+            "Review the export dialog in a terminal at least 60 × 18 first"
+        ));
     }
     if app.log_export_busy {
-        bail!("Another export is already running");
+        bail!(tha::i18n::t("Another export is already running"));
     }
-    let row = app.current().context("Log selection disappeared")?;
+    let row = app
+        .current()
+        .context(tha::i18n::t("Log selection disappeared"))?;
     let engine = &app.engines[row.engine];
     let key = log_scope_key(row, engine, &app.selected_containers(), app.log_since);
     if app.tab != Tab::Logs
@@ -1132,9 +1159,9 @@ fn queue_log_export(app: &mut App, path: &str) -> Result<()> {
         || app.log_scope.as_ref() != Some(&key)
         || app.log_export_scope.as_ref() != Some(&key)
     {
-        bail!(
+        bail!(tha::i18n::t(
             "Log target changed or is unavailable; cancel and reopen export after reviewing Logs"
-        );
+        ));
     }
     let request =
         logs::export::Request::snapshot(PathBuf::from(path), &app.logs, &app.log_view.filter)?;
@@ -1146,18 +1173,15 @@ fn queue_log_export(app: &mut App, path: &str) -> Result<()> {
 fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Sender<u64>) -> bool {
     app.cancel_startup();
     if app.exec_input && app.detail_focus && app.tab == Tab::Exec {
-        // Legacy terminals encode Ctrl-] as 0x1d, which Crossterm reports as Ctrl-5.
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'))
-        {
+        if app.keyboard.leaves_exec(key) {
             app.exec_input = false;
             app.detail_focus = false;
             app.performance_focus = false;
-            app.notice = "Exec is still connected · navigation mode · e refocuses the same container, or select 4 then Enter.".into();
+            app.notice = tha::i18n::t("Exec is still connected · navigation mode · e refocuses the same container, or select 4 then Enter.").into();
         } else if let Some(session) = app.sessions.active_mut()
             && let Err(error) = session.key(key)
         {
-            app.notice = format!("{error:#}");
+            app.notice = tha::tf!("{error}", error = format!("{error:#}"));
         }
         return false;
     }
@@ -1192,9 +1216,9 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                     });
                     if current {
                         removal.pending = true;
-                        app.notice = format!(
-                            "Deleting {} resources · Esc hides progress; no automatic retries",
-                            removal.targets.len()
+                        app.notice = tha::tf!(
+                            "Deleting {a0} resources · Esc hides progress; no automatic retries",
+                            a0 = removal.targets.len()
                         );
                         app.inventory_removal_request = Some(
                             removal
@@ -1205,7 +1229,7 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                         );
                     } else {
                         app.inventory_removal = None;
-                        app.notice = "Runtime changed; deletion cancelled".into();
+                        app.notice = tha::i18n::t("Runtime changed; deletion cancelled").into();
                     }
                 }
                 KeyCode::Up | KeyCode::PageUp => {
@@ -1426,6 +1450,33 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         }
         return false;
     }
+    if app
+        .settings
+        .is_some_and(|settings| settings.picker.is_some())
+    {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.cancel_option(),
+            KeyCode::Enter | KeyCode::Char(' ') => app.confirm_option(),
+            KeyCode::Char('j') | KeyCode::Down => app.move_option(1),
+            KeyCode::Char('k') | KeyCode::Up => app.move_option(-1),
+            KeyCode::Char('g') | KeyCode::Home => app.move_option(isize::MIN),
+            KeyCode::Char('G') | KeyCode::End => app.move_option(isize::MAX),
+            _ => {}
+        }
+        return false;
+    }
+    if app.settings.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | ',') => app.settings = None,
+            KeyCode::Char('j') | KeyCode::Down => app.move_setting(1),
+            KeyCode::Char('k') | KeyCode::Up => app.move_setting(-1),
+            KeyCode::Char('h') | KeyCode::Left => app.change_setting(false, false),
+            KeyCode::Char('l') | KeyCode::Right => app.change_setting(true, false),
+            KeyCode::Enter | KeyCode::Char(' ') => app.change_setting(true, true),
+            _ => {}
+        }
+        return false;
+    }
     if app.help {
         match key.code {
             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::F(1) => {
@@ -1531,30 +1582,36 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
                         Ok(filter) => {
                             app.log_view.filter = filter;
                             app.log_filter_text = input;
-                            app.notice = "Applied retained-log filter; entries without required metadata do not match. :clear-log-filter resets it.".into();
+                            app.notice = tha::i18n::t("Applied retained-log filter; entries without required metadata do not match. :clear-log-filter resets it.").into();
                         }
                         Err(error) => {
-                            app.notice = format!("Invalid log filter: {error:#}");
+                            app.notice = tha::tf!(
+                                "Invalid log filter: {error}",
+                                error = format!("{error:#}")
+                            );
                             app.input_mode = mode;
                             app.input = input;
                         }
                     }
                 } else if mode == InputMode::ExportLogs {
                     if let Err(error) = queue_log_export(app, &input) {
-                        app.notice = format!("{error:#}");
+                        app.notice = tha::tf!("{error}", error = format!("{error:#}"));
                         app.input_mode = mode;
                         app.input = input;
                     }
                 } else if app.detail_focus && app.tab == Tab::Logs {
                     if let Err(error) = app.log_view.check_query(&input) {
-                        app.notice = tha::model::safe_text(&format!("Invalid regex: {error}"))
-                            .split_whitespace()
-                            .collect::<Vec<_>>()
-                            .join(" ");
+                        app.notice = tha::model::safe_text(&tha::tf!(
+                            "Invalid regex: {error}",
+                            error = error
+                        ))
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
                         app.input_mode = mode;
                         app.input = input;
                     } else {
-                        if app.notice.starts_with("Invalid regex") {
+                        if app.notice.starts_with(tha::i18n::t("Invalid regex")) {
                             app.notice.clear();
                         }
                         app.log_view.set_query(input, &mut app.logs);
@@ -1606,10 +1663,10 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
         return false;
     };
     if !action.info().scope.includes(context) {
-        app.notice = format!(
-            "{} is unavailable in {}",
-            action.info().label,
-            context.label()
+        app.notice = tha::tf!(
+            "{a0} is unavailable in {a1}",
+            a0 = action.info().label,
+            a1 = context.label()
         );
         return false;
     }
@@ -1686,6 +1743,7 @@ fn dispatch_navigation(
             app.help = true;
             app.help_scroll = 0;
         }
+        A::Settings => app.settings = Some(Default::default()),
         A::Commands => {
             app.input_mode = InputMode::Command;
             app.input.clear();
@@ -2086,7 +2144,7 @@ fn dispatch_navigation(
         }
         A::Exec => {
             if !app.exec_tab_available() {
-                app.notice = "Exec requires a running container or service.".into();
+                app.notice = tha::i18n::t("Exec requires a running container or service.").into();
                 return false;
             }
             app.tab = Tab::Exec;
@@ -2330,6 +2388,7 @@ fn handle_mouse(
         _ => None,
     };
     if app.help
+        || app.settings.is_some()
         || app.picker.is_some()
         || app.inventory_removal_results_visible
         || app.action_results_visible
@@ -2341,7 +2400,23 @@ fn handle_mouse(
         if let Some(code) = wheel {
             return handle_key(app, KeyEvent::from(code), height, refresh);
         }
-        if let Some(MouseTarget::PickerRow(index)) = target
+        if let Some(MouseTarget::OptionRow(index)) = target
+            && let Some(picker) = app.settings.and_then(|settings| settings.picker)
+        {
+            if picker.selected == index {
+                app.confirm_option();
+            } else {
+                app.preview_option(index);
+            }
+        } else if let Some(MouseTarget::SettingsRow(index)) = target
+            && let Some(settings) = &mut app.settings
+        {
+            if settings.selected == index {
+                app.change_setting(true, true);
+            } else {
+                settings.selected = index;
+            }
+        } else if let Some(MouseTarget::PickerRow(index)) = target
             && let Some(picker) = &mut app.picker
         {
             if picker.selected == index {
@@ -2405,7 +2480,12 @@ fn wheel_over(
                 app.detail_focus = false;
             }
         }
-        T::Overview(_) | T::CollapsedPerformance | T::InventoryRuntime(_) | T::PickerRow(_) => {
+        T::Overview(_)
+        | T::CollapsedPerformance
+        | T::InventoryRuntime(_)
+        | T::PickerRow(_)
+        | T::SettingsRow(_)
+        | T::OptionRow(_) => {
             return false;
         }
     }
@@ -2556,7 +2636,7 @@ fn click(
                 app.detail_focus = false;
             }
         }
-        T::PickerRow(_) => {}
+        T::PickerRow(_) | T::SettingsRow(_) | T::OptionRow(_) => {}
     }
     false
 }
@@ -2638,11 +2718,12 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
                 app.detail_focus = true;
                 app.performance_focus = false;
                 if app.demo {
-                    app.notice = "Demo mode: fixture logs ignore the start time.".into();
+                    app.notice =
+                        tha::i18n::t("Demo mode: fixture logs ignore the start time.").into();
                 }
             }
             Err(error) => {
-                app.notice = format!("{error:#}");
+                app.notice = tha::tf!("{error}", error = format!("{error:#}"));
                 app.input_mode = InputMode::Command;
                 app.input = command.into();
             }
@@ -2665,7 +2746,7 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
             if app.compose_job.is_some() {
                 app.compose_output_visible = true;
             } else {
-                app.notice = "No Compose operation has run in this session".into();
+                app.notice = tha::i18n::t("No Compose operation has run in this session").into();
             }
         }
         "logs-since" => {
@@ -2682,11 +2763,11 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
         "scan-images" => app.request_security_scan(true),
         "prune" => ui::inventory::begin_prune(app),
         "cancel-scan" if app.overview_mode == tha::app::OverviewMode::Containers => {
-            app.notice = "Scans run from the Security view (Ctrl+→ or Alt+4)".into();
+            app.notice = tha::i18n::t("Scans run from the Security view (Ctrl+→ or Alt+4)").into();
         }
         "cancel-scan" => {
             app.security.cancel = true;
-            app.notice = "Cancelling security queue and removing scanner…".into();
+            app.notice = tha::i18n::t("Cancelling security queue and removing scanner…").into();
         }
         "update-security-db" => {
             app.request_security_scan(false);
@@ -2699,7 +2780,7 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
                 app.inventory_removal_results_visible = true;
                 app.inventory_removal_results_scroll = 0;
             } else {
-                app.notice = "No image/volume cleanup results yet".into();
+                app.notice = tha::i18n::t("No image/volume cleanup results yet").into();
             }
         }
         "quit" | "q" => return true,
@@ -2720,9 +2801,9 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
         "refresh" => {
             refresh.send_modify(|value| *value += 1);
             if app.demo {
-                app.notice = "Demo mode: fixture data is unchanged.".into();
+                app.notice = tha::i18n::t("Demo mode: fixture data is unchanged.").into();
             } else {
-                app.notice = "Refreshing all engines…".into();
+                app.notice = tha::i18n::t("Refreshing all engines…").into();
             }
         }
         "reconnect-logs" => {
@@ -2734,7 +2815,8 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
         "exec" => app.request_exec(),
         "layers" => {
             if !app.layers_available() {
-                app.notice = "Layers requires a container or single-container service".into();
+                app.notice =
+                    tha::i18n::t("Layers requires a container or single-container service").into();
                 return false;
             }
             app.tab = Tab::Layers;
@@ -2756,7 +2838,7 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
                 app.detail_focus = true;
                 app.performance_focus = false;
             } else {
-                app.notice = "Select a container to open Metrics".into();
+                app.notice = tha::i18n::t("Select a container to open Metrics").into();
             }
         }
         "reload-layers" => {
@@ -2779,9 +2861,10 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
         "export-logs" => {
             if app.tab != Tab::Logs || app.log_scope.is_none() {
                 app.notice =
-                    "Open and review Logs for the desired workload before exporting".into();
+                    tha::i18n::t("Open and review Logs for the desired workload before exporting")
+                        .into();
             } else if app.log_export_busy {
-                app.notice = "Another export is already running".into();
+                app.notice = tha::i18n::t("Another export is already running").into();
             } else {
                 app.log_export_scope = app.log_scope.clone();
                 app.log_export_review_visible = false;
@@ -2799,14 +2882,17 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
         }
         "all" => while app.back() {},
         "monochrome" => app.monochrome = !app.monochrome,
+        "settings" => app.settings = Some(Default::default()),
         "help" => {
             app.help = true;
             app.help_scroll = 0;
         }
         "" => {}
         _ => {
-            app.notice =
-                format!("Unknown command: {command}. Press : then Tab to discover commands.")
+            app.notice = tha::tf!(
+                "Unknown command: {command}. Press : then Tab to discover commands.",
+                command = command
+            )
         }
     }
     false
@@ -4902,6 +4988,239 @@ mod tests {
             &refresh,
         );
         assert_eq!(app.selected, selected);
+    }
+
+    #[tokio::test]
+    async fn settings_open_change_live_respond_to_the_mouse_and_stay_modal() {
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        let selected = app.selected;
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char(',')), 20, &refresh);
+        assert!(app.settings.is_some());
+        let buffer = draw_at(&mut app, 120, 40);
+        let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Settings"));
+        assert!(text.contains("Terminal colors"));
+        assert!(text.contains("Changes last for this session"));
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')), 20, &refresh);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')), 20, &refresh);
+        assert_eq!(app.selected, selected, "navigation stays behind the pane");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('l')), 20, &refresh);
+        assert_eq!(app.keyboard, tha::keyboard::KeyboardPreset::German);
+        let text: String = draw_at(&mut app, 120, 40)
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("German"));
+        assert!(text.contains("F12"));
+
+        use tha::theme::Theme;
+        click_at(&mut app, MouseTarget::SettingsRow(0), &refresh);
+        assert_eq!(app.settings.unwrap().selected, 0);
+        assert_eq!(app.theme, Theme::Terminal);
+        draw_at(&mut app, 120, 40);
+        click_at(&mut app, MouseTarget::SettingsRow(0), &refresh);
+        assert!(app.settings.unwrap().picker.is_some());
+
+        let text: String = draw_at(&mut app, 120, 40)
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for theme in Theme::ALL {
+            assert!(text.contains(theme.label()), "{theme:?}");
+        }
+        assert!(
+            !app.mouse_regions
+                .iter()
+                .any(|(_, target)| matches!(target, MouseTarget::SettingsRow(_))),
+            "rows behind the list cannot be clicked"
+        );
+        click_at(&mut app, MouseTarget::OptionRow(3), &refresh);
+        assert_eq!(app.theme, Theme::TokyoNight, "the first click previews");
+        assert_eq!(app.saved_settings.theme, None);
+        mouse_at(&mut app, MouseEventKind::ScrollUp, 0, 0, &refresh);
+        assert_eq!(app.theme, Theme::GruvboxDark, "the wheel previews");
+        mouse_at(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Right),
+            0,
+            0,
+            &refresh,
+        );
+        assert_eq!(
+            app.theme,
+            Theme::Terminal,
+            "right-click cancels the preview"
+        );
+        assert!(app.settings.is_some(), "and only closes the list");
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &refresh);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Down), 20, &refresh);
+        assert_eq!(app.theme, Theme::CatppuccinMocha);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &refresh);
+        assert_eq!(app.saved_settings.theme, Some(Theme::CatppuccinMocha));
+        assert_eq!(app.settings.unwrap().picker, None);
+
+        draw_at(&mut app, 120, 40);
+        mouse_at(&mut app, MouseEventKind::ScrollDown, 0, 0, &refresh);
+        assert_eq!(app.settings.unwrap().selected, 1);
+        mouse_at(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Right),
+            0,
+            0,
+            &refresh,
+        );
+        assert!(app.settings.is_none());
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char(',')), 20, &refresh);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 20, &refresh);
+        assert!(app.settings.is_none());
+        execute(&mut app, "settings", &refresh);
+        assert!(app.settings.is_some());
+    }
+
+    #[tokio::test]
+    async fn german_preset_keys_change_the_metrics_range_only_in_metrics() {
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.selected = row_named(&app, "shop-api-2");
+        let minus = KeyEvent::from(KeyCode::Char('-'));
+        let plus = KeyEvent::from(KeyCode::Char('+'));
+        let tab = app.tab;
+        let selected = app.selected;
+        handle_key(&mut app, plus, 20, &refresh);
+        assert_eq!((app.tab, app.selected), (tab, selected));
+
+        app.tab = Tab::History;
+        app.detail_focus = true;
+        let range = app.history_view.range;
+        handle_key(&mut app, plus, 20, &refresh);
+        assert_eq!(app.history_view.range, range, "US has no + key");
+
+        app.set_keyboard(tha::keyboard::KeyboardPreset::German);
+        handle_key(&mut app, plus, 20, &refresh);
+        assert_eq!(app.history_view.range, range + 1);
+        handle_key(&mut app, minus, 20, &refresh);
+        assert_eq!(app.history_view.range, range);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char(']')), 20, &refresh);
+        assert_eq!(
+            app.history_view.range,
+            range + 1,
+            "US keys keep working under German"
+        );
+
+        app.tab = Tab::Overview;
+        app.notice.clear();
+        handle_key(&mut app, plus, 20, &refresh);
+        assert_eq!(app.tab, Tab::Overview);
+        assert_eq!(app.history_view.range, range + 1);
+    }
+
+    #[tokio::test]
+    async fn language_and_keyboard_layout_are_independent_and_clicks_follow_german_text() {
+        use tha::{i18n::Language, keyboard::KeyboardPreset};
+        tha::i18n::isolate_thread();
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.selected = row_named(&app, "shop-api-2");
+
+        // Each combination keeps the other setting's behavior.
+        for (language, keyboard) in [
+            (Language::German, KeyboardPreset::Us),
+            (Language::English, KeyboardPreset::German),
+            (Language::German, KeyboardPreset::German),
+        ] {
+            app.set_language(language);
+            app.set_keyboard(keyboard);
+            assert_eq!((app.language, app.keyboard), (language, keyboard));
+            app.tab = Tab::History;
+            app.detail_focus = true;
+            let range = app.history_view.range;
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char(']')), 20, &refresh);
+            assert_eq!(app.history_view.range, range + 1, "{language:?}");
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char('+')), 20, &refresh);
+            let expected = range + 1 + usize::from(keyboard == KeyboardPreset::German);
+            assert_eq!(app.history_view.range, expected, "{keyboard:?}");
+            app.history_view.range = 0;
+            app.tab = Tab::Overview;
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char('z')), 20, &refresh);
+            assert_eq!(app.detail_zoom, Some(Tab::Overview), "z in {language:?}");
+            app.detail_zoom = None;
+        }
+
+        // Text changes while the identity of the selection and its keys stay put.
+        app.set_keyboard(KeyboardPreset::Us);
+        app.set_language(Language::German);
+        app.tab = Tab::Overview;
+        app.detail_focus = false;
+        assert_eq!(app.current().unwrap().title, "shop-api-2");
+        let buffer = draw_at(&mut app, 240, 50);
+        let text_at = |area: ratatui::layout::Rect| -> String {
+            (area.x..area.right())
+                .map(|x| buffer[(x, area.y)].symbol().to_string())
+                .collect()
+        };
+        for (target, expected) in [
+            (MouseTarget::DetailTab(Tab::Networks), " 3 Netzwerke "),
+            (MouseTarget::DetailTab(Tab::Events), " 5 Ereignisse "),
+            (
+                MouseTarget::Overview(OverviewMode::Containers),
+                "[Container]",
+            ),
+            (MouseTarget::Overview(OverviewMode::Volumes), "Volumes"),
+        ] {
+            let area = app
+                .mouse_regions
+                .iter()
+                .find(|(_, candidate)| *candidate == target)
+                .unwrap_or_else(|| panic!("{target:?}"))
+                .0;
+            assert_eq!(text_at(area), expected);
+        }
+        let screen: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(screen.contains("laufend]"), "tree titles were rebuilt");
+        assert!(!screen.contains("running]"));
+        app.set_language(Language::English);
+    }
+
+    #[tokio::test]
+    async fn every_view_renders_in_german_at_every_size_without_panicking() {
+        use tha::app::Tab::*;
+        tha::i18n::isolate_thread();
+        tha::i18n::set_language(tha::i18n::Language::German);
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.selected = row_named(&app, "shop-api-2");
+        for mode in [
+            OverviewMode::Containers,
+            OverviewMode::Images,
+            OverviewMode::Volumes,
+            OverviewMode::Security,
+        ] {
+            app.overview_mode = mode;
+            for tab in [
+                Overview, Logs, Networks, Exec, Events, History, Layers, Security,
+            ] {
+                app.tab = tab;
+                app.selected = row_named(&app, "shop-api-2");
+                for (width, height) in [(240, 50), (120, 30), (80, 24), (60, 20), (32, 10)] {
+                    draw_at(&mut app, width, height);
+                }
+            }
+        }
+        app.overview_mode = OverviewMode::Containers;
+        for key in ['?', ',', ':'] {
+            handle_key(&mut app, KeyEvent::from(KeyCode::Char(key)), 20, &refresh);
+            for (width, height) in [(120, 30), (60, 20), (32, 10)] {
+                draw_at(&mut app, width, height);
+            }
+            handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 20, &refresh);
+        }
+        tha::i18n::set_language(tha::i18n::Language::English);
     }
 
     #[tokio::test]

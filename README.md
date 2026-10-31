@@ -336,6 +336,7 @@ your navigation. Demo mode never auto-opens a project.
 | `h` / `l`, left / right | Collapse/parent or expand/child in the tree; previous/next tab in focused details; horizontal scroll in unwrapped logs; pan in Metrics |
 | `H` / `L` | Previous/next tab from any focused detail tab, including Metrics and unwrapped logs |
 | Mouse | Click selects and focuses, click again opens like `Enter`; click an arrow to expand or collapse; click tabs and overviews; wheel scrolls the pane under the pointer; drag the log scrollbar; right-click goes back like `Esc`. Confirmations stay keyboard-only. Hold Shift to select terminal text, or set `mouse = false` |
+| `,` / `:settings` | Settings pane: theme, language, keyboard layout, mouse, log wrapping |
 | `Space` | Toggle the selected explorer branch open or closed |
 | `Enter` | Enter a Compose workspace; otherwise open details; on a focused Networks row, select that container in the Explorer |
 | `Backspace` | Return to the previous workspace |
@@ -800,6 +801,27 @@ Existing configuration and Docker context metadata are never removed by Stop.
 Older Tha versions may reject the new optional runtime metadata; move the
 preferences file aside when downgrading rather than deleting runtime configuration.
 
+## Settings
+
+Press `,` or use `:settings` to change these live: **Theme** (terminal colors, Catppuccin
+Mocha, Gruvbox Dark, Tokyo Night, Nord), **Language** (English or Deutsch), **Keyboard layout**
+(US or German, see [keyboard layouts](docs/keybindings.md#keyboard-layouts)), **Mouse**, and
+**Wrap logs**. Enter on Theme or Language opens the full list: moving previews each option,
+Enter applies it and Esc restores the previous one.
+
+Language and keyboard layout are separate settings, so any language works with any layout.
+Keys never change with the language: `y`/`n` confirm in every language. The translation covers
+the interface. Text from your engine, log lines, command names, the security service's scan
+progress, and the command-line tool (`--help`, startup errors) stay in English.
+
+Themes only change foreground colors, so transparent terminals keep working; the palettes
+need a truecolor terminal. `NO_COLOR`, `--monochrome` and `:monochrome` turn colors off
+separately from the theme.
+
+Choices are saved in the preferences file, never `config.toml`, and win over the matching
+`theme`, `language`, `keyboard` and `mouse` config values. **Reset to defaults** returns to the config
+values. With `save_preferences = false` or `--demo`, changes last for the session.
+
 Add navigation-only aliases using crokey key syntax in `config.toml`:
 
 ```toml
@@ -1123,7 +1145,7 @@ manually; a rerun intentionally refuses to overwrite it.
 ```sh
 make help
 make build
-make check      # Formatting, Clippy, unit/integration tests
+make check      # Formatting, Clippy, unit/integration tests; uses 4 cores, CPUS=8 changes it
 make release
 make run ARGS="--demo --monochrome"
 ```

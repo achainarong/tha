@@ -14,10 +14,17 @@ impl PortBinding {
     pub fn overview(&self) -> String {
         let destination = format!("{}/{}", self.container_port, self.protocol);
         let Some(port) = self.host_port else {
-            return format!("{destination} — exposed, no host port");
+            return crate::tf!(
+                "{destination} — exposed, no host port",
+                destination = destination
+            );
         };
         let Some(ip) = self.host_ip.as_deref().filter(|ip| !ip.is_empty()) else {
-            return format!("host port {port} → {destination} (host address not reported)");
+            return crate::tf!(
+                "host port {port} → {destination} (host address not reported)",
+                port = port,
+                destination = destination
+            );
         };
         match ip.parse::<std::net::IpAddr>() {
             Ok(address) if address.is_loopback() => {
@@ -28,7 +35,12 @@ impl PortBinding {
                 } else {
                     format!("{ip}:{port}")
                 };
-                format!("{local} → {destination} (loopback only · {ip})")
+                crate::tf!(
+                    "{local} → {destination} (loopback only · {ip})",
+                    local = local,
+                    destination = destination,
+                    ip = ip
+                )
             }
             Ok(address) if address.is_unspecified() => {
                 let host = if address.is_ipv6() {
@@ -36,7 +48,11 @@ impl PortBinding {
                 } else {
                     format!("{ip}:{port}")
                 };
-                format!("{host} → {destination} (all interfaces; not localhost-only)")
+                crate::tf!(
+                    "{host} → {destination} (all interfaces; not localhost-only)",
+                    host = host,
+                    destination = destination
+                )
             }
             _ => {
                 let host = if ip.contains(':') {
@@ -44,7 +60,11 @@ impl PortBinding {
                 } else {
                     format!("{ip}:{port}")
                 };
-                format!("{host} → {destination} (specific host address)")
+                crate::tf!(
+                    "{host} → {destination} (specific host address)",
+                    host = host,
+                    destination = destination
+                )
             }
         }
     }

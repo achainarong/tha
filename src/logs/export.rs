@@ -43,7 +43,7 @@ impl Write for Size {
 impl Request {
     pub fn snapshot(path: PathBuf, logs: &LogBuffer, filter: &Filter) -> Result<Self> {
         if path.as_os_str().is_empty() {
-            bail!("Choose an explicit destination filename");
+            bail!(crate::i18n::t("Choose an explicit destination filename"));
         }
         let mut bytes = Size(0);
         let mut entries = Vec::new();
@@ -51,14 +51,16 @@ impl Request {
             serde_json::to_writer(&mut bytes, &record(entry))?;
             bytes.write_all(b"\n")?;
             if bytes.0 > MAX_BYTES {
-                bail!(
+                bail!(crate::i18n::t(
                     "Export exceeds the 16 MiB snapshot limit; narrow the filter first. No file created"
-                );
+                ));
             }
             entries.push(entry.clone());
         }
         if entries.is_empty() {
-            bail!("No retained entries match this filter; no file created");
+            bail!(crate::i18n::t(
+                "No retained entries match this filter; no file created"
+            ));
         }
         Ok(Self { path, entries })
     }
@@ -68,9 +70,9 @@ impl Request {
             .create_new(true)
             .mode(0o600)
             .open(&self.path)
-            .context(
+            .context(crate::i18n::t(
                 "Cannot create export: destination must be a new file in an existing directory",
-            )?;
+            ))?;
         let result = (|| {
             for entry in &self.entries {
                 serde_json::to_writer(&mut file, &record(entry))?;
@@ -79,11 +81,13 @@ impl Request {
             file.flush()?;
             Ok::<_, anyhow::Error>(())
         })();
-        result.context("Export write failed; a partial new export file may remain")?;
-        Ok(format!(
-            "Exported {} retained entries to {} (JSONL, mode 0600; may contain secrets)",
-            self.entries.len(),
-            self.path.display()
+        result.context(crate::i18n::t(
+            "Export write failed; a partial new export file may remain",
+        ))?;
+        Ok(crate::tf!(
+            "Exported {a0} retained entries to {a1} (JSONL, mode 0600; may contain secrets)",
+            a0 = self.entries.len(),
+            a1 = self.path.display()
         ))
     }
 }

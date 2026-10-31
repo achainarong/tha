@@ -32,6 +32,20 @@ duplicate normalized keys and unknown actions are rejected.
 Security overviews by default. Shift+arrows and F7/F8 remain compatibility aliases.
 To disable those aliases, bind `shift-left`, `shift-right`, `F7`, and `F8` to `none`.
 
+## Keyboard layouts
+
+Press `,` to choose a layout, or set `keyboard = "german"` in `config.toml`. A layout
+follows how that keyboard is normally used instead of copying US key positions, and only
+adds keys, so every default keeps working. `:`, `/` and `?` stay where German keyboards
+have them, and `z` stays Zoom.
+
+| Action | US | German adds | Why |
+| --- | --- | --- | --- |
+| Metrics range shorter / longer | `[` `]` | `-` `+` | `[` and `]` need AltGr on QWERTZ |
+| Leave shell input | `Ctrl-]` | `F12` | `Ctrl-]` needs AltGr and is unreliable; in this layout the shell no longer receives `F12` |
+
+Your own `[bindings]` take priority over a layout's keys.
+
 ## Input and safety
 
 Custom bindings apply only in navigation, not while typing, using pickers or
@@ -67,6 +81,7 @@ configured keys take precedence.
 | `previous-view`, `next-view` | Cycle top-level overviews |
 | `containers-view`, `images-view`, `volumes-view`, `security-view` | Open a top-level overview |
 | `overview`, `logs`, `networks`, `exec`, `metrics`, `layers`, `security`, `events` | Select an inner workload tab; `exec` selects navigation, not shell input |
+| `settings` | Open the settings pane |
 | `zoom` | Expand/restore the focused Explorer, detail tab, Performance, or inventory view |
 | `toggle-branch` | Toggle an Explorer branch |
 | `next-match`, `previous-match` | Navigate tree/log search matches |

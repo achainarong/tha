@@ -87,6 +87,8 @@ pub enum MouseTarget {
     InventoryRuntime(usize),
     InventoryRow(usize),
     PickerRow(usize),
+    SettingsRow(usize),
+    OptionRow(usize),
 }
 
 /// One cursor stop in the Networks tab, recorded by the last draw.
@@ -260,10 +262,10 @@ impl ActionFeedback {
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let elapsed = now.saturating_duration_since(self.started_at);
         let verb = match action {
-            Action::Start => "Starting",
-            Action::Stop => "Stopping",
-            Action::Restart => "Restarting",
-            Action::Delete => "Deleting",
+            Action::Start => crate::i18n::t("Starting"),
+            Action::Stop => crate::i18n::t("Stopping"),
+            Action::Restart => crate::i18n::t("Restarting"),
+            Action::Delete => crate::i18n::t("Deleting"),
         };
         RowActionFeedback {
             symbol: FRAMES[((elapsed.as_millis() / 100) % FRAMES.len() as u128) as usize],
@@ -302,6 +304,13 @@ pub struct App {
     pub context_pins: Vec<String>,
     pub context_sort: crate::context_sort::ContextSort,
     pub keymap: crate::keymap::Keymap,
+    pub keyboard: crate::keyboard::KeyboardPreset,
+    pub theme: crate::theme::Theme,
+    pub language: crate::i18n::Language,
+    pub base_settings: crate::settings::BaseSettings,
+    pub saved_settings: crate::settings::SavedSettings,
+    pub settings: Option<crate::settings::SettingsState>,
+    pub settings_save_error: Option<String>,
     pub custom_bindings: std::collections::BTreeMap<String, String>,
     pub preferences_path: Option<PathBuf>,
     pending_preferences: Option<crate::preferences::Preferences>,
@@ -406,6 +415,13 @@ impl App {
             context_pins: Vec::new(),
             context_sort: Default::default(),
             keymap: Default::default(),
+            keyboard: Default::default(),
+            theme: Default::default(),
+            language: Default::default(),
+            base_settings: Default::default(),
+            saved_settings: Default::default(),
+            settings: None,
+            settings_save_error: None,
             custom_bindings: Default::default(),
             preferences_path: None,
             pending_preferences: None,
@@ -583,7 +599,7 @@ impl App {
             while self.back() {}
             self.project = None;
             self.detail_scroll = 0;
-            self.notice = "Compose project has no containers; returned to all runtimes. Retained resources are still available.".into();
+            self.notice = crate::i18n::t("Compose project has no containers; returned to all runtimes. Retained resources are still available.").into();
         }
         self.refresh_tree();
         self.restore_performance_focus(performance_engine);
@@ -604,13 +620,15 @@ impl App {
                 }
                 1 => {
                     self.open_project(projects[0].clone());
-                    self.notice = "Opened the Compose project matching this directory. Backspace returns to all runtimes.".into();
+                    self.notice = crate::i18n::t("Opened the Compose project matching this directory. Backspace returns to all runtimes.").into();
                 }
                 _ => {
                     self.notice.clear();
                     self.picker = Some(Picker {
-                        title: "Multiple projects match this directory · Choose a connection"
-                            .into(),
+                        title: crate::i18n::t(
+                            "Multiple projects match this directory · Choose a connection",
+                        )
+                        .into(),
                         choices: projects.into_iter().map(Choice::Project).collect(),
                         selected: 0,
                     });
@@ -684,7 +702,7 @@ impl App {
                             engine.metrics = Default::default();
                             engine.metrics_revision = engine.metrics_revision.wrapping_add(1);
                             engine.error =
-                                Some("Podman socket changed; refreshing inventory".into());
+                                Some(crate::i18n::t("Podman socket changed; refreshing inventory").into());
                         }
                         // A Docker context may be the primary row for this same socket.
                         // Give it the verified machine target too, without trusting its name.
@@ -703,7 +721,7 @@ impl App {
                     }
                     Some(Err(error)) => Some(error.clone()),
                     None => Some(
-                        "Podman machine is no longer listed; refresh after starting it separately"
+                        crate::i18n::t("Podman machine is no longer listed; refresh after starting it separately")
                             .into(),
                     ),
                 }
@@ -744,7 +762,7 @@ impl App {
                     error: None,
                 });
             }
-            Err(error) => self.notice = format!("{error:#}"),
+            Err(error) => self.notice = crate::tf!("{error}", error = format!("{error:#}")),
         }
     }
 
@@ -779,28 +797,40 @@ impl App {
         action: crate::actions::Action,
     ) -> anyhow::Result<crate::actions::Request> {
         if self.demo {
-            anyhow::bail!("Demo mode: lifecycle mutations are disabled");
+            anyhow::bail!(
+                "{}",
+                crate::i18n::t("Demo mode: lifecycle mutations are disabled")
+            );
         }
         if self.compose_busy() {
-            anyhow::bail!("Wait for the running Compose operation to finish first");
+            anyhow::bail!(
+                "{}",
+                crate::i18n::t("Wait for the running Compose operation to finish first")
+            );
         }
         let row = self.action_row().ok_or_else(|| {
             anyhow::anyhow!(if self.performance_focus {
-                "Select a target in Performance before requesting an action"
+                crate::i18n::t("Select a target in Performance before requesting an action")
             } else {
-                "Select a container or Compose workload"
+                crate::i18n::t("Select a container or Compose workload")
             })
         })?;
         let engine = &self.engines[row.engine];
         if row.scope == Scope::Engine {
             if engine.alias.is_some() {
-                anyhow::bail!("Select the primary runtime, not an alias");
+                anyhow::bail!(
+                    "{}",
+                    crate::i18n::t("Select the primary runtime, not an alias")
+                );
             }
-            let target = engine.runtime.clone().ok_or_else(|| anyhow::anyhow!("Runtime control unsupported for this endpoint; select a workload for container actions"))?;
+            let target = engine.runtime.clone().ok_or_else(|| anyhow::anyhow!("{}", crate::i18n::t("Runtime control unsupported for this endpoint; select a workload for container actions")))?;
             if action != crate::actions::Action::Start
                 && (engine.error.is_some() || engine.snapshot.is_none())
             {
-                anyhow::bail!("Runtime is offline; use Start to bring it online");
+                anyhow::bail!(
+                    "{}",
+                    crate::i18n::t("Runtime is offline; use Start to bring it online")
+                );
             }
             let request =
                 crate::actions::Request::runtime(row.engine, &engine.connection, target, action)?;
@@ -808,9 +838,9 @@ impl App {
             return Ok(request);
         }
         if engine.error.is_some() || engine.alias.is_some() {
-            anyhow::bail!(
+            anyhow::bail!(crate::i18n::t(
                 "Connection unavailable or aliased; select its connected primary context"
-            );
+            ));
         }
         let mut request = crate::actions::Request::build(
             row.engine,
@@ -842,9 +872,9 @@ impl App {
                 .is_some_and(|(a, b)| a == b);
             !job.finished && (job.request.conflicts(request) || current_owners_match)
         }) {
-            anyhow::bail!(
+            anyhow::bail!(crate::i18n::t(
                 "An action is already active on this runtime; other runtimes remain available. :action-results shows progress"
-            );
+            ));
         }
         Ok(())
     }
@@ -855,11 +885,11 @@ impl App {
         row: &str,
     ) -> Result<usize, String> {
         if self.action_row().is_none_or(|current| current.key != row) {
-            return Err("Selection changed; reopen Actions".into());
+            return Err(crate::i18n::t("Selection changed; reopen Actions").into());
         }
         self.plan_action(action)
             .map(|request| request.target_count())
-            .map_err(|error| format!("{error:#}"))
+            .map_err(|error| crate::tf!("{error}", error = format!("{error:#}")))
     }
 
     pub fn open_actions(&mut self) {
@@ -880,7 +910,7 @@ impl App {
             }
         );
         self.picker = Some(Picker {
-            title: format!("Actions · {}", row.title),
+            title: crate::tf!("Actions · {a0}", a0 = row.title),
             choices: [
                 crate::actions::Action::Start,
                 crate::actions::Action::Stop,
@@ -914,26 +944,40 @@ impl App {
         action: crate::compose::Action,
     ) -> anyhow::Result<crate::compose::Request> {
         if self.demo {
-            anyhow::bail!("Demo mode: Compose operations are disabled");
+            anyhow::bail!(
+                "{}",
+                crate::i18n::t("Demo mode: Compose operations are disabled")
+            );
         }
         if self.compose_busy() {
-            anyhow::bail!("Another Compose operation is still running; :compose-output shows it");
+            anyhow::bail!(
+                "{}",
+                crate::i18n::t(
+                    "Another Compose operation is still running; :compose-output shows it"
+                )
+            );
         }
         if self.has_active_actions() {
-            anyhow::bail!("Wait for running lifecycle actions to finish first");
+            anyhow::bail!(
+                "{}",
+                crate::i18n::t("Wait for running lifecycle actions to finish first")
+            );
         }
-        let row = self
-            .action_row()
-            .ok_or_else(|| anyhow::anyhow!("Select a Compose project or service"))?;
+        let row = self.action_row().ok_or_else(|| {
+            anyhow::anyhow!("{}", crate::i18n::t("Select a Compose project or service"))
+        })?;
         let engine = &self.engines[row.engine];
         if engine.error.is_some() || engine.alias.is_some() {
-            anyhow::bail!("Select a connected runtime, not an offline engine or alias");
+            anyhow::bail!(
+                "{}",
+                crate::i18n::t("Select a connected runtime, not an offline engine or alias")
+            );
         }
         let project = match &row.scope {
             Scope::Project { project, .. }
             | Scope::Services { project, .. }
             | Scope::Service { project, .. } => project.clone(),
-            _ => anyhow::bail!("Select a Compose project or service"),
+            _ => anyhow::bail!("{}", crate::i18n::t("Select a Compose project or service")),
         };
         // A selected service still needs its project's labels, so resolve against them all.
         let members: Vec<_> = engine
@@ -955,7 +999,7 @@ impl App {
                     error: None,
                 });
             }
-            Err(error) => self.notice = format!("{error:#}"),
+            Err(error) => self.notice = crate::tf!("{error}", error = format!("{error:#}")),
         }
     }
 
@@ -965,13 +1009,14 @@ impl App {
         };
         let request = confirmation.request.clone();
         if request.action.requires_typing() && confirmation.typed != request.target.project {
-            confirmation.error = Some("Type the exact project name to confirm".into());
+            confirmation.error =
+                Some(crate::i18n::t("Type the exact project name to confirm").into());
             self.compose_confirmation = Some(confirmation);
             return;
         }
         // The dialog may have stayed open while something else started.
         if self.compose_busy() || self.has_active_actions() {
-            self.notice = "Another operation started; nothing was sent".into();
+            self.notice = crate::i18n::t("Another operation started; nothing was sent").into();
             return;
         }
         self.compose_job = Some(crate::compose::Job::new(format!(
@@ -1085,13 +1130,16 @@ impl App {
 
     pub fn open_security(&mut self) {
         if !self.security.enabled {
-            self.notice = "Install the security module first: tha module install security".into();
+            self.notice =
+                crate::i18n::t("Install the security module first: tha module install security")
+                    .into();
             return;
         }
         // Containers shows the report in place. Scanning belongs to the Security view.
         if self.overview_mode == OverviewMode::Containers {
             if !self.security_tab_available() {
-                self.notice = "Select a container or single-container service".into();
+                self.notice =
+                    crate::i18n::t("Select a container or single-container service").into();
                 return;
             }
             self.tab = Tab::Security;
@@ -1104,7 +1152,7 @@ impl App {
         if self.security.busy {
             self.overview_mode = OverviewMode::Security;
             self.detail_focus = true;
-            self.notice = "Showing the service's active queue; x cancels it".into();
+            self.notice = crate::i18n::t("Showing the service's active queue; x cancels it").into();
             return;
         }
         let checked = if matches!(
@@ -1121,7 +1169,7 @@ impl App {
         let Some(target) = target else {
             self.overview_mode = OverviewMode::Security;
             self.detail_focus = false;
-            self.notice = "Select an image to inspect its security report".into();
+            self.notice = crate::i18n::t("Select an image to inspect its security report").into();
             return;
         };
         if let Some(engine) = self
@@ -1147,7 +1195,8 @@ impl App {
 
     pub fn request_security_scan(&mut self, checked: bool) {
         if self.overview_mode == OverviewMode::Containers {
-            self.notice = "Scans run from the Security view (Ctrl+→ or Alt+4)".into();
+            self.notice =
+                crate::i18n::t("Scans run from the Security view (Ctrl+→ or Alt+4)").into();
             return;
         }
         let detail_focus = self.detail_focus;
@@ -1158,19 +1207,24 @@ impl App {
                 .get(&(self.inventory_engine, OverviewMode::Images))
                 .is_some_and(|view| !view.scan_marked.is_empty());
         if self.demo {
-            self.notice = "Demo mode: security scans and downloads are disabled".into();
-        } else if !self.security.enabled {
             self.notice =
-                "Install first: tha module install security (or installer MODULES=security)".into();
+                crate::i18n::t("Demo mode: security scans and downloads are disabled").into();
+        } else if !self.security.enabled {
+            self.notice = crate::i18n::t(
+                "Install first: tha module install security (or installer MODULES=security)",
+            )
+            .into();
         } else if self.security.busy {
-            self.notice = "A security queue is already running".into();
+            self.notice = crate::i18n::t("A security queue is already running").into();
         } else {
             if self.overview_mode == OverviewMode::Images
                 || (self.overview_mode == OverviewMode::Security && (!self.detail_focus || checked))
             {
                 let targets = crate::ui::inventory::security_targets(self, checked);
                 if targets.is_empty() {
-                    self.notice = "No checked images remain to scan; select images with m".into();
+                    self.notice =
+                        crate::i18n::t("No checked images remain to scan; select images with m")
+                            .into();
                     return;
                 }
                 let selected = crate::ui::inventory::security_targets(self, false)
@@ -1251,7 +1305,10 @@ impl App {
         if !self.action_review_visible {
             if let Some(confirmation) = &mut self.action_confirmation {
                 confirmation.error = Some(
-                    "Resize the terminal to review this confirmation before confirming".into(),
+                    crate::i18n::t(
+                        "Resize the terminal to review this confirmation before confirming",
+                    )
+                    .into(),
                 );
             }
             return;
@@ -1262,7 +1319,8 @@ impl App {
         if confirmation.request.action == crate::actions::Action::Delete
             && confirmation.typed != confirmation.request.name
         {
-            confirmation.error = Some("Name does not match; nothing was sent".into());
+            confirmation.error =
+                Some(crate::i18n::t("Name does not match; nothing was sent").into());
             self.action_confirmation = Some(confirmation);
             return;
         }
@@ -1272,30 +1330,48 @@ impl App {
             let engine = self
                 .engines
                 .get(request.engine)
-                .ok_or_else(|| anyhow::anyhow!("Runtime no longer exists"))?;
+                .ok_or_else(|| anyhow::anyhow!("{}", crate::i18n::t("Runtime no longer exists")))?;
             if self.demo || engine.alias.is_some() || engine.connection != request.connection {
-                anyhow::bail!("Connection changed or is unavailable; select and confirm again");
+                anyhow::bail!(
+                    "{}",
+                    crate::i18n::t(
+                        "Connection changed or is unavailable; select and confirm again"
+                    )
+                );
             }
             if let Some(target) = &request.runtime {
                 if engine.runtime.as_ref() != Some(target) {
-                    anyhow::bail!("Runtime provider changed; select and confirm again");
+                    anyhow::bail!(
+                        "{}",
+                        crate::i18n::t("Runtime provider changed; select and confirm again")
+                    );
                 }
                 if request.action != crate::actions::Action::Start
                     && (engine.error.is_some() || engine.snapshot.is_none())
                 {
-                    anyhow::bail!("Runtime is offline; use Start instead");
+                    anyhow::bail!(
+                        "{}",
+                        crate::i18n::t("Runtime is offline; use Start instead")
+                    );
                 }
                 return Ok(());
             }
             if engine.error.is_some() {
-                anyhow::bail!("Connection changed or is unavailable; select and confirm again");
+                anyhow::bail!(
+                    "{}",
+                    crate::i18n::t(
+                        "Connection changed or is unavailable; select and confirm again"
+                    )
+                );
             }
-            let snapshot = engine
-                .snapshot
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Refresh inventory before retrying"))?;
+            let snapshot = engine.snapshot.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("{}", crate::i18n::t("Refresh inventory before retrying"))
+            })?;
             if snapshot.engine_id.as_deref() != Some(request.identity.as_str()) {
-                anyhow::bail!("Runtime identity changed; select and confirm again");
+                anyhow::bail!(
+                    "{}",
+                    crate::i18n::t("Runtime identity changed; select and confirm again")
+                );
             }
             for container in &request.containers {
                 let current = snapshot
@@ -1303,18 +1379,22 @@ impl App {
                     .iter()
                     .find(|current| current.id == container.id)
                     .ok_or_else(|| {
-                        anyhow::anyhow!("Container disappeared; select and confirm again")
+                        anyhow::anyhow!(
+                            "{}",
+                            crate::i18n::t("Container disappeared; select and confirm again")
+                        )
                     })?;
                 request.validate_container(container, current)?;
             }
             Ok::<_, anyhow::Error>(())
         })();
         if let Err(error) = validation {
-            self.notice = format!("{error:#}");
+            self.notice = crate::tf!("{error}", error = format!("{error:#}"));
             return;
         }
         let Some(operation) = self.next_action_id.checked_add(1) else {
-            self.notice = "Operation IDs exhausted; restart Tha before another action".into();
+            self.notice =
+                crate::i18n::t("Operation IDs exhausted; restart Tha before another action").into();
             return;
         };
         self.next_action_id = operation;
@@ -1366,7 +1446,11 @@ impl App {
                 )
             });
         let issues = if failed + unknown > 0 {
-            format!(" · {failed} failed, {unknown} unknown")
+            crate::tf!(
+                " · {failed} failed, {unknown} unknown",
+                failed = failed,
+                unknown = unknown
+            )
         } else {
             String::new()
         };
@@ -1384,29 +1468,32 @@ impl App {
                 })
                 .collect::<Vec<_>>()
                 .join(" · ");
-            return Some(format!(
-                "{} running{issues} · {summary} · :action-results",
-                active.len()
+            return Some(crate::tf!(
+                "{a0} running{issues} · {summary} · :action-results",
+                a0 = active.len(),
+                issues = issues,
+                summary = summary
             ));
         }
         if self.action_jobs.len() > 1 {
-            return Some(format!(
-                "{} runtimes finished{issues} · :action-results",
-                self.action_jobs.len()
+            return Some(crate::tf!(
+                "{a0} runtimes finished{issues} · :action-results",
+                a0 = self.action_jobs.len(),
+                issues = issues
             ));
         }
         let progress = self.action_progress()?;
         if !progress.finished {
-            return Some(format!(
-                "{} · {} · :action-results",
-                self.active_action_label(progress, now),
-                progress.summary()
+            return Some(crate::tf!(
+                "{a0} · {a1} · :action-results",
+                a0 = self.active_action_label(progress, now),
+                a1 = progress.summary()
             ));
         }
-        Some(format!(
-            "{} · {} · :action-results",
-            progress.request.action.label(),
-            progress.summary()
+        Some(crate::tf!(
+            "{a0} · {a1} · :action-results",
+            a0 = progress.request.action.label(),
+            a1 = progress.summary()
         ))
     }
 
@@ -1494,7 +1581,7 @@ impl App {
                         return None;
                     }
                     let label = if job.request.runtime.is_some() {
-                        "command completed"
+                        crate::i18n::t("command completed")
                     } else {
                         "completed"
                     };
@@ -1506,11 +1593,13 @@ impl App {
                 }
                 Status::Failed(_) => (
                     "×",
-                    format!("{} failed", job.request.action.label()),
+                    crate::tf!("{action} failed", action = job.request.action.label()),
                     Tone::Error,
                 ),
-                Status::Unknown(_) => ("?", "Outcome unknown".into(), Tone::Warning),
-                Status::Skipped(_) => ("–", "Not attempted".into(), Tone::Warning),
+                Status::Unknown(_) => {
+                    ("?", crate::i18n::t("Outcome unknown").into(), Tone::Warning)
+                }
+                Status::Skipped(_) => ("–", crate::i18n::t("Not attempted").into(), Tone::Warning),
             };
             return Some(RowActionFeedback {
                 symbol,
@@ -1559,14 +1648,14 @@ impl App {
 
     pub fn open_action_results(&mut self) {
         match self.action_jobs.len() {
-            0 => self.notice = "No lifecycle action results yet".into(),
+            0 => self.notice = crate::i18n::t("No lifecycle action results yet").into(),
             1 => {
                 self.action_selected = self.action_jobs.keys().next().copied();
                 self.action_results_visible = true;
             }
             _ => {
                 self.picker = Some(Picker {
-                    title: "Action results · Choose a runtime".into(),
+                    title: crate::i18n::t("Action results · Choose a runtime").into(),
                     choices: self
                         .action_jobs
                         .keys()
@@ -1923,8 +2012,10 @@ impl App {
             .map(|(index, _)| index)
             .collect();
         if indices.is_empty() {
-            self.notice =
-                "No containers in the current Explorer scope; adjust workspace or search".into();
+            self.notice = crate::i18n::t(
+                "No containers in the current Explorer scope; adjust workspace or search",
+            )
+            .into();
             return;
         }
         let position = match indices.binary_search(&selected) {
@@ -2008,27 +2099,31 @@ impl App {
                 self.exec_input = true;
                 self.notice.clear();
             }
-            Err(error) => self.notice = format!("Exec unavailable: {error:#}"),
+            Err(error) => {
+                self.notice = crate::tf!("Exec unavailable: {error}", error = format!("{error:#}"))
+            }
         }
     }
 
     pub fn close_exec(&mut self) {
         self.sessions.close_active();
         self.exec_input = false;
-        self.notice = "Exec closed; the container was not stopped.".into();
+        self.notice = crate::i18n::t("Exec closed; the container was not stopped.").into();
     }
 
     pub fn pick_sessions(&mut self) {
         if self.sessions.is_empty() {
-            self.notice =
-                "No retained Exec sessions. Select a running container and press e.".into();
+            self.notice = crate::i18n::t(
+                "No retained Exec sessions. Select a running container and press e.",
+            )
+            .into();
             return;
         }
         self.picker = Some(Picker {
-            title: format!(
-                "Exec sessions · {}/{} retained",
-                self.sessions.len(),
-                self.sessions.limit()
+            title: crate::tf!(
+                "Exec sessions · {a0}/{a1} retained",
+                a0 = self.sessions.len(),
+                a1 = self.sessions.limit()
             ),
             choices: self
                 .sessions
@@ -2060,7 +2155,7 @@ impl App {
                         namespace: project.namespace.clone(),
                         project: project.name.clone(),
                     },
-                    format!("{} [not in latest inventory]", project.name),
+                    crate::tf!("{a0} [not in latest inventory]", a0 = project.name),
                     vec![],
                 )
             })
@@ -2102,6 +2197,27 @@ impl App {
             .selected
             .saturating_add_signed(amount)
             .min(self.rows.len().saturating_sub(1));
+    }
+
+    /// The key shown in hints: the user's binding, then the layout preset's, then the default.
+    pub fn key_hint(&self, action: crate::shortcuts::ActionId) -> String {
+        self.keymap
+            .bindings()
+            .find(|(_, candidate)| *candidate == action)
+            .map(|(key, _)| {
+                key.as_letter().map_or_else(
+                    || crokey::KeyCombinationFormat::default().to_string(key),
+                    |letter| letter.to_string(),
+                )
+            })
+            .or_else(|| {
+                action
+                    .info()
+                    .bindings
+                    .first()
+                    .map(|binding| binding.key.to_owned())
+            })
+            .unwrap_or_default()
     }
 
     pub fn mouse_target(&self, column: u16, row: u16) -> Option<MouseTarget> {
@@ -2224,7 +2340,7 @@ impl App {
             }
             self.tree_query.clear();
             self.expanded.remove(&row.key);
-            self.notice = "Tree search cleared; selected branch collapsed.".into();
+            self.notice = crate::i18n::t("Tree search cleared; selected branch collapsed.").into();
         } else if !self.expanded.remove(&row.key) {
             self.expanded.insert(row.key);
         }
@@ -2258,8 +2374,10 @@ impl App {
     pub fn configure_startup(&mut self, cwd: PathBuf) {
         self.startup_cwd = Some(cwd);
         self.startup_pending = (0..self.engines.len()).collect();
-        self.notice =
-            "Matching the current directory to Compose projects… (--overview skips this)".into();
+        self.notice = crate::i18n::t(
+            "Matching the current directory to Compose projects… (--overview skips this)",
+        )
+        .into();
     }
 
     pub fn cancel_startup(&mut self) {
@@ -2274,6 +2392,7 @@ impl App {
         preferences: crate::preferences::Preferences,
         restore_navigation: bool,
     ) {
+        self.apply_saved_settings(preferences.settings);
         // Only validated provider/name metadata is retained; no endpoints or commands.
         if let Some(home) = std::env::var_os("HOME") {
             for saved in &preferences.runtimes {
@@ -2294,7 +2413,7 @@ impl App {
                     },
                     runtime: Some(saved.target.clone()),
                     snapshot: None,
-                    error: Some("Offline · waiting for runtime discovery".into()),
+                    error: Some(crate::i18n::t("Offline · waiting for runtime discovery").into()),
                     alias: None,
                     metrics: Default::default(),
                     metrics_revision: 0,
@@ -2352,6 +2471,7 @@ impl App {
         expanded.truncate(1024);
         crate::preferences::Preferences {
             version: 1,
+            settings: self.saved_settings,
             runtimes: self
                 .engines
                 .iter()
@@ -2502,19 +2622,21 @@ impl App {
 
     pub fn request_exec(&mut self) {
         if self.demo {
-            self.notice = "Exec is disabled in demo mode.".into();
+            self.notice = crate::i18n::t("Exec is disabled in demo mode.").into();
             return;
         }
         let Some(row) = self.current().cloned() else {
             return;
         };
         if !matches!(row.scope, Scope::Container(_) | Scope::Service { .. }) {
-            self.notice = "Select a container or service, then press e to exec.".into();
+            self.notice =
+                crate::i18n::t("Select a container or service, then press e to exec.").into();
             return;
         }
         let engine = &self.engines[row.engine];
         if engine.error.is_some() || engine.alias.is_some() {
-            self.notice = "Exec is unavailable on a disconnected or aliased engine.".into();
+            self.notice =
+                crate::i18n::t("Exec is unavailable on a disconnected or aliased engine.").into();
             return;
         }
         let containers: Vec<_> = self
@@ -2523,7 +2645,8 @@ impl App {
             .filter(|c| c.running() && !c.managed)
             .collect();
         if containers.is_empty() {
-            self.notice = "Exec requires a running, non-Kubernetes-managed container.".into();
+            self.notice =
+                crate::i18n::t("Exec requires a running, non-Kubernetes-managed container.").into();
         } else if containers.len() == 1 {
             self.exec_request = Some(crate::exec::Request {
                 connection: engine.connection.clone(),
@@ -2532,7 +2655,7 @@ impl App {
             });
         } else {
             self.picker = Some(Picker {
-                title: "Exec · Choose a running container".into(),
+                title: crate::i18n::t("Exec · Choose a running container").into(),
                 choices: containers
                     .into_iter()
                     .map(|container| Choice::Exec {
@@ -2574,8 +2697,10 @@ impl App {
                     self.detail_focus = true;
                     self.performance_focus = false;
                     self.exec_input = false;
-                    self.notice =
-                        format!("Selected Exec session #{id}; Enter resumes input if connected");
+                    self.notice = crate::tf!(
+                        "Selected Exec session #{id}; Enter resumes input if connected",
+                        id = id
+                    );
                 }
             }
             Choice::Action { action, row } => {
@@ -2588,13 +2713,16 @@ impl App {
                 self.context_sort = mode;
                 self.reorder_contexts();
                 self.refresh_tree();
-                self.notice = format!("Context order: {} · o to sort again", mode.label());
+                self.notice =
+                    crate::tf!("Context order: {a0} · o to sort again", a0 = mode.label());
             }
             Choice::Project(project) => self.open_project(project),
             Choice::Exec { engine, container } => {
                 if self.engines[engine].error.is_some() || self.engines[engine].alias.is_some() {
-                    self.notice =
-                        "Connection unavailable. Select a connected container and retry.".into();
+                    self.notice = crate::i18n::t(
+                        "Connection unavailable. Select a connected container and retry.",
+                    )
+                    .into();
                     return;
                 }
                 self.exec_request = Some(crate::exec::Request {
@@ -2609,7 +2737,7 @@ impl App {
     pub fn pick_context_sort(&mut self) {
         use crate::context_sort::ContextSort;
         self.picker = Some(Picker {
-            title: "Sort contexts · pins stay first".into(),
+            title: crate::i18n::t("Sort contexts · pins stay first").into(),
             choices: ContextSort::ALL
                 .into_iter()
                 .map(Choice::ContextSort)
@@ -2714,20 +2842,20 @@ fn engine_tree(index: usize, engine: &Engine) -> Node {
                 children.push(node(
                     index,
                     Scope::Namespace(namespace.clone()),
-                    format!("Namespace: {namespace}"),
+                    crate::tf!("Namespace: {namespace}", namespace = namespace),
                     workload_tree(index, snapshot, Some(namespace)),
                 ));
             }
         }
     }
     let status = if engine.alias.is_some() {
-        " [alias]"
+        crate::i18n::t(" [alias]")
     } else if engine.error.is_some() {
-        " (offline)"
+        crate::i18n::t(" (offline)")
     } else if engine.snapshot.is_some() {
         ""
     } else {
-        " [connecting]"
+        crate::i18n::t(" [connecting]")
     };
     node(
         index,
@@ -2766,7 +2894,7 @@ fn workload_tree(index: usize, snapshot: &Snapshot, namespace: Option<&String>) 
             .into_iter()
             .map(|(service, instances)| {
                 let running = instances.iter().filter(|c| c.running()).count();
-                let title = format!("{service} [{running}/{} running]", instances.len());
+                let title = group_title(service, running, instances.len());
                 node(
                     index,
                     Scope::Service {
@@ -2788,7 +2916,7 @@ fn workload_tree(index: usize, snapshot: &Snapshot, namespace: Option<&String>) 
                 namespace: namespace.cloned(),
                 project: project.clone(),
             },
-            format!("Services ({})", service_nodes.len()),
+            crate::tf!("Services ({a0})", a0 = service_nodes.len()),
             service_nodes,
         )];
         if namespace.is_none() {
@@ -2797,7 +2925,7 @@ fn workload_tree(index: usize, snapshot: &Snapshot, namespace: Option<&String>) 
         nodes.push(node(
             index,
             scope,
-            format!("{project} [{running}/{member_count} running]"),
+            group_title(project, running, member_count),
             project_nodes,
         ));
     }
@@ -2811,7 +2939,7 @@ fn workload_tree(index: usize, snapshot: &Snapshot, namespace: Option<&String>) 
         nodes.push(node(
             index,
             Scope::Standalone(namespace.cloned()),
-            format!("Standalone ({})", standalone.len()),
+            crate::tf!("Standalone ({a0})", a0 = standalone.len()),
             standalone,
         ));
     }
@@ -2823,8 +2951,16 @@ fn workload_tree(index: usize, snapshot: &Snapshot, namespace: Option<&String>) 
 
 fn resource_nodes(index: usize, snapshot: &Snapshot, project: Option<&String>) -> Vec<Node> {
     [
-        (ResourceKind::Network, "Networks", &snapshot.networks),
-        (ResourceKind::Volume, "Volumes", &snapshot.volumes),
+        (
+            ResourceKind::Network,
+            crate::i18n::t("Networks"),
+            &snapshot.networks,
+        ),
+        (
+            ResourceKind::Volume,
+            crate::i18n::t("Volumes"),
+            &snapshot.volumes,
+        ),
     ]
     .into_iter()
     .filter_map(|(kind, label, resources)| {
@@ -2857,7 +2993,7 @@ fn resource_nodes(index: usize, snapshot: &Snapshot, project: Option<&String>) -
                         if r.external
                             || project.is_some_and(|project| r.project.as_ref() != Some(project))
                         {
-                            " [shared/external]"
+                            crate::i18n::t(" [shared/external]")
                         } else {
                             ""
                         }
@@ -2877,7 +3013,11 @@ fn resource_nodes(index: usize, snapshot: &Snapshot, project: Option<&String>) -
                 },
                 format!(
                     "{}{} ({})",
-                    if project.is_none() { "Shared " } else { "" },
+                    if project.is_none() {
+                        crate::i18n::t("Shared ")
+                    } else {
+                        ""
+                    },
                     label,
                     children.len()
                 ),
@@ -2886,6 +3026,20 @@ fn resource_nodes(index: usize, snapshot: &Snapshot, project: Option<&String>) -
         }
     })
     .collect()
+}
+
+/// A count of zero running reads as if something were running, so a stopped group says so.
+fn group_title(name: &str, running: usize, total: usize) -> String {
+    if running == 0 && total > 0 {
+        crate::tf!("{name} [stopped]", name = name)
+    } else {
+        crate::tf!(
+            "{name} [{running}/{total} running]",
+            name = name,
+            running = running,
+            total = total
+        )
+    }
 }
 
 fn container_node(index: usize, c: &Container) -> Node {
@@ -2944,6 +3098,19 @@ fn flatten(
                 rows,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod group_title_tests {
+    use super::group_title;
+
+    #[test]
+    fn a_group_with_nothing_running_says_stopped_instead_of_a_zero_count() {
+        assert_eq!(group_title("db", 0, 1), "db [stopped]");
+        assert_eq!(group_title("db", 0, 3), "db [stopped]");
+        assert_eq!(group_title("shop", 4, 5), "shop [4/5 running]");
+        assert_eq!(group_title("shop", 5, 5), "shop [5/5 running]");
     }
 }
 
@@ -3798,7 +3965,7 @@ mod tests {
     fn runtime_is_parent_of_projects_and_vim_navigation_works() {
         let mut app = app();
         assert_eq!(app.rows[0].scope, Scope::Engine);
-        assert_eq!(app.rows[1].title, "shop [0/1 running]");
+        assert_eq!(app.rows[1].title, "shop [stopped]");
         app.move_selection(1);
         app.expand();
         app.move_selection(1);
@@ -4465,7 +4632,7 @@ mod tests {
         snapshot.namespaces = vec!["first".into(), "second".into()];
         app.update_engine(0, Ok(snapshot.clone()));
         let tree = engine_tree(0, &app.engines[0]);
-        assert_eq!(tree.children[0].children[0].row.title, "shop [0/1 running]");
+        assert_eq!(tree.children[0].children[0].row.title, "shop [stopped]");
         assert_eq!(tree.children[1].children[0].row.title, "shop [1/1 running]");
         app.selected = 1;
         app.expand();

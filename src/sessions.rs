@@ -30,7 +30,9 @@ impl Default for Sessions {
 impl Sessions {
     pub fn set_limit(&mut self, limit: usize) -> Result<()> {
         if !(1..=8).contains(&limit) || self.entries.len() > limit {
-            bail!("Exec session limit must be 1–8; close retained sessions before reducing it");
+            bail!(crate::i18n::t(
+                "Exec session limit must be 1–8; close retained sessions before reducing it"
+            ));
         }
         self.limit = limit;
         Ok(())
@@ -84,11 +86,11 @@ impl Sessions {
             return Ok(slot.id);
         }
         if self.entries.len() >= self.limit {
-            bail!(
-                "Exec session limit reached ({}/{} retained). Use F6 to select one and :close-exec to free a slot",
-                self.len(),
-                self.limit
-            );
+            bail!(crate::tf!(
+                "Exec session limit reached ({open}/{limit} retained). Use F6 to select one and :close-exec to free a slot",
+                open = self.len(),
+                limit = self.limit
+            ));
         }
         let command = crate::exec::prepare(&request)?;
         let session = Session::start(request, command, dimensions.0, dimensions.1)?;
@@ -99,7 +101,7 @@ impl Sessions {
         self.next_id = self
             .next_id
             .checked_add(1)
-            .context("Exec session IDs exhausted")?;
+            .context(crate::i18n::t("Exec session IDs exhausted"))?;
         self.entries.push(Slot { id, terminal });
         self.active = Some(id);
         Ok(id)

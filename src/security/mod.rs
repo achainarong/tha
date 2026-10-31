@@ -73,12 +73,15 @@ pub struct View {
 
 impl View {
     pub fn start(&mut self, total: usize) {
-        self.batch = format!("{total} image(s) queued; continues after image errors");
+        self.batch = crate::tf!(
+            "{total} image(s) queued; continues after image errors",
+            total = total
+        );
         self.completed = 0;
         self.failed = 0;
         self.busy = true;
         self.generation = self.generation.wrapping_add(1);
-        self.progress = "Starting security queue…".into();
+        self.progress = crate::i18n::t("Starting security queue…").into();
         self.scan_target = None;
         self.started = Some(std::time::Instant::now());
         self.queue_cancelled = false;
@@ -98,7 +101,10 @@ impl View {
         }
         self.state = match target.as_ref().map(store::load).transpose() {
             Ok(Some(Some(report))) => State::Ready(report),
-            Err(error) => State::Failed(format!("Cannot load saved report: {error:#}")),
+            Err(error) => State::Failed(crate::tf!(
+                "Cannot load saved report: {error}",
+                error = format!("{error:#}")
+            )),
             _ => State::Idle,
         };
         self.target = target;
@@ -114,13 +120,15 @@ impl View {
         if matches!(&event.result, Outcome::QueueDone) {
             self.busy = false;
             let status = if self.queue_cancelled {
-                "Queue cancelled"
+                crate::i18n::t("Queue cancelled")
             } else {
-                "Queue complete"
+                crate::i18n::t("Queue complete")
             };
-            self.batch = format!(
-                "{status} · {} completed · {} failed · completed reports saved to SQLite",
-                self.completed, self.failed
+            self.batch = crate::tf!(
+                "{status} · {completed} completed · {failed} failed · completed reports saved to SQLite",
+                status = status,
+                completed = self.completed,
+                failed = self.failed
             );
             return;
         }
@@ -142,7 +150,7 @@ impl View {
             }
             Outcome::Finished(Err(error)) => {
                 self.failed += 1;
-                self.progress = format!("Image scan failed: {error}");
+                self.progress = crate::tf!("Image scan failed: {error}", error = error);
                 // A failed rescan must not erase a previously completed report.
                 if selected && !matches!(self.state, State::Ready(_)) {
                     self.state = State::Failed(error);

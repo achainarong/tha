@@ -37,25 +37,29 @@ impl Action {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Update => "Compose update (pull, then up -d)",
-            Self::Pull => "Compose pull",
-            Self::Up => "Compose up -d",
-            Self::Recreate => "Compose up -d --force-recreate",
-            Self::Down => "Compose down (keeps volumes)",
+            Self::Update => crate::i18n::t("Compose update (pull, then up -d)"),
+            Self::Pull => crate::i18n::t("Compose pull"),
+            Self::Up => crate::i18n::t("Compose up -d"),
+            Self::Recreate => crate::i18n::t("Compose up -d --force-recreate"),
+            Self::Down => crate::i18n::t("Compose down (keeps volumes)"),
         }
     }
 
     pub fn effect(self) -> &'static str {
         match self {
-            Self::Update => {
-                "Downloads newer images, then recreates containers whose image or configuration changed."
+            Self::Update => crate::i18n::t(
+                "Downloads newer images, then recreates containers whose image or configuration changed.",
+            ),
+            Self::Pull => {
+                crate::i18n::t("Downloads newer images. Running containers are not changed.")
             }
-            Self::Pull => "Downloads newer images. Running containers are not changed.",
-            Self::Up => "Creates or recreates containers whose configuration changed.",
-            Self::Recreate => "Recreates every container, even if nothing changed.",
-            Self::Down => {
-                "Stops and removes the project's containers and networks. Volumes and images are kept."
+            Self::Up => {
+                crate::i18n::t("Creates or recreates containers whose configuration changed.")
             }
+            Self::Recreate => crate::i18n::t("Recreates every container, even if nothing changed."),
+            Self::Down => crate::i18n::t(
+                "Stops and removes the project's containers and networks. Volumes and images are kept.",
+            ),
         }
     }
 
@@ -101,41 +105,52 @@ impl Target {
                 project,
                 service,
             } => (project.clone(), Some(service.clone())),
-            _ => bail!("Select a Compose project or service"),
+            _ => bail!(crate::i18n::t("Select a Compose project or service")),
         };
         if !plain_name(&project) || service.as_deref().is_some_and(|name| !plain_name(name)) {
-            bail!("This Compose name cannot be safely used on a command line");
+            bail!(crate::i18n::t(
+                "This Compose name cannot be safely used on a command line"
+            ));
         }
         let members: Vec<_> = containers
             .iter()
             .filter(|container| container.project.as_deref() == Some(project.as_str()))
             .collect();
         let Some(first) = members.first() else {
-            bail!("No containers of this Compose project are available");
+            bail!(crate::i18n::t(
+                "No containers of this Compose project are available"
+            ));
         };
         if members.iter().any(|container| {
             container.compose_working_dir != first.compose_working_dir
                 || container.compose_config_files != first.compose_config_files
                 || container.compose_env_files != first.compose_env_files
         }) {
-            bail!("This project's containers came from different Compose configurations");
+            bail!(crate::i18n::t(
+                "This project's containers came from different Compose configurations"
+            ));
         }
         if members.iter().any(|container| container.managed) {
-            bail!("Kubernetes-managed containers cannot be changed");
+            bail!(crate::i18n::t(
+                "Kubernetes-managed containers cannot be changed"
+            ));
         }
-        let working_dir = first
-            .compose_working_dir
-            .clone()
-            .context("These containers have no Compose working directory label")?;
+        let working_dir = first.compose_working_dir.clone().context(crate::i18n::t(
+            "These containers have no Compose working directory label",
+        ))?;
         if first.compose_config_files.is_empty() {
-            bail!("These containers have no Compose file label");
+            bail!(crate::i18n::t(
+                "These containers have no Compose file label"
+            ));
         }
         for path in std::iter::once(&working_dir)
             .chain(&first.compose_config_files)
             .chain(&first.compose_env_files)
         {
             if !path.is_absolute() || safe_text(&path.to_string_lossy()) != path.to_string_lossy() {
-                bail!("Compose labels contain an unsafe path; nothing will run");
+                bail!(crate::i18n::t(
+                    "Compose labels contain an unsafe path; nothing will run"
+                ));
             }
         }
         Ok(Self {
@@ -217,11 +232,15 @@ impl Request {
         action: Action,
     ) -> Result<Self> {
         if connection.kind != BackendKind::Docker {
-            bail!("Compose actions support Docker and Podman API connections only");
+            bail!(crate::i18n::t(
+                "Compose actions support Docker and Podman API connections only"
+            ));
         }
         let target = Target::resolve(scope, containers)?;
         if action == Action::Down && target.service.is_some() {
-            bail!("Compose down applies to a whole project; select the project row");
+            bail!(crate::i18n::t(
+                "Compose down applies to a whole project; select the project row"
+            ));
         }
         let missing = target.missing_paths();
         if let Some(path) = missing.first() {
@@ -307,7 +326,9 @@ fn program(connection: &Connection) -> Result<std::process::Command> {
         command.env("DOCKER_HOST", format!("unix://{socket}"));
         return Ok(command);
     }
-    bail!("Install the Docker Compose plugin (docker compose) or docker-compose to use this")
+    bail!(crate::i18n::t(
+        "Install the Docker Compose plugin (docker compose) or docker-compose to use this"
+    ))
 }
 
 async fn run_step(request: &Request, step: &[&str], tx: &mpsc::Sender<Event>) -> Result<()> {
@@ -323,7 +344,7 @@ async fn run_step(request: &Request, step: &[&str], tx: &mpsc::Sender<Event>) ->
     let mut child = command
         .kill_on_drop(true)
         .spawn()
-        .context("Cannot start Compose")?;
+        .context(crate::i18n::t("Cannot start Compose"))?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let forward = |pipe: Box<dyn tokio::io::AsyncRead + Send + Unpin>| {

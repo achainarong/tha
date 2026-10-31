@@ -84,6 +84,7 @@ impl Event {
             "destroy" => "removed",
             other => other,
         };
+        let action = crate::i18n::dynamic(action);
         if self.detail.is_empty() {
             action.to_owned()
         } else {

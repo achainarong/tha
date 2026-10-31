@@ -24,36 +24,42 @@ fn draw_confirmation(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Line::from(request.action.effect()),
-        Line::from(format!("Runtime: {}", safe_text(&request.connection.name))),
-        Line::from(format!("Directory: {}", path(&target.working_dir))),
+        Line::from(crate::tf!(
+            "Runtime: {a0}",
+            a0 = safe_text(&request.connection.name)
+        )),
+        Line::from(crate::tf!(
+            "Directory: {a0}",
+            a0 = path(&target.working_dir)
+        )),
     ];
     lines.extend(
         target
             .files
             .iter()
-            .map(|file| Line::from(format!("File: {}", path(file)))),
+            .map(|file| Line::from(crate::tf!("File: {a0}", a0 = path(file)))),
     );
     lines.extend(
         target
             .env_files
             .iter()
-            .map(|file| Line::from(format!("Env file: {}", path(file)))),
+            .map(|file| Line::from(crate::tf!("Env file: {a0}", a0 = path(file)))),
     );
     lines.push(Line::styled(
-        "These paths come from container labels and Compose runs what they contain. Check them.",
+        crate::i18n::t("These paths come from container labels and Compose runs what they contain. Check them."),
         accent(app, Color::Yellow),
     ));
     lines.push(Line::from(""));
     let hint = if request.action.requires_typing() {
-        lines.push(Line::from(format!(
-            "Type {} to confirm: {}▏",
-            target.project,
-            safe_text(&confirmation.typed)
+        lines.push(Line::from(crate::tf!(
+            "Type {a0} to confirm: {a1}▏",
+            a0 = target.project,
+            a1 = safe_text(&confirmation.typed)
         )));
-        " Enter Confirm · Esc Cancel "
+        crate::i18n::t(" Enter Confirm · Esc Cancel ")
     } else {
-        lines.push(Line::from("Run this now?"));
-        " y/Enter Run · n/Esc Cancel "
+        lines.push(Line::from(crate::i18n::t("Run this now?")));
+        crate::i18n::t(" y/Enter Run · n/Esc Cancel ")
     };
     if let Some(error) = &confirmation.error {
         lines.push(Line::styled(error.clone(), accent(app, Color::Red)));
@@ -61,7 +67,7 @@ fn draw_confirmation(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::bordered()
-                .title(" Compose ")
+                .title(crate::i18n::t(" Compose "))
                 .title_bottom(hint)
                 .border_style(accent(app, Color::Yellow)),
         ),
@@ -76,13 +82,24 @@ fn draw_output(frame: &mut Frame, app: &mut App, area: Rect) {
     let dialog = centered(area, 110, area.height.saturating_sub(2).min(30));
     frame.render_widget(Clear, dialog);
     let (status, style) = match &job.outcome {
-        None => ("Running…".to_owned(), accent(app, Color::Cyan)),
-        Some(Ok(())) => ("Finished".to_owned(), accent(app, Color::Green)),
-        Some(Err(error)) => (format!("Failed: {error}"), accent(app, Color::Red)),
+        None => (
+            crate::i18n::t("Running…").to_owned(),
+            accent(app, Color::Cyan),
+        ),
+        Some(Ok(())) => (
+            crate::i18n::t("Finished").to_owned(),
+            accent(app, Color::Green),
+        ),
+        Some(Err(error)) => (
+            crate::tf!("Failed: {error}", error = error),
+            accent(app, Color::Red),
+        ),
     };
     let block = Block::bordered()
         .title(format!(" {} ", safe_text(&job.title)))
-        .title_bottom(" j/k Scroll · G Latest · Esc Close; a running operation continues ");
+        .title_bottom(crate::i18n::t(
+            " j/k Scroll · G Latest · Esc Close; a running operation continues ",
+        ));
     let inner = block.inner(dialog);
     frame.render_widget(block, dialog);
     if inner.height < 2 {
