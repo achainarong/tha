@@ -335,13 +335,14 @@ your navigation. Demo mode never auto-opens a project.
 | `j` / `k`, up / down | Move or scroll the focused pane |
 | `h` / `l`, left / right | Collapse/parent or expand/child in the tree; previous/next tab in focused details; horizontal scroll in unwrapped logs; pan in Metrics |
 | `H` / `L` | Previous/next tab from any focused detail tab, including Metrics and unwrapped logs |
-| Mouse | Click selects and focuses, click again opens like `Enter`; click an arrow to expand or collapse; click tabs and overviews; wheel scrolls the pane under the pointer; drag the log scrollbar. Confirmations stay keyboard-only. Hold Shift to select terminal text, or set `mouse = false` |
+| Mouse | Click selects and focuses, click again opens like `Enter`; click an arrow to expand or collapse; click tabs and overviews; wheel scrolls the pane under the pointer; drag the log scrollbar; right-click goes back like `Esc`. Confirmations stay keyboard-only. Hold Shift to select terminal text, or set `mouse = false` |
 | `Space` | Toggle the selected explorer branch open or closed |
 | `Enter` | Enter a Compose workspace; otherwise open details; on a focused Networks row, select that container in the Explorer |
 | `Backspace` | Return to the previous workspace |
 | `gg` / `G` | First / last; `G` resumes log following |
 | `Ctrl-u` / `Ctrl-d` | Half-page up / down |
 | `Tab` / `Shift-Tab` | Cycle Explorer / Performance (when open) / Details |
+| `z` | Expand/restore the focused pane to full width: Explorer, detail tab, or inventory view; `Esc` also restores |
 | `p` / `:performance` | Expand/collapse bottom-left global Performance |
 | `P` (Shift-p) | Switch Runtime / Selected container Performance; open panel |
 | `z` (Performance focused) | Toggle compact / full-width bottom Performance |

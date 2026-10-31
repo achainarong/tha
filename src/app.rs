@@ -313,6 +313,7 @@ pub struct App {
     pub tree_offset: usize,
     pub detail_focus: bool,
     pub detail_zoom: Option<Tab>,
+    pub explorer_zoom: bool,
     pub performance_open: bool,
     pub performance_scope: PerformanceScope,
     pub performance_expanded: bool,
@@ -433,6 +434,7 @@ impl App {
             tree_offset: 0,
             detail_focus: false,
             detail_zoom: None,
+            explorer_zoom: false,
             performance_open: false,
             performance_scope: PerformanceScope::Runtime,
             performance_expanded: false,
@@ -2109,6 +2111,14 @@ impl App {
             .rev()
             .find(|(area, _)| area.contains(position))
             .map(|(_, target)| *target)
+    }
+
+    /// Explorer zoom only shows while the Explorer has focus, like detail zoom on the other side.
+    pub fn explorer_zoomed(&self) -> bool {
+        self.explorer_zoom
+            && self.overview_mode == OverviewMode::Containers
+            && !self.detail_focus
+            && !self.performance_focus
     }
 
     /// The Networks tab falls back to plain scrolling when it has no rows to select.

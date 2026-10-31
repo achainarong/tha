@@ -612,7 +612,7 @@ pub fn navigate(app: &mut App, code: KeyCode, height: usize) {
             KeyCode::Char('M') if key.1 == OverviewMode::Images && app.security.enabled => {
                 view.scan_marked = rows.iter().map(|row| row.key.clone()).collect();
             }
-            KeyCode::Char(' ') if !view.details => {
+            KeyCode::Char(' ') => {
                 if let Some(row) = rows.get(view.index) {
                     if row.status == "unreferenced"
                         && !(key.1 == OverviewMode::Volumes && view.filter == 5)
@@ -625,7 +625,7 @@ pub fn navigate(app: &mut App, code: KeyCode, height: usize) {
                     }
                 }
             }
-            KeyCode::Char('u') if !view.details => {
+            KeyCode::Char('u') => {
                 view.marked = rows
                     .iter()
                     .filter(|row| {
@@ -635,7 +635,7 @@ pub fn navigate(app: &mut App, code: KeyCode, height: usize) {
                     .map(|row| row.key.clone())
                     .collect()
             }
-            KeyCode::Char('c') if !view.details => {
+            KeyCode::Char('c') => {
                 view.marked.clear();
                 view.scan_marked.clear();
             }
@@ -1360,6 +1360,20 @@ mod tests {
         );
         navigate(&mut app, KeyCode::Char('u'), 25);
         assert_eq!(app.inventory_views[&key].marked.len(), 2);
+        let view = app.inventory_views.get_mut(&key).unwrap();
+        view.details = true;
+        view.index = usize::MAX;
+        view.selected = None;
+        navigate(&mut app, KeyCode::Char(' '), 25);
+        assert_eq!(
+            app.inventory_views[&key].marked.len(),
+            1,
+            "Space toggles the row while Details is open"
+        );
+        navigate(&mut app, KeyCode::Char(' '), 25);
+        assert_eq!(app.inventory_views[&key].marked.len(), 2);
+        assert!(app.inventory_views[&key].details);
+        app.inventory_views.get_mut(&key).unwrap().details = false;
         navigate(&mut app, KeyCode::Char('c'), 25);
         app.inventory_views.get_mut(&key).unwrap().query = "old_cache".into();
         navigate(&mut app, KeyCode::Char('u'), 25);

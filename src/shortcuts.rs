@@ -149,7 +149,6 @@ pub enum Scope {
     Logs,
     Metrics,
     Inventory,
-    InventoryList,
     Images,
     Security,
     SecurityImages,
@@ -186,7 +185,6 @@ impl Scope {
             Self::Logs => context == C::Logs,
             Self::Metrics => context == C::Metrics,
             Self::Inventory => context.inventory(),
-            Self::InventoryList => matches!(context, C::Images | C::Volumes),
             Self::Images => matches!(context, C::Images | C::ImageDetails | C::SecurityImages),
             Self::Security => matches!(
                 context,
@@ -196,7 +194,8 @@ impl Scope {
             Self::Zoom => {
                 matches!(
                     context,
-                    C::Performance
+                    C::Explorer
+                        | C::Performance
                         | C::Overview
                         | C::Logs
                         | C::Networks
@@ -341,9 +340,9 @@ catalog! {
     MetricsRight, "Pan / inspect later metrics", [], Metrics, 25, false, ["l"], ["right"];
     MetricsCursor, "Toggle metrics cursor", [], Metrics, 15, false, ["c"], [];
     MetricsLive, "Live metrics", [], Metrics, 15, false, ["f"], [];
-    Mark, "Mark unused resource for cleanup", [], InventoryList, 7, false, ["space"], [];
-    MarkUnused, "Mark visible unused resources", [], InventoryList, 15, false, ["u"], [];
-    ClearMarks, "Clear resource and scan marks", [], InventoryList, 15, false, ["c"], [];
+    Mark, "Mark unused resource for cleanup", [], Inventory, 7, false, ["space"], [];
+    MarkUnused, "Mark visible unused resources", [], Inventory, 15, false, ["u"], [];
+    ClearMarks, "Clear resource and scan marks", [], Inventory, 15, false, ["c"], [];
     RemoveResources, "Delete unused resources (confirmation required)", [], Inventory, 10, false, ["d"], ["delete"];
     PruneResources, "Prune all unreferenced resources (confirmation required)", ["prune"], Inventory, 11, false, ["p"], [];
     InventoryFilter, "Filter inventory", [], Inventory, 8, false, ["f"], [];
@@ -702,6 +701,25 @@ mod tests {
                 .filter(|(_, info, _)| info.scope.includes(context))
             {
                 assert!(keys.insert(*key), "{context:?}: {} ({:?})", key, info.id);
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_marks_work_with_the_details_panel_open() {
+        for context in [
+            NavigationContext::Images,
+            NavigationContext::ImageDetails,
+            NavigationContext::Volumes,
+            NavigationContext::VolumeDetails,
+        ] {
+            for (key, action) in [
+                ("space", ActionId::Mark),
+                ("u", ActionId::MarkUnused),
+                ("c", ActionId::ClearMarks),
+            ] {
+                let event: KeyEvent = key.parse::<KeyCombination>().unwrap().into();
+                assert_eq!(default_action(context, event, true), Some(action));
             }
         }
     }

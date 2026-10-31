@@ -2002,7 +2002,9 @@ fn dispatch_navigation(
             app.request_action(action.lifecycle().expect("lifecycle action"))
         }
         A::Back => {
-            if app.detail_zoom == Some(app.tab) {
+            if app.explorer_zoomed() {
+                app.explorer_zoom = false;
+            } else if app.detail_zoom == Some(app.tab) {
                 app.detail_zoom = None;
             } else if app.tab == Tab::History && app.history_view.expanded {
                 app.history_view.expanded = false;
@@ -2015,7 +2017,9 @@ fn dispatch_navigation(
             }
         }
         A::Escape => {
-            if app.detail_zoom == Some(app.tab) {
+            if app.explorer_zoomed() {
+                app.explorer_zoom = false;
+            } else if app.detail_zoom == Some(app.tab) {
                 app.detail_zoom = None;
             } else if app.tab == Tab::History && app.history_view.expanded {
                 app.history_view.expanded = false;
@@ -2053,6 +2057,7 @@ fn dispatch_navigation(
                 Some(app.tab)
             };
         }
+        A::Zoom => app.explorer_zoom = !app.explorer_zoom,
         A::SortContexts => app.pick_context_sort(),
         A::ExecSessions => app.pick_sessions(),
         A::Actions => app.open_actions(),
@@ -2295,7 +2300,7 @@ fn handle_mouse(
             }
             return false;
         }
-        MouseEventKind::Down(MouseButton::Left)
+        MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
         | MouseEventKind::ScrollUp
         | MouseEventKind::ScrollDown => {}
         _ => return false,
@@ -2311,6 +2316,13 @@ fn handle_mouse(
     {
         return false;
     }
+    let back = mouse.kind == MouseEventKind::Down(MouseButton::Right);
+    if back && app.exec_input {
+        // Esc belongs to the shell, so this matches Ctrl-] instead.
+        app.exec_input = false;
+        app.detail_focus = false;
+        return false;
+    }
     let target = app.mouse_target(mouse.column, mouse.row);
     let wheel = match mouse.kind {
         MouseEventKind::ScrollUp => Some(KeyCode::Up),
@@ -2323,6 +2335,9 @@ fn handle_mouse(
         || app.action_results_visible
         || app.compose_output_visible
     {
+        if back {
+            return handle_key(app, KeyEvent::from(KeyCode::Esc), height, refresh);
+        }
         if let Some(code) = wheel {
             return handle_key(app, KeyEvent::from(code), height, refresh);
         }
@@ -2336,6 +2351,10 @@ fn handle_mouse(
             }
         }
         return false;
+    }
+    if back {
+        let esc = KeyEvent::from(KeyCode::Esc);
+        return dispatch_navigation(app, A::Escape, esc, height, refresh);
     }
     let Some(target) = target else {
         return false;
@@ -4883,6 +4902,109 @@ mod tests {
             &refresh,
         );
         assert_eq!(app.selected, selected);
+    }
+
+    #[tokio::test]
+    async fn zoom_works_on_the_explorer_side_too() {
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.selected = row_named(&app, "shop-api-2");
+        let press = |app: &mut App, code| {
+            handle_key(app, KeyEvent::from(code), 20, &refresh);
+        };
+        let explorer_width = |app: &mut App| {
+            draw_at(app, 200, 40);
+            app.mouse_regions
+                .iter()
+                .find(|(_, target)| *target == MouseTarget::Explorer)
+                .map(|(area, _)| area.width)
+        };
+        let normal = explorer_width(&mut app).unwrap();
+        assert!(normal < 200);
+        assert!(
+            app.mouse_regions
+                .iter()
+                .any(|(_, target)| *target == MouseTarget::Details)
+        );
+
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(explorer_width(&mut app), Some(200));
+        assert!(
+            !app.mouse_regions
+                .iter()
+                .any(|(_, target)| *target == MouseTarget::Details)
+        );
+
+        // Moving to the other pane leaves this zoom behind until focus returns.
+        press(&mut app, KeyCode::Tab);
+        assert!(app.detail_focus);
+        assert_eq!(explorer_width(&mut app), Some(normal));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(explorer_width(&mut app), Some(200));
+
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.explorer_zoom);
+        assert_eq!(explorer_width(&mut app), Some(normal));
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.explorer_zoom, "q restores before it can quit");
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Char('z'));
+        assert!(!app.explorer_zoom);
+    }
+
+    #[tokio::test]
+    async fn right_click_goes_back_like_esc_without_touching_confirmations() {
+        let right = MouseEventKind::Down(MouseButton::Right);
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+
+        app.overview_mode = OverviewMode::Security;
+        app.security.enabled = true;
+        app.security.expanded = true;
+        app.detail_focus = true;
+        mouse_at(&mut app, right, 0, 0, &refresh);
+        assert!(!app.security.expanded, "closes an open advisory first");
+        assert_eq!(app.overview_mode, OverviewMode::Security);
+        assert!(app.detail_focus);
+        mouse_at(&mut app, right, 0, 0, &refresh);
+        assert!(!app.detail_focus, "then returns to the image list");
+
+        app.overview_mode = OverviewMode::Containers;
+        app.tab = Tab::Logs;
+        app.detail_focus = true;
+        mouse_at(&mut app, right, 0, 0, &refresh);
+        assert!(!app.detail_focus);
+        assert!(
+            !handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: right,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                20,
+                &refresh,
+            ),
+            "never quits from home"
+        );
+
+        app.help = true;
+        mouse_at(&mut app, right, 0, 0, &refresh);
+        assert!(!app.help);
+
+        app.exec_input = true;
+        app.tab = Tab::Exec;
+        app.detail_focus = true;
+        mouse_at(&mut app, right, 0, 0, &refresh);
+        assert!(!app.exec_input);
+        assert!(!app.detail_focus);
+
+        app.input_mode = InputMode::Search;
+        app.detail_focus = true;
+        mouse_at(&mut app, right, 0, 0, &refresh);
+        assert!(app.detail_focus, "typing ignores the mouse");
     }
 
     #[tokio::test]

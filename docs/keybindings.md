@@ -67,7 +67,7 @@ configured keys take precedence.
 | `previous-view`, `next-view` | Cycle top-level overviews |
 | `containers-view`, `images-view`, `volumes-view`, `security-view` | Open a top-level overview |
 | `overview`, `logs`, `networks`, `exec`, `metrics`, `layers`, `security`, `events` | Select an inner workload tab; `exec` selects navigation, not shell input |
-| `zoom` | Expand/restore the focused detail tab, Performance, or inventory view |
+| `zoom` | Expand/restore the focused Explorer, detail tab, Performance, or inventory view |
 | `toggle-branch` | Toggle an Explorer branch |
 | `next-match`, `previous-match` | Navigate tree/log search matches |
 | `workspace-back`, `all-runtimes` | Return one workspace or all the way to runtime home |

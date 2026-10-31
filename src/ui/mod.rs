@@ -330,7 +330,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         && app.detail_focus
         && !app.performance_focus
         && app.detail_zoom == Some(app.tab);
+    let explorer_zoom = app.explorer_zoomed();
     let expanded = app.overview_mode == OverviewMode::Containers
+        && !explorer_zoom
         && !history_zoom
         && !security_zoom
         && !detail_zoom
@@ -352,6 +354,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         security::draw_overview(frame, app, body);
     } else if app.overview_mode != OverviewMode::Containers {
         inventory::draw_overview(frame, app, body);
+    } else if explorer_zoom {
+        draw_tree(frame, app, body);
     } else if security_zoom {
         security::draw(frame, app, body);
     } else if history_zoom {
@@ -2677,7 +2681,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         } else if app.detail_focus && app.tab == Tab::Logs {
             "? Keys  F3 Filter  :logs-since  J JSON  w Wrap  / Search  n/N Match  j/k Scroll  f Follow  Tab Explorer"
         } else {
-            "Ctrl+←/→ Overview  ? Keys  a Actions  p Performance  Enter Open  e Exec  Tab Pane  1..8 Details  : Commands"
+            "Ctrl+←/→ Overview  ? Keys  a Actions  p Performance  Enter Open  e Exec  Tab Pane  z Zoom  1..8 Details  : Commands"
         };
         vec![Line::styled(hints, muted()), Line::from(safe_text(notice))]
     };
@@ -2777,7 +2781,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         "/                 Search; Enter applies, Esc cancels input\n",
         "n / N             Next / previous highlighted occurrence\n",
         "f                 Toggle follow; scrolling pauses it\n",
-        "Mouse             Click selects, click again opens; wheel scrolls; drag log scrollbar\n",
+        "Mouse             Click selects, click again opens; right-click back; wheel scrolls; drag log scrollbar\n",
         "                  Scrollbar + Rows readout track wrapped display lines\n",
         "Esc               Clear highlights without hiding log context\n",
         "\nSecurity (optional module)\n",
