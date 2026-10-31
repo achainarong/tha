@@ -74,10 +74,16 @@ def main():
         keys(b":logs\r")
         expect("Wrap: on")
         keys(b"\x1b[13~")  # F3
-        expect("Filter retained logs")
+        expect("Filter retained logs · Text")
+        keys(b"retry UPSTREAM\r")  # Every word, in any order, ignoring case.
+        expect("Filter: retry UPSTREAM")
+        expect('"level":"warn"')
+        keys(b"\x1b[13~")
+        keys(b"\t")  # Tab reaches the JSON filter, which combines with the text.
+        expect("Filter retained logs · Advanced JSON")
         keys(b"\x15")  # Ctrl-u clears the initial {}.
         keys(b'\x1b[200~{"min_level":"warn"}\x1b[201~\r')
-        expect("Filter: on")
+        expect("Filter: retry UPSTREAM + advanced")
         expect('"level":"warn"')
         destination = directory / "filtered.jsonl"
         keys(b":export-logs\r")
