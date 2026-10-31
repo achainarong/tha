@@ -1,7 +1,7 @@
 use crate::{
     app::{
-        App, Choice, InputMode, NetworkTarget, OverviewMode, PerformanceScope, ResourceKind, Scope,
-        Tab,
+        App, Choice, InputMode, MouseTarget, NetworkTarget, OverviewMode, PerformanceScope,
+        ResourceKind, Scope, Tab,
     },
     config::BackendKind,
     logs::view::{self as log_view, Field},
@@ -195,7 +195,22 @@ fn condition_style(app: &App, condition: Condition) -> Style {
     }
 }
 
+/// Cell ranges of `Tabs` titles: one space of padding each side and a one-cell divider.
+fn tab_regions(area: Rect, titles: &[&str]) -> Vec<Rect> {
+    let mut x = area.x;
+    titles
+        .iter()
+        .map(|title| {
+            let width = title.width() as u16 + 2;
+            let region = Rect::new(x, area.y, width, 1).intersection(area);
+            x = x.saturating_add(width + 1);
+            region
+        })
+        .collect()
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.mouse_regions.clear();
     app.reconcile_detail_tab();
     app.action_review_visible = false;
     if let Some(removal) = app.inventory_removal.as_mut() {
@@ -230,6 +245,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             engine.snapshot.is_some() && engine.error.is_none() && engine.alias.is_none()
         })
         .count();
+    let mut overview_x = layout[0].x + if app.demo { 15 } else { 8 };
+    for (mode, label, available) in [
+        (OverviewMode::Containers, "Containers", true),
+        (OverviewMode::Images, "Images", true),
+        (OverviewMode::Volumes, "Volumes", true),
+        (OverviewMode::Security, "Security", app.security.enabled),
+    ] {
+        if !available || layout[0].height == 0 {
+            continue;
+        }
+        let width = label.width() as u16 + if app.overview_mode == mode { 2 } else { 0 };
+        app.mouse_regions.push((
+            Rect::new(overview_x, layout[0].y, width, 1).intersection(layout[0]),
+            MouseTarget::Overview(mode),
+        ));
+        overview_x += width + 3;
+    }
     let header = Line::from(vec![
         Span::styled(" ⊤ Tha ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(if app.demo { " Demo · " } else { " " }),
@@ -715,6 +747,8 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(height)]).split(area);
     draw_tree(frame, app, parts[0]);
     if height == 1 {
+        app.mouse_regions
+            .push((parts[1], MouseTarget::CollapsedPerformance));
         frame.render_widget(
             Paragraph::new(if app.performance_scope == PerformanceScope::Container {
                 " ▸ Performance · Selected container (p/P)"
@@ -746,6 +780,7 @@ fn draw_performance_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     .title_bottom(" j/k Select · Enter Inspect · z Zoom · p Close ");
     let inner = padded(block.inner(area));
     frame.render_widget(block, area);
+    app.mouse_regions.push((area, MouseTarget::Performance));
     if app.performance_scope == PerformanceScope::Container {
         if let Some((index, _)) = app.performance_container() {
             draw_performance_history(frame, app, index, inner);
@@ -798,6 +833,17 @@ fn draw_performance_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             .take(capacity)
             .enumerate()
         {
+            if let Some(position) = engines.iter().position(|&engine| engine == other) {
+                app.mouse_regions.push((
+                    Rect::new(
+                        inner.x,
+                        inner.y + graph_height + offset as u16,
+                        inner.width,
+                        1,
+                    ),
+                    MouseTarget::PerformanceEngine(position),
+                ));
+            }
             draw_usage(
                 frame,
                 app,
@@ -823,10 +869,19 @@ fn draw_performance_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         app.performance_offset = app.performance_scroll + 1 - capacity;
     }
     let mut y = inner.y;
-    for &index in engines.iter().skip(app.performance_offset).take(capacity) {
+    for (position, &index) in engines
+        .iter()
+        .enumerate()
+        .skip(app.performance_offset)
+        .take(capacity)
+    {
         if y + item_height > inner.bottom() {
             break;
         }
+        app.mouse_regions.push((
+            Rect::new(inner.x, y, inner.width, item_height),
+            MouseTarget::PerformanceEngine(position),
+        ));
         draw_usage(
             frame,
             app,
@@ -897,6 +952,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     let inner = padded(block.inner(area));
     frame.render_widget(block, area);
+    app.mouse_regions.push((area, MouseTarget::Explorer));
     let show_metrics = inner.width >= 44;
     // Match the table's fixed metric columns (9 + 11 cells) and two 1-cell gaps.
     let workload_width = if show_metrics {
@@ -997,6 +1053,27 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
             TableRow::new(cells).style(style)
         })
         .collect();
+    let first_row = inner.y + u16::from(show_metrics);
+    for (offset, row) in app
+        .rows
+        .iter()
+        .skip(app.tree_offset)
+        .take(height)
+        .enumerate()
+    {
+        let index = app.tree_offset + offset;
+        let y = first_row + offset as u16;
+        app.mouse_regions.push((
+            Rect::new(inner.x, y, workload_width, 1),
+            MouseTarget::TreeRow(index),
+        ));
+        if row.branch {
+            app.mouse_regions.push((
+                Rect::new(inner.x + row.depth as u16 * 2, y, 2, 1).intersection(inner),
+                MouseTarget::TreeArrow(index),
+            ));
+        }
+    }
     if app.rows.is_empty() {
         frame.render_widget(
             Paragraph::new("No matching workloads. Esc clears search."),
@@ -1057,6 +1134,7 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = pane(app, format!(" {label}{exec_context} "), app.detail_focus);
     let inner = padded(block.inner(area));
     frame.render_widget(block, area);
+    app.mouse_regions.push((area, MouseTarget::Details));
     if inner.height < 3 || inner.width < 2 || app.tab == Tab::Exec && inner.height < 4 {
         return;
     }
@@ -1073,23 +1151,33 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         (vec!["1", "2", "3"], "4")
     };
+    let mut bar_tabs = vec![Tab::Overview, Tab::Logs, Tab::Networks];
     let exec_index = names.len();
     if app.exec_tab_available() {
         names.push(exec_name);
+        bar_tabs.push(Tab::Exec);
     }
+    bar_tabs.push(Tab::Events);
     names.push(if inner.width >= 56 { "5 Events" } else { "5" });
     let events_index = names.len() - 1;
     let metrics_index = names.len();
     if app.performance_container().is_some() {
         names.push(if inner.width >= 44 { "6 Metrics" } else { "6" });
+        bar_tabs.push(Tab::History);
     }
     let layers_index = names.len();
     if app.layers_available() {
         names.push(if inner.width >= 44 { "7 Layers" } else { "7" });
+        bar_tabs.push(Tab::Layers);
     }
     let security_index = names.len();
     if app.security_tab_available() {
         names.push(if inner.width >= 44 { "8 Security" } else { "8" });
+        bar_tabs.push(Tab::Security);
+    }
+    for (region, tab) in tab_regions(sections[0], &names).into_iter().zip(bar_tabs) {
+        app.mouse_regions
+            .push((region, MouseTarget::DetailTab(tab)));
     }
     let active = match app.tab {
         Tab::Overview => 0,
@@ -1278,6 +1366,15 @@ fn draw_layers(frame: &mut Frame, app: &mut App, area: Rect) {
             &mut state,
         );
         app.layers.offset = state.offset();
+        for offset in 0..parts[2].height.saturating_sub(1) {
+            let index = app.layers.offset + offset as usize;
+            if index < image.rows() {
+                app.mouse_regions.push((
+                    Rect::new(parts[2].x, parts[2].y + 1 + offset, parts[2].width, 1),
+                    MouseTarget::LayerRow(index),
+                ));
+            }
+        }
         frame.render_widget(
             Paragraph::new("j/k Select · Enter Details · :reload-layers Retry").style(muted()),
             parts[3],
@@ -2099,15 +2196,28 @@ fn draw_networks(frame: &mut Frame, app: &mut App, area: Rect) {
         .detail_focus
         .then(|| targets.get(app.network_cursor))
         .flatten();
-    if let Some(target) = cursor {
-        // Wrapped rows take several terminal lines, so measure before scrolling to the cursor.
-        let rows = |line: &Line<'static>| {
-            Paragraph::new(line.clone())
+    // Wrapped rows take several terminal lines, so measure before placing the cursor and clicks.
+    let tops: Vec<usize> = lines
+        .iter()
+        .scan(0, |top, line| {
+            let current = *top;
+            *top += Paragraph::new(line.clone())
                 .wrap(Wrap { trim: false })
-                .line_count(area.width)
-        };
-        let top: usize = lines[..target.line].iter().map(rows).sum();
-        let bottom = top + rows(&lines[target.line]);
+                .line_count(area.width);
+            Some(current)
+        })
+        .collect();
+    let total_rows = Paragraph::new(lines.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(area.width);
+    let bounds = |line: usize| {
+        (
+            tops[line],
+            tops.get(line + 1).copied().unwrap_or(total_rows),
+        )
+    };
+    if let Some(target) = cursor {
+        let (top, bottom) = bounds(target.line);
         if app.network_cursor == 0 {
             app.detail_scroll = 0;
         } else if top < app.detail_scroll {
@@ -2117,12 +2227,22 @@ fn draw_networks(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         lines[target.line] = lines[target.line].clone().patch_style(selected());
     }
-    app.network_targets = targets;
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let maximum = paragraph
-        .line_count(area.width)
-        .saturating_sub(area.height as usize);
+    let maximum = total_rows.saturating_sub(area.height as usize);
     app.detail_scroll = app.detail_scroll.min(maximum).min(u16::MAX as usize);
+    for (index, target) in targets.iter().enumerate() {
+        let (top, bottom) = bounds(target.line);
+        for row in top.max(app.detail_scroll)..bottom {
+            let y = row - app.detail_scroll;
+            if y < area.height as usize {
+                app.mouse_regions.push((
+                    Rect::new(area.x, area.y + y as u16, area.width, 1),
+                    MouseTarget::NetworkRow(index),
+                ));
+            }
+        }
+    }
+    app.network_targets = targets;
     frame.render_widget(paragraph.scroll((app.detail_scroll as u16, 0)), area);
 }
 
@@ -2364,6 +2484,15 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
         ]),
         areas[0],
     );
+    app.mouse_regions.push((
+        Rect::new(
+            areas[1].right().saturating_sub(1),
+            areas[1].y,
+            1,
+            areas[1].height,
+        ),
+        MouseTarget::LogScrollbar,
+    ));
     let mut scrollbar = ScrollbarState::new(total)
         .position(start)
         .viewport_content_length(areas[1].height as usize);
@@ -2648,6 +2777,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
         "/                 Search; Enter applies, Esc cancels input\n",
         "n / N             Next / previous highlighted occurrence\n",
         "f                 Toggle follow; scrolling pauses it\n",
+        "Mouse             Click selects, click again opens; wheel scrolls; drag log scrollbar\n",
         "                  Scrollbar + Rows readout track wrapped display lines\n",
         "Esc               Clear highlights without hiding log context\n",
         "\nSecurity (optional module)\n",
@@ -2738,7 +2868,7 @@ fn draw_palette(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_picker(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(picker) = &app.picker else {
         return;
     };
@@ -2781,6 +2911,15 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     let start = picker
         .selected
         .saturating_sub(inner.height.saturating_sub(1) as usize);
+    for offset in 0..inner.height {
+        let index = start + offset as usize;
+        if index < picker.choices.len() {
+            app.mouse_regions.push((
+                Rect::new(inner.x, inner.y + offset, inner.width, 1),
+                MouseTarget::PickerRow(index),
+            ));
+        }
+    }
     let lines: Vec<_> = picker
         .choices
         .iter()

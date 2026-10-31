@@ -335,6 +335,7 @@ your navigation. Demo mode never auto-opens a project.
 | `j` / `k`, up / down | Move or scroll the focused pane |
 | `h` / `l`, left / right | Collapse/parent or expand/child in the tree; previous/next tab in focused details; horizontal scroll in unwrapped logs; pan in Metrics |
 | `H` / `L` | Previous/next tab from any focused detail tab, including Metrics and unwrapped logs |
+| Mouse | Click selects and focuses, click again opens like `Enter`; click an arrow to expand or collapse; click tabs and overviews; wheel scrolls the pane under the pointer; drag the log scrollbar. Confirmations stay keyboard-only. Hold Shift to select terminal text, or set `mouse = false` |
 | `Space` | Toggle the selected explorer branch open or closed |
 | `Enter` | Enter a Compose workspace; otherwise open details; on a focused Networks row, select that container in the Explorer |
 | `Backspace` | Return to the previous workspace |
@@ -460,7 +461,8 @@ The right-edge scrollbar and **Rows first–last / total** readout show your
 position in retained history. With wrapping on, these are displayed rows rather
 than container log records. With wrapping off, each entry occupies one row.
 Follow keeps the thumb at the bottom; pausing, searching, and resizing update
-its position. This is a keyboard-driven indicator, not a mouse-drag scrollbar.
+its position. Click or drag it to jump, or click its arrows to move one row; both pause
+following, and `f` or `G` resumes.
 
 Merged logs are ordered by engine timestamp. History is fully sorted before it is shown;
 live lines are held for 150 ms so concurrent containers interleave correctly, and a line

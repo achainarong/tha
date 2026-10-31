@@ -66,6 +66,29 @@ pub struct Row {
     pub running: Option<bool>,
 }
 
+/// What a mouse event over part of the screen acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseTarget {
+    Overview(OverviewMode),
+    Explorer,
+    TreeRow(usize),
+    TreeArrow(usize),
+    Details,
+    DetailTab(Tab),
+    LogScrollbar,
+    NetworkRow(usize),
+    LayerRow(usize),
+    FindingsPane,
+    FindingRow(usize),
+    Performance,
+    CollapsedPerformance,
+    PerformanceEngine(usize),
+    InventoryPane,
+    InventoryRuntime(usize),
+    InventoryRow(usize),
+    PickerRow(usize),
+}
+
 /// One cursor stop in the Networks tab, recorded by the last draw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkTarget {
@@ -301,6 +324,10 @@ pub struct App {
     pub network_cursor: usize,
     pub network_cursor_owner: Option<String>,
     pub network_targets: Vec<NetworkTarget>,
+    pub mouse_enabled: bool,
+    /// Rebuilt by every draw, in paint order, so the last match is on top.
+    pub mouse_regions: Vec<(ratatui::layout::Rect, MouseTarget)>,
+    pub log_scrollbar_drag: bool,
     pub log_view: LogView,
     pub log_filter_text: String,
     pub log_export_scope: Option<String>,
@@ -424,6 +451,9 @@ impl App {
             network_cursor: 0,
             network_cursor_owner: None,
             network_targets: Vec::new(),
+            mouse_enabled: true,
+            mouse_regions: Vec::new(),
+            log_scrollbar_drag: false,
             log_view: LogView::new(true),
             log_filter_text: "{}".into(),
             log_export_scope: None,
@@ -2070,6 +2100,15 @@ impl App {
             .selected
             .saturating_add_signed(amount)
             .min(self.rows.len().saturating_sub(1));
+    }
+
+    pub fn mouse_target(&self, column: u16, row: u16) -> Option<MouseTarget> {
+        let position = ratatui::layout::Position::new(column, row);
+        self.mouse_regions
+            .iter()
+            .rev()
+            .find(|(area, _)| area.contains(position))
+            .map(|(_, target)| *target)
     }
 
     /// The Networks tab falls back to plain scrolling when it has no rows to select.

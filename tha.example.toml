@@ -5,6 +5,7 @@ context_order = [] # Exact names pinned first, e.g. ["Colima / default", "OrbSta
 log_capacity = 5000
 monochrome = false
 log_wrap = true # Initial state; press w in the log pane to toggle at any time.
+mouse = true # Clicks, wheel and scrollbars. Hold Shift to select terminal text, or set false.
 exec_command = ["sh"] # Use ["bash", "-l"] if your image has bash instead.
 max_exec_sessions = 4 # Includes exited sessions; F6 selects, :close-exec frees a slot (1–8).
 save_preferences = true # Separate XDG state file; never stores logs or shells. Demo never writes state.

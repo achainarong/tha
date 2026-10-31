@@ -50,6 +50,7 @@ fn read_only(app: &App) -> bool {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.mouse_regions.push((area, MouseTarget::FindingsPane));
     let block = pane(
         app,
         if app.security.expanded {
@@ -453,6 +454,16 @@ fn draw_findings(frame: &mut Frame, app: &mut App, area: Rect) {
         &mut state,
     );
     app.security.offset = start;
+    let first_row = area.y + 1 + margin;
+    for offset in 0..area.height.saturating_sub(1 + margin) {
+        let index = start + offset as usize;
+        if index < report.findings.len() {
+            app.mouse_regions.push((
+                Rect::new(area.x, first_row + offset, area.width, 1),
+                MouseTarget::FindingRow(index),
+            ));
+        }
+    }
 }
 
 fn score(score: Option<f64>) -> String {

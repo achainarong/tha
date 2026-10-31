@@ -853,6 +853,13 @@ fn draw_overview_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: 
     app.inventory_engine = app
         .inventory_engine
         .min(app.engines.len().saturating_sub(1));
+    let titles: Vec<&str> = names.iter().map(String::as_str).collect();
+    for (index, region) in tab_regions(parts[0], &titles).into_iter().enumerate() {
+        app.mouse_regions
+            .push((region, MouseTarget::InventoryRuntime(index)));
+    }
+    app.mouse_regions
+        .push((parts[1], MouseTarget::InventoryPane));
     frame.render_widget(
         Tabs::new(names)
             .select(app.inventory_engine)
@@ -1163,6 +1170,16 @@ fn draw_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
                 &mut state,
             );
             view.offset = state.offset();
+            // The header row and its margin sit above the first table row.
+            for offset in 0..table_area.height.saturating_sub(2) {
+                let index = view.offset + offset as usize;
+                if index < rows.len() {
+                    app.mouse_regions.push((
+                        Rect::new(table_area.x, table_area.y + 2 + offset, table_area.width, 1),
+                        MouseTarget::InventoryRow(index),
+                    ));
+                }
+            }
         }
         if let Some(details_area) = details_area {
             let row = &rows[view.index];

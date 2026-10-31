@@ -34,6 +34,8 @@ pub struct Config {
     pub log_capacity: usize,
     pub monochrome: bool,
     pub log_wrap: bool,
+    /// Captures the mouse, so selecting terminal text needs the terminal's bypass (usually Shift).
+    pub mouse: bool,
     pub exec_command: Vec<String>,
     pub max_exec_sessions: usize,
     pub save_preferences: bool,
@@ -54,6 +56,7 @@ impl Default for Config {
             log_capacity: 5000,
             monochrome: false,
             log_wrap: true,
+            mouse: true,
             exec_command: vec!["sh".into()],
             max_exec_sessions: 4,
             save_preferences: true,

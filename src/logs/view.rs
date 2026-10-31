@@ -343,6 +343,19 @@ impl LogView {
         buffer.follow = false;
     }
 
+    /// Jumps to a fraction of the scrollable range, as a scrollbar drag does.
+    pub fn scroll_to_fraction(
+        &mut self,
+        buffer: &mut LogBuffer,
+        numerator: usize,
+        denominator: usize,
+    ) {
+        self.sync(buffer, self.width, self.height);
+        let range = self.total_rows().saturating_sub(self.height);
+        self.anchor = self.position_at(range * numerator / denominator.max(1));
+        buffer.follow = false;
+    }
+
     pub fn first(&mut self, buffer: &mut LogBuffer) {
         self.sync(buffer, self.width, self.height);
         self.anchor = self.position_at(0);

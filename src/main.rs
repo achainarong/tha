@@ -1,10 +1,13 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use futures_util::StreamExt;
 use std::{io::IsTerminal, path::PathBuf, time::Duration};
 use tha::{
-    app::{App, InputMode, Tab},
+    app::{App, InputMode, MouseTarget, OverviewMode, Tab},
     backend,
     cli::Cli,
     config::{BackendKind, Config, Connection, parse_connection},
@@ -188,6 +191,7 @@ async fn start() -> Result<()> {
         }
     }
     app.log_view.wrap = config.log_wrap;
+    app.mouse_enabled = config.mouse;
     app.exec_command = config.exec_command;
     app.sessions.set_limit(config.max_exec_sessions)?;
     app.local_metrics_refresh_seconds = config.metrics_refresh_seconds;
@@ -261,7 +265,11 @@ fn connections(cli: &Cli, config: &Config) -> Result<Vec<Connection>> {
 struct TerminalRestore;
 impl Drop for TerminalRestore {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste
+        );
         ratatui::restore();
     }
 }
@@ -364,6 +372,9 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let mut terminal = ratatui::try_init().context("Cannot initialize terminal")?;
     let _restore = TerminalRestore;
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
+    if app.mouse_enabled {
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+    }
     let mut events = EventStream::new();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<SnapshotEvent>(32);
@@ -451,6 +462,11 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
                     let height = terminal.size()?.height.saturating_sub(5 + ui::footer_height(&app)) as usize;
                     if handle_key(&mut app, key, height, &refresh_tx) { break; }
+                    redraw_now = true;
+                },
+                Some(Ok(Event::Mouse(mouse))) if mouse.kind != MouseEventKind::Moved => {
+                    let height = terminal.size()?.height.saturating_sub(5 + ui::footer_height(&app)) as usize;
+                    if handle_mouse(&mut app, mouse, height, &refresh_tx) { break; }
                     redraw_now = true;
                 },
                 Some(Ok(Event::Paste(text))) => {
@@ -2243,7 +2259,11 @@ fn cycle_tab(
     } else {
         (index + tabs.len() - 1) % tabs.len()
     };
-    let action = match tabs[next] {
+    dispatch_navigation(app, tab_action(tabs[next]), key, height, refresh)
+}
+
+fn tab_action(tab: Tab) -> A {
+    match tab {
         Tab::Overview => A::Overview,
         Tab::Logs => A::Logs,
         Tab::Networks => A::Networks,
@@ -2252,8 +2272,296 @@ fn cycle_tab(
         Tab::History => A::Metrics,
         Tab::Layers => A::Layers,
         Tab::Security => A::Security,
+    }
+}
+
+const WHEEL_ROWS: usize = 3;
+
+/// Mouse events only navigate. Anything destructive still needs its keyboard confirmation.
+fn handle_mouse(
+    app: &mut App,
+    mouse: MouseEvent,
+    height: usize,
+    refresh: &watch::Sender<u64>,
+) -> bool {
+    match mouse.kind {
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.log_scrollbar_drag = false;
+            return false;
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if app.log_scrollbar_drag {
+                seek_log_scrollbar(app, mouse.row);
+            }
+            return false;
+        }
+        MouseEventKind::Down(MouseButton::Left)
+        | MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollDown => {}
+        _ => return false,
+    }
+    app.cancel_startup();
+    if app.action_confirmation.is_some()
+        || app.compose_confirmation.is_some()
+        || app.input_mode != InputMode::Normal
+        || app
+            .inventory_removal
+            .as_ref()
+            .is_some_and(|removal| !removal.dismissed)
+    {
+        return false;
+    }
+    let target = app.mouse_target(mouse.column, mouse.row);
+    let wheel = match mouse.kind {
+        MouseEventKind::ScrollUp => Some(KeyCode::Up),
+        MouseEventKind::ScrollDown => Some(KeyCode::Down),
+        _ => None,
     };
-    dispatch_navigation(app, action, key, height, refresh)
+    if app.help
+        || app.picker.is_some()
+        || app.inventory_removal_results_visible
+        || app.action_results_visible
+        || app.compose_output_visible
+    {
+        if let Some(code) = wheel {
+            return handle_key(app, KeyEvent::from(code), height, refresh);
+        }
+        if let Some(MouseTarget::PickerRow(index)) = target
+            && let Some(picker) = &mut app.picker
+        {
+            if picker.selected == index {
+                app.choose();
+            } else {
+                picker.selected = index;
+            }
+        }
+        return false;
+    }
+    let Some(target) = target else {
+        return false;
+    };
+    match wheel {
+        Some(code) => wheel_over(app, target, code, height, refresh),
+        None => click(app, target, mouse, height, refresh),
+    }
+}
+
+fn focus_explorer(app: &mut App) {
+    app.exec_input = false;
+    app.detail_focus = false;
+    app.performance_focus = false;
+}
+
+fn focus_details(app: &mut App) {
+    app.detail_focus = true;
+    app.performance_focus = false;
+}
+
+fn focus_performance(app: &mut App) {
+    app.exec_input = false;
+    app.detail_focus = false;
+    app.performance_focus = true;
+}
+
+fn wheel_over(
+    app: &mut App,
+    target: MouseTarget,
+    code: KeyCode,
+    height: usize,
+    refresh: &watch::Sender<u64>,
+) -> bool {
+    use MouseTarget as T;
+    match target {
+        T::Explorer | T::TreeRow(_) | T::TreeArrow(_) => focus_explorer(app),
+        T::Performance | T::PerformanceEngine(_) => focus_performance(app),
+        T::Details
+        | T::DetailTab(_)
+        | T::LogScrollbar
+        | T::NetworkRow(_)
+        | T::LayerRow(_)
+        | T::FindingsPane
+        | T::FindingRow(_) => focus_details(app),
+        T::InventoryPane | T::InventoryRow(_) => {
+            if app.overview_mode == OverviewMode::Security {
+                app.detail_focus = false;
+            }
+        }
+        T::Overview(_) | T::CollapsedPerformance | T::InventoryRuntime(_) | T::PickerRow(_) => {
+            return false;
+        }
+    }
+    let logs =
+        app.overview_mode == OverviewMode::Containers && app.detail_focus && app.tab == Tab::Logs;
+    // Rolling down at the live end should not stop following.
+    if logs && app.logs.follow && code == KeyCode::Down {
+        return false;
+    }
+    let scrolling_text = app.overview_mode == OverviewMode::Containers
+        && app.detail_focus
+        && matches!(
+            app.tab,
+            Tab::Overview | Tab::Logs | Tab::Exec | Tab::Events | Tab::History
+        );
+    let action = if code == KeyCode::Up { A::Up } else { A::Down };
+    for _ in 0..if scrolling_text { WHEEL_ROWS } else { 1 } {
+        if dispatch_navigation(app, action, KeyEvent::from(code), height, refresh) {
+            return true;
+        }
+    }
+    false
+}
+
+fn click(
+    app: &mut App,
+    target: MouseTarget,
+    mouse: MouseEvent,
+    height: usize,
+    refresh: &watch::Sender<u64>,
+) -> bool {
+    use MouseTarget as T;
+    let open = KeyEvent::from(KeyCode::Enter);
+    let explorer_focused = !app.detail_focus && !app.performance_focus;
+    let details_focused = app.detail_focus && !app.performance_focus;
+    match target {
+        T::Overview(mode) => {
+            let action = match mode {
+                OverviewMode::Containers => A::ContainersView,
+                OverviewMode::Images => A::ImagesView,
+                OverviewMode::Volumes => A::VolumesView,
+                OverviewMode::Security => A::SecurityView,
+            };
+            app.exec_input = false;
+            return dispatch_navigation(app, action, open, height, refresh);
+        }
+        T::Explorer => focus_explorer(app),
+        T::TreeRow(index) => {
+            let again = explorer_focused && app.selected == index;
+            focus_explorer(app);
+            if again {
+                return dispatch_navigation(app, A::Open, open, height, refresh);
+            }
+            app.selected = index;
+            app.detail_scroll = 0;
+        }
+        T::TreeArrow(index) => {
+            focus_explorer(app);
+            app.selected = index;
+            app.detail_scroll = 0;
+            app.toggle_branch();
+        }
+        T::Details => {
+            if details_focused && app.tab == Tab::Exec && app.sessions.active().is_some() {
+                return dispatch_navigation(app, A::Open, open, height, refresh);
+            }
+            focus_details(app);
+        }
+        T::DetailTab(tab) => {
+            app.exec_input = false;
+            focus_details(app);
+            return dispatch_navigation(app, tab_action(tab), open, height, refresh);
+        }
+        T::LogScrollbar => {
+            focus_details(app);
+            let track = app
+                .mouse_regions
+                .iter()
+                .find(|(_, target)| *target == T::LogScrollbar)
+                .map(|(area, _)| *area);
+            match track {
+                Some(area) if mouse.row == area.y => app.log_view.scroll(&mut app.logs, -1),
+                Some(area) if mouse.row + 1 == area.bottom() => {
+                    app.log_view.scroll(&mut app.logs, 1)
+                }
+                _ => {
+                    app.log_scrollbar_drag = true;
+                    seek_log_scrollbar(app, mouse.row);
+                }
+            }
+        }
+        T::NetworkRow(index) => {
+            if details_focused && app.network_cursor == index {
+                app.open_network_target();
+            } else {
+                focus_details(app);
+                app.network_cursor = index;
+            }
+        }
+        T::LayerRow(index) => {
+            if details_focused && app.layers.selected == index {
+                return dispatch_navigation(app, A::Open, open, height, refresh);
+            }
+            focus_details(app);
+            app.layers.selected = index;
+        }
+        T::FindingsPane => focus_details(app),
+        T::FindingRow(index) => {
+            if details_focused && app.security.selected == index {
+                return dispatch_navigation(app, A::Open, open, height, refresh);
+            }
+            focus_details(app);
+            app.security.selected = index;
+        }
+        T::Performance => focus_performance(app),
+        T::CollapsedPerformance => app.toggle_performance(),
+        T::PerformanceEngine(index) => {
+            if app.performance_focus && app.performance_scroll == index {
+                return dispatch_navigation(app, A::Open, open, height, refresh);
+            }
+            focus_performance(app);
+            app.performance_scroll = index;
+        }
+        T::InventoryPane => {
+            if app.overview_mode == OverviewMode::Security {
+                app.detail_focus = false;
+            }
+        }
+        T::InventoryRuntime(index) => app.inventory_engine = index,
+        T::InventoryRow(index) => {
+            let security = app.overview_mode == OverviewMode::Security;
+            let mode = if security {
+                OverviewMode::Images
+            } else {
+                app.overview_mode
+            };
+            let view = app
+                .inventory_views
+                .entry((app.inventory_engine, mode))
+                .or_default();
+            if view.index == index && !(security && app.detail_focus) {
+                return dispatch_navigation(app, A::Open, open, height, refresh);
+            }
+            view.index = index;
+            // Selection follows the row's identity, so the old key would pull it back.
+            view.selected = None;
+            if security {
+                app.detail_focus = false;
+            }
+        }
+        T::PickerRow(_) => {}
+    }
+    false
+}
+
+/// The arrows at each end of the scrollbar are not part of its track.
+fn seek_log_scrollbar(app: &mut App, row: u16) {
+    let Some(area) = app
+        .mouse_regions
+        .iter()
+        .find(|(_, target)| *target == MouseTarget::LogScrollbar)
+        .map(|(area, _)| *area)
+    else {
+        return;
+    };
+    let track = area.height.saturating_sub(2);
+    if track == 0 {
+        return;
+    }
+    let offset = row.clamp(area.y + 1, area.y + track) - (area.y + 1);
+    app.log_view.scroll_to_fraction(
+        &mut app.logs,
+        offset as usize,
+        track.saturating_sub(1).max(1) as usize,
+    );
 }
 
 fn move_by(app: &mut App, amount: isize, _height: usize) {
@@ -4299,6 +4607,282 @@ mod tests {
         app.tab = Tab::Networks;
         handle_key(&mut app, KeyEvent::from(KeyCode::Right), 20, &refresh);
         assert_eq!(app.tab, Tab::Events, "tab movement skips Exec");
+    }
+
+    fn click_at(app: &mut App, target: MouseTarget, refresh: &watch::Sender<u64>) {
+        let (area, _) = *app
+            .mouse_regions
+            .iter()
+            .rev()
+            .find(|(_, candidate)| *candidate == target)
+            .unwrap_or_else(|| panic!("{target:?} not drawn"));
+        mouse_at(
+            app,
+            MouseEventKind::Down(MouseButton::Left),
+            area.x,
+            area.y,
+            refresh,
+        );
+    }
+
+    fn mouse_at(
+        app: &mut App,
+        kind: MouseEventKind,
+        column: u16,
+        row: u16,
+        refresh: &watch::Sender<u64>,
+    ) {
+        handle_mouse(
+            app,
+            MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            20,
+            refresh,
+        );
+    }
+
+    fn row_named(app: &App, title: &str) -> usize {
+        app.rows.iter().position(|row| row.title == title).unwrap()
+    }
+
+    #[tokio::test]
+    async fn clicks_select_tree_rows_open_on_second_click_and_toggle_arrows() {
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        draw_at(&mut app, 200, 50);
+        let row = row_named(&app, "shop-api-2");
+        click_at(&mut app, MouseTarget::TreeRow(row), &refresh);
+        assert_eq!(app.selected, row);
+        assert!(!app.detail_focus);
+        draw_at(&mut app, 200, 50);
+        click_at(&mut app, MouseTarget::TreeRow(row), &refresh);
+        assert!(app.detail_focus, "a second click opens like Enter");
+
+        draw_at(&mut app, 200, 50);
+        let branch = app
+            .rows
+            .iter()
+            .position(|row| row.title.starts_with("api ["))
+            .unwrap();
+        let before = app.rows.len();
+        click_at(&mut app, MouseTarget::TreeArrow(branch), &refresh);
+        assert!(!app.detail_focus);
+        assert_eq!(app.selected, branch);
+        assert_eq!(app.rows.len(), before - 2);
+    }
+
+    #[tokio::test]
+    async fn click_positions_match_what_is_drawn() {
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.selected = row_named(&app, "shop-api-2");
+        let buffer = draw_at(&mut app, 240, 50);
+        let text_at = |area: ratatui::layout::Rect| -> String {
+            (area.x..area.right())
+                .map(|x| buffer[(x, area.y)].symbol().to_string())
+                .collect()
+        };
+        for (target, expected) in [
+            (MouseTarget::DetailTab(Tab::Logs), " 2 Logs "),
+            (MouseTarget::DetailTab(Tab::Exec), " 4 Exec "),
+            (MouseTarget::DetailTab(Tab::Events), " 5 Events "),
+            (MouseTarget::DetailTab(Tab::Layers), " 7 Layers "),
+            (
+                MouseTarget::Overview(OverviewMode::Containers),
+                "[Containers]",
+            ),
+            (MouseTarget::Overview(OverviewMode::Volumes), "Volumes"),
+        ] {
+            let area = app
+                .mouse_regions
+                .iter()
+                .find(|(_, candidate)| *candidate == target)
+                .unwrap_or_else(|| panic!("{target:?}"))
+                .0;
+            assert_eq!(text_at(area), expected);
+        }
+        let row = row_named(&app, "shop-api-1");
+        let area = app
+            .mouse_regions
+            .iter()
+            .find(|(_, candidate)| *candidate == MouseTarget::TreeRow(row))
+            .unwrap()
+            .0;
+        assert!(text_at(area).contains("shop-api-1"));
+
+        click_at(&mut app, MouseTarget::DetailTab(Tab::Events), &refresh);
+        assert_eq!(app.tab, Tab::Events);
+        assert!(app.detail_focus);
+        draw_at(&mut app, 240, 50);
+        click_at(
+            &mut app,
+            MouseTarget::Overview(OverviewMode::Volumes),
+            &refresh,
+        );
+        assert_eq!(app.overview_mode, OverviewMode::Volumes);
+    }
+
+    #[tokio::test]
+    async fn network_rows_select_on_click_and_open_on_second_click() {
+        let mut app = focused_networks_app();
+        let (refresh, _) = watch::channel(0);
+        let buffer = draw_at(&mut app, 240, 50);
+        let area = app
+            .mouse_regions
+            .iter()
+            .find(|(_, target)| *target == MouseTarget::NetworkRow(3))
+            .unwrap()
+            .0;
+        let text: String = (area.x..area.right())
+            .map(|x| buffer[(x, area.y)].symbol().to_string())
+            .collect();
+        assert!(text.contains("shop-postgres-1"), "{text}");
+        click_at(&mut app, MouseTarget::NetworkRow(3), &refresh);
+        assert_eq!(app.network_cursor, 3);
+        assert!(app.detail_focus);
+        draw_at(&mut app, 240, 50);
+        click_at(&mut app, MouseTarget::NetworkRow(3), &refresh);
+        assert_eq!(app.current().unwrap().title, "shop-postgres-1");
+    }
+
+    #[tokio::test]
+    async fn log_scrollbar_jumps_drags_and_steps_and_the_wheel_scrolls() {
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.selected = row_named(&app, "shop-api-2");
+        app.tab = Tab::Logs;
+        app.detail_focus = true;
+        for index in 0..200 {
+            app.logs.push("api", &format!("line {index}"), false);
+        }
+        app.logs.follow = true;
+        draw_at(&mut app, 200, 40);
+        let (end, total) = app.log_view.scroll_position(&app.logs);
+        assert!(end > 0, "{end}/{total}");
+        let area = app
+            .mouse_regions
+            .iter()
+            .find(|(_, target)| *target == MouseTarget::LogScrollbar)
+            .unwrap()
+            .0;
+
+        // Rolling down at the live end keeps following; rolling up pauses.
+        mouse_at(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            area.x - 5,
+            area.y + 2,
+            &refresh,
+        );
+        assert!(app.logs.follow);
+        mouse_at(
+            &mut app,
+            MouseEventKind::ScrollUp,
+            area.x - 5,
+            area.y + 2,
+            &refresh,
+        );
+        assert!(!app.logs.follow);
+        assert_eq!(app.log_view.scroll_position(&app.logs).0, end - WHEEL_ROWS);
+
+        mouse_at(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            area.x,
+            area.y + 1,
+            &refresh,
+        );
+        assert!(app.log_scrollbar_drag);
+        assert_eq!(app.log_view.scroll_position(&app.logs).0, 0);
+        mouse_at(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            area.x + 9,
+            area.bottom() + 5,
+            &refresh,
+        );
+        assert_eq!(app.log_view.scroll_position(&app.logs).0, end);
+        mouse_at(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            area.x,
+            area.y,
+            &refresh,
+        );
+        assert!(!app.log_scrollbar_drag);
+        mouse_at(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            area.x,
+            area.y + 1,
+            &refresh,
+        );
+        assert_eq!(app.log_view.scroll_position(&app.logs).0, end);
+
+        mouse_at(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            area.x,
+            area.y,
+            &refresh,
+        );
+        assert_eq!(app.log_view.scroll_position(&app.logs).0, end - 1);
+        assert!(!app.log_scrollbar_drag);
+    }
+
+    #[tokio::test]
+    async fn inventory_and_picker_rows_respond_and_text_input_ignores_the_mouse() {
+        let app_fixture = app;
+        let mut app = app_fixture();
+        let (refresh, _) = watch::channel(0);
+        app.overview_mode = OverviewMode::Images;
+        draw_at(&mut app, 200, 50);
+        click_at(&mut app, MouseTarget::InventoryRow(1), &refresh);
+        let key = (app.inventory_engine, OverviewMode::Images);
+        assert_eq!(app.inventory_views[&key].index, 1);
+        assert!(!app.inventory_views[&key].details);
+        draw_at(&mut app, 200, 50);
+        click_at(&mut app, MouseTarget::InventoryRow(1), &refresh);
+        assert!(app.inventory_views[&key].details);
+
+        let mut app = app_fixture();
+        app.selected = row_named(&app, "shop-api-2");
+        app.picker = Some(tha::app::Picker {
+            title: "Test".into(),
+            choices: vec![
+                tha::app::Choice::Compose(tha::compose::Action::Pull),
+                tha::app::Choice::Compose(tha::compose::Action::Up),
+            ],
+            selected: 0,
+        });
+        draw_at(&mut app, 200, 50);
+        click_at(&mut app, MouseTarget::PickerRow(1), &refresh);
+        assert_eq!(app.picker.as_ref().unwrap().selected, 1);
+        mouse_at(&mut app, MouseEventKind::ScrollUp, 0, 0, &refresh);
+        assert_eq!(app.picker.as_ref().unwrap().selected, 0);
+        app.picker = None;
+
+        // Typing owns the keyboard and the pointer until it finishes.
+        draw_at(&mut app, 200, 50);
+        let selected = app.selected;
+        let (area, _) = *app
+            .mouse_regions
+            .iter()
+            .find(|(_, target)| *target == MouseTarget::TreeRow(0))
+            .unwrap();
+        app.input_mode = InputMode::Search;
+        mouse_at(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            area.x,
+            area.y,
+            &refresh,
+        );
+        assert_eq!(app.selected, selected);
     }
 
     #[tokio::test]
