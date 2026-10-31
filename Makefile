@@ -16,8 +16,24 @@ help: ## Show available commands
 build: ## Build a debug binary
 	cargo build --locked
 
-release: ## Build an optimized binary
+RELEASE_TAG := $(filter v%,$(MAKECMDGOALS))
+ifneq ($(filter release,$(MAKECMDGOALS)),)
+ifneq ($(RELEASE_TAG),)
+ifneq ($(words $(MAKECMDGOALS)),2)
+$(error Use exactly: make release vX.Y.Z)
+endif
+.PHONY: $(RELEASE_TAG)
+$(RELEASE_TAG):
+	@:
+endif
+endif
+
+release: ## Build locally; add vX.Y.Z to commit all changes and publish a release
+ifneq ($(RELEASE_TAG),)
+	python3 scripts/release.py "$(RELEASE_TAG)"
+else
 	cargo build --release --locked
+endif
 
 run: ## Run Tha (use ARGS="..." for CLI options)
 	cargo run --locked -- $(ARGS)

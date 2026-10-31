@@ -1126,14 +1126,23 @@ uploaded to a draft release and then published. Each archive contains `tha`,
 `contents: write` only in the publish job; no personal access token is needed.
 No release is published on ordinary branch pushes or pull requests.
 
-After committing/pushing the intended release source and matching version,
-a maintainer can trigger publication explicitly:
+A maintainer on `main` can bump the version and trigger publication explicitly
+(requires Python 3.11+, Cargo, Git, and push access to `origin`):
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+make release v0.19.0
 ```
 
+This updates `Cargo.toml`, runs `cargo check` (updating `Cargo.lock`), stages **all
+current changes, including untracked files not ignored by Git**, commits `Release
+v0.19.0`, pushes `main`, creates an annotated tag, and pushes the tag. Review
+`git status` first. It refuses non-main branches, existing tags, versions that do
+not increase, and a local branch behind/diverged from `origin/main`. Nothing is
+force-pushed. Failures stop immediately and leave files/commits intact for inspection;
+if only the tag push fails, retry `git push origin refs/tags/v0.19.0` after fixing it.
+
+Plain `make release` still only builds an optimized local binary.
+Test the command offline with `python3 scripts/release_command_smoke.py`.
 No tags or releases are created by local build/test commands. Existing releases
 are never overwritten automatically, and moving a tag during the build prevents
 publication of assets from the old commit. If publishing fails after creating a draft,
