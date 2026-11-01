@@ -278,6 +278,9 @@ pub struct Header {
     pub kind: Kind,
     pub size: u64,
     pub modified: i64,
+    pub mode: u32,
+    pub uid: u64,
+    pub gid: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -437,6 +440,9 @@ impl TarReader {
             kind,
             size,
             modified: octal(&block[136..148]).unwrap_or(0) as i64,
+            mode: octal(&block[100..108]).unwrap_or(0o644) as u32,
+            uid: octal(&block[108..116]).unwrap_or(0),
+            gid: octal(&block[116..124]).unwrap_or(0),
         }));
         self.data_left = size;
         self.padding = padding(size);
@@ -508,12 +514,24 @@ fn write_octal(field: &mut [u8], value: u64) {
 }
 
 fn tar_header(name: &[u8], flag: u8, size: u64, mode: u32, modified: i64) -> [u8; BLOCK] {
+    tar_header_owned(name, flag, size, mode, modified, 0, 0)
+}
+
+fn tar_header_owned(
+    name: &[u8],
+    flag: u8,
+    size: u64,
+    mode: u32,
+    modified: i64,
+    uid: u64,
+    gid: u64,
+) -> [u8; BLOCK] {
     let mut block = [0u8; BLOCK];
     let length = name.len().min(100);
     block[..length].copy_from_slice(&name[..length]);
     write_octal(&mut block[100..108], u64::from(mode & 0o7777));
-    write_octal(&mut block[108..116], 0);
-    write_octal(&mut block[116..124], 0);
+    write_octal(&mut block[108..116], uid);
+    write_octal(&mut block[116..124], gid);
     write_octal(&mut block[124..136], size);
     write_octal(&mut block[136..148], modified.max(0) as u64);
     block[156] = flag;
@@ -525,6 +543,19 @@ fn tar_header(name: &[u8], flag: u8, size: u64, mode: u32, modified: i64) -> [u8
     block
 }
 
+fn long_name_header(name: &[u8]) -> Vec<u8> {
+    if name.len() <= 100 {
+        return Vec::new();
+    }
+    let size = name.len() as u64 + 1;
+    let mut out = Vec::with_capacity(BLOCK + name.len() + 1 + padding(size) as usize);
+    out.extend_from_slice(&tar_header(b"././@LongLink", b'L', size, 0, 0));
+    out.extend_from_slice(name);
+    out.push(0);
+    out.extend(std::iter::repeat_n(0, padding(size) as usize));
+    out
+}
+
 fn write_entry_header(
     out: &mut impl Write,
     name: &[u8],
@@ -533,18 +564,7 @@ fn write_entry_header(
     mode: u32,
     modified: i64,
 ) -> Result<()> {
-    if name.len() > 100 {
-        out.write_all(&tar_header(
-            b"././@LongLink",
-            b'L',
-            name.len() as u64 + 1,
-            0,
-            0,
-        ))?;
-        out.write_all(name)?;
-        out.write_all(&[0])?;
-        out.write_all(&vec![0; padding(name.len() as u64 + 1) as usize])?;
-    }
+    out.write_all(&long_name_header(name))?;
     out.write_all(&tar_header(name, flag, size, mode, modified))?;
     Ok(())
 }
@@ -1120,6 +1140,153 @@ pub async fn network_test(source: &Source, host: &str, port: u16) -> Result<NetT
     network_test_in_container(&local_docker(connection).await?, id, host, port).await
 }
 
+// ---- Reading a file's contents ----
+
+/// The start of a file: all of it, or `limit` bytes with `truncated` set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStart {
+    pub header: Header,
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
+/// A NUL byte, or text that is not UTF-8 apart from a character cut off at the limit.
+pub fn looks_binary(bytes: &[u8], truncated: bool) -> bool {
+    if bytes.iter().take(8192).any(|byte| *byte == 0) {
+        return true;
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(_) => false,
+        Err(error) => !(truncated && bytes.len() - error.valid_up_to() < 4),
+    }
+}
+
+/// Stops reading at the limit, so a huge file costs no more than a small one.
+pub async fn read_start(source: &Source, path: &str, limit: usize) -> Result<FileStart> {
+    let mut stream = archive(source, path).await?;
+    let mut reader = TarReader::default();
+    let mut header: Option<Header> = None;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        for event in reader.feed(&chunk?)? {
+            match event {
+                TarEvent::Entry(entry) if header.is_none() => {
+                    ensure!(
+                        entry.kind == Kind::File,
+                        "{}",
+                        crate::i18n::t(
+                            "This path is a link or special file; use its target's path"
+                        )
+                    );
+                    header = Some(entry);
+                }
+                // Only the first entry is the file that was asked for.
+                TarEvent::Entry(_) => {}
+                TarEvent::Data(data) => bytes.extend_from_slice(&data),
+            }
+        }
+        if let Some(header) = &header {
+            if bytes.len() > limit {
+                bytes.truncate(limit);
+                return Ok(FileStart {
+                    header: header.clone(),
+                    bytes,
+                    truncated: true,
+                });
+            }
+            if bytes.len() as u64 >= header.size {
+                break;
+            }
+        }
+    }
+    let header = header.with_context(|| crate::i18n::t("No such file or folder").to_owned())?;
+    ensure!(
+        bytes.len() as u64 >= header.size,
+        "{}",
+        crate::i18n::t("The transfer ended early")
+    );
+    Ok(FileStart {
+        header,
+        bytes,
+        truncated: false,
+    })
+}
+
+/// A file's new contents plus its backup, as one archive, with the original's owner and mode.
+pub fn edited_archive(name: &str, header: &Header, old: &[u8], new: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(old.len() + new.len() + BLOCK * 6);
+    let mut entry = |name: &str, mode: u32, modified: i64, data: &[u8]| {
+        out.extend_from_slice(&long_name_header(name.as_bytes()));
+        out.extend_from_slice(&tar_header_owned(
+            name.as_bytes(),
+            b'0',
+            data.len() as u64,
+            mode,
+            modified,
+            header.uid,
+            header.gid,
+        ));
+        out.extend_from_slice(data);
+        out.extend(std::iter::repeat_n(
+            0u8,
+            padding(data.len() as u64) as usize,
+        ));
+    };
+    entry(&format!("{name}.tha-backup"), 0o600, header.modified, old);
+    entry(name, header.mode, crate::history::now_ms() / 1000, new);
+    out.extend_from_slice(&[0; BLOCK * 2]);
+    out
+}
+
+/// Whether this container accepts writes from here. Only a server's policy can say no.
+pub async fn can_upload(source: &Source, folder: &str) -> bool {
+    match source {
+        Source::Container { connection, id, .. } => {
+            match crate::remote::local_socket(&connection.endpoint) {
+                Some(socket) => agent_body(&socket, "upload-check", id, folder)
+                    .await
+                    .is_ok(),
+                None => true,
+            }
+        }
+        Source::Server { .. } => false,
+    }
+}
+
+pub async fn upload_bytes(source: &Source, folder: &str, archive: Vec<u8>) -> Result<()> {
+    let Source::Container { connection, id, .. } = source else {
+        bail!("{}", crate::i18n::t("Select a single container"));
+    };
+    let chunks = futures_util::stream::iter(vec![Bytes::from(archive)]);
+    send_archive(connection, id, folder, chunks).await
+}
+
+async fn send_archive(
+    connection: &Connection,
+    id: &str,
+    folder: &str,
+    chunks: impl Stream<Item = Bytes> + Send + 'static,
+) -> Result<()> {
+    if let Some(socket) = crate::remote::local_socket(&connection.endpoint) {
+        // A refusal mid-transfer would only surface as a broken pipe, so ask before sending.
+        let answer = agent_body(&socket, "upload-check", id, folder).await?;
+        collect(answer, 4096).await?;
+        return upload_through_agent(&socket, id, folder, chunks).await;
+    }
+    local_docker(connection)
+        .await?
+        .upload_to_container(
+            id,
+            Some(bollard::query_parameters::UploadToContainerOptions {
+                path: folder.to_owned(),
+                ..Default::default()
+            }),
+            bollard::body_stream(chunks),
+        )
+        .await?;
+    Ok(())
+}
+
 // ---- Upload ----
 
 /// Reads a tar file in chunks, reporting how far along it is.
@@ -1169,24 +1336,7 @@ pub async fn upload(
         sent += count;
         progress(sent);
     });
-    if let Some(socket) = crate::remote::local_socket(&connection.endpoint) {
-        // A refusal mid-transfer would only surface as a broken pipe, so ask before sending.
-        let answer = agent_body(&socket, "upload-check", id, folder).await?;
-        collect(answer, 4096).await?;
-        upload_through_agent(&socket, id, folder, chunks).await?;
-    } else {
-        let docker = local_docker(connection).await?;
-        docker
-            .upload_to_container(
-                id,
-                Some(bollard::query_parameters::UploadToContainerOptions {
-                    path: folder.to_owned(),
-                    ..Default::default()
-                }),
-                bollard::body_stream(chunks),
-            )
-            .await?;
-    }
+    send_archive(connection, id, folder, chunks).await?;
     Ok(total)
 }
 
@@ -1914,6 +2064,103 @@ mod tests {
         let totals: Totals = serde_json::from_str(text.lines().last().unwrap()).unwrap();
         assert_eq!((totals.bytes, totals.files, totals.done), (123, 2, true));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn binary_is_a_nul_or_invalid_text_but_not_a_character_cut_at_the_limit() {
+        assert!(!looks_binary(b"plain text\n", false));
+        assert!(!looks_binary("grüße".as_bytes(), false));
+        assert!(looks_binary(b"ab\0cd", false));
+        assert!(looks_binary(&[0xff, 0xfe, b'a'], false));
+        let cut = &"grüße".as_bytes()[..3];
+        assert!(looks_binary(cut, false));
+        assert!(!looks_binary(cut, true));
+    }
+
+    #[test]
+    fn an_edited_archive_keeps_owner_and_mode_and_backs_up_the_old_version_privately() {
+        let original = Header {
+            name: "app.conf".into(),
+            kind: Kind::File,
+            size: 3,
+            modified: 5,
+            mode: 0o640,
+            uid: 101,
+            gid: 102,
+        };
+        let archive = edited_archive("app.conf", &original, b"old", b"new text");
+        let mut reader = TarReader::default();
+        let mut entries = Vec::new();
+        let mut data = Vec::new();
+        for event in reader.feed(&archive).unwrap() {
+            match event {
+                TarEvent::Entry(entry) => entries.push(entry),
+                TarEvent::Data(part) => data.extend_from_slice(&part),
+            }
+        }
+        assert!(reader.complete());
+        assert_eq!(data, b"oldnew text");
+        assert_eq!(entries[0].name, "app.conf.tha-backup");
+        assert_eq!(entries[0].mode, 0o600);
+        assert_eq!(entries[1].name, "app.conf");
+        assert_eq!(
+            (entries[1].mode, entries[1].uid, entries[1].gid),
+            (0o640, 101, 102)
+        );
+    }
+
+    #[test]
+    fn edited_archives_preserve_long_names_and_distinct_backups_with_system_tar() {
+        for name in [
+            "x".repeat(95),
+            "x".repeat(100),
+            "x".repeat(150),
+            "ü".repeat(75),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let owner = directory.path().metadata().unwrap();
+            let header = Header {
+                name: name.clone(),
+                kind: Kind::File,
+                size: 3,
+                modified: 0,
+                mode: 0o600,
+                uid: u64::from(owner.uid()),
+                gid: u64::from(owner.gid()),
+            };
+            let archive = edited_archive(&name, &header, b"old", b"new");
+            let mut reader = TarReader::default();
+            let names: Vec<_> = reader
+                .feed(&archive)
+                .unwrap()
+                .into_iter()
+                .filter_map(|event| match event {
+                    TarEvent::Entry(entry) => Some(entry.name),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(names, [format!("{name}.tha-backup"), name.clone()]);
+
+            let archive_path = directory.path().join("edit.tar");
+            std::fs::write(&archive_path, archive).unwrap();
+            let result = std::process::Command::new("tar")
+                .args(["-xf"])
+                .arg(&archive_path)
+                .arg("-C")
+                .arg(directory.path())
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(std::fs::read(directory.path().join(&name)).unwrap(), b"new");
+            assert_eq!(
+                std::fs::read(directory.path().join(format!("{name}.tha-backup"))).unwrap(),
+                b"old"
+            );
+        }
     }
 
     #[test]

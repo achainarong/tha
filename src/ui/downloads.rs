@@ -1,7 +1,7 @@
 //! The download manager panel and its review dialog.
 use super::*;
 use crate::{
-    downloads::{Folder, JobStatus, Pane, Preview, human_size},
+    downloads::{FilePreview, Folder, JobStatus, Pane, Preview, human_size},
     files::Kind,
 };
 
@@ -20,32 +20,126 @@ fn muted() -> Style {
 
 fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
     let manager = &app.downloads;
-    let dialog = centered(area, 110, area.height.saturating_sub(2));
+    let dialog = centered(
+        area,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
     frame.render_widget(Clear, dialog);
     let label = manager
         .tree()
         .map_or_else(String::new, |tree| safe_text(tree.source.label()));
     let block = Block::bordered()
-        .title(crate::tf!(" Download manager · {label} ", label = label))
+        .title(crate::tf!(" File explorer · {label} ", label = label))
         .title_bottom(match manager.pane {
             Pane::Browse => crate::i18n::t(
-                " j/k Move · Enter Open or download · d Download · Tab Downloads · Esc Close ",
+                " j/k Move · Enter Open folder · e Edit · d Download · r Refresh · : Command · Tab Downloads · Esc Close ",
             ),
-            Pane::Downloads => crate::i18n::t(
-                " j/k Move · x Cancel · Tab Browse · Esc Close; downloads keep running ",
-            ),
+            Pane::Downloads => {
+                crate::i18n::t(" j/k Move · x Cancel · Tab Files · Esc Close; downloads keep running ")
+            }
         });
     let inner = padded(block.inner(dialog));
     frame.render_widget(block, dialog);
     let height = inner.height as usize;
-    let lines = match manager.pane {
-        Pane::Browse => browse_lines(app, height),
-        Pane::Downloads => job_lines(app, height),
-    };
-    frame.render_widget(Paragraph::new(lines), inner);
+    if manager.pane == Pane::Downloads {
+        frame.render_widget(Paragraph::new(job_lines(app, height)), inner);
+        return;
+    }
+    let footer = u16::from(manager.command.is_some() || manager.message.is_some());
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(footer)]).split(inner);
+    let columns =
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(rows[0]);
+    frame.render_widget(
+        Paragraph::new(browse_lines(
+            app,
+            columns[0].height as usize,
+            columns[0].width as usize,
+        )),
+        columns[0],
+    );
+    let preview = Block::new().borders(ratatui::widgets::Borders::LEFT);
+    let right = padded(preview.inner(columns[1]));
+    frame.render_widget(preview, columns[1]);
+    frame.render_widget(preview_paragraph(app), right);
+    if let Some(command) = &manager.command {
+        frame.render_widget(Paragraph::new(format!(":{}▏", safe_text(command))), rows[1]);
+    } else if let Some(message) = &manager.message {
+        frame.render_widget(
+            Paragraph::new(safe_text(message)).style(accent(app, Color::Yellow)),
+            rows[1],
+        );
+    }
 }
 
-fn browse_lines(app: &App, height: usize) -> Vec<Line<'static>> {
+/// Read-only, and only ever sanitized text: file contents never reach the terminal raw.
+fn preview_paragraph(app: &App) -> Paragraph<'static> {
+    let warn = accent(app, Color::Yellow);
+    let Some(preview) = &app.downloads.preview else {
+        return Paragraph::new(crate::i18n::t("Select a file to see it here.")).style(muted());
+    };
+    let lines: Vec<Line<'static>> = match &preview.status {
+        FilePreview::Waiting | FilePreview::Loading => {
+            vec![Line::styled(crate::i18n::t("Reading…"), muted())]
+        }
+        FilePreview::Folder => vec![Line::styled(
+            crate::i18n::t("A folder. Enter opens it, d downloads it."),
+            muted(),
+        )],
+        FilePreview::Special => vec![Line::styled(
+            crate::i18n::t("A link or special file, so it is not shown."),
+            muted(),
+        )],
+        FilePreview::Binary => vec![
+            Line::styled(
+                crate::i18n::t("This looks like a binary file, so it is not shown."),
+                warn,
+            ),
+            Line::styled(crate::i18n::t("d downloads it."), muted()),
+        ],
+        FilePreview::TooBig(size) => vec![
+            Line::styled(
+                crate::tf!(
+                    "This file is big ({size}), so it is not shown automatically.",
+                    size = human_size(*size)
+                ),
+                warn,
+            ),
+            Line::styled(
+                crate::tf!(
+                    "p shows the first {limit}. d downloads it.",
+                    limit = human_size(crate::downloads::PREVIEW_LIMIT as u64)
+                ),
+                muted(),
+            ),
+        ],
+        FilePreview::Failed(error) => vec![Line::styled(
+            crate::tf!(
+                "Could not read this file: {error}",
+                error = safe_text(error)
+            ),
+            warn,
+        )],
+        FilePreview::Text { text, truncated } => {
+            let mut lines: Vec<Line<'static>> = text
+                .lines()
+                .map(|line| Line::from(safe_text(&line.replace('\t', "    "))))
+                .collect();
+            if *truncated {
+                lines.push(Line::styled(
+                    crate::i18n::t("… only the start of this file is shown"),
+                    warn,
+                ));
+            }
+            lines
+        }
+    };
+    let limit = lines.len().saturating_sub(1);
+    let scroll = preview.scroll.min(limit);
+    Paragraph::new(lines).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
+}
+
+fn browse_lines(app: &App, height: usize, width: usize) -> Vec<Line<'static>> {
     let manager = &app.downloads;
     let Some(tree) = manager.tree() else {
         return Vec::new();
@@ -96,7 +190,9 @@ fn browse_lines(app: &App, height: usize) -> Vec<Line<'static>> {
             "  ".repeat(row.level),
             safe_text(&row.entry.name)
         );
-        let text = format!("{name:<60} {detail}");
+        let room = width.saturating_sub(detail.chars().count() + 1);
+        let shown: String = name.chars().take(room).collect();
+        let text = format!("{shown:<room$} {detail}");
         lines.push(if index == manager.selected {
             Line::styled(text, Style::default().add_modifier(Modifier::REVERSED))
         } else {
@@ -279,10 +375,10 @@ mod tests {
     fn the_panel_browses_a_tree_and_the_dialog_reviews_before_anything_downloads() {
         let mut app = demo_on_container();
         assert!(app.downloads.trees.is_empty(), "selecting starts nothing");
-        app.open_download_manager();
+        app.open_file_explorer();
         assert!(app.take_download_requests().is_empty());
         let output = screen(&mut app);
-        assert!(output.contains("Download manager"), "{output}");
+        assert!(output.contains("File explorer"), "{output}");
         assert!(output.contains("etc") && output.contains("var"), "{output}");
 
         // /tmp holds the dump; opening it shows the file with its size.
@@ -312,6 +408,72 @@ mod tests {
         assert!(app.downloads.jobs.is_empty());
     }
 
+    fn settle_preview(app: &mut App) {
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        app.downloads.update_preview(std::time::Instant::now());
+        app.downloads.update_preview(later);
+        app.take_download_requests();
+    }
+
+    #[test]
+    fn a_selected_file_shows_on_the_right_and_big_ones_warn_instead() {
+        let mut app = demo_on_container();
+        app.open_file_explorer();
+        app.take_download_requests();
+        let rows = app.downloads.tree().unwrap().rows();
+        app.downloads.selected = rows.iter().position(|row| row.path == "/etc").unwrap();
+        app.downloads.toggle_selected();
+        app.take_download_requests();
+        let rows = app.downloads.tree().unwrap().rows();
+        app.downloads.selected = rows
+            .iter()
+            .position(|row| row.path == "/etc/hostname")
+            .unwrap();
+        settle_preview(&mut app);
+        let output = screen(&mut app);
+        assert!(
+            output.contains("Sample contents of /etc/hostname"),
+            "{output}"
+        );
+
+        let rows = app.downloads.tree().unwrap().rows();
+        app.downloads.selected = rows.iter().position(|row| row.path == "/tmp").unwrap();
+        app.downloads.toggle_selected();
+        app.take_download_requests();
+        let rows = app.downloads.tree().unwrap().rows();
+        app.downloads.selected = rows
+            .iter()
+            .position(|row| row.path == "/tmp/mydb.dump")
+            .unwrap();
+        settle_preview(&mut app);
+        let output = screen(&mut app);
+        assert!(output.contains("is big (2.4 GB)"), "{output}");
+        assert!(!output.contains("Sample contents"), "{output}");
+        app.edit_selected_file();
+        assert!(app.edit_request.is_none());
+    }
+
+    #[test]
+    fn file_contents_cannot_send_control_sequences_to_the_terminal() {
+        let mut app = demo_on_container();
+        app.open_file_explorer();
+        app.take_download_requests();
+        settle_preview(&mut app);
+        app.downloads.preview = None;
+        let rows = app.downloads.tree().unwrap().rows();
+        app.downloads.selected = rows.iter().position(|row| row.path == "/etc").unwrap();
+        app.downloads.update_preview(std::time::Instant::now());
+        if let Some(preview) = &mut app.downloads.preview {
+            preview.status = FilePreview::Text {
+                text: "before\u{1b}[2Jafter".into(),
+                truncated: false,
+            };
+        }
+        let output = screen(&mut app);
+        assert!(output.contains("before"), "{output}");
+        assert!(!output.contains('\u{1b}'));
+    }
+
     #[test]
     fn a_folder_shows_its_size_and_file_count_and_saves_as_tar() {
         let mut app = demo_on_container();
@@ -331,7 +493,7 @@ mod tests {
         assert!(app.notice.contains("below /"), "{}", app.notice);
         assert!(app.downloads.dialog.is_none());
         app.selected = 0;
-        app.open_download_manager();
+        app.open_file_explorer();
         assert!(app.downloads.open.is_none());
         assert!(!app.notice.is_empty());
     }
@@ -374,10 +536,10 @@ mod tests {
         crate::i18n::isolate_thread();
         crate::i18n::set_language(crate::i18n::Language::German);
         let mut app = demo_on_container();
-        app.open_download_manager();
+        app.open_file_explorer();
         app.take_download_requests();
         let output = screen(&mut app);
         crate::i18n::set_language(crate::i18n::Language::English);
-        assert!(output.contains("Download-Manager"), "{output}");
+        assert!(output.contains("Datei-Explorer"), "{output}");
     }
 }

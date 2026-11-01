@@ -432,6 +432,48 @@ pub(super) fn handle_key(
     }
     if app.downloads.open.is_some() {
         use tha::downloads::Pane;
+        if let Some(command) = app.downloads.command.clone() {
+            match key.code {
+                KeyCode::Esc => app.downloads.command = None,
+                KeyCode::Backspace => {
+                    app.downloads.command = (!command.is_empty()).then(|| {
+                        let mut text = command;
+                        text.pop();
+                        text
+                    });
+                }
+                KeyCode::Char(character) => {
+                    app.downloads.command = Some(command + &character.to_string());
+                }
+                KeyCode::Enter => {
+                    app.downloads.command = None;
+                    let command = command.trim();
+                    let (name, argument) = command
+                        .split_once(char::is_whitespace)
+                        .map_or((command, ""), |(name, argument)| (name, argument.trim()));
+                    match (name, argument) {
+                        ("edit" | "e", "") => app.edit_selected_file(),
+                        ("download" | "d", "") => app.downloads.dialog_selected(),
+                        ("download" | "d", path) => {
+                            app.download_path(path);
+                            if app.downloads.dialog.is_none() {
+                                app.downloads.message = Some(app.notice.clone());
+                            }
+                        }
+                        ("q" | "quit", "") => app.downloads.close(),
+                        ("", "") => {}
+                        _ => {
+                            app.downloads.message = Some(tha::tf!(
+                                "Unknown command: {command}. Try :edit, :download or :q",
+                                command = tha::model::safe_text(command)
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
         let pane = app.downloads.pane;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => app.downloads.close(),
@@ -444,21 +486,18 @@ pub(super) fn handle_key(
             }
             KeyCode::Char('j') | KeyCode::Down => app.downloads.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => app.downloads.move_selection(-1),
-            KeyCode::PageDown => app.downloads.move_selection(height.max(1) as isize),
-            KeyCode::PageUp => app.downloads.move_selection(-(height.max(1) as isize)),
+            KeyCode::PageDown => app.downloads.scroll_preview(height.max(1) as isize),
+            KeyCode::PageUp => app.downloads.scroll_preview(-(height.max(1) as isize)),
             KeyCode::Char('x') if pane == Pane::Downloads => app.downloads.cancel_selected(),
+            KeyCode::Char(':') if pane == Pane::Browse => {
+                app.downloads.command = Some(String::new());
+            }
+            KeyCode::Char('e') if pane == Pane::Browse => app.edit_selected_file(),
             KeyCode::Char('d') if pane == Pane::Browse => app.downloads.dialog_selected(),
-            KeyCode::Char(' ') if pane == Pane::Browse => app.downloads.toggle_selected(),
-            KeyCode::Enter if pane == Pane::Browse => {
-                let folder = app
-                    .downloads
-                    .current_row()
-                    .is_some_and(|row| row.entry.kind == tha::files::Kind::Folder);
-                if folder {
-                    app.downloads.toggle_selected();
-                } else {
-                    app.downloads.dialog_selected();
-                }
+            KeyCode::Char('p') if pane == Pane::Browse => app.downloads.show_big_file(),
+            KeyCode::Char('r') if pane == Pane::Browse => app.downloads.refresh_selected(),
+            KeyCode::Char(' ') | KeyCode::Enter if pane == Pane::Browse => {
+                app.downloads.toggle_selected();
             }
             _ => {}
         }
@@ -1262,7 +1301,7 @@ pub(super) fn dispatch_navigation(
         A::Alerts => app.alerts.view_open = true,
         A::Timeline => app.open_timeline(),
         A::Fleet => app.open_fleet(),
-        A::DownloadManager => app.open_download_manager(),
+        A::FileExplorer => app.open_file_explorer(),
         A::Capabilities => app.open_capabilities(),
         A::ExecSessions => app.pick_sessions(),
         A::Actions => app.open_actions(),
@@ -2127,7 +2166,7 @@ pub(super) fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>
         "alerts" => app.alerts.view_open = true,
         "timeline" => app.open_timeline(),
         "fleet" => app.open_fleet(),
-        "download-manager" => app.open_download_manager(),
+        "file-explorer" => app.open_file_explorer(),
         "capabilities" => app.open_capabilities(),
         "back" => {
             app.back();

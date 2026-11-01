@@ -215,8 +215,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("copy-image", "Copy the selected container's image name"),
     ("copy-log-line", "Copy the newest visible log line"),
     (
-        "download-manager",
-        "Browse and download files from the selected container or server",
+        "file-explorer",
+        "Browse, read, edit and download the selected container or server's files",
     ),
     ("download", "Download a file or folder: download PATH"),
     (

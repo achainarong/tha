@@ -20,8 +20,8 @@ diagnostics.
 - **File download is in scope** for containers and remote server shells. Users run
   their own commands, and Tha only copies the file or folder they name. The dialog
   shows the size, and for folders the number of files, before downloading.
-- **`:download-manager` is the main way in:** browse, start, watch, and cancel downloads
-  there. `:download PATH` stays as the shortcut.
+- **`:file-explorer` is the main way in:** the tree on the left, a read-only file on the right, and `e` or
+  `:edit` to open it in the local editor. `:download PATH` stays as the shortcut.
 
 ## Status
 
@@ -35,8 +35,8 @@ are not done:
   at full detail.
 
 Server paths were tested against a real engine through the agent code, but not over a real SSH connection.
-The same is true of server shells for `:download`, and real vim, Neovim, nano, and VS Code were not launched:
-the hand-off was tested with a stand-in program.
+The same is true of server file browsing and editing. Real vim, Neovim, nano, and VS Code were not launched: the
+hand-off was tested with a stand-in program.
 
 ## Recommended delivery order
 
@@ -65,7 +65,7 @@ Everything else can be scheduled independently as demand becomes clearer.
 | --- | --- | --- |
 | Saved views and filters **(finished 2026-11-01)** | Save named views such as “Production failures,” “Backend errors,” and “Unused images,” including server/project scope, sorting, and filters. | Small–medium |
 | Remote image actions **(finished 2026-11-01)** | Pull images, check for image updates, and prune on servers without a separate SSH session. Uses `--allow-images`; pulls are anonymous. | Medium |
-| File download **(finished 2026-11-01)** | Browse and download files and folders from a container or remote server in a download manager, such as a database backup, with the size shown first. | Large |
+| File explorer **(finished 2026-11-01)** | Browse, read, edit, and download files and folders from a container or remote server, such as a database backup, with the size shown first. | Large |
 | Fleet health overview **(finished 2026-11-01)** | Show unhealthy/restarting containers, unreachable servers, stale data, and critical vulnerabilities across connected servers. Jump directly to an affected workload. | Medium |
 | Unified incident timeline **(finished 2026-11-01)** | Correlate exits, OOM events, health failures, and CPU/memory spikes, with links to available logs. Reuse evidence currently shown separately. | Medium |
 | Alerts **(finished 2026-11-01)** | Flag crash loops, OOM kills, unhealthy containers, sustained high memory, and unreachable servers. | Medium–large |
@@ -97,28 +97,13 @@ The new-version notice contacts GitHub, so it must be opt-in.
 
 ## File download
 
-### Download manager
+### File explorer
 
-`:download-manager` opens a panel for the selected container or server, and closing it leaves
-downloads running. It has two parts:
-
-- **Browse:** a tree of folders and files that fills in as folders are opened, with each entry's
-  size. Press `Enter` on a file or folder to open the download dialog below.
-- **Downloads:** every active and finished download of this session, with progress, speed, and
-  errors. Cancel one from here. The status line shows a small indicator while one runs.
-
-Browsing a Docker-compatible container runs `ls` in it, one folder at a time as folders open. This
-is the one command Tha runs for this feature, and it needs exec, so a remote container needs
-`--allow-exec`. If the image has no `ls`, browsing says so and `:download PATH` still works. Native
-containerd is not covered. Browsing a server lists folders in the SSH session as the login user.
-
-The tree builds in the background from the moment a container or server is opened in the download
-manager, so the view never waits for it. Selecting a container elsewhere in Tha starts nothing.
-Folders the user opens are read first. To limit load, listing runs one folder at a time at a set
-depth and entry limit, skips `/proc`, `/sys`, and `/dev`, and stops if the container stops, and the
-view says when the tree is incomplete. The tree is cached in memory only, is never written to disk,
-and is released after 10 minutes without use; opening the manager again rebuilds it. A cached entry
-can be out of date, so the download dialog reads the real size before starting.
+**Finished 2026-11-01.** `:file-explorer` replaces the planned download manager. The tree is on the left and the
+selected file shows read-only on the right. Files over 256 KiB and binaries show a warning instead of loading. `e` or
+`:edit` opens the file in the local editor, using a private temporary copy for a remote file, because a local editor
+needs a local file. Editing ends when the editor process exits (or, for VS Code, through `code --wait`), and the file
+goes back only if it changed. A separate pane lists downloads, and `--allow-server-edit` covers editing any server file.
 
 ### Downloading a file
 

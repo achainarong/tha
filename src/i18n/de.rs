@@ -3101,8 +3101,80 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ),
     ("Editor", "Editor"),
     (
-        "Opens Compose files with :compose-edit. It must be installed on this computer.",
-        "Öffnet Compose-Dateien mit :compose-edit. Er muss auf diesem Computer installiert sein.",
+        "You cannot write this file there, so it opened read-only",
+        "Diese Datei ist dort nicht beschreibbar, daher nur lesend geöffnet",
+    ),
+    ("Sending the file back…", "Datei wird zurückgesendet…"),
+    (
+        "Saved. Nothing was restarted or applied.",
+        "Gespeichert. Es wurde nichts neu gestartet oder angewendet.",
+    ),
+    (
+        "Not saved: {error}. Your copy is kept in {folder}",
+        "Nicht gespeichert: {error}. Die lokale Kopie liegt in {folder}",
+    ),
+    ("Getting {file}…", "{file} wird geholt…"),
+    (
+        "Select a file to edit",
+        "Eine Datei zum Bearbeiten auswählen",
+    ),
+    (
+        "This file is larger than 1 MiB, so it was not opened",
+        "Diese Datei ist größer als 1 MiB und wurde nicht geöffnet",
+    ),
+    (
+        "This file is larger than 1 MiB",
+        "Diese Datei ist größer als 1 MiB",
+    ),
+    (
+        "This looks like a binary file, so it was not opened",
+        "Das sieht nach einer Binärdatei aus und wurde nicht geöffnet",
+    ),
+    (
+        "Editing files on this server",
+        "Dateien auf diesem Server bearbeiten",
+    ),
+    (
+        "Unknown command: {command}. Try :edit, :download or :q",
+        "Unbekannter Befehl: {command}. Versuche :edit, :download oder :q",
+    ),
+    (
+        "Select a file to see it here.",
+        "Eine Datei auswählen, um sie hier zu sehen.",
+    ),
+    ("Reading…", "Wird gelesen…"),
+    (
+        "A folder. Enter opens it, d downloads it.",
+        "Ein Ordner. Enter öffnet ihn, d lädt ihn herunter.",
+    ),
+    (
+        "A link or special file, so it is not shown.",
+        "Ein Link oder eine Spezialdatei, daher nicht angezeigt.",
+    ),
+    (
+        "This looks like a binary file, so it is not shown.",
+        "Das sieht nach einer Binärdatei aus und wird nicht angezeigt.",
+    ),
+    ("d downloads it.", "d lädt sie herunter."),
+    (
+        "This file is big ({size}), so it is not shown automatically.",
+        "Diese Datei ist groß ({size}) und wird nicht automatisch angezeigt.",
+    ),
+    (
+        "p shows the first {limit}. d downloads it.",
+        "p zeigt die ersten {limit}. d lädt sie herunter.",
+    ),
+    (
+        "Could not read this file: {error}",
+        "Diese Datei konnte nicht gelesen werden: {error}",
+    ),
+    (
+        "… only the start of this file is shown",
+        "… nur der Anfang dieser Datei wird angezeigt",
+    ),
+    (
+        "Opens files for editing. It must be installed on this computer.",
+        "Öffnet Dateien zum Bearbeiten. Er muss auf diesem Computer installiert sein.",
     ),
     ("How it looks now:", "So sieht es jetzt aus:"),
     ("Editing Compose files", "Compose-Dateien bearbeiten"),
@@ -3156,34 +3228,10 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ),
     ("…and {count} more", "…und {count} weitere"),
     (
-        "You cannot write this file on the server, so it opened read-only",
-        "Diese Datei ist auf dem Server nicht beschreibbar, daher nur lesend geöffnet",
-    ),
-    (
-        "Sending the file back to the server…",
-        "Datei wird zurück zum Server gesendet…",
-    ),
-    (
-        "Saved on the server. Nothing was applied; run a Compose action to use it.",
-        "Auf dem Server gespeichert. Es wurde nichts angewendet; dafür eine Compose-Aktion ausführen.",
-    ),
-    (
         "No changes, so nothing was sent.",
         "Keine Änderungen, daher nichts gesendet.",
     ),
-    (
-        "Not saved on the server: {error}. Your copy is kept in {folder}",
-        "Nicht auf dem Server gespeichert: {error}. Die lokale Kopie liegt in {folder}",
-    ),
-    (
-        "Saved. Nothing was applied; run a Compose action to use it.",
-        "Gespeichert. Es wurde nichts angewendet; dafür eine Compose-Aktion ausführen.",
-    ),
     ("No changes.", "Keine Änderungen."),
-    (
-        "Getting {file} from the server…",
-        "{file} wird vom Server geholt…",
-    ),
     (
         "Could not open the file: {error}",
         "Datei konnte nicht geöffnet werden: {error}",
@@ -3339,16 +3387,16 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "Der Remote-Server ist getrennt",
     ),
     (
-        "Browse and download files",
-        "Dateien durchsuchen und herunterladen",
+        "Browse, read, edit and download files",
+        "Dateien durchsuchen, lesen, bearbeiten und herunterladen",
     ),
     (
         "Download a file or folder by path",
         "Datei oder Ordner per Pfad herunterladen",
     ),
     (
-        "Browse and download files from the selected container or server",
-        "Dateien des ausgewählten Containers oder Servers durchsuchen und herunterladen",
+        "Browse, read, edit and download the selected container or server's files",
+        "Dateien des ausgewählten Containers oder Servers durchsuchen, lesen, bearbeiten und herunterladen",
     ),
     (
         "Download a file or folder: download PATH",
@@ -3408,17 +3456,14 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "The destination folder does not exist",
         "Der Zielordner existiert nicht",
     ),
+    (" File explorer · {label} ", " Datei-Explorer · {label} "),
     (
-        " Download manager · {label} ",
-        " Download-Manager · {label} ",
+        " j/k Move · Enter Open folder · e Edit · d Download · r Refresh · : Command · Tab Downloads · Esc Close ",
+        " j/k Bewegen · Enter Ordner öffnen · e Bearbeiten · d Laden · r Neu laden · : Befehl · Tab Downloads · Esc Schließen ",
     ),
     (
-        " j/k Move · Enter Open or download · d Download · Tab Downloads · Esc Close ",
-        " j/k Bewegen · Enter Öffnen oder laden · d Laden · Tab Downloads · Esc Schließen ",
-    ),
-    (
-        " j/k Move · x Cancel · Tab Browse · Esc Close; downloads keep running ",
-        " j/k Bewegen · x Abbrechen · Tab Durchsuchen · Esc Schließen; Downloads laufen weiter ",
+        " j/k Move · x Cancel · Tab Files · Esc Close; downloads keep running ",
+        " j/k Bewegen · x Abbrechen · Tab Dateien · Esc Schließen; Downloads laufen weiter ",
     ),
     (
         "Browsing is unavailable: {reason} · :download PATH still works",

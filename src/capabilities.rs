@@ -265,6 +265,11 @@ fn server_rows(machine: &Machine) -> Vec<Capability> {
             "--allow-server-download",
         ),
         opt_in(
+            crate::i18n::t("Editing files on this server"),
+            reported.map(|c| c.allow_server_edit),
+            "--allow-server-edit",
+        ),
+        opt_in(
             crate::i18n::t("Editing Compose files"),
             reported.map(|c| c.allow_compose_edit),
             "--allow-compose-edit",
@@ -382,6 +387,7 @@ mod tests {
                 allow_compose: false,
                 allow_compose_edit: false,
                 allow_upload: false,
+                allow_server_edit: false,
                 security: false,
                 history: true,
                 agent_version: "1".into(),

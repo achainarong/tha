@@ -71,6 +71,20 @@ def main():
         keys(b"\r")
         expect("Start · disabled")  # A disabled action must not dismiss or mutate.
         keys(b"\x1b")
+        keys(b":file-explorer\r")
+        expect("File explorer")
+        keys(b"\rj")
+        expect("Sample contents of /etc/hostname")
+        keys(b"e")
+        expect("Demo mode: files are not edited")
+        keys(b":download /tmp/mydb.dump\r")
+        expect("2.4 GB")
+        keys(b"\r")
+        expect("Demo mode: files are not downloaded")
+        keys(b"\x1b")
+        keys(b"\t")
+        expect("No downloads in this session yet.")
+        keys(b"\x1b")
         keys(b":logs\r")
         expect("Wrap: on")
         keys(b"\x1b[13~")  # F3
@@ -152,7 +166,7 @@ def main():
         process.wait(timeout=5)
         assert process.returncode == 0
         assert termios.tcgetattr(slave) == original
-        print("PASS: selectable inventory tables, search/clear, filters/sort, image and bind-mount details, F7/F8 overview cycling/state retention, Layers/details, log filtering/private export, resize, terminal restoration; demo only")
+        print("PASS: selectable inventory tables, search/clear, filters/sort, image and bind-mount details, F7/F8 overview cycling/state retention, Layers/details, file explorer/preview/download confirmation, log filtering/private export, resize, terminal restoration; demo only")
     finally:
         if process.poll() is None:
             process.kill()

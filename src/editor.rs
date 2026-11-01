@@ -1,7 +1,11 @@
 //! The editors Tha can open a file in. The choice is a name from this list, never a command
 //! line, so nothing typed into a setting ever reaches a program as an argument.
 use serde::{Deserialize, Serialize};
-use std::{ffi::OsString, path::Path, process::Command};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -46,15 +50,24 @@ impl Editor {
         arguments
     }
 
-    pub fn command(self, path: &Path) -> Option<Command> {
-        let program = crate::exec::find_program(self.program())?;
-        let mut command = Command::new(program);
+    /// VS Code's own path wins when set, because `code` is often not on PATH.
+    fn resolve(self, vscode_path: Option<&Path>) -> Option<PathBuf> {
+        match (self, vscode_path) {
+            (Self::VsCode, Some(path)) => path.is_file().then(|| path.to_owned()),
+            _ => crate::exec::find_program(self.program()),
+        }
+    }
+
+    /// The returned command exits when editing is over: a terminal editor when it quits, however
+    /// it quit, and VS Code through `--wait` when the file's tab closes.
+    pub fn command(self, path: &Path, vscode_path: Option<&Path>) -> Option<Command> {
+        let mut command = Command::new(self.resolve(vscode_path)?);
         command.args(self.arguments(path));
         Some(command)
     }
 
-    pub fn available(self) -> bool {
-        crate::exec::find_program(self.program()).is_some()
+    pub fn available(self, vscode_path: Option<&Path>) -> bool {
+        self.resolve(vscode_path).is_some()
     }
 }
 
@@ -73,6 +86,19 @@ mod tests {
             Editor::Vim.arguments(path),
             ["--", "-evil.yaml"].map(OsString::from)
         );
+    }
+
+    #[test]
+    fn a_vs_code_path_is_used_when_set_and_must_exist() {
+        let directory = tempfile::tempdir().unwrap();
+        let code = directory.path().join("code");
+        std::fs::write(&code, b"").unwrap();
+        let file = Path::new("/tmp/a.yaml");
+        let command = Editor::VsCode.command(file, Some(&code)).unwrap();
+        assert_eq!(command.get_program(), code.as_os_str());
+        let missing = directory.path().join("missing");
+        assert!(Editor::VsCode.command(file, Some(&missing)).is_none());
+        assert!(!Editor::VsCode.available(Some(&missing)));
     }
 
     #[test]

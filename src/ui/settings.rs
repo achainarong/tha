@@ -66,7 +66,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         )),
         SettingRow::Keyboard => lines.push(Line::styled(t(app.keyboard.summary()), muted())),
         SettingRow::Editor => lines.push(Line::styled(
-            t("Opens Compose files with :compose-edit. It must be installed on this computer."),
+            t("Opens files for editing. It must be installed on this computer."),
             muted(),
         )),
         SettingRow::Mouse => lines.push(Line::styled(

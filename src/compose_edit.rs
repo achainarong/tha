@@ -1,6 +1,6 @@
-//! Editing a Compose file with the user's own editor. A local file is edited in place. A server's
-//! file is copied to a private temporary file, edited here, and sent back when the editor closes.
-//! Saving never applies anything: running Compose stays its own confirmed action.
+//! Editing a file with the user's own editor. A local file is edited in place. A remote one is
+//! copied to a private temporary file, edited here, and sent back when the editor exits, if it
+//! changed. Saving a Compose file never applies it: running Compose stays its own confirmed action.
 use crate::remote::Remote;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -79,10 +79,11 @@ pub struct Access {
     pub writable: bool,
 }
 
-fn regular_file(path: &Path) -> Result<std::fs::Metadata> {
+/// `any` means this server allows editing every file the login user can write.
+fn regular_file(path: &Path, any: bool) -> Result<std::fs::Metadata> {
     ensure!(
-        allowed_path(path),
-        "Only Compose and .env files can be edited this way"
+        any || allowed_path(path),
+        "Only Compose and .env files can be edited on this server; --allow-server-edit allows others"
     );
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("Cannot read {}", path.display()))?;
@@ -108,8 +109,8 @@ fn writable(path: &Path) -> bool {
 
 /// Replaces the file only if it is still what was downloaded, keeping one backup beside it, and
 /// keeps its owner and mode. A reader sees the old file or the new one, never part of one.
-pub fn write_checked(path: &Path, expected: &str, contents: &[u8]) -> Result<()> {
-    let metadata = regular_file(path)?;
+pub fn write_checked(path: &Path, expected: &str, contents: &[u8], any: bool) -> Result<()> {
+    let metadata = regular_file(path, any)?;
     ensure!(
         contents.len() as u64 <= MAX_FILE_BYTES,
         "This file is larger than 1 MiB"
@@ -157,13 +158,13 @@ pub fn write_checked(path: &Path, expected: &str, contents: &[u8]) -> Result<()>
 }
 
 /// Runs as the SSH login user, so normal file permissions decide.
-pub fn serve_host(request: HostEdit) -> Result<()> {
+pub fn serve_host(request: HostEdit, any: bool) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     match request {
         HostEdit::Check(path) => {
             let path = Path::new(&path);
-            regular_file(path)?;
+            regular_file(path, any)?;
             serde_json::to_writer(
                 &mut out,
                 &Access {
@@ -173,7 +174,7 @@ pub fn serve_host(request: HostEdit) -> Result<()> {
         }
         HostEdit::Read(path) => {
             let path = Path::new(&path);
-            regular_file(path)?;
+            regular_file(path, any)?;
             out.write_all(&std::fs::read(path)?)?;
         }
         HostEdit::Write { path, expected } => {
@@ -181,7 +182,7 @@ pub fn serve_host(request: HostEdit) -> Result<()> {
             std::io::stdin()
                 .take(MAX_FILE_BYTES + 1)
                 .read_to_end(&mut contents)?;
-            write_checked(Path::new(&path), &expected, &contents)?;
+            write_checked(Path::new(&path), &expected, &contents, any)?;
         }
     }
     out.flush()?;
@@ -198,6 +199,10 @@ pub enum Location {
         control: PathBuf,
         path: String,
     },
+    Container {
+        source: crate::files::Source,
+        path: String,
+    },
 }
 
 /// A server's file, copied here for the editor.
@@ -207,6 +212,9 @@ pub struct Fetched {
     pub path: PathBuf,
     pub hash: String,
     pub writable: bool,
+    /// A container file's owner and mode, which go back with it.
+    pub header: Option<crate::files::Header>,
+    pub original: Vec<u8>,
 }
 
 async fn run_ssh(
@@ -241,60 +249,201 @@ async fn run_ssh(
     Ok(output.stdout)
 }
 
-/// The access answer is advisory. The server checks again when the file comes back.
-pub async fn fetch(remote: &Remote, control: &Path, path: &str) -> Result<Fetched> {
-    let hex = encode(path);
-    let access: Access = serde_json::from_slice(
-        &run_ssh(
+/// Only text can be edited this way; a binary file would be corrupted by most editors.
+fn check_editable(bytes: &[u8]) -> Result<()> {
+    ensure!(
+        bytes.len() as u64 <= MAX_FILE_BYTES,
+        "{}",
+        crate::i18n::t("This file is larger than 1 MiB")
+    );
+    ensure!(
+        !crate::files::looks_binary(bytes, false),
+        "{}",
+        crate::i18n::t("This looks like a binary file, so it was not opened")
+    );
+    Ok(())
+}
+
+fn folder_of(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some(("", _)) | None => "/",
+        Some((folder, _)) => folder,
+    }
+}
+
+/// The access answer is advisory. The other side checks again when the file comes back.
+pub async fn fetch(location: &Location) -> Result<Fetched> {
+    let (name, bytes, writable, header) = match location {
+        Location::Local(_) => bail!("A local file is edited in place"),
+        Location::Server {
             remote,
             control,
-            &format!("tha-agent edit check {hex}"),
-            None,
-        )
-        .await?,
-    )?;
-    let bytes = run_ssh(remote, control, &format!("tha-agent edit read {hex}"), None).await?;
+            path,
+        } => {
+            let hex = encode(path);
+            let access: Access = serde_json::from_slice(
+                &run_ssh(
+                    remote,
+                    control,
+                    &format!("tha-agent edit check {hex}"),
+                    None,
+                )
+                .await?,
+            )?;
+            let bytes =
+                run_ssh(remote, control, &format!("tha-agent edit read {hex}"), None).await?;
+            (path, bytes, access.writable, None)
+        }
+        Location::Container { source, path } => {
+            let start = crate::files::read_start(source, path, MAX_FILE_BYTES as usize).await?;
+            ensure!(
+                !start.truncated,
+                "{}",
+                crate::i18n::t("This file is larger than 1 MiB, so it was not opened")
+            );
+            let writable = crate::files::can_upload(source, folder_of(path)).await;
+            (path, start.bytes, writable, Some(start.header))
+        }
+    };
+    check_editable(&bytes)?;
     let folder = tempfile::Builder::new().prefix("tha-edit-").tempdir()?;
     // Keeps the name, so the editor recognizes the file type. tempdir() is private to this user.
-    let local = folder.path().join(crate::files::file_name(path));
+    let local = folder.path().join(crate::files::file_name(name));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(if access.writable { 0o600 } else { 0o400 })
+        .mode(if writable { 0o600 } else { 0o400 })
         .open(&local)?;
     file.write_all(&bytes)?;
     Ok(Fetched {
         folder,
         path: local,
         hash: hash(&bytes),
-        writable: access.writable,
+        writable,
+        header,
+        original: bytes,
     })
 }
 
 /// `Ok(false)` means nothing changed, so nothing was sent.
-pub async fn send_back(
-    remote: &Remote,
-    control: &Path,
-    path: &str,
-    fetched: &Fetched,
-) -> Result<bool> {
-    let contents = std::fs::read(&fetched.path)?;
+pub async fn send_back(location: &Location, fetched: &Fetched) -> Result<bool> {
+    let mut contents = Vec::new();
+    std::fs::File::open(&fetched.path)?
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut contents)?;
+    check_editable(&contents)?;
     if hash(&contents) == fetched.hash {
         return Ok(false);
     }
-    run_ssh(
-        remote,
-        control,
-        &format!("tha-agent edit write {} {}", encode(path), fetched.hash),
-        Some(&contents),
-    )
-    .await?;
+    match location {
+        Location::Local(_) => bail!("A local file is edited in place"),
+        Location::Server {
+            remote,
+            control,
+            path,
+        } => {
+            run_ssh(
+                remote,
+                control,
+                &format!("tha-agent edit write {} {}", encode(path), fetched.hash),
+                Some(&contents),
+            )
+            .await?;
+        }
+        Location::Container { source, path } => {
+            // The engine cannot replace a file only if unchanged, so this narrows the window
+            // rather than closing it. The backup covers what is left.
+            let current = crate::files::read_start(source, path, MAX_FILE_BYTES as usize).await?;
+            check_unchanged(&current, &fetched.hash)?;
+            let header = fetched
+                .header
+                .as_ref()
+                .context("The file's details are missing")?;
+            let archive = crate::files::edited_archive(
+                crate::files::file_name(path),
+                header,
+                &fetched.original,
+                &contents,
+            );
+            crate::files::upload_bytes(source, folder_of(path), archive).await?;
+        }
+    }
     Ok(true)
+}
+
+fn check_unchanged(current: &crate::files::FileStart, expected: &str) -> Result<()> {
+    ensure!(
+        !current.truncated && hash(&current.bytes) == expected,
+        "The file changed in the container while it was being edited; nothing was overwritten"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folders_of_paths_and_binary_files_are_handled() {
+        assert_eq!(folder_of("/etc/nginx/nginx.conf"), "/etc/nginx");
+        assert_eq!(folder_of("/hostname"), "/");
+        assert!(check_editable(b"text").is_ok());
+        assert!(check_editable(b"bin\0ary").is_err());
+    }
+
+    #[tokio::test]
+    async fn edited_contents_are_validated_before_any_transport_and_kept_on_rejection() {
+        for contents in [
+            vec![b'x'; MAX_FILE_BYTES as usize + 1],
+            b"binary\0data".to_vec(),
+        ] {
+            let folder = tempfile::tempdir().unwrap();
+            let path = folder.path().join("file.txt");
+            std::fs::write(&path, &contents).unwrap();
+            let fetched = Fetched {
+                folder,
+                path: path.clone(),
+                hash: hash(b"original"),
+                writable: true,
+                header: None,
+                original: b"original".to_vec(),
+            };
+            // No transport is available: validation must reject the bytes first.
+            let error = send_back(&Location::Local(path.clone()), &fetched)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(if contents.len() as u64 > MAX_FILE_BYTES {
+                        "larger than 1 MiB"
+                    } else {
+                        "binary"
+                    }),
+                "{error:#}"
+            );
+            assert_eq!(std::fs::read(path).unwrap(), contents);
+        }
+    }
+
+    #[test]
+    fn an_appended_file_at_the_edit_limit_is_a_conflict_even_when_its_prefix_matches() {
+        let original = vec![b'x'; MAX_FILE_BYTES as usize];
+        let current = crate::files::FileStart {
+            header: crate::files::Header {
+                name: "file.txt".into(),
+                kind: crate::files::Kind::File,
+                size: MAX_FILE_BYTES + 1,
+                modified: 0,
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+            },
+            bytes: original.clone(),
+            truncated: true,
+        };
+        assert!(check_unchanged(&current, &hash(&original)).is_err());
+    }
 
     #[test]
     fn only_compose_and_env_files_qualify() {
@@ -348,7 +497,7 @@ mod tests {
         let path = directory.path().join("compose.yaml");
         std::fs::write(&path, b"old").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        write_checked(&path, &hash(b"old"), b"new").unwrap();
+        write_checked(&path, &hash(b"old"), b"new", false).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -369,7 +518,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("compose.yaml");
         std::fs::write(&path, b"someone else's edit").unwrap();
-        let error = write_checked(&path, &hash(b"what I downloaded"), b"mine").unwrap_err();
+        let error = write_checked(&path, &hash(b"what I downloaded"), b"mine", false).unwrap_err();
         assert!(error.to_string().contains("changed"));
         assert_eq!(std::fs::read(&path).unwrap(), b"someone else's edit");
     }
@@ -381,13 +530,26 @@ mod tests {
         std::fs::write(&target, b"x").unwrap();
         let link = directory.path().join("link.yaml");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(write_checked(&link, &hash(b"x"), b"y").is_err());
+        assert!(write_checked(&link, &hash(b"x"), b"y", false).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"x");
 
         let big = directory.path().join("big.yaml");
         std::fs::write(&big, vec![0; MAX_FILE_BYTES as usize + 1]).unwrap();
-        assert!(regular_file(&big).is_err());
-        assert!(regular_file(&directory.path().join("notes.txt")).is_err());
+        assert!(regular_file(&big, false).is_err());
+        assert!(
+            regular_file(&big, true).is_err(),
+            "The size limit always applies"
+        );
+        let notes = directory.path().join("notes.txt");
+        std::fs::write(&notes, b"x").unwrap();
+        assert!(
+            regular_file(&notes, false).is_err(),
+            "Compose edit stays limited to Compose files"
+        );
+        assert!(
+            regular_file(&notes, true).is_ok(),
+            "--allow-server-edit reaches any file"
+        );
     }
 
     #[test]
@@ -399,7 +561,7 @@ mod tests {
         std::fs::write(&victim, b"keep").unwrap();
         std::os::unix::fs::symlink(&victim, directory.path().join("compose.yaml.tha-backup"))
             .unwrap();
-        write_checked(&path, &hash(b"old"), b"new").unwrap();
+        write_checked(&path, &hash(b"old"), b"new", false).unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
     }
 }

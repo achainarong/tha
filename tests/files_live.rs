@@ -194,3 +194,70 @@ async fn the_agent_routes_work_against_a_real_engine_and_refuse_what_is_off() {
     assert!(refused.contains("--allow-upload"), "{refused}");
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[tokio::test]
+#[ignore = "needs a running container; writes small files under /tmp in it"]
+async fn editing_a_container_file_keeps_its_owner_and_mode_and_refuses_a_changed_file() {
+    use tha::compose_edit::{Location, fetch, send_back};
+    let source = source();
+    let directory = std::env::temp_dir().join(format!("tha-live-edit-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = "/tmp/tha-live-edit.conf";
+    // A starting point with a real owner and mode, written the same way an edit writes.
+    let start = files::Header {
+        name: "tha-live-edit.conf".into(),
+        kind: Kind::File,
+        size: 3,
+        modified: 1_700_000_000,
+        mode: 0o640,
+        uid: 101,
+        gid: 101,
+    };
+    let archive = files::edited_archive("tha-live-edit.conf", &start, b"", b"old");
+    files::upload_bytes(&source, "/tmp", archive).await.unwrap();
+
+    let location = Location::Container {
+        source: source.clone(),
+        path: path.into(),
+    };
+    let fetched = fetch(&location).await.unwrap();
+    assert!(fetched.writable);
+    assert!(
+        !send_back(&location, &fetched).await.unwrap(),
+        "No change, nothing sent"
+    );
+
+    std::fs::write(&fetched.path, b"new contents").unwrap();
+    assert!(send_back(&location, &fetched).await.unwrap());
+    let after = files::read_start(&source, path, 4096).await.unwrap();
+    assert_eq!(after.bytes, b"new contents");
+    assert_eq!(
+        (
+            after.header.mode & 0o777,
+            after.header.uid,
+            after.header.gid
+        ),
+        (0o640, 101, 101)
+    );
+    let backup = files::read_start(&source, "/tmp/tha-live-edit.conf.tha-backup", 4096)
+        .await
+        .unwrap();
+    assert_eq!(backup.bytes, b"old");
+    assert_eq!(backup.header.mode & 0o777, 0o600);
+
+    // Someone else saved it in the meantime, so this edit must not overwrite theirs.
+    let stale = fetched;
+    std::fs::write(&stale.path, b"my later edit").unwrap();
+    let error = send_back(&location, &stale).await.unwrap_err();
+    assert!(error.to_string().contains("changed"), "{error:#}");
+    assert_eq!(
+        files::read_start(&source, path, 4096).await.unwrap().bytes,
+        b"new contents"
+    );
+
+    let binary = files::read_start(&source, "/bin/sh", 4096).await;
+    if let Ok(start) = binary {
+        assert!(files::looks_binary(&start.bytes, start.truncated));
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}

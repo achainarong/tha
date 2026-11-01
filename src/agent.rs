@@ -46,6 +46,8 @@ pub struct AgentConfig {
     pub allow_download: bool,
     /// Lets the key read whatever the SSH login user can read on the server itself.
     pub allow_server_download: bool,
+    /// Lets the key rewrite any file the SSH login user can write, not only Compose files.
+    pub allow_server_edit: bool,
     /// Lets the key write files into containers.
     pub allow_upload: bool,
     /// Lets the key run Compose actions on projects whose files already are on this server.
@@ -794,7 +796,7 @@ where
 #[derive(Debug, PartialEq, Eq)]
 pub enum Requested<'a> {
     Files(crate::files::HostOp, String),
-    Edit(crate::compose_edit::HostEdit),
+    Edit(crate::compose_edit::HostEdit, bool),
     List,
     Shell,
     Engine(&'a AgentEngine),
@@ -812,10 +814,10 @@ pub fn parse_command<'a>(config: &'a AgentConfig, command: Option<&str>) -> Resu
     }
     if let Some(request) = crate::compose_edit::parse_host_command(command) {
         ensure!(
-            config.allow_compose_edit,
-            "Compose file editing is turned off on this server; rerun tha-agent setup with --allow-compose-edit"
+            config.allow_compose_edit || config.allow_server_edit,
+            "File editing is turned off on this server; rerun tha-agent setup with --allow-server-edit, or --allow-compose-edit for Compose files only"
         );
-        return Ok(Requested::Edit(request?));
+        return Ok(Requested::Edit(request?, config.allow_server_edit));
     }
     if let Some(request) = crate::files::parse_host_command(command) {
         ensure!(
@@ -865,6 +867,7 @@ pub struct Capabilities {
     pub allow_compose: bool,
     pub allow_compose_edit: bool,
     pub allow_upload: bool,
+    pub allow_server_edit: bool,
     pub security: bool,
     pub history: bool,
     pub agent_version: String,
@@ -887,6 +890,7 @@ pub fn listing(config: &AgentConfig) -> Listing {
             allow_compose: config.allow_compose,
             allow_compose_edit: config.allow_compose_edit,
             allow_upload: config.allow_upload,
+            allow_server_edit: config.allow_server_edit,
             security: config.security.enabled,
             history: true,
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -930,14 +934,14 @@ pub async fn run(argument: Option<&str>) -> Result<()> {
             ));
             crate::files::serve_host(op, &path)
         }
-        Requested::Edit(request) => {
+        Requested::Edit(request, any) => {
             if let crate::compose_edit::HostEdit::Write { path, .. } = &request {
                 syslog(&format!(
-                    "allowed Compose file edit as SSH login user: {}",
+                    "allowed file edit as SSH login user: {}",
                     loggable(path)
                 ));
             }
-            crate::compose_edit::serve_host(request)
+            crate::compose_edit::serve_host(request, any)
         }
         Requested::Shell => {
             syslog("allowed server shell as SSH login user");
@@ -1056,6 +1060,19 @@ mod tests {
         ));
         assert!(parse_command(&config, Some("tha-agent files read 2f;id")).is_err());
         assert!(parse_command(&config, Some("tha-agent files write 2f")).is_err());
+        // Editing has its own options, and only one of them reaches every file.
+        let edit = "tha-agent edit read 2f746d702f612e747874";
+        assert!(parse_command(&config, Some(edit)).is_err());
+        config.allow_compose_edit = true;
+        assert!(matches!(
+            parse_command(&config, Some(edit)).unwrap(),
+            Requested::Edit(_, false)
+        ));
+        config.allow_server_edit = true;
+        assert!(matches!(
+            parse_command(&config, Some(edit)).unwrap(),
+            Requested::Edit(_, true)
+        ));
         // It does not open the shell, which keeps its own option.
         assert!(parse_command(&config, Some("tha-agent shell")).is_err());
     }

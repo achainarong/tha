@@ -179,7 +179,7 @@ mod tests {
             "alerts",
             "timeline",
             "fleet",
-            "download-manager",
+            "file-explorer",
             "download",
             "capabilities",
             "save-view",

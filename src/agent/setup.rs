@@ -39,6 +39,7 @@ pub struct Options {
     pub allow_compose: bool,
     pub allow_compose_edit: bool,
     pub allow_upload: bool,
+    pub allow_server_edit: bool,
     /// Where the agent posts alerts. Kept in a root-only file, not the policy.
     pub alert_webhook: Option<String>,
     pub no_alert_webhook: bool,
@@ -221,6 +222,7 @@ pub fn merge_config(
         allow_compose: existing.allow_compose,
         allow_compose_edit: existing.allow_compose_edit,
         allow_upload: existing.allow_upload,
+        allow_server_edit: existing.allow_server_edit,
         engines: if engines.is_empty() {
             existing.engines
         } else {
@@ -407,7 +409,7 @@ fn find_engines() -> Vec<AgentEngine> {
 fn finish_root_setup(policy: &Path, config: &AgentConfig) -> Result<()> {
     write_policy(policy, config)?;
     println!(
-        "Agent policy written. tha's traffic goes through the allowlist (delete {}, exec {}, images {}, downloads {}, server downloads {}, compose {}, compose edit {}, uploads {}).",
+        "Agent policy written. tha's traffic goes through the allowlist (delete {}, exec {}, images {}, downloads {}, server downloads {}, compose {}, compose edit {}, uploads {}, server edit {}).",
         if config.allow_delete { "on" } else { "off" },
         if config.allow_exec { "on" } else { "off" },
         if config.allow_images { "on" } else { "off" },
@@ -424,6 +426,11 @@ fn finish_root_setup(policy: &Path, config: &AgentConfig) -> Result<()> {
             "off"
         },
         if config.allow_upload { "on" } else { "off" },
+        if config.allow_server_edit {
+            "on"
+        } else {
+            "off"
+        },
     );
     println!(
         "Root's SSH keys are not restricted: anyone holding one still has full root access. Use a dedicated user to limit the key itself."
@@ -535,6 +542,7 @@ pub fn run_setup(options: &Options) -> Result<()> {
     config.allow_compose |= options.allow_compose;
     config.allow_compose_edit |= options.allow_compose_edit;
     config.allow_upload |= options.allow_upload;
+    config.allow_server_edit |= options.allow_server_edit;
     configure_security(&mut config.security, options);
     config.validate()?;
     ensure!(
@@ -633,7 +641,7 @@ fn finish_dedicated_setup(
     }
 
     println!(
-        "Agent ready for user {}: {} (delete {}, exec {}, images {}, downloads {}, server downloads {}, compose {}, compose edit {}, uploads {})",
+        "Agent ready for user {}: {} (delete {}, exec {}, images {}, downloads {}, server downloads {}, compose {}, compose edit {}, uploads {}, server edit {})",
         options.user,
         config
             .engines
@@ -657,6 +665,11 @@ fn finish_dedicated_setup(
             "off"
         },
         if config.allow_upload { "on" } else { "off" },
+        if config.allow_server_edit {
+            "on"
+        } else {
+            "off"
+        },
     );
     println!(
         "If sshd uses AllowUsers or AllowGroups, also allow {}.",
@@ -687,6 +700,7 @@ mod tests {
             allow_compose: false,
             allow_compose_edit: false,
             allow_upload: false,
+            allow_server_edit: false,
             alert_webhook: None,
             no_alert_webhook: false,
             engines: vec![],
@@ -811,6 +825,7 @@ mod tests {
             allow_compose: false,
             allow_compose_edit: false,
             allow_upload: false,
+            allow_server_edit: false,
             alert_webhook: None,
             no_alert_webhook: false,
             engines: vec!["docker=/missing-security-test.sock".into()],
@@ -885,6 +900,7 @@ mod tests {
             allow_compose: false,
             allow_compose_edit: false,
             allow_upload: false,
+            allow_server_edit: false,
             engines: vec![AgentEngine {
                 name: "docker".into(),
                 socket: "/a".into(),

@@ -257,6 +257,7 @@ async fn start() -> Result<()> {
     tha::keymap::Keymap::parse(&config.bindings)?;
     app.custom_bindings = config.bindings;
     app.alert_rules = config.alerts;
+    app.vscode_path = config.vscode_path;
     app.check_updates = config.check_updates && !cli.demo;
     app.config_path = cli
         .config
@@ -345,13 +346,38 @@ fn connections(cli: &Cli, config: &Config, allow_empty: bool) -> Result<Vec<Conn
 
 enum EditEvent {
     Fetched {
-        remote: Box<tha::remote::Remote>,
-        control: PathBuf,
-        path: String,
+        location: Box<tha::compose_edit::Location>,
         fetched: tha::compose_edit::Fetched,
     },
     Notice(String),
+    Saved {
+        location: Box<tha::compose_edit::Location>,
+        message: String,
+    },
     NetworkTest(Result<tha::files::NetTest, String>),
+}
+
+fn invalidate_edited_preview(
+    manager: &mut tha::downloads::Manager,
+    location: &tha::compose_edit::Location,
+) {
+    use tha::{compose_edit::Location, files::Source};
+    match location {
+        Location::Local(_) => {}
+        Location::Container { source, path } => manager.invalidate_preview(&source.key(), path),
+        Location::Server {
+            remote,
+            control,
+            path,
+        } => {
+            let source = Source::Server {
+                remote: remote.clone(),
+                control: control.clone(),
+                label: remote.name.clone(),
+            };
+            manager.invalidate_preview(&source.key(), path);
+        }
+    }
 }
 
 /// Gives the terminal to the editor until it exits. Other work keeps running, and the screen and
@@ -360,10 +386,11 @@ async fn hand_off(
     terminal: &mut ratatui::DefaultTerminal,
     events: &mut Option<EventStream>,
     editor: tha::editor::Editor,
+    vscode_path: Option<&std::path::Path>,
     path: &std::path::Path,
     mouse: bool,
 ) -> Result<()> {
-    let Some(mut command) = editor.command(path) else {
+    let Some(mut command) = editor.command(path, vscode_path) else {
         bail!(
             "{}",
             tha::tf!(
@@ -560,7 +587,8 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let (diagnostics_tx, mut diagnostics_rx) = mpsc::channel::<tha::diagnostics::Event>(4);
     let (downloads_tx, mut downloads_rx) = mpsc::channel::<tha::downloads::Event>(64);
     let mut download_lists: Vec<AbortTask> = Vec::new();
-    let mut download_dialog: [Option<AbortTask>; 2] = [None, None];
+    // Inspecting and counting for the dialog, and the file preview.
+    let mut download_dialog: [Option<AbortTask>; 3] = [None, None, None];
     let mut download_jobs: std::collections::HashMap<u64, AbortTask> = Default::default();
     if app.check_updates {
         let sender = edit_tx.clone();
@@ -817,41 +845,49 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
             },
             Some(event) = edit_rx.recv() => {
                 match event {
-                    EditEvent::Fetched { remote, control, path, fetched } => {
+                    EditEvent::Fetched { location, fetched } => {
                         let editor = app.editor;
+                        let vscode = app.vscode_path.clone();
                         if !fetched.writable {
                             app.notice = tha::i18n::t(
-                                "You cannot write this file on the server, so it opened read-only",
+                                "You cannot write this file there, so it opened read-only",
                             )
                             .into();
                         }
-                        match hand_off(&mut terminal, &mut events, editor, &fetched.path, mouse_captured).await {
+                        match hand_off(&mut terminal, &mut events, editor, vscode.as_deref(), &fetched.path, mouse_captured).await {
                             Err(error) => {
                                 app.notice = tha::tf!("{error}", error = format!("{error:#}"));
                             }
                             Ok(()) if !fetched.writable => {}
                             Ok(()) => {
                                 let sender = edit_tx.clone();
-                                app.notice = tha::i18n::t("Sending the file back to the server…").into();
+                                app.notice = tha::i18n::t("Sending the file back…").into();
                                 edit_tasks.push(AbortTask(tokio::spawn(async move {
-                                    let result = tha::compose_edit::send_back(&remote, &control, &path, &fetched).await;
+                                    let result = tha::compose_edit::send_back(&location, &fetched).await;
                                     let message = match result {
-                                        Ok(true) => tha::i18n::t("Saved on the server. Nothing was applied; run a Compose action to use it.").to_owned(),
+                                        Ok(true) => tha::i18n::t("Saved. Nothing was restarted or applied.").to_owned(),
                                         Ok(false) => tha::i18n::t("No changes, so nothing was sent.").to_owned(),
                                         Err(error) => {
                                             // The edits must not be lost with the temporary folder.
                                             let kept = fetched.folder.keep();
                                             tha::tf!(
-                                                "Not saved on the server: {error}. Your copy is kept in {folder}",
+                                                "Not saved: {error}. Your copy is kept in {folder}",
                                                 error = tha::model::safe_text(&format!("{error:#}")),
                                                 folder = kept.display().to_string()
                                             )
                                         }
                                     };
-                                    let _ = sender.send(EditEvent::Notice(message)).await;
+                                    let _ = sender.send(EditEvent::Saved { location, message }).await;
                                 })));
                             }
                         }
+                    }
+                    EditEvent::Saved { location, message } => {
+                        invalidate_edited_preview(&mut app.downloads, &location);
+                        if app.downloads.open.is_some() {
+                            app.downloads.message = Some(message.clone());
+                        }
+                        app.notice = message;
                     }
                     EditEvent::Notice(message) => app.notice = message,
                     EditEvent::NetworkTest(result) => {
@@ -1029,31 +1065,31 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 tha::compose_edit::Location::Local(path) => {
                     let before = std::fs::read(&path).ok();
                     let editor = app.editor;
-                    app.notice =
-                        match hand_off(&mut terminal, &mut events, editor, &path, mouse_captured)
-                            .await
-                        {
-                            Err(error) => tha::tf!("{error}", error = format!("{error:#}")),
-                            Ok(()) if std::fs::read(&path).ok() != before => tha::i18n::t(
-                                "Saved. Nothing was applied; run a Compose action to use it.",
-                            )
-                            .to_owned(),
-                            Ok(()) => tha::i18n::t("No changes.").to_owned(),
-                        };
+                    let vscode = app.vscode_path.clone();
+                    app.notice = match hand_off(
+                        &mut terminal,
+                        &mut events,
+                        editor,
+                        vscode.as_deref(),
+                        &path,
+                        mouse_captured,
+                    )
+                    .await
+                    {
+                        Err(error) => tha::tf!("{error}", error = format!("{error:#}")),
+                        Ok(()) if std::fs::read(&path).ok() != before => {
+                            tha::i18n::t("Saved. Nothing was restarted or applied.").to_owned()
+                        }
+                        Ok(()) => tha::i18n::t("No changes.").to_owned(),
+                    };
                 }
-                tha::compose_edit::Location::Server {
-                    remote,
-                    control,
-                    path,
-                } => {
-                    app.notice = tha::tf!("Getting {file} from the server…", file = request.label);
+                location => {
+                    app.notice = tha::tf!("Getting {file}…", file = request.label);
                     let sender = edit_tx.clone();
                     edit_tasks.push(AbortTask(tokio::spawn(async move {
-                        let event = match tha::compose_edit::fetch(&remote, &control, &path).await {
+                        let event = match tha::compose_edit::fetch(&location).await {
                             Ok(fetched) => EditEvent::Fetched {
-                                remote: Box::new(remote),
-                                control,
-                                path,
+                                location: Box::new(location),
                                 fetched,
                             },
                             Err(error) => EditEvent::Notice(tha::tf!(
@@ -1143,6 +1179,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
             }
         }
         app.downloads.release_idle(std::time::Instant::now());
+        redraw_now |= app.downloads.update_preview(std::time::Instant::now());
         for request in app.take_download_requests() {
             run_download_request(
                 request,
@@ -1450,7 +1487,7 @@ fn run_download_request(
     request: tha::downloads::Request,
     tx: &mpsc::Sender<tha::downloads::Event>,
     lists: &mut Vec<AbortTask>,
-    dialog: &mut [Option<AbortTask>; 2],
+    dialog: &mut [Option<AbortTask>; 3],
     jobs: &mut std::collections::HashMap<u64, AbortTask>,
 ) {
     use tha::downloads::{Event, Request};
@@ -1545,7 +1582,34 @@ fn run_download_request(
         Request::Cancel { job } => {
             jobs.remove(&job);
         }
-        Request::CloseDialog => *dialog = [None, None],
+        Request::Preview {
+            generation,
+            source,
+            path,
+        } => {
+            // Replacing the task stops reading the file that was selected before.
+            dialog[2] = Some(AbortTask(tokio::spawn(async move {
+                let result = tokio::time::timeout(
+                    QUICK,
+                    tha::files::read_start(&source, &path, tha::downloads::PREVIEW_LIMIT),
+                )
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!(tha::i18n::t("Timed out"))))
+                .map_err(message);
+                let _ = sender
+                    .send(Event::Previewed {
+                        key: source.key(),
+                        generation,
+                        path,
+                        result,
+                    })
+                    .await;
+            })));
+        }
+        Request::CloseDialog => {
+            dialog[0] = None;
+            dialog[1] = None;
+        }
     }
 }
 

@@ -55,6 +55,8 @@ pub struct Config {
     pub alerts: crate::alerts::Rules,
     /// Opens Compose files. One of: vim, neovim, nano, vscode.
     pub editor: crate::editor::Editor,
+    /// VS Code's `code` program, when it is not on PATH.
+    pub vscode_path: Option<PathBuf>,
     /// Asks GitHub once at startup whether a newer release exists. Off unless set.
     pub check_updates: bool,
 }
@@ -85,6 +87,7 @@ impl Default for Config {
             context_order: Vec::new(),
             alerts: Default::default(),
             editor: Default::default(),
+            vscode_path: None,
             check_updates: false,
         }
     }

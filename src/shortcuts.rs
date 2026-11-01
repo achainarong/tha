@@ -335,7 +335,7 @@ catalog! {
     Alerts, "Show alerts", ["alerts"], Containers, 15, false, [], [];
     Timeline, "Incidents for the selected workload", ["timeline"], Containers, 15, false, [], [];
     Fleet, "What needs attention across all connections", ["fleet"], Containers, 15, false, [], [];
-    DownloadManager, "Browse and download files", ["download-manager"], Containers, 40, false, [], [];
+    FileExplorer, "Browse, read, edit and download files", ["file-explorer"], Containers, 40, false, [], [];
     Download, "Download a file or folder by path", ["download"], Containers, 40, false, [], [];
     Capabilities, "Show what this connection can do", ["capabilities"], Containers, 40, false, [], [];
     SaveView, "Save this view under a name", ["save-view"], Containers, 40, false, [], [];
@@ -491,7 +491,7 @@ impl ActionId {
             Self::Alerts => "alerts",
             Self::Timeline => "timeline",
             Self::Fleet => "fleet",
-            Self::DownloadManager => "download-manager",
+            Self::FileExplorer => "file-explorer",
             Self::Download => "download",
             Self::Capabilities => "capabilities",
             Self::SaveView => "save-view",

@@ -22,6 +22,7 @@
 #                         --allow-compose opts in to Compose actions on files already on the server.
 #                         --allow-compose-edit opts in to rewriting Compose and .env files.
 #                         --allow-upload opts in to writing files into containers.
+#                         --allow-server-edit opts in to rewriting any file the SSH user can write.
 #                         --allow-all turns on every --allow option; see the list in the README.
 #                         --alert-webhook URL posts alerts to an https:// URL while Tha is closed.
 #                         --no-alert-webhook removes it.
@@ -66,6 +67,7 @@ if [ "$MODE" = agent ]; then
     agent_compose=
     agent_compose_edit=
     agent_upload=
+    agent_server_edit=
     agent_all=
     agent_webhook=
     agent_no_webhook=
@@ -84,6 +86,7 @@ if [ "$MODE" = agent ]; then
             --allow-compose) agent_compose=1; shift ;;
             --allow-compose-edit) agent_compose_edit=1; shift ;;
             --allow-upload) agent_upload=1; shift ;;
+            --allow-server-edit) agent_server_edit=1; shift ;;
             --allow-all) agent_all=1; shift ;;
             --alert-webhook)
                 [ "$#" -ge 2 ] || die "--alert-webhook needs an https:// URL"
@@ -92,7 +95,7 @@ if [ "$MODE" = agent ]; then
             --scanner-digest) [ $# -ge 2 ] || die "--scanner-digest needs sha256:DIGEST"; agent_scanner_digest=$2; shift 2 ;;
             --security-interval) [ $# -ge 2 ] || die "--security-interval needs seconds"; agent_security_interval=$2; shift 2 ;;
             --no-security) agent_no_security=1; shift ;;
-            *) die "unknown agent option '$1'; expected --key, --user, --allow-delete, --allow-images, --allow-download, --allow-server-download, --allow-compose, --allow-compose-edit, --allow-upload, --allow-all, --allow-exec, --no-security or --security-interval" ;;
+            *) die "unknown agent option '$1'; expected --key, --user, --allow-delete, --allow-images, --allow-download, --allow-server-download, --allow-compose, --allow-compose-edit, --allow-upload, --allow-server-edit, --allow-all, --allow-exec, --no-security or --security-interval" ;;
         esac
     done
     if [ "$agent_user" = root ]; then
@@ -108,8 +111,8 @@ if [ "$MODE" = agent ]; then
     if [ -n "$agent_images" ] && [ -z "$agent_key$agent_user" ]; then
         die "--allow-images needs --key or --user root"
     fi
-    if [ -n "$agent_download$agent_server_download$agent_compose$agent_compose_edit$agent_upload" ] && [ -z "$agent_key$agent_user" ]; then
-        die "--allow-download, --allow-server-download, --allow-compose, --allow-compose-edit and --allow-upload need --key or --user root"
+    if [ -n "$agent_download$agent_server_download$agent_compose$agent_compose_edit$agent_upload$agent_server_edit" ] && [ -z "$agent_key$agent_user" ]; then
+        die "--allow-download, --allow-server-download, --allow-compose, --allow-compose-edit, --allow-upload and --allow-server-edit need --key or --user root"
     fi
     if [ -n "$agent_all" ] && [ -z "$agent_key$agent_user" ]; then
         die "--allow-all needs --key or --user root"
@@ -301,6 +304,7 @@ if [ "$MODE" = agent ]; then
     [ -z "$agent_compose" ] || set -- "$@" --allow-compose
     [ -z "$agent_compose_edit" ] || set -- "$@" --allow-compose-edit
     [ -z "$agent_upload" ] || set -- "$@" --allow-upload
+    [ -z "$agent_server_edit" ] || set -- "$@" --allow-server-edit
     [ -z "$agent_all" ] || set -- "$@" --allow-all
     [ -z "$agent_webhook" ] || set -- "$@" --alert-webhook "$agent_webhook"
     [ -z "$agent_no_webhook" ] || set -- "$@" --no-alert-webhook

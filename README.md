@@ -126,6 +126,7 @@ Everything else is off until you turn it on in the setup command on the **server
 | `--allow-download` | Downloading files and folders from containers | Read anything inside any container |
 | `--allow-server-download` | Browsing and downloading the server's own files | Read whatever the SSH login user can read |
 | `--allow-upload` | Copying files into containers | Change files inside running workloads |
+| `--allow-server-edit` | Editing any file on the server | Rewrite whatever the SSH login user can write |
 | `--allow-compose` | Compose actions on projects whose files are on the server | Recreate projects from those files |
 | `--allow-compose-edit` | Editing Compose and `.env` files | Change them, which together with `--allow-compose` amounts to root |
 | `--allow-all` | All of the above | All of the above |
@@ -147,6 +148,7 @@ allow_upload = false
 ```
 
 Keep these at the top of the file, before any table headers. See the [user guide](docs/guide.md) for details on each.
+`:file-explorer` shows which option each file action needs.
 
 ### Background agent features
 

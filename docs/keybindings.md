@@ -96,7 +96,7 @@ configured keys take precedence.
 | --- | --- |
 | `performance`, `performance-close`, `performance-scope` | Toggle Performance; close focused Performance; switch runtime/container scope |
 | `sort-contexts` | Open runtime sorting picker |
-| `download-manager`, `download` | Open the download manager, or prompt for a path to download |
+| `file-explorer`, `download` | Open the file explorer, or prompt for a path to download |
 | `timeline` | Show incidents for the selected workload |
 | `alerts` | Show alerts |
 | `fleet` | Show what needs attention across all connections |

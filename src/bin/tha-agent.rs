@@ -26,7 +26,7 @@ enum Command {
     Shell,
     /// Read server files as the SSH login user (requires allow_server_download)
     Files { op: String, path: String },
-    /// Read or replace a Compose file as the SSH login user (requires allow_compose_edit)
+    /// Read or replace a file as the SSH login user (requires allow_server_edit or allow_compose_edit)
     Edit {
         op: String,
         path: String,
@@ -67,6 +67,9 @@ enum Command {
         /// Allow writing files into containers (disabled by default)
         #[arg(long)]
         allow_upload: bool,
+        /// Allow rewriting any file the SSH login user can write (disabled by default)
+        #[arg(long)]
+        allow_server_edit: bool,
         /// Turn on every option above that starts with --allow. Read the README's list first
         #[arg(long)]
         allow_all: bool,
@@ -136,6 +139,7 @@ async fn main() {
             allow_compose,
             allow_compose_edit,
             allow_upload,
+            allow_server_edit,
             allow_all,
             alert_webhook,
             no_alert_webhook,
@@ -154,6 +158,7 @@ async fn main() {
             allow_compose: allow_compose || allow_all,
             allow_compose_edit: allow_compose_edit || allow_all,
             allow_upload: allow_upload || allow_all,
+            allow_server_edit: allow_server_edit || allow_all,
             alert_webhook,
             no_alert_webhook,
             engines: engine,

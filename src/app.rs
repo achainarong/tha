@@ -453,6 +453,7 @@ pub struct App {
     pub compose_review_until: Option<std::time::Instant>,
     pub compose_before: Option<(usize, String, Vec<crate::compose::ServiceImage>)>,
     pub editor: crate::editor::Editor,
+    pub vscode_path: Option<PathBuf>,
     pub edit_request: Option<EditRequest>,
     pub config_path: Option<PathBuf>,
     pub config_modified: Option<std::time::SystemTime>,
@@ -618,6 +619,7 @@ impl App {
             compose_review_until: None,
             compose_before: None,
             editor: Default::default(),
+            vscode_path: None,
             edit_request: None,
             config_path: None,
             config_modified: None,
@@ -3890,9 +3892,71 @@ impl App {
         })
     }
 
+    /// Opens the selected file in the user's editor, as a private copy for a remote file.
+    pub fn edit_selected_file(&mut self) {
+        use crate::compose_edit::Location;
+        let Some(row) = self.downloads.current_row() else {
+            return;
+        };
+        let refuse = |app: &mut Self, reason: &str| {
+            app.downloads.message = Some(reason.to_owned());
+        };
+        if row.entry.kind != crate::files::Kind::File {
+            refuse(self, crate::i18n::t("Select a file to edit"));
+            return;
+        }
+        if self.demo {
+            refuse(self, crate::i18n::t("Demo mode: files are not edited"));
+            return;
+        }
+        if row.entry.size.is_some_and(|size| size > 1024 * 1024) {
+            refuse(
+                self,
+                crate::i18n::t("This file is larger than 1 MiB, so it was not opened"),
+            );
+            return;
+        }
+        if self.downloads.preview_is_binary() {
+            refuse(
+                self,
+                crate::i18n::t("This looks like a binary file, so it was not opened"),
+            );
+            return;
+        }
+        if !self.editor.available(self.vscode_path.as_deref()) {
+            let reason = crate::tf!(
+                "{editor} is not installed; choose another editor in Settings (,)",
+                editor = self.editor.label()
+            );
+            refuse(self, &reason);
+            return;
+        }
+        let Some(source) = self.downloads.tree().map(|tree| tree.source.clone()) else {
+            return;
+        };
+        let location = match source {
+            crate::files::Source::Server {
+                remote, control, ..
+            } => Location::Server {
+                remote,
+                control,
+                path: row.path.clone(),
+            },
+            source @ crate::files::Source::Container { .. } => Location::Container {
+                source,
+                path: row.path.clone(),
+            },
+        };
+        self.downloads.message = None;
+        self.edit_request = Some(EditRequest {
+            location,
+            label: crate::model::safe_text(&row.path),
+        });
+    }
+
     /// Opens the panel. The tree starts building now, and only for this choice: selecting a
     /// container anywhere else never runs anything in it.
-    pub fn open_download_manager(&mut self) {
+    pub fn open_file_explorer(&mut self) {
         match self.download_source() {
             Ok(source) => self
                 .downloads
@@ -3915,7 +3979,12 @@ impl App {
                 crate::i18n::t("Choose a folder below /, not the whole filesystem").into();
             return;
         }
-        match self.download_source() {
+        let source = self
+            .downloads
+            .tree()
+            .map(|tree| tree.source.clone())
+            .map_or_else(|| self.download_source(), Ok);
+        match source {
             Ok(source) => self.downloads.open_dialog(source, path),
             Err(notice) => self.notice = notice,
         }
@@ -3950,6 +4019,9 @@ impl App {
                             kind: entry.kind,
                             size: entry.size.unwrap_or(0),
                             modified: 0,
+                            mode: 0o644,
+                            uid: 0,
+                            gid: 0,
                         })
                         .ok_or_else(|| crate::i18n::t("No such file or folder").to_owned());
                     self.downloads
@@ -3966,6 +4038,34 @@ impl App {
                         Event::Counted {
                             dialog,
                             result: Ok(totals),
+                        },
+                        now,
+                    );
+                }
+                Request::Preview {
+                    generation,
+                    source,
+                    path,
+                } => {
+                    let result = Ok(crate::files::FileStart {
+                        header: crate::files::Header {
+                            name: path.clone(),
+                            kind: crate::files::Kind::File,
+                            size: 0,
+                            modified: 0,
+                            mode: 0o644,
+                            uid: 0,
+                            gid: 0,
+                        },
+                        bytes: format!("Sample contents of {path}\n").into_bytes(),
+                        truncated: false,
+                    });
+                    self.downloads.apply(
+                        Event::Previewed {
+                            key: source.key(),
+                            generation,
+                            path,
+                            result,
                         },
                         now,
                     );
@@ -4056,7 +4156,7 @@ impl App {
                 return;
             }
         };
-        if !self.editor.available() {
+        if !self.editor.available(self.vscode_path.as_deref()) {
             self.notice = crate::tf!(
                 "{editor} is not installed; choose another editor in Settings (,)",
                 editor = self.editor.label()
@@ -4196,6 +4296,7 @@ impl App {
             Ok(config) => {
                 self.custom_bindings = config.bindings.clone();
                 self.alert_rules = config.alerts.clone();
+                self.vscode_path = config.vscode_path.clone();
                 let saved = self.saved_settings;
                 self.apply_base_settings(crate::settings::BaseSettings {
                     theme: config.theme,

@@ -460,7 +460,7 @@ every holder of the key pull any public image. Updating `/etc/tha/agent.toml` wi
 `allow_images = true` and restarting `tha-agent` does the same. Pruning needs `--allow-delete`,
 because Tha removes each unreferenced resource individually.
 
-**File downloads** need their own options; see [Downloading files](#downloading-files).
+**File downloads** need their own options; see [File explorer](#file-explorer).
 
 **Compose actions** are off unless setup ran with `--allow-compose`. The agent finds the project from
 its own engine's labels, runs the Compose CLI on the server (Docker's Compose plugin must be installed
@@ -1153,31 +1153,68 @@ its existing limits: no detailed inspection and no peer comparison.
 
 Run **`:upload LOCAL-PATH /folder/in/the/container`** with a container selected. A dialog shows both ends
 before anything is written, because anything there with the same name is replaced and the running workload
-can see it. Progress appears in the download manager, whose Downloads pane lists uploads too. On a server
+can see it. Progress appears in the file explorer, whose Downloads pane lists uploads too. On a server
 this needs `--allow-upload`, which lets every holder of the key change files inside containers.
 
 ## Editing Compose files
 
-Run **`:compose-edit`** on a Compose project or service. It opens the file in your editor; a project
-with several files asks which one. Choose the editor in Settings (`,`), or set `editor` in `config.toml`
-to `vim` (the default), `neovim`, `nano` or `vscode`. Tha does not read `VISUAL` or `EDITOR`, and it says
-so if the editor is not installed rather than opening a different one. With VS Code, Tha waits until you
-close the file's tab. Saving never applies anything; a Compose action does that.
+Run **`:compose-edit`** on a Compose project or service. It opens the file in your editor, the same way as the
+[file explorer](#file-explorer); a project with several files asks which one. Choose the editor in Settings (`,`), or
+set `editor` in `config.toml` to `vim` (the default), `neovim`, `nano` or `vscode`. Tha does not read `VISUAL` or
+`EDITOR`, and it says so if the editor is not installed rather than opening a different one. Saving never applies
+anything; a Compose action does that.
 
-**On a server,** this needs `--allow-compose-edit`. Nothing is mounted: Tha copies the file to a private
-temporary folder here and sends it back when the editor closes. If it changed on the server meanwhile,
-Tha refuses to overwrite it and keeps your copy, naming where. The old version is kept beside it as
-`<file>.tha-backup`. The write happens as the SSH login user, so normal permissions decide, and a file
-you cannot write opens read-only. Only `.yml`, `.yaml` and `.env` files up to 1 MiB qualify.
-`root` can edit them all; the dedicated `tha` user only those it has been given access to.
+On a server, this needs `--allow-compose-edit`, which reaches only `.yml`, `.yaml` and `.env` files, or
+`--allow-server-edit`, which reaches every file the login user can write.
 
-## Downloading files
+## File explorer
 
-Run **`:download-manager`** on a container or server row. **Browse** shows a tree that builds in
-the background, so the panel never waits for it. Opening a folder reads it first. **`Enter`** opens
-a folder or starts downloading a file, **`d`** downloads the selected file or folder, and **`Tab`**
-switches to **Downloads**, where you can follow progress and speed and press **`x`** to cancel.
-**`Esc`** closes the panel and downloads keep running, with a `↓` indicator in the status line.
+Run **`:file-explorer`** on a container or server row. Files are in a tree on the left, which builds in the
+background so the panel never waits for it, and the selected file shows read-only on the right.
+
+| Key | Action |
+| --- | --- |
+| `j`/`k` | Move through the tree; the right side follows |
+| `Enter` / `Space` | Open or close a folder |
+| `e` or `:edit` | Open the file in your editor |
+| `d` or `:download` | Download the file or folder |
+| `PageUp`/`PageDown` | Scroll the file on the right |
+| `p` | Show the start of a big file |
+| `r` | Read the selected folder again; the tree shows each folder as it was when read |
+| `Tab` | Switch to **Downloads**, with progress and speed; `x` cancels |
+| `Esc` or `:q` | Close; downloads keep running, with a `↓` in the status line |
+
+**What gets shown:** a file over 256 KiB is not read while you browse. You get a warning with its size, and `p`
+shows its first 256 KiB. A binary file gets a warning instead of its contents. Moving quickly through the tree
+reads nothing, because a file is only read once the cursor rests on it.
+
+### Editing a file
+
+`e` opens the file in the editor from Settings: vim, Neovim and nano take over the terminal, and VS Code opens its
+own window. The file on a container or server is copied to a private temporary folder here, because a local editor
+needs a local file. Tha then waits for the editor to exit: `:q` and `:wq` both end it, and with VS Code, closing the
+file's tab does. If the file changed, it goes back once, however many times you saved. If it did not, nothing is sent.
+The temporary copy is removed afterwards. A local file is edited in place, with no copy.
+
+The old version is kept beside the file as `<file>.tha-backup`. If the file changed in the meantime, Tha refuses to
+overwrite it and tells you where your copy is. Files stay limited to 1 MiB of text. Nothing is restarted or applied.
+Changes to a container's own files are lost when it is recreated, unless the file is on a volume.
+
+If `code` is not on your `PATH`, set `vscode_path` in `config.toml` to its full path.
+
+On a server, what you can do depends on its options:
+
+| Action | Container | The server itself |
+| --- | --- | --- |
+| Browse | `--allow-exec` | `--allow-server-download` |
+| Read and download | `--allow-download` | `--allow-server-download` |
+| Edit | `--allow-download` and `--allow-upload` | `--allow-server-edit` |
+
+A file you cannot write opens read-only. **`--allow-server-edit` lets every holder of the key rewrite any file the
+login user can write. With a root login, that means any file on the server, including its keys and system
+configuration.**
+
+### Downloading
 
 Run **`:download PATH`** when you know the path. Leave a shell with `Ctrl-]` first. The path must be
 absolute, because Tha cannot see a shell's current directory. For example:
@@ -1185,6 +1222,9 @@ absolute, because Tha cannot see a shell's current directory. For example:
 ```
 :download /tmp/mydb.dump
 ```
+
+This also works inside the file explorer, using the container or server being browsed, even when
+its tree cannot be listed.
 
 Both open the same dialog, which shows the size before anything transfers. A folder also shows its
 file count, as a running total while it is counted, and you can start without waiting. Counting a
@@ -1790,7 +1830,7 @@ containerd image inventory was added by this change.
 - `agent/alerts.rs`: the agent's own rules and its opt-in webhook.
 - `timeline.rs`: groups events and metric spikes into incidents.
 - `files.rs`: file transport over tar streams, for containers and servers.
-- `downloads.rs`: download manager state: the background tree, its cache, and jobs.
+- `downloads.rs`: file explorer state: the background tree, previews, its cache, and jobs.
 
 The UI never awaits engine requests. Each engine refreshes independently;
 failures retain visibly stale last-known inventory. Log tasks are cancelled when

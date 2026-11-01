@@ -309,6 +309,7 @@ fn allow_all_and_every_single_option_reach_setup_and_need_a_key_or_root() {
         "--allow-compose",
         "--allow-compose-edit",
         "--allow-upload",
+        "--allow-server-edit",
     ] {
         for arguments in [
             vec!["agent", "--key", "K", flag],

@@ -14,6 +14,11 @@ pub const MAX_DEPTH: usize = 6;
 pub const MAX_FOLDERS: usize = 2000;
 pub const MAX_ENTRIES: usize = 100_000;
 pub const MAX_RUNNING: usize = 4;
+/// Larger files are not read just because the cursor passed over them.
+pub const PREVIEW_LIMIT: usize = 256 * 1024;
+const MAX_CACHED_PREVIEWS: usize = 32;
+/// Moving quickly through the tree must not read every file along the way.
+const PREVIEW_DELAY: Duration = Duration::from_millis(150);
 const SKIPPED: [&str; 3] = ["/proc", "/sys", "/dev"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +41,32 @@ pub struct Tree {
     /// Browsing cannot work here at all, such as an image without `ls`.
     pub stopped: Option<String>,
     last_used: Instant,
+    previews: HashMap<String, FilePreview>,
+}
+
+/// What the right side of the explorer shows for the selected row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilePreview {
+    Waiting,
+    Loading,
+    Text {
+        text: String,
+        truncated: bool,
+    },
+    Binary,
+    /// Over the limit, so it was not read. `p` shows the start of it anyway.
+    TooBig(u64),
+    Folder,
+    Special,
+    Failed(String),
+}
+
+pub struct PreviewState {
+    pub path: String,
+    pub status: FilePreview,
+    pub scroll: usize,
+    since: Instant,
+    generation: u64,
 }
 
 fn depth(path: &str) -> usize {
@@ -54,6 +85,7 @@ impl Tree {
             limited: false,
             stopped: None,
             last_used: now,
+            previews: HashMap::new(),
         };
         tree.folders.insert("/".into(), Folder::Queued);
         tree.queue.push_back("/".into());
@@ -270,6 +302,12 @@ pub enum Request {
         local: PathBuf,
         folder: String,
     },
+    /// Replaces any preview still loading.
+    Preview {
+        generation: u64,
+        source: Source,
+        path: String,
+    },
     Cancel {
         job: u64,
     },
@@ -290,6 +328,12 @@ pub enum Event {
     Counted {
         dialog: u64,
         result: Result<Totals, String>,
+    },
+    Previewed {
+        key: String,
+        generation: u64,
+        path: String,
+        result: Result<files::FileStart, String>,
     },
     Progress {
         job: u64,
@@ -316,6 +360,11 @@ pub struct Manager {
     pub trees: HashMap<String, Tree>,
     pub dialog: Option<Dialog>,
     pub upload: Option<UploadDialog>,
+    pub preview: Option<PreviewState>,
+    /// Text typed after `:` in the explorer, as in vim.
+    pub command: Option<String>,
+    /// Why the last key did nothing.
+    pub message: Option<String>,
     pub jobs: Vec<Job>,
     pub requests: Vec<Request>,
     pub next_id: u64,
@@ -332,6 +381,9 @@ impl Default for Manager {
             trees: HashMap::new(),
             dialog: None,
             upload: None,
+            preview: None,
+            command: None,
+            message: None,
             jobs: Vec::new(),
             requests: Vec::new(),
             next_id: 0,
@@ -384,15 +436,172 @@ impl Manager {
             .last_used = now;
         if self.open.as_deref() != Some(&key) {
             self.selected = 0;
+            self.preview = None;
+            self.command = None;
+            self.message = None;
         }
         self.open = Some(key);
         self.pane = Pane::Browse;
         self.pump();
     }
 
+    /// Follows the selection. Waits briefly so that moving through the tree reads nothing, and
+    /// leaves large files alone, so browsing never costs more than a glance. Returns whether
+    /// the view changed, including timer-driven transitions that need their own redraw.
+    pub fn update_preview(&mut self, now: Instant) -> bool {
+        if self.pane != Pane::Browse || self.open.is_none() {
+            return false;
+        }
+        let Some(row) = self.current_row() else {
+            return self.preview.take().is_some();
+        };
+        let changed = self
+            .preview
+            .as_ref()
+            .is_none_or(|preview| preview.path != row.path);
+        if changed {
+            let cached = self
+                .tree()
+                .and_then(|tree| tree.previews.get(&row.path).cloned());
+            self.preview = Some(PreviewState {
+                path: row.path.clone(),
+                status: cached.unwrap_or(FilePreview::Waiting),
+                scroll: 0,
+                since: now,
+                generation: 0,
+            });
+            self.message = None;
+        }
+        let waiting = self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.status == FilePreview::Waiting);
+        if !waiting
+            || self
+                .preview
+                .as_ref()
+                .is_some_and(|p| now.duration_since(p.since) < PREVIEW_DELAY)
+        {
+            return changed;
+        }
+        let status = match row.entry.kind {
+            Kind::Folder => FilePreview::Folder,
+            Kind::Link | Kind::Other => FilePreview::Special,
+            Kind::File
+                if row
+                    .entry
+                    .size
+                    .is_some_and(|size| size > PREVIEW_LIMIT as u64) =>
+            {
+                FilePreview::TooBig(row.entry.size.unwrap_or(0))
+            }
+            Kind::File => FilePreview::Loading,
+        };
+        if status == FilePreview::Loading {
+            self.request_preview();
+        } else if let Some(preview) = &mut self.preview {
+            preview.status = status;
+        }
+        true
+    }
+
+    fn request_preview(&mut self) {
+        let generation = self.id();
+        let Some(source) = self.tree().map(|tree| tree.source.clone()) else {
+            return;
+        };
+        let Some(preview) = &mut self.preview else {
+            return;
+        };
+        preview.status = FilePreview::Loading;
+        preview.generation = generation;
+        let path = preview.path.clone();
+        self.requests.push(Request::Preview {
+            generation,
+            source,
+            path,
+        });
+    }
+
+    /// Reads the selected folder again, or the folder holding the selected file. The tree shows
+    /// each folder as it was when read, so this is how new files appear.
+    pub fn refresh_selected(&mut self) {
+        self.touch();
+        let folder = self.current_row().map_or_else(
+            || "/".to_owned(),
+            |row| {
+                if row.entry.kind == Kind::Folder {
+                    row.path
+                } else {
+                    match row.path.rsplit_once('/') {
+                        Some(("", _)) | None => "/".to_owned(),
+                        Some((parent, _)) => parent.to_owned(),
+                    }
+                }
+            },
+        );
+        let Some(tree) = self.tree_mut() else {
+            return;
+        };
+        if tree.stopped.is_some() {
+            return;
+        }
+        let prefix = if folder == "/" {
+            "/".to_owned()
+        } else {
+            format!("{folder}/")
+        };
+        tree.previews.retain(|path, _| !path.starts_with(&prefix));
+        tree.folders.remove(&folder);
+        tree.prioritize(&folder);
+        self.preview = None;
+        self.pump();
+    }
+
+    /// `p` on a big file: shows its start after all, still bounded by the limit.
+    pub fn show_big_file(&mut self) {
+        let too_big = self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| matches!(preview.status, FilePreview::TooBig(_)));
+        if too_big {
+            self.request_preview();
+        }
+    }
+
+    pub fn scroll_preview(&mut self, amount: isize) {
+        if let Some(preview) = &mut self.preview {
+            preview.scroll = preview.scroll.saturating_add_signed(amount);
+        }
+    }
+
+    pub fn preview_is_binary(&self) -> bool {
+        self.preview
+            .as_ref()
+            .is_some_and(|preview| preview.status == FilePreview::Binary)
+    }
+
+    /// After an edit, what was shown is out of date.
+    pub fn invalidate_preview(&mut self, key: &str, path: &str) {
+        if let Some(tree) = self.trees.get_mut(key) {
+            tree.previews.remove(path);
+        }
+        if self.open.as_deref() == Some(key)
+            && self
+                .preview
+                .as_ref()
+                .is_some_and(|preview| preview.path == path)
+        {
+            self.preview = None;
+        }
+    }
+
     /// Leaves downloads running. The walk pauses, since nobody is looking at it.
     pub fn close(&mut self) {
         self.open = None;
+        self.preview = None;
+        self.command = None;
+        self.message = None;
     }
 
     /// Queues the next folder for the open tree only.
@@ -655,6 +864,40 @@ impl Manager {
 
     pub fn apply(&mut self, event: Event, now: Instant) {
         match event {
+            Event::Previewed {
+                key,
+                generation,
+                path,
+                result,
+            } => {
+                if self.open.as_deref() != Some(&key) {
+                    return;
+                }
+                let Some(preview) = self
+                    .preview
+                    .as_mut()
+                    .filter(|preview| preview.generation == generation && preview.path == path)
+                else {
+                    return;
+                };
+                let status = match result {
+                    Err(error) => FilePreview::Failed(error),
+                    Ok(start) if files::looks_binary(&start.bytes, start.truncated) => {
+                        FilePreview::Binary
+                    }
+                    Ok(start) => FilePreview::Text {
+                        text: String::from_utf8_lossy(&start.bytes).into_owned(),
+                        truncated: start.truncated,
+                    },
+                };
+                preview.status = status.clone();
+                if let Some(tree) = self.tree_mut() {
+                    if tree.previews.len() >= MAX_CACHED_PREVIEWS {
+                        tree.previews.clear();
+                    }
+                    tree.previews.insert(path, status);
+                }
+            }
             Event::Listed { key, path, result } => {
                 if let Some(tree) = self.trees.get_mut(&key) {
                     tree.listed(&path, result);
@@ -949,6 +1192,252 @@ mod tests {
         assert!(lists(&mut manager).is_empty());
     }
 
+    fn previews(manager: &mut Manager) -> Vec<String> {
+        manager
+            .requests
+            .drain(..)
+            .filter_map(|request| match request {
+                Request::Preview { path, .. } => Some(path),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn explorer_with(entries: Vec<Entry>) -> (Manager, Instant) {
+        let start = Instant::now();
+        let mut manager = Manager::default();
+        let key = source("a").key();
+        manager.open_source(source("a"), start);
+        answer(&mut manager, &key, "/", listing(entries));
+        manager.requests.clear();
+        (manager, start)
+    }
+
+    fn answer_preview(manager: &mut Manager, bytes: &[u8], truncated: bool) {
+        let preview = manager.preview.as_ref().unwrap();
+        let (generation, path) = (preview.generation, preview.path.clone());
+        manager.apply(
+            Event::Previewed {
+                key: manager.open.clone().unwrap(),
+                generation,
+                path: path.clone(),
+                result: Ok(files::FileStart {
+                    header: Header {
+                        name: path,
+                        kind: Kind::File,
+                        size: bytes.len() as u64,
+                        modified: 0,
+                        mode: 0o644,
+                        uid: 0,
+                        gid: 0,
+                    },
+                    bytes: bytes.to_vec(),
+                    truncated,
+                }),
+            },
+            Instant::now(),
+        );
+    }
+
+    #[test]
+    fn a_file_previews_after_a_short_pause_and_moving_on_reads_nothing_in_between() {
+        let (mut manager, start) = explorer_with(vec![
+            file("a.txt", 10),
+            file("b.txt", 10),
+            file("c.txt", 10),
+        ]);
+        assert!(manager.update_preview(start));
+        assert!(!manager.update_preview(start));
+        assert!(previews(&mut manager).is_empty(), "Not immediately");
+        manager.selected = 1;
+        manager.update_preview(start + Duration::from_millis(100));
+        manager.selected = 2;
+        manager.update_preview(start + Duration::from_millis(200));
+        assert!(
+            previews(&mut manager).is_empty(),
+            "Passing over files reads nothing"
+        );
+        assert!(manager.update_preview(start + Duration::from_millis(400)));
+        assert_eq!(previews(&mut manager), ["/c.txt"]);
+        answer_preview(&mut manager, b"hello", false);
+        assert!(!manager.update_preview(start + Duration::from_secs(1)));
+        assert_eq!(
+            manager.preview.as_ref().unwrap().status,
+            FilePreview::Text {
+                text: "hello".into(),
+                truncated: false
+            }
+        );
+    }
+
+    #[test]
+    fn matching_paths_on_cached_sources_never_share_previews_or_late_answers() {
+        let (mut manager, start) = explorer_with(vec![file("same.txt", 10)]);
+        let a = source("a").key();
+        let b = source("b").key();
+        manager.update_preview(start);
+        manager.update_preview(start + Duration::from_secs(1));
+        answer_preview(&mut manager, b"container a", false);
+
+        manager.open_source(source("b"), start);
+        answer(&mut manager, &b, "/", listing(vec![file("same.txt", 10)]));
+        manager.update_preview(start);
+        manager.update_preview(start + Duration::from_secs(1));
+        answer_preview(&mut manager, b"container b", false);
+
+        manager.close();
+        manager.open_source(source("a"), start);
+        manager.update_preview(start);
+        assert!(matches!(&manager.preview.as_ref().unwrap().status,
+            FilePreview::Text { text, .. } if text == "container a"));
+
+        manager.invalidate_preview(&a, "/same.txt");
+        manager.update_preview(start);
+        manager.update_preview(start + Duration::from_secs(1));
+        let late = manager.preview.as_ref().unwrap().generation;
+        manager.open_source(source("b"), start);
+        manager.update_preview(start);
+        manager.apply(
+            Event::Previewed {
+                key: a,
+                generation: late,
+                path: "/same.txt".into(),
+                result: Err("late answer from a".into()),
+            },
+            start,
+        );
+        assert!(matches!(&manager.preview.as_ref().unwrap().status,
+            FilePreview::Text { text, .. } if text == "container b"));
+        assert!(matches!(manager.tree().unwrap().previews.get("/same.txt"),
+            Some(FilePreview::Text { text, .. }) if text == "container b"));
+    }
+
+    #[test]
+    fn edit_invalidation_targets_the_edited_file_even_after_selection_or_source_changes() {
+        let (mut manager, start) = explorer_with(vec![file("a.txt", 10), file("b.txt", 10)]);
+        let key = source("a").key();
+        manager.update_preview(start);
+        manager.update_preview(start + Duration::from_secs(1));
+        answer_preview(&mut manager, b"old a", false);
+        manager.move_selection(1);
+        manager.update_preview(start);
+        manager.update_preview(start + Duration::from_secs(1));
+        answer_preview(&mut manager, b"b", false);
+        manager.invalidate_preview(&key, "/a.txt");
+        assert_eq!(manager.preview.as_ref().unwrap().path, "/b.txt");
+        assert!(!manager.tree().unwrap().previews.contains_key("/a.txt"));
+
+        manager.move_selection(-1);
+        manager.update_preview(start);
+        manager.update_preview(start + Duration::from_secs(1));
+        answer_preview(&mut manager, b"new a", false);
+        manager.open_source(source("b"), start);
+        manager.invalidate_preview(&key, "/a.txt");
+        manager.open_source(source("a"), start);
+        manager.update_preview(start);
+        assert_eq!(
+            manager.preview.as_ref().unwrap().status,
+            FilePreview::Waiting
+        );
+    }
+
+    #[test]
+    fn big_files_warn_instead_of_loading_until_asked_and_binaries_are_never_shown() {
+        let big = PREVIEW_LIMIT as u64 + 1;
+        let (mut manager, start) = explorer_with(vec![file("huge.iso", big), file("tool", 10)]);
+        manager.update_preview(start);
+        manager.update_preview(start + Duration::from_secs(1));
+        assert!(previews(&mut manager).is_empty());
+        assert_eq!(
+            manager.preview.as_ref().unwrap().status,
+            FilePreview::TooBig(big)
+        );
+
+        manager.show_big_file();
+        assert_eq!(previews(&mut manager), ["/huge.iso"]);
+        answer_preview(&mut manager, b"start of it", true);
+        assert!(matches!(
+            manager.preview.as_ref().unwrap().status,
+            FilePreview::Text {
+                truncated: true,
+                ..
+            }
+        ));
+
+        manager.selected = 1;
+        manager.update_preview(start + Duration::from_secs(2));
+        manager.update_preview(start + Duration::from_secs(3));
+        assert_eq!(previews(&mut manager), ["/tool"]);
+        answer_preview(&mut manager, b"\x7fELF\0\0", false);
+        assert!(manager.preview_is_binary());
+    }
+
+    #[test]
+    fn refreshing_rereads_the_files_folder_and_shows_what_is_new() {
+        let (mut manager, start) = explorer_with(vec![folder("logs"), file("a.txt", 1)]);
+        let key = source("a").key();
+        manager.selected = 1;
+        manager.update_preview(start);
+        manager.refresh_selected();
+        // The walk has `/logs` in flight here, so the refresh waits its turn.
+        answer(&mut manager, &key, "/logs", listing(vec![]));
+        assert_eq!(lists(&mut manager), ["/"]);
+        answer(
+            &mut manager,
+            &key,
+            "/",
+            listing(vec![folder("logs"), file("a.txt", 1), file("new.txt", 2)]),
+        );
+        let rows = manager.tree().unwrap().rows();
+        assert!(rows.iter().any(|row| row.path == "/new.txt"));
+    }
+
+    #[test]
+    fn a_late_preview_never_lands_on_another_file_and_a_cached_one_reads_nothing() {
+        let (mut manager, start) = explorer_with(vec![file("a.txt", 10), file("b.txt", 10)]);
+        manager.update_preview(start);
+        manager.update_preview(start + Duration::from_secs(1));
+        previews(&mut manager);
+        let late = manager.preview.as_ref().unwrap().generation;
+        manager.selected = 1;
+        manager.update_preview(start + Duration::from_secs(2));
+        manager.apply(
+            Event::Previewed {
+                key: source("a").key(),
+                generation: late,
+                path: "/a.txt".into(),
+                result: Err("late".into()),
+            },
+            start,
+        );
+        assert_eq!(
+            manager.preview.as_ref().unwrap().status,
+            FilePreview::Waiting
+        );
+
+        manager.update_preview(start + Duration::from_secs(3));
+        previews(&mut manager);
+        answer_preview(&mut manager, b"b", false);
+        manager.selected = 0;
+        manager.update_preview(start + Duration::from_secs(4));
+        manager.selected = 1;
+        manager.update_preview(start + Duration::from_secs(5));
+        assert!(matches!(
+            manager.preview.as_ref().unwrap().status,
+            FilePreview::Text { .. }
+        ));
+        assert!(previews(&mut manager).is_empty());
+
+        manager.invalidate_preview(&source("a").key(), "/b.txt");
+        manager.update_preview(start + Duration::from_secs(6));
+        manager.update_preview(start + Duration::from_secs(7));
+        assert_eq!(
+            previews(&mut manager),
+            ["/b.txt"],
+            "After an edit it reads again"
+        );
+    }
+
     #[test]
     fn the_cache_is_reused_and_released_after_it_goes_unused() {
         let start = Instant::now();
@@ -1003,6 +1492,9 @@ mod tests {
                     kind,
                     size,
                     modified: 0,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
                 }),
             },
             Instant::now(),

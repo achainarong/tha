@@ -86,6 +86,66 @@ fn app() -> App {
 }
 
 #[test]
+fn explorer_download_path_works_without_a_listing_and_keeps_the_explorers_source() {
+    use tha::{config::Connection, files::Source};
+    let mut app = app();
+    let (tx, _) = watch::channel(0);
+    let source = Source::Container {
+        connection: Connection {
+            name: "fixture".into(),
+            kind: BackendKind::Docker,
+            endpoint: "unix:///not-a-real-engine".into(),
+        },
+        id: "explorer-container".into(),
+        label: "explorer".into(),
+    };
+    app.downloads
+        .open_source(source.clone(), std::time::Instant::now());
+    app.downloads.apply(
+        tha::downloads::Event::Listed {
+            key: source.key(),
+            path: "/".into(),
+            result: Err("no ls".into()),
+        },
+        std::time::Instant::now(),
+    );
+    // The underlying application selection is deliberately not this container.
+    app.selected = 0;
+    app.downloads.command = Some("download /tmp/my backup.dump".into());
+    handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+    let dialog = app.downloads.dialog.as_ref().unwrap();
+    assert_eq!(dialog.source, source);
+    assert_eq!(dialog.path, "/tmp/my backup.dump");
+    assert!(
+        app.downloads.jobs.is_empty(),
+        "Confirmation is still required"
+    );
+}
+
+#[test]
+fn explorer_download_path_reports_invalid_paths_in_the_panel() {
+    use tha::files::Source;
+    let mut app = app();
+    let (tx, _) = watch::channel(0);
+    let source = Source::Container {
+        connection: app.engines[0].connection.clone(),
+        id: "fixture".into(),
+        label: "fixture".into(),
+    };
+    app.downloads.open_source(source, std::time::Instant::now());
+    app.downloads.command = Some("download relative.txt".into());
+    handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+    assert!(app.downloads.dialog.is_none());
+    assert!(
+        app.downloads
+            .message
+            .as_ref()
+            .unwrap()
+            .contains("full path")
+    );
+}
+
+#[test]
 fn search_input_does_not_trigger_navigation_or_quit() {
     let mut app = app();
     let (tx, _) = watch::channel(0);
