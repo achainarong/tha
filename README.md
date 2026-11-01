@@ -40,22 +40,38 @@ curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/instal
 `tha-agent`, with no UI, service or modules, as a root-owned binary in `/usr/local/bin`.
 Linux only, and it does need root; see [Remote servers](#remote-servers):
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent
-```
-
-Then set up the server. It is not ready until you do. With a dedicated user and its own
-key (recommended, and the form under `:servers` shows this command with your key filled in):
+First, on your own machine, create a key for the server and print its public part:
 
 ```sh
-sudo tha-agent setup --user tha --key 'ssh-ed25519 AAAA...'
+ssh-keygen -t ed25519 -f ~/.ssh/tha-agent
+cat ~/.ssh/tha-agent.pub
 ```
 
-Or with an existing root key:
+Then, on the server, run this one command with that public key. It installs the agent and
+sets the server up. The form under `:servers` shows it with your key filled in:
 
 ```sh
-sudo tha-agent setup --user root
+curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent --key 'ssh-ed25519 AAAA...'
 ```
+
+This creates the dedicated `tha` user for you, so do not create it first, and exposes every
+Docker and Podman socket it finds. One it cannot reach is skipped with a message. Add `--user NAME` for another user name, or
+`--allow-delete` to let this server delete containers, images and volumes.
+
+**Permissions:** you only need root or `sudo` to run it. You do not need to give `tha` any
+permissions yourself. Setup adds it to the group that owns the engine's socket, usually
+`docker`, and it gets nothing else: no usable password, no sudo, and a key that can only
+run the agent. Do not add sudo rules or other keys, because they would bypass the agent.
+If only the socket's owner can use it, as with most rootless engines, setup stops and
+explains why instead of widening access.
+
+To use an existing root key instead, with no new user or key:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent --user root
+```
+
+To update the agent later, run the install again with just `agent`; setup stays in place.
 
 See [Remote servers](#remote-servers) for what each one means.
 
@@ -339,13 +355,11 @@ allowlist runs on the server, so with a dedicated user it holds even for someone
 has stolen the key and does not use Tha.
 
 **Add a server:** press `.` or type `:servers`, then `a`. Enter the host, user and
-key path, or create a key from the form. It shows the command to run once on the
-server, as an admin. It has two parts, and the server needs both: installing
-`tha-agent`, then `tha-agent setup`:
+key path, or create a key from the form. It shows the one command to run on the
+server, as an admin. It installs `tha-agent` and sets the server up:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent \
-  && sudo /usr/local/bin/tha-agent setup --user tha --key 'ssh-ed25519 AAAA...'
+curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent --key 'ssh-ed25519 AAAA...'
 ```
 
 `tha-agent` is all the server needs; the full `tha` stays on your own machine. The
@@ -373,10 +387,10 @@ confirm, and Tha never accepts a host key itself.
    cat ~/.ssh/tha-agent.pub
    ```
 
-2. On the server, as an admin, pass that public key to setup:
+2. On the server, as an admin, run the install with that public key:
 
    ```sh
-   sudo tha-agent setup --user tha --key 'ssh-ed25519 AAAA...'
+   curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent --key 'ssh-ed25519 AAAA...'
    ```
 
    This creates `tha` with no usable password, gives it access to the engine's socket, and
@@ -392,8 +406,7 @@ works if it has no other SSH keys, but setup stops if any are there.
 You can also connect as `root` with an existing key. Setup then only writes the policy:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent
-sudo /usr/local/bin/tha-agent setup --user root
+curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent --user root
 ```
 
 `tha`'s own traffic still goes through the allowlist, but the key is not restricted:

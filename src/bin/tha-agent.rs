@@ -32,7 +32,7 @@ enum Command {
         /// Let this server delete containers, images and volumes (force is always refused)
         #[arg(long)]
         allow_delete: bool,
-        /// Engine to expose (repeatable); without it, known sockets are offered interactively
+        /// Expose only this engine (repeatable); without it, every known socket found is exposed
         #[arg(long, value_name = "NAME=SOCKET")]
         engine: Vec<String>,
     },

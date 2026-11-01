@@ -187,7 +187,7 @@ fn run_agent(
     fs::create_dir(root.join("assets")).unwrap();
     script(
         &root.join("assets/tha-agent"),
-        "#!/bin/sh\n[ \"$1\" = --version ] && echo 'tha-agent fixture'\n",
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'tha-agent fixture'; exit 0; fi\nprintf '%s\\n' \"$*\" >> \"$INSTALL_LOG\"\nexit \"${SETUP_EXIT:-0}\"\n",
     );
     assert!(
         Command::new("tar")
@@ -244,8 +244,8 @@ fn agent_mode_installs_only_the_gate_and_starts_nothing() {
     assert!(!temp.path().join("installed/tha").exists());
     assert!(stdout.contains("tha-agent fixture"), "{stdout}");
     assert!(stdout.contains("still needs setup"), "{stdout}");
-    assert!(stdout.contains("setup --user root"), "{stdout}");
-    assert!(stdout.contains("setup --user tha --key"), "{stdout}");
+    assert!(stdout.contains("--user root"), "{stdout}");
+    assert!(stdout.contains("--key 'PUBLIC_KEY'"), "{stdout}");
     let calls = fs::read_to_string(temp.path().join("calls")).unwrap();
     assert!(calls.contains("tha-agent-linux-amd64.tar.gz"), "{calls}");
     assert!(!calls.contains("/tha-linux-amd64"), "{calls}");
@@ -272,4 +272,72 @@ fn agent_mode_refuses_modules_before_downloading() {
     assert!(!output.status.success());
     assert!(!temp.path().join("calls").exists());
     assert!(!temp.path().join("installed").exists());
+}
+
+fn agent_calls(temp: &tempfile::TempDir) -> String {
+    fs::read_to_string(temp.path().join("calls")).unwrap_or_default()
+}
+
+#[test]
+fn agent_key_installs_and_sets_up_with_one_command() {
+    let key = "ssh-ed25519 AAAA test comment";
+    let (temp, output) = run_agent("0", &["agent", "--key", key], "");
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        agent_calls(&temp).contains(&format!("setup --user tha --key {key}")),
+        "{}",
+        agent_calls(&temp)
+    );
+}
+
+#[test]
+fn agent_root_setup_passes_no_key() {
+    let (temp, output) = run_agent("0", &["agent", "--user", "root"], "");
+    assert!(output.status.success(), "{output:?}");
+    assert!(agent_calls(&temp).contains("setup --user root\n"));
+}
+
+#[test]
+fn agent_custom_user_and_delete_reach_setup() {
+    let (temp, output) = run_agent(
+        "0",
+        &["agent", "--user", "ops", "--key", "K", "--allow-delete"],
+        "",
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        agent_calls(&temp).contains("setup --user ops --key K --allow-delete"),
+        "{}",
+        agent_calls(&temp)
+    );
+}
+
+#[test]
+fn agent_without_options_only_installs() {
+    let (temp, output) = run_agent("0", &["agent"], "");
+    assert!(output.status.success());
+    assert!(!agent_calls(&temp).contains("setup"));
+}
+
+#[test]
+fn bad_agent_options_stop_before_downloading() {
+    for arguments in [
+        vec!["agent", "--bogus"],
+        vec!["agent", "--key"],
+        vec!["agent", "--user", "ops"],
+        vec!["agent", "--user", "root", "--key", "K"],
+        vec!["agent", "--allow-delete"],
+    ] {
+        let (temp, output) = run_agent("0", &arguments, "");
+        assert!(!output.status.success(), "{arguments:?}");
+        assert!(agent_calls(&temp).is_empty(), "{arguments:?}");
+        assert!(!temp.path().join("installed").exists(), "{arguments:?}");
+    }
+}
+
+#[test]
+fn other_modes_refuse_agent_options() {
+    let (temp, output) = run_agent("0", &["service", "--key", "K"], "");
+    assert!(!output.status.success());
+    assert!(agent_calls(&temp).is_empty());
 }

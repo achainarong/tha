@@ -378,9 +378,7 @@ pub fn keygen_command(path: &str) -> Result<std::process::Command> {
 pub fn setup_command(remote: &Remote) -> Result<String> {
     // Root's existing key stays as it is, so only the policy file is needed.
     if unrestricted_login(&remote.user) {
-        return Ok(format!(
-            "{AGENT_INSTALL} && sudo /usr/local/bin/tha-agent setup --user root"
-        ));
+        return Ok(format!("{AGENT_INSTALL} --user root"));
     }
     let key = remote.key_path()?;
     let mut public = key.into_os_string();
@@ -397,7 +395,7 @@ pub fn setup_command(remote: &Remote) -> Result<String> {
 fn render_setup_command(user: &str, public_key: &str) -> Result<String> {
     let key = crate::agent::setup::parse_public_key(public_key)?;
     Ok(format!(
-        "{AGENT_INSTALL} && sudo /usr/local/bin/tha-agent setup --user {user} --key '{}'",
+        "{AGENT_INSTALL} --user {user} --key '{}'",
         key.as_line()
     ))
 }
@@ -1243,12 +1241,7 @@ mod tests {
         const KEY: &str =
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBUo4CVCKfmH3UjnNfr0F2hsmKRKEFmCJfNDIyVGxsHq";
         let command = render_setup_command("tha", &format!("{KEY} me';sh;'\n")).unwrap();
-        assert_eq!(
-            command,
-            format!(
-                "{AGENT_INSTALL} && sudo /usr/local/bin/tha-agent setup --user tha --key '{KEY}'"
-            )
-        );
+        assert_eq!(command, format!("{AGENT_INSTALL} --user tha --key '{KEY}'"));
         assert!(render_setup_command("tha", "command=\"sh\" x y").is_err());
     }
 
@@ -1261,7 +1254,7 @@ mod tests {
         let command = setup_command(&candidate).unwrap();
         assert!(command.starts_with(AGENT_INSTALL), "{command}");
         assert!(
-            command.ends_with("sudo /usr/local/bin/tha-agent setup --user root"),
+            command.ends_with("sudo sh -s -- agent --user root"),
             "{command}"
         );
     }

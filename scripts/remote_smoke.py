@@ -215,7 +215,7 @@ def main():
 
         public = (scratch / "key.pub").read_text().strip()
         setup = f"tha-agent setup --user tha --key {shlex.quote(public)}"
-        print(inside(f"{setup} --engine docker=/var/run/docker.sock").stdout.strip())
+        print(inside(setup).stdout.strip())
         inside(setup)
         lines = inside("grep -c . /home/tha/.ssh/authorized_keys").stdout.strip()
         if lines != "1":

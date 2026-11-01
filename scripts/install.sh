@@ -3,14 +3,18 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sh
 #   curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sh -s -- service
-#   curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent
+#   curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent --key 'ssh-ed25519 AAAA...'
 #
 # Three modes:
 #   standalone (default)  only the tha binary; metrics are sampled while the UI is open
 #   service               also installs and starts the per-user background collector
 #                         (launchd/systemd, no sudo), so History keeps 24 hours of metrics
-#   agent                  for a server managed by Tha elsewhere: only tha-agent, owned by root
+#   agent                 for a server managed by Tha elsewhere: only tha-agent, owned by root
 #                         in /usr/local/bin. Linux only, needs root, starts no service.
+#                         --key 'PUBLIC_KEY' also sets it up with a dedicated user, tha, or the
+#                         one named by --user. --user root sets it up for an existing root key.
+#                         Without these it only installs or updates; existing setup is kept.
+#                         --allow-delete lets that server delete containers, images and volumes.
 #
 #   THA_MODE=service      same as passing `service`
 #   THA_VERSION=v0.6.0    install that release instead of the latest
@@ -23,7 +27,12 @@
 set -eu
 
 REPO=achainarong/tha
-MODE=${1:-${THA_MODE:-standalone}}
+requested=${THA_MODE:-}
+case ${1:-} in
+    '' | -*) ;;
+    *) requested=$1; shift ;;
+esac
+MODE=${requested:-standalone}
 VERSION=${THA_VERSION:-latest}
 MODULES=${MODULES:-}
 
@@ -36,7 +45,26 @@ if [ "$MODE" = agent ]; then
     [ "$(id -u)" = 0 ] || die "agent mode installs a root-owned binary; run it with: | sudo sh -s -- agent"
     BIN_DIR=${THA_BIN_DIR:-/usr/local/bin}
     log_dir=${THA_INSTALL_LOG_DIR:-/var/log/tha-agent}
+    agent_key=
+    agent_user=
+    agent_delete=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --key) [ $# -ge 2 ] || die "--key needs the public key line"; agent_key=$2; shift 2 ;;
+            --user) [ $# -ge 2 ] || die "--user needs a name"; agent_user=$2; shift 2 ;;
+            --allow-delete) agent_delete=1; shift ;;
+            *) die "unknown agent option '$1'; expected --key, --user or --allow-delete" ;;
+        esac
+    done
+    if [ "$agent_user" = root ]; then
+        [ -z "$agent_key" ] || die "--user root keeps root's own keys, so --key does not apply"
+    elif [ -n "$agent_user" ] && [ -z "$agent_key" ]; then
+        die "--user $agent_user needs --key with the public key for that user"
+    elif [ -z "$agent_key" ] && [ -n "$agent_delete" ]; then
+        die "--allow-delete needs --key or --user root"
+    fi
 else
+    [ $# -eq 0 ] || die "only agent mode takes options, not '$1'"
     BIN_DIR=${THA_BIN_DIR:-$HOME/.local/bin}
     log_dir=${THA_INSTALL_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tha/install}
 fi
@@ -112,7 +140,7 @@ IFS=$old_ifs
 case ,$MODULES, in
     *,security,*)
         if [ "$MODE" = standalone ]; then
-            if [ "${1:-${THA_MODE:-}}" = standalone ]; then
+            if [ "$requested" = standalone ]; then
                 die "security is a service module; use service mode with MODULES=security"
             fi
             MODE=service
@@ -188,9 +216,22 @@ if [ "$MODE" = agent ]; then
     run mkdir -p "$BIN_DIR"
     run install -m 755 "$tmp/tha-agent" "$bin"
     say "installed $(run "$bin" --version) to $bin"
-    say "not ready yet: this server still needs setup. Run one of these next:"
-    say "  dedicated user (recommended): sudo $bin setup --user tha --key 'PUBLIC_KEY'"
-    say "  existing root key:            sudo $bin setup --user root"
+    if [ -z "$agent_key$agent_user" ]; then
+        if [ -r /etc/tha/agent.toml ]; then
+            say "existing setup kept; this server is ready"
+        else
+            say "not ready yet: this server still needs setup. Run this again with one of:"
+            say "  dedicated user (recommended): --key 'PUBLIC_KEY'"
+            say "  existing root key:            --user root"
+        fi
+        exit 0
+    fi
+    step "setting up tha-agent"
+    set -- setup --user "${agent_user:-tha}"
+    [ -z "$agent_key" ] || set -- "$@" --key "$agent_key"
+    [ -z "$agent_delete" ] || set -- "$@" --allow-delete
+    run "$bin" "$@" < /dev/null ||
+        die "tha-agent was installed, but setup failed; fix the problem above and run this again"
     exit 0
 fi
 running=0

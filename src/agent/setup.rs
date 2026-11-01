@@ -3,7 +3,7 @@
 use super::{AgentConfig, AgentEngine};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
-    io::{BufRead, IsTerminal, Write},
+    io::Write,
     os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
@@ -33,7 +33,7 @@ pub struct Options {
     pub user: String,
     pub key: Option<String>,
     pub allow_delete: bool,
-    /// `NAME=/path/to/socket`. When empty, a terminal is asked or an existing policy is kept.
+    /// `NAME=/path/to/socket`, to expose only these. When empty, every known socket is exposed.
     pub engines: Vec<String>,
 }
 
@@ -337,38 +337,29 @@ fn install_key(account: &Account, line: &str) -> Result<()> {
     atomic_write(&path, &merged, 0o600, Some((account.uid, account.gid)))
 }
 
-fn ask_for_engines(existing: &AgentConfig) -> Result<Vec<AgentEngine>> {
-    if !existing.engines.is_empty() {
-        return Ok(Vec::new());
+/// Every known socket on this server, added to what is already exposed. An existing entry
+/// is never dropped, so a rerun cannot silently take an engine away.
+pub fn merge_found(existing: &[AgentEngine], found: Vec<AgentEngine>) -> Vec<AgentEngine> {
+    let mut engines = existing.to_vec();
+    for engine in found {
+        if !engines.iter().any(|known| known.name == engine.name) {
+            engines.push(engine);
+        }
     }
-    let available: Vec<_> = KNOWN_SOCKETS
+    engines
+}
+
+fn find_engines() -> Vec<AgentEngine> {
+    KNOWN_SOCKETS
         .iter()
         .filter(|(_, socket)| {
             std::fs::metadata(socket).is_ok_and(|metadata| metadata.file_type().is_socket())
         })
-        .collect();
-    ensure!(
-        !available.is_empty(),
-        "No known engine socket was found; pass --engine NAME=/path/to/socket"
-    );
-    ensure!(
-        std::io::stdin().is_terminal(),
-        "Pass --engine NAME=/path/to/socket when running without a terminal"
-    );
-    let mut chosen = Vec::new();
-    for (name, socket) in available {
-        print!("Expose {name} ({socket}) through the agent? [y/N] ");
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().lock().read_line(&mut answer)?;
-        if matches!(answer.trim(), "y" | "Y" | "yes") {
-            chosen.push(AgentEngine {
-                name: (*name).to_owned(),
-                socket: PathBuf::from(socket),
-            });
-        }
-    }
-    Ok(chosen)
+        .map(|(name, socket)| AgentEngine {
+            name: (*name).to_owned(),
+            socket: PathBuf::from(socket),
+        })
+        .collect()
 }
 
 /// Root can already reach every socket, and its keys are not ours to rewrite.
@@ -440,16 +431,20 @@ pub fn run_setup(options: &Options) -> Result<()> {
         .iter()
         .map(|engine| parse_engine(engine))
         .collect::<Result<Vec<_>>>()?;
-    let engines = if requested.is_empty() {
-        ask_for_engines(&existing.clone().unwrap_or_default())?
-    } else {
+    let explicit = !requested.is_empty();
+    let engines = if explicit {
         requested
+    } else {
+        merge_found(
+            existing.as_ref().map_or(&[][..], |config| &config.engines),
+            find_engines(),
+        )
     };
-    let config = merge_config(existing, engines, options.allow_delete);
+    let mut config = merge_config(existing, engines, options.allow_delete);
     config.validate()?;
     ensure!(
         !config.engines.is_empty(),
-        "No engines were chosen, so the agent would have nothing to serve"
+        "No known engine socket was found; pass --engine NAME=/path/to/socket"
     );
 
     if root {
@@ -480,9 +475,24 @@ pub fn run_setup(options: &Options) -> Result<()> {
         options.user,
         account.shell
     );
-    for engine in &config.engines {
-        grant_socket(&options.user, &account, engine)?;
+    // An engine asked for by name must work. One merely found must not block the others, as a
+    // root-only Podman socket beside a normal Docker one would.
+    let mut reachable = Vec::new();
+    let mut skipped = None;
+    for engine in std::mem::take(&mut config.engines) {
+        match grant_socket(&options.user, &account, &engine) {
+            Ok(()) => reachable.push(engine),
+            Err(error) if !explicit => {
+                println!("Skipping {}: {error:#}", engine.name);
+                skipped = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
     }
+    if reachable.is_empty() {
+        return Err(skipped.unwrap_or_else(|| anyhow::anyhow!("No engine could be exposed")));
+    }
+    config.engines = reachable;
     // Written last: the key must not start working before the policy it depends on exists.
     write_policy(policy, &config)?;
     install_key(&account, &line)?;
@@ -610,6 +620,33 @@ mod tests {
             false,
         );
         assert_eq!(replaced.engines[0].name, "podman");
+    }
+
+    fn engine(name: &str) -> AgentEngine {
+        AgentEngine {
+            name: name.into(),
+            socket: format!("/{name}.sock").into(),
+        }
+    }
+
+    #[test]
+    fn found_engines_are_added_without_dropping_existing_ones() {
+        let merged = merge_found(
+            &[engine("custom")],
+            vec![engine("docker"), engine("podman")],
+        );
+        let names: Vec<_> = merged.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["custom", "docker", "podman"]);
+    }
+
+    #[test]
+    fn an_engine_already_exposed_keeps_its_configured_socket() {
+        let existing = AgentEngine {
+            name: "docker".into(),
+            socket: "/custom/docker.sock".into(),
+        };
+        let merged = merge_found(std::slice::from_ref(&existing), vec![engine("docker")]);
+        assert_eq!(merged, [existing]);
     }
 
     #[test]
