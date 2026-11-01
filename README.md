@@ -55,6 +55,15 @@ In Tha, open `:servers`, add the host with user `tha` and your key path, then te
 the connection. Setup creates a restricted user and a persistent systemd agent.
 It opens no additional network port. Deletion is opt-in with `--allow-delete`.
 
+Alternatively, use an existing **root SSH key**:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent --user root
+```
+
+Set the server user to `root` in Tha. Setup leaves root's keys unchanged;
+anyone holding that key retains full root access.
+
 Remote security scans are separately opt-in with an approved Grype manifest digest.
 They run on the server with resource limits and load-aware deferral; only reports
 are sent back and saved centrally. See [remote security setup](docs/remote-security.md).
