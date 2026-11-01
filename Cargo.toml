@@ -1,6 +1,6 @@
 [package]
 name = "tha"
-version = "0.20.2"
+version = "0.20.3"
 edition = "2024"
 default-run = "tha"
 rust-version = "1.88"
@@ -16,8 +16,8 @@ crokey = "1.5.1"
 futures-util = "0.3"
 http-body-util = "0.1"
 fs2 = "0.4"
-hyper = { version = "1", features = ["client", "http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "http2", "server-auto", "tokio"] }
 libc = "0.2"
 portable-pty = "0.9"
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
