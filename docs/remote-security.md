@@ -44,19 +44,30 @@ disable scanning without deleting reports or the scanner/database cache.
 
 ## Scheduling and headroom
 
-- Every minute, discover unique images referenced by running or stopped containers.
-- Scan new images and rescan completed images after the configured interval
-  (default 24 hours). Unused images can be requested manually from Tha.
+- Automatic scans are off by default; scans run only when requested from Tha.
+- To turn them on, open Security in Tha, select the server's engine and press **t**
+  (or `:scan-schedule`). Enter a standard five-field cron schedule, for example
+  `0 0 * * *` for every day at 00:00, or leave it empty to turn scans off. Times use
+  the server's time zone. Each engine has its own schedule, stored by the agent.
+- With a schedule, the agent checks every minute for unique images referenced by
+  running or stopped containers. It scans images without a report right away and
+  rescans all of them at each scheduled start. A start missed during downtime runs
+  once when the agent is back. Unused images can be requested manually from Tha.
+- Refresh the vulnerability database with the first scan after midnight.
 - One job runs at a time across all engines on a server. Pending jobs are deduplicated.
 - Defer jobs when one-minute load exceeds 70% of available cores or `MemAvailable`
   is below 1536 MiB. Unknown pressure also defers. Check again every 30 seconds.
+  **Ignore CPU and RAM thresholds** in the schedule dialog skips this check for every
+  scan on that engine, manual ones included. It is off by default, and the scanner's
+  hard limits below still apply.
 - Scanner and database-update containers default to half a CPU, 768 MiB RAM,
   no extra swap, 128 processes, and a low CPU weight. An optional container I/O
   weight is not requested: some engines do not expose the cgroup `io.weight` file.
   Engine/cgroup support is required for the remaining hard limits; unsupported
   limits fail the job rather than silently dropping them.
 - The agent service itself runs with low CPU/I/O scheduling priority.
-- Failed scheduled scans retry after an hour. Previous successful reports remain.
+- While a schedule is on, failed scans retry after an hour. Previous successful
+  reports remain.
 
 Admission checks do not predict future application load. Hard container limits
 remain in force during a scan. Image export still causes host/engine disk I/O and

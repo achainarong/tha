@@ -746,6 +746,30 @@ pub(super) fn handle_key(
                         app.input_mode = mode;
                         app.input = input;
                     }
+                } else if mode == InputMode::SecuritySchedule {
+                    let valid = if input.is_empty() {
+                        Ok(())
+                    } else {
+                        tha::security::cron::Cron::parse(&input).map(|_| ())
+                    };
+                    match (valid, app.security.schedule_connection.take()) {
+                        (Err(error), connection) => {
+                            app.notice = tha::tf!(
+                                "Invalid scan schedule: {error}",
+                                error = format!("{error:#}")
+                            );
+                            app.security.schedule_connection = connection;
+                            app.input_mode = mode;
+                            app.input = input;
+                        }
+                        (Ok(()), Some(connection)) => {
+                            app.security.schedule_save =
+                                Some((connection, input, app.security.schedule_ignore));
+                            app.notice =
+                                tha::i18n::t("Saving the scan schedule on the server…").into();
+                        }
+                        (Ok(()), None) => {}
+                    }
                 } else if app.detail_focus && app.tab == Tab::Logs {
                     if let Err(error) = app.log_view.check_query(&input) {
                         app.notice = tha::model::safe_text(&tha::tf!(
@@ -784,6 +808,9 @@ pub(super) fn handle_key(
             {
                 app.toggle_log_filter_field();
             }
+            KeyCode::Tab if app.input_mode == InputMode::SecuritySchedule => {
+                app.security.schedule_ignore = !app.security.schedule_ignore;
+            }
             KeyCode::Tab if app.input_mode == InputMode::Command => {
                 if let Some((command, _)) = ui::COMMANDS
                     .iter()
@@ -799,7 +826,10 @@ pub(super) fn handle_key(
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(
                         app.input_mode,
-                        InputMode::LogTextFilter | InputMode::LogFilter | InputMode::ExportLogs
+                        InputMode::LogTextFilter
+                            | InputMode::LogFilter
+                            | InputMode::ExportLogs
+                            | InputMode::SecuritySchedule
                     ) =>
             {
                 app.input.clear()
@@ -962,6 +992,7 @@ pub(super) fn dispatch_navigation(
             | A::PullImage
             | A::CloseExec
             | A::UpdateSecurity
+            | A::ScanSchedule
             | A::ReloadLayers
             | A::Refresh
             | A::ActionResults
@@ -2122,6 +2153,7 @@ pub(super) fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>
             app.security.cancel = true;
             app.notice = tha::i18n::t("Cancelling security queue and removing scanner…").into();
         }
+        "scan-schedule" => app.begin_security_schedule(),
         "update-security-db" => {
             app.request_security_scan(false);
             if app.security.request {

@@ -644,6 +644,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let mut diagnostics_tasks: [Option<AbortTask>; 5] = [None, None, None, None, None];
     let (security_tx, mut security_rx) = mpsc::channel::<tha::security::Event>(16);
     let (security_notice_tx, mut security_notice_rx) = mpsc::channel::<String>(4);
+    let (schedule_tx, mut schedule_rx) = mpsc::channel::<tha::security::ScheduleEvent>(4);
     let mut security_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut security_cancel: Option<watch::Sender<bool>> = None;
     let (export_tx, mut export_rx) = mpsc::channel::<String>(4);
@@ -981,6 +982,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 redraw_now = true;
             },
             Some(notice) = security_notice_rx.recv() => { app.notice = notice; redraw_now = true; },
+            Some(event) = schedule_rx.recv() => { app.apply_schedule_event(event); redraw_now = true; },
             _ = redraw.tick() => {
                 if source_checked.elapsed() >= Duration::from_secs(1) {
                     app.security.enabled = app.service_modules && tha::security::enabled();
@@ -1499,6 +1501,28 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 }
                 app.security.request = false;
                 app.security.update = false;
+            }
+            if let Some(connection) = app.security.schedule_load.take() {
+                let sender = schedule_tx.clone();
+                tokio::spawn(async move {
+                    let result = tha::security::remote::schedule(&connection)
+                        .await
+                        .map_err(|error| tha::layers::text(&format!("{error:#}")));
+                    let _ = sender
+                        .send(tha::security::ScheduleEvent::Loaded(connection, result))
+                        .await;
+                });
+            }
+            if let Some((connection, cron, ignore)) = app.security.schedule_save.take() {
+                let sender = schedule_tx.clone();
+                tokio::spawn(async move {
+                    let result = tha::security::remote::set_schedule(&connection, &cron, ignore)
+                        .await
+                        .map_err(|error| tha::layers::text(&format!("{error:#}")));
+                    let _ = sender
+                        .send(tha::security::ScheduleEvent::Saved(result))
+                        .await;
+                });
             }
             update_platform(&mut app, &mut platform_task, &platform_tx);
             update_logs(&mut app, &mut log_task, &log_tx, log_capacity);

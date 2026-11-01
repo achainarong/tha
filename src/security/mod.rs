@@ -1,5 +1,6 @@
 //! Opt-in image security. Scanner/container details stay behind this module.
 pub mod agent;
+pub mod cron;
 mod grype;
 mod registry;
 pub mod remote;
@@ -85,6 +86,18 @@ pub struct View {
     pub scan_target: Option<Target>,
     pub started: Option<std::time::Instant>,
     pub queue_cancelled: bool,
+    pub schedule_load: Option<Connection>,
+    pub schedule_save: Option<(Connection, String, bool)>,
+    /// The engine the open schedule dialog belongs to.
+    pub schedule_connection: Option<Connection>,
+    pub schedule_ignore: bool,
+    pub schedule_next: Option<String>,
+}
+
+/// A finished schedule request to the agent. Errors are already readable text.
+pub enum ScheduleEvent {
+    Loaded(Connection, Result<agent::Schedule, String>),
+    Saved(Result<agent::Schedule, String>),
 }
 
 impl View {

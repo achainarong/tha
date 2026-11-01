@@ -2486,6 +2486,76 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "Sicherheits-Warteschlange abbrechen",
     ),
     (
+        "Automatic scan schedule for this server",
+        "Automatischer Scan-Zeitplan für diesen Server",
+    ),
+    (" Scan schedule · {server} ", " Scan-Zeitplan · {server} "),
+    (
+        "Cron schedule in the server's time zone: minute hour day month weekday.",
+        "Cron-Zeitplan in der Zeitzone des Servers: Minute Stunde Tag Monat Wochentag.",
+    ),
+    (
+        "Example: 0 0 * * * runs every day at 00:00. Leave empty to turn automatic scans off.",
+        "Beispiel: 0 0 * * * läuft täglich um 00:00 Uhr. Leer lassen schaltet automatische Scans aus.",
+    ),
+    (
+        "Ignore CPU and RAM thresholds",
+        "CPU- und RAM-Grenzwerte ignorieren",
+    ),
+    (
+        "Scans start even when the server is busy. The scanner's own limits still apply.",
+        "Scans starten auch bei ausgelastetem Server. Die Limits des Scanners gelten weiterhin.",
+    ),
+    (
+        "Enter Save · Tab Toggle thresholds · Ctrl-U Clear · Esc Cancel",
+        "Enter Speichern · Tab Grenzwerte umschalten · Strg-U Leeren · Esc Abbrechen",
+    ),
+    (
+        "Scan schedule · Enter Save · Esc Cancel",
+        "Scan-Zeitplan · Enter Speichern · Esc Abbrechen",
+    ),
+    (
+        "Next run: {next} server time",
+        "Nächster Lauf: {next} Serverzeit",
+    ),
+    ("Automatic scans are off", "Automatische Scans sind aus"),
+    (
+        "Scan schedule saved: {cron} · next run {next} server time",
+        "Scan-Zeitplan gespeichert: {cron} · nächster Lauf {next} Serverzeit",
+    ),
+    (
+        "Scan schedules are disabled in demo mode",
+        "Scan-Zeitpläne sind im Demo-Modus deaktiviert",
+    ),
+    (
+        "Set scan schedules from the Security view",
+        "Scan-Zeitpläne werden in der Sicherheitsansicht festgelegt",
+    ),
+    (
+        "Scan schedules are set per server; local runtimes scan on request",
+        "Scan-Zeitpläne gelten pro Server; lokale Laufzeiten scannen auf Anforderung",
+    ),
+    (
+        "Reading the scan schedule from the server…",
+        "Scan-Zeitplan wird vom Server gelesen…",
+    ),
+    (
+        "Saving the scan schedule on the server…",
+        "Scan-Zeitplan wird auf dem Server gespeichert…",
+    ),
+    (
+        "Cannot read the scan schedule: {error}. The server's agent may need an update.",
+        "Scan-Zeitplan kann nicht gelesen werden: {error}. Der Agent auf dem Server braucht vielleicht ein Update.",
+    ),
+    (
+        "Cannot save the scan schedule: {error}",
+        "Scan-Zeitplan kann nicht gespeichert werden: {error}",
+    ),
+    (
+        "Invalid scan schedule: {error}",
+        "Ungültiger Scan-Zeitplan: {error}",
+    ),
+    (
         "Update scanner database and rescan",
         "Scanner-Datenbank aktualisieren und neu scannen",
     ),

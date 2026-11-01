@@ -383,6 +383,7 @@ catalog! {
     ScanImages, "Scan checked images", ["scan-images"], Security, 8, true, ["shift-s"], [];
     CancelScan, "Cancel security queue", ["cancel-scan"], Security, 9, true, ["x"], [];
     UpdateSecurity, "Update scanner database and rescan", ["update-security-db"], Security, 40, true, [], [];
+    ScanSchedule, "Automatic scan schedule for this server", ["scan-schedule"], SecurityImages, 16, true, ["t"], [];
     ReloadLayers, "Retry image layers lookup", ["reload-layers"], Containers, 40, false, [], [];
     Refresh, "Refresh all engines", ["refresh"], Global, 40, false, [], [];
     ActionResults, "Background lifecycle progress and results", ["action-results"], Global, 40, false, [], [];
@@ -542,6 +543,7 @@ impl ActionId {
             Self::ScanImages => "scan-images",
             Self::CancelScan => "cancel-scan",
             Self::UpdateSecurity => "update-security-db",
+            Self::ScanSchedule => "scan-schedule",
             Self::ReloadLayers => "reload-layers",
             Self::Refresh => "refresh",
             Self::ActionResults => "action-results",

@@ -212,6 +212,13 @@ removes only the previously tracked Grype image, without force or parent pruning
 If that old image is still referenced, the queue reports an error rather than force
 deleting it. **`:update-security-db`** forces an update and rescan of the selected image.
 Docker-compatible Unix endpoints are supported initially; native containerd is not.
+
+Remote servers scan only on request by default. To scan automatically, select the
+server's engine in Security and press **t** (or **`:scan-schedule`**). Enter a standard
+cron schedule in the server's time zone, such as `0 0 * * *` for every day at 00:00, or
+leave it empty to turn automatic scans off. **Tab** toggles **Ignore CPU and RAM
+thresholds**, which is off by default. See [remote security](remote-security.md).
+
 Podman compatibility depends on its Docker API and the Docker CLI and must be verified
 for the installed version.
 

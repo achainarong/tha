@@ -1,7 +1,7 @@
 //! Fetch reports over the existing authenticated agent transport; never export remote layers.
 use super::{
     Event, Outcome, Report, Target,
-    agent::{Entry, Snapshot},
+    agent::{Entry, Schedule, Snapshot},
     store, updates,
 };
 use crate::config::Connection;
@@ -161,6 +161,34 @@ pub async fn sync(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub async fn schedule(connection: &Connection) -> Result<Schedule> {
+    let bytes = request(connection, Method::GET, "/tha/security/schedule").await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// An empty `cron` turns automatic scans off. The agent validates the schedule again.
+pub async fn set_schedule(
+    connection: &Connection,
+    cron: &str,
+    ignore_thresholds: bool,
+) -> Result<Schedule> {
+    let bytes = request(
+        connection,
+        Method::POST,
+        &schedule_path(cron, ignore_thresholds),
+    )
+    .await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn schedule_path(cron: &str, ignore_thresholds: bool) -> String {
+    format!(
+        "/tha/security/schedule?cron={}&ignore_thresholds={}",
+        cron.split_whitespace().collect::<Vec<_>>().join("+"),
+        u8::from(ignore_thresholds)
+    )
+}
+
 async fn enqueue(target: &Target, refresh: bool) -> Result<Snapshot> {
     let operation = if refresh { "refresh" } else { "rescan" };
     let host = target
@@ -300,6 +328,28 @@ pub(super) async fn submit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::agent::Route;
+
+    #[test]
+    fn schedule_requests_are_accepted_by_the_agent_route() {
+        let path = schedule_path(" */5  0 * * mon-fri ", true);
+        assert!(matches!(
+            crate::security::agent::route(&Method::POST, &path),
+            Some(Route::SetSchedule {
+                cron: "*/5+0+*+*+mon-fri",
+                ignore_thresholds: true,
+            })
+        ));
+        let path = schedule_path("", false);
+        assert!(matches!(
+            crate::security::agent::route(&Method::POST, &path),
+            Some(Route::SetSchedule {
+                cron: "",
+                ignore_thresholds: false,
+            })
+        ));
+    }
+
     #[test]
     fn remote_server_cannot_select_a_local_endpoint() {
         let connection = crate::remote::connection("prod", "docker");

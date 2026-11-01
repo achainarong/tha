@@ -514,6 +514,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ) {
         draw_log_editor(frame, app, area);
     }
+    if app.input_mode == InputMode::SecuritySchedule {
+        security::draw_schedule(frame, app, area);
+    }
     if app.diagnostics.is_some() {
         diagnostics::draw(frame, app, area);
     }
@@ -3149,6 +3152,14 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         vec![
             Line::styled(
                 crate::i18n::t("Log dialog · Enter Apply/Export · Esc Cancel"),
+                muted(),
+            ),
+            Line::from(safe_text(notice)),
+        ]
+    } else if app.input_mode == InputMode::SecuritySchedule {
+        vec![
+            Line::styled(
+                crate::i18n::t("Scan schedule · Enter Save · Esc Cancel"),
                 muted(),
             ),
             Line::from(safe_text(notice)),

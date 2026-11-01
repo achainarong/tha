@@ -1,6 +1,10 @@
 //! Narrow, agent-owned scan jobs. No client-controlled commands, mounts or scanner references.
 pub use super::grype::Limits;
-use super::{Report, Target, grype, registry, source, store, updates};
+use super::{
+    Report, Target,
+    cron::{self, Cron},
+    grype, registry, source, store, updates,
+};
 use crate::{
     agent::AgentEngine,
     config::{BackendKind, Connection},
@@ -11,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -23,6 +28,7 @@ pub struct Policy {
     /// Optional legacy/expert pin. Empty resolves the official registry image automatically.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub scanner_digest: String,
+    /// How long a report satisfies a plain scan request. Automatic scans follow `Schedule`.
     pub interval_seconds: u64,
     pub limits: Limits,
     pub max_load_percent: u32,
@@ -64,8 +70,109 @@ impl Policy {
     }
 }
 
+/// What Tha reads and sets for one engine. Automatic scans are off without a `cron`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Schedule {
+    pub cron: Option<String>,
+    pub ignore_thresholds: bool,
+    /// The next start in the server's time zone, for display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct StoredSchedule {
+    cron: Option<String>,
+    ignore_thresholds: bool,
+    /// Starts up to this time have been handled, so downtime costs at most one catch-up.
+    last_run: u64,
+}
+
+struct ActiveSchedule {
+    cron: Option<Cron>,
+    ignore_thresholds: bool,
+    last_run: u64,
+    path: Option<PathBuf>,
+}
+
+impl ActiveSchedule {
+    /// An unreadable file means no automatic scans, never a surprise scan.
+    fn load(path: Option<PathBuf>) -> Self {
+        let stored = path
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(
+                |bytes| match serde_json::from_slice::<StoredSchedule>(&bytes) {
+                    Ok(stored) => Some(stored),
+                    Err(error) => {
+                        eprintln!("tha-agent security: ignoring scan schedule: {error}");
+                        None
+                    }
+                },
+            )
+            .unwrap_or_default();
+        Self {
+            cron: stored
+                .cron
+                .as_deref()
+                .and_then(|cron| Cron::parse(cron).ok()),
+            ignore_thresholds: stored.ignore_thresholds,
+            last_run: stored.last_run,
+            path,
+        }
+    }
+
+    fn save(&self) -> Result<()> {
+        let path = self.path.as_ref().context("Scan schedule has no storage")?;
+        let parent = path.parent().context("Scan schedule has no directory")?;
+        std::fs::create_dir_all(parent)?;
+        let file = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer(
+            file.as_file(),
+            &StoredSchedule {
+                cron: self.cron.as_ref().map(|cron| cron.source().to_owned()),
+                ignore_thresholds: self.ignore_thresholds,
+                last_run: self.last_run,
+            },
+        )?;
+        file.persist(path).context("Cannot save scan schedule")?;
+        Ok(())
+    }
+
+    fn status(&self, now: u64) -> Schedule {
+        Schedule {
+            cron: self.cron.as_ref().map(|cron| cron.source().to_owned()),
+            ignore_thresholds: self.ignore_thresholds,
+            next: self
+                .cron
+                .as_ref()
+                .and_then(|cron| cron.next(now))
+                .and_then(cron::format_local),
+        }
+    }
+
+    /// `None` while automatic scans are off, otherwise whether a start has passed.
+    fn due(&self, now: u64) -> Option<bool> {
+        let cron = self.cron.as_ref()?;
+        Some(cron.next(self.last_run).is_some_and(|next| next <= now))
+    }
+}
+
+/// Between starts only images without a report are scanned, or failed ones after an hour.
+fn should_enqueue(due: bool, scanned: u64, failed_at: Option<u64>, now: u64) -> bool {
+    due || match failed_at {
+        Some(at) => now.saturating_sub(at) >= 3600,
+        None => scanned == 0,
+    }
+}
+
 pub enum Route<'a> {
     Images,
+    GetSchedule,
+    SetSchedule {
+        cron: &'a str,
+        ignore_thresholds: bool,
+    },
     Report(&'a str),
     Scan {
         image: &'a str,
@@ -80,6 +187,28 @@ pub fn route<'a>(method: &Method, path: &'a str) -> Option<Route<'a>> {
         return Some(Route::Images);
     }
     let rest = path.strip_prefix("/tha/security/")?;
+    if method == Method::GET && rest == "schedule" {
+        return Some(Route::GetSchedule);
+    }
+    // Agents refuse request bodies, so the schedule travels in the query. `+` is a space.
+    if method == Method::POST
+        && let Some(query) = rest.strip_prefix("schedule?cron=")
+    {
+        let (cron, ignore) = query.split_once("&ignore_thresholds=")?;
+        let ignore_thresholds = match ignore {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        let allowed = cron.len() <= 128
+            && cron.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '*' | ',' | '-' | '/' | '+' | '@')
+            });
+        return allowed.then_some(Route::SetSchedule {
+            cron,
+            ignore_thresholds,
+        });
+    }
     let (operation, argument) = rest.split_once('/')?;
     if method == Method::GET
         && operation == "report"
@@ -132,6 +261,7 @@ pub struct Engine {
     connection: Connection,
     policy: Policy,
     jobs: Mutex<HashMap<String, Job>>,
+    schedule: Mutex<ActiveSchedule>,
     sender: mpsc::Sender<Work>,
 }
 
@@ -151,10 +281,15 @@ impl Engine {
             ),
         };
         let (sender, mut receiver) = mpsc::channel(256);
+        let key = format!("{:x}", Sha256::digest(connection.endpoint.as_bytes()));
+        let path = super::root()
+            .ok()
+            .map(|root| root.join(format!("schedule-{key}.json")));
         let state = Arc::new(Self {
             connection,
             policy: policy.clone(),
             jobs: Mutex::new(HashMap::new()),
+            schedule: Mutex::new(ActiveSchedule::load(path)),
             sender,
         });
         let worker = state.clone();
@@ -170,7 +305,8 @@ impl Engine {
                         let Some(Work { target, update_db }) = work else { break; };
                         let Ok(_permit) = scans.clone().acquire_owned().await else { break; };
                         worker.set_state(&target, "waiting", None);
-                        while !worker.has_headroom() {
+                        // Read each time, so turning the checkbox on releases a waiting scan.
+                        while !worker.ignores_thresholds() && !worker.has_headroom() {
                             tokio::time::sleep(Duration::from_secs(30)).await;
                         }
                         worker.set_state(&target, "running", None);
@@ -270,7 +406,39 @@ impl Engine {
         Ok(())
     }
 
+    fn schedule_state(&self) -> Result<std::sync::MutexGuard<'_, ActiveSchedule>> {
+        self.schedule
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Agent schedule state unavailable"))
+    }
+
+    fn ignores_thresholds(&self) -> bool {
+        self.schedule_state()
+            .is_ok_and(|schedule| schedule.ignore_thresholds)
+    }
+
+    fn set_schedule(&self, cron: &str, ignore_thresholds: bool) -> Result<Schedule> {
+        let text = cron.replace('+', " ");
+        let cron = if text.trim().is_empty() {
+            None
+        } else {
+            Some(Cron::parse(&text)?)
+        };
+        let now = updates::now();
+        let mut schedule = self.schedule_state()?;
+        schedule.cron = cron;
+        schedule.ignore_thresholds = ignore_thresholds;
+        // A new schedule starts from now and does not catch up on earlier starts.
+        schedule.last_run = now;
+        schedule.save()?;
+        Ok(schedule.status(now))
+    }
+
     async fn schedule(&self) -> Result<()> {
+        let now = updates::now();
+        let Some(due) = self.schedule_state()?.due(now) else {
+            return Ok(());
+        };
         let docker = crate::backend::docker::connect(&self.connection)?
             .negotiate_version()
             .await?;
@@ -288,21 +456,25 @@ impl Engine {
             if !crate::platform::immutable_image_id(&image) {
                 continue;
             }
-            let retry = self
+            let failed_at = self
                 .jobs
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Agent job state unavailable"))?
                 .get(&image)
-                .is_none_or(|job| {
-                    job.state != "failed" || updates::now().saturating_sub(job.at) >= 3600
-                });
-            if retry {
-                let target = self.target(&image).await?;
-                if let Err(error) = self.enqueue(target, false, false) {
-                    eprintln!("tha-agent security queue: {error:#}");
-                    break;
-                }
+                .filter(|job| job.state == "failed")
+                .map(|job| job.at);
+            let target = self.target(&image).await?;
+            if should_enqueue(due, store::scanned(&target)?, failed_at, now)
+                && let Err(error) = self.enqueue(target, true, false)
+            {
+                eprintln!("tha-agent security queue: {error:#}");
+                break;
             }
+        }
+        if due {
+            let mut schedule = self.schedule_state()?;
+            schedule.last_run = now;
+            schedule.save()?;
         }
         Ok(())
     }
@@ -383,6 +555,15 @@ impl Engine {
 
     pub async fn handle(&self, route: Route<'_>) -> Result<serde_json::Value> {
         match route {
+            Route::GetSchedule => Ok(serde_json::to_value(
+                self.schedule_state()?.status(updates::now()),
+            )?),
+            Route::SetSchedule {
+                cron,
+                ignore_thresholds,
+            } => Ok(serde_json::to_value(
+                self.set_schedule(cron, ignore_thresholds)?,
+            )?),
             Route::Images => {
                 let (runtime, host) = self.identity().await?;
                 let entries = store::list(&self.connection)?
@@ -568,6 +749,115 @@ mod tests {
         assert!(!fresh(&report, &policy, 99));
         report.scanner_digest = None;
         assert!(!fresh(&report, &policy, 101));
+    }
+
+    #[test]
+    fn schedule_routes_accept_only_cron_characters_and_explicit_flags() {
+        assert!(matches!(
+            route(&Method::GET, "/tha/security/schedule"),
+            Some(Route::GetSchedule)
+        ));
+        assert!(matches!(
+            route(
+                &Method::POST,
+                "/tha/security/schedule?cron=*/5+0+*+*+mon-fri&ignore_thresholds=1"
+            ),
+            Some(Route::SetSchedule {
+                cron: "*/5+0+*+*+mon-fri",
+                ignore_thresholds: true,
+            })
+        ));
+        assert!(matches!(
+            route(
+                &Method::POST,
+                "/tha/security/schedule?cron=&ignore_thresholds=0"
+            ),
+            Some(Route::SetSchedule {
+                cron: "",
+                ignore_thresholds: false,
+            })
+        ));
+        for path in [
+            "/tha/security/schedule",
+            "/tha/security/schedule?cron=0+0+*+*+*",
+            "/tha/security/schedule?cron=0+0+*+*+*&ignore_thresholds=yes",
+            "/tha/security/schedule?cron=$(id)&ignore_thresholds=0",
+            "/tha/security/schedule?cron=0;0&ignore_thresholds=0",
+        ] {
+            assert!(route(&Method::POST, path).is_none(), "{path}");
+        }
+        assert!(
+            route(
+                &Method::GET,
+                "/tha/security/schedule?cron=&ignore_thresholds=0"
+            )
+            .is_none()
+        );
+    }
+
+    fn schedule(cron: Option<&str>, last_run: u64, path: Option<PathBuf>) -> ActiveSchedule {
+        ActiveSchedule {
+            cron: cron.map(|cron| Cron::parse(cron).unwrap()),
+            ignore_thresholds: false,
+            last_run,
+            path,
+        }
+    }
+
+    #[test]
+    fn automatic_scans_and_threshold_bypass_are_off_by_default() {
+        let schedule = ActiveSchedule::load(None);
+        assert_eq!(schedule.due(1_000_000), None);
+        assert!(!schedule.ignore_thresholds);
+        assert_eq!(schedule.status(1_000_000), Schedule::default());
+    }
+
+    #[test]
+    fn a_start_is_due_once_including_after_downtime() {
+        let hour = 3600;
+        let now = 1_781_524_800; // On a whole hour.
+        let hourly = |last_run| schedule(Some("0 * * * *"), last_run, None);
+        assert_eq!(hourly(now - 1).due(now), Some(true));
+        assert_eq!(hourly(now).due(now), Some(false));
+        assert_eq!(hourly(now).due(now + hour - 1), Some(false));
+        assert_eq!(hourly(now - 30 * 24 * hour).due(now), Some(true));
+    }
+
+    #[test]
+    fn only_new_or_long_failed_images_scan_between_starts() {
+        let now = 100_000;
+        assert!(should_enqueue(true, 50, None, now), "a start rescans");
+        assert!(
+            should_enqueue(true, 50, Some(now), now),
+            "a start overrides the backoff"
+        );
+        assert!(should_enqueue(false, 0, None, now), "new image");
+        assert!(!should_enqueue(false, 50, None, now), "scanned images wait");
+        assert!(
+            !should_enqueue(false, 0, Some(now - 3599), now),
+            "failure backs off"
+        );
+        assert!(
+            should_enqueue(false, 50, Some(now - 3600), now),
+            "failure retries"
+        );
+    }
+
+    #[test]
+    fn schedule_survives_a_restart_and_a_broken_file_disables_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        let mut saved = schedule(Some("0  0 * * *"), 123, Some(path.clone()));
+        saved.ignore_thresholds = true;
+        saved.save().unwrap();
+        let loaded = ActiveSchedule::load(Some(path.clone()));
+        assert_eq!(loaded.cron, saved.cron);
+        assert_eq!(loaded.last_run, 123);
+        assert!(loaded.ignore_thresholds);
+        std::fs::write(&path, "{not json").unwrap();
+        let loaded = ActiveSchedule::load(Some(path));
+        assert_eq!(loaded.cron, None);
+        assert!(!loaded.ignore_thresholds);
     }
 
     #[test]

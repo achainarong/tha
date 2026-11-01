@@ -23,6 +23,39 @@ pub fn now() -> u64 {
         .as_secs()
 }
 
+/// The most recent midnight in the server's time zone, if it can be determined.
+fn last_local_midnight(now: u64) -> Option<u64> {
+    let time = libc::time_t::try_from(now).ok()?;
+    // SAFETY: both calls only access the valid, exclusively borrowed values passed here.
+    // An all-zero `tm` is a valid value, and `localtime_r` fills it before it is read.
+    let midnight = unsafe {
+        let mut local: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&time, &mut local).is_null() {
+            return None;
+        }
+        local.tm_hour = 0;
+        local.tm_min = 0;
+        local.tm_sec = 0;
+        // Let the C library decide whether daylight saving applies at midnight.
+        local.tm_isdst = -1;
+        libc::mktime(&mut local)
+    };
+    // Where clocks change at midnight, the normalized time must still be in the past.
+    u64::try_from(midnight)
+        .ok()
+        .map(|midnight| midnight.min(now))
+}
+
+/// Whether `at` falls after the latest local midnight. Without a known local time,
+/// `fallback_seconds` of age is the limit, so a broken zone cannot stop rescans.
+pub fn same_local_day(at: u64, now: u64, fallback_seconds: u64) -> bool {
+    at <= now
+        && match last_local_midnight(now) {
+            Some(midnight) => at >= midnight,
+            None => now - at < fallback_seconds,
+        }
+}
+
 pub fn lock() -> Result<File> {
     let root = root()?;
     std::fs::create_dir_all(&root)?;

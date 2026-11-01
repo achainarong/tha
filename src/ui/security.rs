@@ -1,6 +1,59 @@
 use super::*;
 use crate::security::State;
 
+/// The selected server engine's schedule. The input is the cron text; Tab flips the checkbox.
+pub fn draw_schedule(frame: &mut Frame, app: &App, area: Rect) {
+    let dialog = centered(area, 86, 15);
+    frame.render_widget(Clear, dialog);
+    let server = app
+        .security
+        .schedule_connection
+        .as_ref()
+        .map(|connection| safe_text(&connection.name))
+        .unwrap_or_default();
+    let block = Block::bordered().title(crate::tf!(" Scan schedule · {server} ", server = server));
+    let inner = padded(block.inner(dialog));
+    frame.render_widget(block, dialog);
+    let next = match &app.security.schedule_next {
+        Some(next) => crate::tf!("Next run: {next} server time", next = safe_text(next)),
+        None => crate::i18n::t("Automatic scans are off").into(),
+    };
+    let checkbox = if app.security.schedule_ignore {
+        "[x]"
+    } else {
+        "[ ]"
+    };
+    let lines = vec![
+        Line::from(crate::i18n::t(
+            "Cron schedule in the server's time zone: minute hour day month weekday.",
+        )),
+        Line::from(crate::i18n::t(
+            "Example: 0 0 * * * runs every day at 00:00. Leave empty to turn automatic scans off.",
+        )),
+        Line::default(),
+        Line::from(format!("> {}▏", safe_text(&app.input))),
+        Line::styled(next, muted()),
+        Line::default(),
+        Line::from(format!(
+            "{checkbox} {}",
+            crate::i18n::t("Ignore CPU and RAM thresholds")
+        )),
+        Line::styled(
+            crate::i18n::t(
+                "Scans start even when the server is busy. The scanner's own limits still apply.",
+            ),
+            muted(),
+        ),
+        Line::default(),
+        Line::from(safe_text(&app.notice)),
+        Line::styled(
+            crate::i18n::t("Enter Save · Tab Toggle thresholds · Ctrl-U Clear · Esc Cancel"),
+            muted(),
+        ),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 /// Fourth top-level overview: image selection and findings share one workspace.
 pub fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
     if !app.security.enabled {
@@ -482,6 +535,68 @@ fn score(score: Option<f64>) -> String {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    fn screen(terminal: &mut Terminal<TestBackend>, app: &App) -> String {
+        terminal
+            .draw(|frame| draw_schedule(frame, app, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn schedule_dialog_opens_from_the_agent_answer_and_shows_its_state() {
+        use crate::security::{ScheduleEvent, agent::Schedule};
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        app.overview_mode = OverviewMode::Security;
+        let connection = crate::remote::connection("prod", "docker");
+        app.apply_schedule_event(ScheduleEvent::Loaded(
+            connection.clone(),
+            Ok(Schedule::default()),
+        ));
+        assert_eq!(app.input_mode, InputMode::SecuritySchedule);
+        assert_eq!(app.input, "");
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let text = screen(&mut terminal, &app);
+        assert!(text.contains("[ ] Ignore CPU and RAM thresholds"));
+        assert!(text.contains("Automatic scans are off"));
+
+        app.input_mode = InputMode::Normal;
+        app.apply_schedule_event(ScheduleEvent::Loaded(
+            connection,
+            Ok(Schedule {
+                cron: Some("0 0 * * *".into()),
+                ignore_thresholds: true,
+                next: Some("2026-11-02 00:00".into()),
+            }),
+        ));
+        let text = screen(&mut terminal, &app);
+        assert!(text.contains("> 0 0 * * *"));
+        assert!(text.contains("[x] Ignore CPU and RAM thresholds"));
+        assert!(text.contains("2026-11-02 00:00"));
+    }
+
+    #[test]
+    fn schedules_are_refused_for_local_runtimes_and_stale_answers_stay_closed() {
+        use crate::security::{ScheduleEvent, agent::Schedule};
+        let mut app = App::new(crate::demo::connections(), 100, false, true);
+        app.begin_security_schedule();
+        assert!(app.security.schedule_load.is_none());
+        app.overview_mode = OverviewMode::Security;
+        app.begin_security_schedule();
+        assert!(app.security.schedule_load.is_none());
+        app.overview_mode = OverviewMode::Images;
+        app.apply_schedule_event(ScheduleEvent::Loaded(
+            crate::remote::connection("prod", "docker"),
+            Ok(Schedule::default()),
+        ));
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
 
     #[test]
     fn top_level_security_shows_images_and_findings_without_cleanup_actions() {

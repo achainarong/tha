@@ -183,30 +183,32 @@ async fn resolve_and_prepare(
     );
     let reference = format!("docker.io/anchore/grype@{digest}");
     // Never trust a local image merely because it is tagged anchore/grype:latest.
-    if grype::command(
-        connection,
-        &["image", "inspect", "--format", "{{.Id}}", &id],
-        30,
-    )
-    .await
-    .is_err()
-    {
+    let inspect = ["image", "inspect", "--format", "{{.Id}}", &reference];
+    if grype::command(connection, &inspect, 30).await.is_err() {
         grype::command(connection, &["pull", &reference], 600).await?;
     }
-    let actual = grype::command(
-        connection,
-        &["image", "inspect", "--format", "{{.Id}}", &id],
-        30,
-    )
-    .await?;
-    ensure!(
-        String::from_utf8_lossy(&actual).trim() == id,
-        "Downloaded scanner identity mismatch; execution refused"
-    );
+    let actual = grype::command(connection, &inspect, 30).await?;
+    let image_id = verified_image_id(&String::from_utf8_lossy(&actual), &id, &digest)?;
     Ok(Scanner {
-        image_id: id,
+        image_id,
         manifest_digest: latest_digest,
     })
+}
+
+/// The engine's ID for a verified scanner: the classic image store reports the config
+/// digest, the containerd image store the manifest digest. Anything else is refused.
+fn verified_image_id(actual: &str, config: &str, manifest: &str) -> Result<String> {
+    let actual = actual.trim();
+    ensure!(
+        actual == config || actual == manifest,
+        "Downloaded scanner identity mismatch; execution refused"
+    );
+    Ok(actual.to_owned())
+}
+
+/// Rolling 24 hours would let a midnight rescan reuse yesterday's database.
+fn database_current(updated: u64, now: u64) -> bool {
+    updates::same_local_day(updated, now, 86400)
 }
 
 pub(super) async fn database(
@@ -223,9 +225,7 @@ pub(super) async fn database(
         .ok()
         .and_then(|b| serde_json::from_slice::<(String, u64)>(&b).ok());
     if !force
-        && previous.is_some_and(|(id, at)| {
-            id == scanner && at <= updates::now() && updates::now() - at < 86400
-        })
+        && previous.is_some_and(|(id, at)| id == scanner && database_current(at, updates::now()))
     {
         return Ok(());
     }
@@ -255,6 +255,68 @@ mod tests {
     #[test]
     fn malformed_digest_is_not_a_registry_reference() {
         assert!(verify(b"x", "latest").is_err());
+    }
+
+    #[test]
+    fn scanner_identity_accepts_both_image_stores_and_nothing_else() {
+        let (config, manifest) = ("sha256:config", "sha256:manifest");
+        assert_eq!(
+            verified_image_id("sha256:config\n", config, manifest).unwrap(),
+            config,
+            "classic image store"
+        );
+        assert_eq!(
+            verified_image_id("sha256:manifest\n", config, manifest).unwrap(),
+            manifest,
+            "containerd image store"
+        );
+        assert!(verified_image_id("sha256:other\n", config, manifest).is_err());
+        assert!(verified_image_id("", config, manifest).is_err());
+    }
+
+    /// Set `THA_LIVE_DOCKER_ENDPOINT` to an engine and `THA_LIVE_SCAN_IMAGE` to a local image.
+    #[tokio::test]
+    #[ignore = "Pulls the scanner, updates its database and scans an image on a live engine"]
+    async fn live_scanner_resolves_and_scans_on_the_engines_image_store() {
+        let endpoint = std::env::var("THA_LIVE_DOCKER_ENDPOINT").unwrap();
+        let image = std::env::var("THA_LIVE_SCAN_IMAGE").unwrap();
+        let connection = Connection {
+            name: "live".into(),
+            kind: crate::config::BackendKind::Docker,
+            endpoint: endpoint.clone(),
+        };
+        let scanner = scanner(&connection, "").await.unwrap();
+        let limits = grype::Limits::default();
+        grype::update_database_limited(
+            &connection,
+            &scanner.image_id,
+            &grype::container_name(),
+            &|_| {},
+            &limits,
+        )
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("image.tar");
+        let saved = std::process::Command::new("docker")
+            .args(["--host", &endpoint, "save", "-o"])
+            .arg(&archive)
+            .arg(&image)
+            .status()
+            .unwrap();
+        assert!(saved.success());
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let report = grype::scan_limited(
+            &connection,
+            &grype::container_name(),
+            &scanner.image_id,
+            &archive,
+            &limits,
+        )
+        .await
+        .unwrap();
+        assert!(report.scanned > 0);
     }
 
     #[tokio::test]

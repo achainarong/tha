@@ -155,3 +155,4 @@ These modal keys do not trigger global navigation or workload actions while typi
 | `check-security-image`, `clear-scan-checks` | Toggle a Security image-list check or clear scan checks |
 | `scan-image`, `scan-images`, `cancel-scan` | Scan selected/checked images or cancel the scan queue |
 | `update-security-db` | Update scanner/database and rescan |
+| `scan-schedule` | Set the selected server engine's automatic scan schedule |

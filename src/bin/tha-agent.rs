@@ -88,8 +88,8 @@ enum Command {
         /// Disable remote security scanning (enabled by default; Grype is verified automatically)
         #[arg(long)]
         no_security: bool,
-        /// Rescan interval in seconds (at least one hour)
-        #[arg(long, default_value_t = 86400)]
+        /// Deprecated and has no automatic effect: scan schedules are set per engine in Tha
+        #[arg(long, default_value_t = 86400, hide = true)]
         security_interval: u64,
     },
 }

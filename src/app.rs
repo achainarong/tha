@@ -240,9 +240,75 @@ pub enum InputMode {
     /// The advanced JSON document.
     LogFilter,
     ExportLogs,
+    /// The selected server engine's automatic scan schedule.
+    SecuritySchedule,
 }
 
 impl App {
+    /// Asks the selected engine's agent for its schedule; the dialog opens with the answer.
+    pub fn begin_security_schedule(&mut self) {
+        if self.demo {
+            self.notice = crate::i18n::t("Scan schedules are disabled in demo mode").into();
+            return;
+        }
+        if self.overview_mode != OverviewMode::Security {
+            self.notice = crate::i18n::t("Set scan schedules from the Security view").into();
+            return;
+        }
+        let connection = self
+            .engines
+            .get(self.inventory_engine)
+            .map(|engine| engine.connection.clone())
+            .filter(crate::remote::is_remote);
+        let Some(connection) = connection else {
+            self.notice =
+                crate::i18n::t("Scan schedules are set per server; local runtimes scan on request")
+                    .into();
+            return;
+        };
+        self.security.schedule_load = Some(connection);
+        self.notice = crate::i18n::t("Reading the scan schedule from the server…").into();
+    }
+
+    pub fn apply_schedule_event(&mut self, event: crate::security::ScheduleEvent) {
+        use crate::security::ScheduleEvent;
+        match event {
+            ScheduleEvent::Loaded(connection, Ok(schedule)) => {
+                // The answer is stale once the user has moved on.
+                if self.input_mode != InputMode::Normal
+                    || self.overview_mode != OverviewMode::Security
+                {
+                    return;
+                }
+                self.security.schedule_connection = Some(connection);
+                self.security.schedule_ignore = schedule.ignore_thresholds;
+                self.security.schedule_next = schedule.next;
+                self.input = schedule.cron.unwrap_or_default();
+                self.input_mode = InputMode::SecuritySchedule;
+                self.notice.clear();
+            }
+            ScheduleEvent::Loaded(_, Err(error)) => {
+                self.notice = crate::tf!(
+                    "Cannot read the scan schedule: {error}. The server's agent may need an update.",
+                    error = error
+                );
+            }
+            ScheduleEvent::Saved(Ok(schedule)) => {
+                self.notice = match schedule.cron {
+                    Some(cron) => crate::tf!(
+                        "Scan schedule saved: {cron} · next run {next} server time",
+                        cron = cron,
+                        next = schedule.next.unwrap_or_default()
+                    ),
+                    None => crate::i18n::t("Automatic scans are off").into(),
+                };
+            }
+            ScheduleEvent::Saved(Err(error)) => {
+                self.notice = crate::tf!("Cannot save the scan schedule: {error}", error = error);
+            }
+        }
+    }
+
     /// Opens a log filter field, with the other field's active value ready behind Tab.
     pub fn open_log_filter(&mut self, mode: InputMode) {
         let (input, other) = if mode == InputMode::LogFilter {

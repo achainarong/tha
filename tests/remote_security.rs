@@ -185,6 +185,57 @@ async fn report_sync_child() {
         label: "fixture".into(),
     }));
     assert!(matches!(view.state, tha::security::State::Ready(_)));
+    for (method, query, status, cron, ignore) in [
+        ("GET", "", hyper::StatusCode::OK, None, false),
+        (
+            "POST",
+            "?cron=0+0+*+*+*&ignore_thresholds=1",
+            hyper::StatusCode::OK,
+            Some("0 0 * * *"),
+            true,
+        ),
+        ("GET", "", hyper::StatusCode::OK, Some("0 0 * * *"), true),
+        (
+            "POST",
+            "?cron=99+*+*+*+*&ignore_thresholds=0",
+            hyper::StatusCode::BAD_REQUEST,
+            None,
+            false,
+        ),
+        ("GET", "", hyper::StatusCode::OK, Some("0 0 * * *"), true),
+        (
+            "POST",
+            "?cron=&ignore_thresholds=0",
+            hyper::StatusCode::OK,
+            None,
+            false,
+        ),
+    ] {
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .method(method)
+                    .uri(format!("http://agent/tha/security/schedule{query}"))
+                    .body(
+                        Empty::<Bytes>::new()
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{method} {query}");
+        if status.is_success() {
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let schedule: tha::security::agent::Schedule = serde_json::from_slice(&body).unwrap();
+            assert_eq!(schedule.cron.as_deref(), cron, "{method} {query}");
+            assert_eq!(schedule.ignore_thresholds, ignore, "{method} {query}");
+            assert_eq!(schedule.next.is_some(), cron.is_some(), "{method} {query}");
+        } else {
+            response.into_body().collect().await.unwrap();
+        }
+    }
     let image = format!("sha256:{}", "a".repeat(64));
     let wrong = format!("sha256:{}", "c".repeat(64));
     let response = sender
