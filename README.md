@@ -44,8 +44,20 @@ Linux only, and it does need root; see [Remote servers](#remote-servers):
 curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent
 ```
 
-This only installs the binary. The server is not ready until you also run
-`tha-agent setup`; the commands are under [Remote servers](#remote-servers).
+Then set up the server. It is not ready until you do. With a dedicated user and its own
+key (recommended, and the form under `:servers` shows this command with your key filled in):
+
+```sh
+sudo tha-agent setup --user tha --key 'ssh-ed25519 AAAA...'
+```
+
+Or with an existing root key:
+
+```sh
+sudo tha-agent setup --user root
+```
+
+See [Remote servers](#remote-servers) for what each one means.
 
 The [script](scripts/install.sh) downloads the release archive and `SHA256SUMS`,
 verifies the checksum, and installs `tha` into `~/.local/bin`. It needs `curl` or
@@ -338,7 +350,10 @@ curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/instal
 
 `tha-agent` is all the server needs; the full `tha` stays on your own machine. The
 agent is not a service: it opens no port and uses nothing while idle. SSH starts it for
-each connection, and it exits when the connection ends.
+each connection, and it exits when the connection ends. All requests share one SSH
+connection, with one agent process per engine, so a server's `MaxSessions` limit does not
+matter. Update the agent on your servers along with `tha`: rerun the install command, and
+`tha` tells you if a server's agent is too old.
 
 Setup creates the dedicated user, writes the root-owned policy `/etc/tha/agent.toml`,
 and restricts the key in `authorized_keys` to the agent. It stops if that user already

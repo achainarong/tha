@@ -130,6 +130,24 @@ async fn the_whole_path_works_through_real_ssh() {
             .any(|c| c.id.as_deref() == Some(&container.id))
     );
 
+    // MaxSessions is 10 by default, so this many at once would fail with one channel each.
+    let results =
+        futures_util::future::join_all((0..40).map(|_| backend::snapshot(&connection))).await;
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    // Finished agents can remain as zombies in a container without an init process.
+    if let Ok(server) = std::env::var("THA_SMOKE_SERVER") {
+        let agents = std::process::Command::new("docker")
+            .args(["exec", &server, "sh", "-c", "ps -eo stat,args | grep '[t]ha-agent' | grep -vc '^Z'; ps -eo stat,user,etimes,args | grep '[t]ha-agent' >&2"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&agents.stdout).trim(),
+            "1",
+            "one channel means one agent process: {}",
+            String::from_utf8_lossy(&agents.stderr)
+        );
+    }
+
     let refused = docker
         .create_exec(
             &container.id,

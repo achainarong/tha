@@ -10,11 +10,11 @@ use anyhow::{Context, Result, bail, ensure};
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, StatusCode,
-    body::{Bytes, Incoming},
+    body::{Body as _, Bytes, Incoming},
     header,
     service::service_fn,
 };
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, os::unix::fs::MetadataExt, path::Path, path::PathBuf, sync::Arc};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -22,6 +22,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub const CONFIG_PATH: &str = "/etc/tha/agent.toml";
 const MAX_REQUEST_BUFFER: usize = 64 * 1024;
 const MAX_LOGGED_TARGET: usize = 256;
+const MAX_CONCURRENT_STREAMS: u32 = 128;
+
+/// What the client needs from the agent. 2 means every request shares one HTTP/2 channel.
+pub const PROTOCOL: u32 = 2;
 
 type Body = BoxBody<Bytes, hyper::Error>;
 
@@ -398,7 +402,10 @@ fn is_version(segment: &str) -> bool {
 
 /// Refused outright rather than stripped: a client sending these is not `tha`.
 fn screen_headers<B>(request: &Request<B>) -> std::result::Result<(), String> {
-    if request.uri().scheme().is_some() || request.uri().authority().is_some() {
+    // HTTP/2 always carries a scheme and authority. Only the validated path is ever used.
+    if request.version() != hyper::Version::HTTP_2
+        && (request.uri().scheme().is_some() || request.uri().authority().is_some())
+    {
         return Err("absolute request targets are refused".into());
     }
     let headers = request.headers();
@@ -465,6 +472,14 @@ async fn handle(
         .to_owned();
     let decision =
         screen_headers(&request).and_then(|()| check(agent.allow_delete, &method, &target));
+    // A body has no way through, and HTTP/2 can send one without any length header.
+    let decision = decision.and_then(|access| {
+        if request.body().is_end_stream() {
+            Ok(access)
+        } else {
+            Err("request bodies are refused".to_owned())
+        }
+    });
     drop(request);
     let access = match decision {
         Ok(access) => access,
@@ -526,14 +541,18 @@ where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let agent = Arc::new(agent);
-    hyper::server::conn::http1::Builder::new()
-        .max_buf_size(MAX_REQUEST_BUFFER)
+    let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    builder.http1().max_buf_size(MAX_REQUEST_BUFFER);
+    builder
+        .http2()
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS);
+    builder
         .serve_connection(
             TokioIo::new(io),
             service_fn(move |request| handle(request, agent.clone())),
         )
         .await
-        .context("Agent connection failed")
+        .map_err(|error| anyhow::anyhow!("Agent connection failed: {error}"))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -565,6 +584,9 @@ pub fn parse_command<'a>(config: &'a AgentConfig, command: Option<&str>) -> Resu
 pub struct Listing {
     pub engines: Vec<String>,
     pub allow_delete: bool,
+    /// Missing from agents that opened one SSH channel per request.
+    #[serde(default)]
+    pub protocol: u32,
 }
 
 pub fn listing(config: &AgentConfig) -> Listing {
@@ -575,6 +597,7 @@ pub fn listing(config: &AgentConfig) -> Listing {
             .map(|engine| engine.name.clone())
             .collect(),
         allow_delete: config.allow_delete,
+        protocol: PROTOCOL,
     }
 }
 

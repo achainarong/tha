@@ -295,9 +295,16 @@ mod tests {
     #[test]
     fn the_explorer_names_each_machine() {
         let mut app = app();
-        let screen = render(&mut app, 120, 30);
+        let screen = render(&mut app, 160, 30);
         assert!(screen.contains("Local"), "{screen}");
-        assert!(screen.contains("prod [not connected]"), "{screen}");
+        assert!(screen.contains("prod (remote) [not connected]"), "{screen}");
+    }
+
+    #[test]
+    fn a_narrow_explorer_keeps_the_name_and_remote_label() {
+        let mut app = app();
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("prod (remote)"), "{screen}");
     }
 
     #[test]

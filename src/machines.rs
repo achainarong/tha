@@ -1039,15 +1039,15 @@ impl App {
         self.detail_focus = false;
         self.tab = Tab::Overview;
         let note = if kind == "test" {
-            let engines = screen
-                .lines()
-                .rev()
-                .find_map(|line| remote::parse_listing(line.trim().as_bytes()).ok());
-            match engines {
-                Some(listing) => crate::tf!(
+            // The screen wraps long lines, so the answer is read without its line breaks.
+            let answer: String = screen.lines().map(str::trim).collect();
+            let listed = answer.find("{\"engines\"").map(|at| &answer[at..]);
+            match listed.map(|text| remote::parse_listing(text.as_bytes())) {
+                Some(Ok(listing)) => crate::tf!(
                     "Connection works. Engines: {engines}",
                     engines = listing.engines.join(", ")
                 ),
+                Some(Err(error)) => crate::model::safe_text(&format!("{error:#}")),
                 None => crate::i18n::t("Connection works.").into(),
             }
         } else {
@@ -1513,7 +1513,7 @@ mod tests {
         let mut command = std::process::Command::new("/bin/sh");
         command.args([
             "-c",
-            r#"printf '%s\n' '{"engines":["docker"],"allow_delete":false}'"#,
+            r#"printf '%s\n' '{"engines":["docker"],"allow_delete":false,"protocol":2}'"#,
         ]);
         app.open_local_tool("Test", "test", Ok(command));
         assert!(!app.servers_modal_visible());
@@ -1711,7 +1711,7 @@ mod tests {
         let mut command = std::process::Command::new("/bin/sh");
         command.args([
             "-c",
-            r#"printf '%s\n' '{"engines":["docker"],"allow_delete":false}'"#,
+            r#"printf '%s\n' '{"engines":["docker"],"allow_delete":false,"protocol":2}'"#,
         ]);
         app.open_local_tool("Test", "test", Ok(command));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

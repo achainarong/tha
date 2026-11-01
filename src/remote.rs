@@ -5,6 +5,13 @@
 //! nothing in this module is a security boundary against the holder of the key.
 use crate::config::{BackendKind, Connection};
 use anyhow::{Context, Result, bail, ensure};
+use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
+use hyper::{
+    Request, Response, StatusCode,
+    body::{Bytes, Incoming},
+    service::service_fn,
+};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::hash_map::DefaultHasher,
@@ -18,7 +25,7 @@ use std::{
 };
 use tokio::{
     io::AsyncReadExt,
-    net::{UnixListener, UnixStream},
+    net::UnixListener,
     process::{Child, Command},
     sync::mpsc,
     task::JoinHandle,
@@ -511,7 +518,8 @@ impl Drop for AbortOnDrop {
 
 struct Session {
     master: Child,
-    _listeners: Vec<(AbortOnDrop, SocketFile)>,
+    channels: Vec<EngineChannel>,
+    lost: mpsc::Receiver<usize>,
     _control: SocketFile,
 }
 
@@ -653,6 +661,13 @@ pub fn parse_listing(bytes: &[u8]) -> Result<crate::agent::Listing> {
         );
     }
     ensure!(
+        listing.protocol >= crate::agent::PROTOCOL,
+        "{}",
+        crate::i18n::t(
+            "This server runs an older tha-agent. Update it by running the setup command on it."
+        )
+    );
+    ensure!(
         !listing.engines.is_empty(),
         "{}",
         crate::i18n::t("The server agent exposes no engines")
@@ -660,47 +675,126 @@ pub fn parse_listing(bytes: &[u8]) -> Result<crate::agent::Listing> {
     Ok(listing)
 }
 
-/// One local connection is one `ssh` channel running the agent for that engine.
-async fn pipe_connection(mut local: UnixStream, args: Vec<OsString>) -> Result<()> {
-    let mut child = Command::new("ssh")
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
-    let stdin = child.stdin.take().context("ssh stdin unavailable")?;
-    let stdout = child.stdout.take().context("ssh stdout unavailable")?;
-    let mut remote = tokio::io::join(stdout, stdin);
-    tokio::io::copy_bidirectional(&mut local, &mut remote).await?;
-    Ok(())
+/// The tha side of one channel. Every request shares it as an HTTP/2 stream, so a server sees
+/// one connection and one agent process however many requests are running.
+pub async fn connect_channel<I>(
+    io: I,
+) -> Result<(
+    hyper::client::conn::http2::SendRequest<Empty<Bytes>>,
+    impl std::future::Future<Output = ()> + Send + 'static,
+)>
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .adaptive_window(true)
+        .handshake(TokioIo::new(io))
+        .await
+        .context("Cannot start the agent channel")?;
+    Ok((sender, async move {
+        let _ = connection.await;
+    }))
 }
 
-fn listen(
+fn proxy_error(message: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let body = serde_json::json!({ "message": message }).to_string();
+    let mut response = Response::new(
+        Full::new(Bytes::from(body))
+            .map_err(|never: std::convert::Infallible| match never {})
+            .boxed(),
+    );
+    *response.status_mut() = StatusCode::BAD_GATEWAY;
+    response
+}
+
+async fn forward(
+    request: Request<Incoming>,
+    mut sender: hyper::client::conn::http2::SendRequest<Empty<Bytes>>,
+) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
+    let lost = crate::i18n::t("The connection to the server was lost");
+    let target = request
+        .uri()
+        .path_and_query()
+        .map_or("/", |value| value.as_str());
+    let Ok(outgoing) = Request::builder()
+        .method(request.method())
+        .uri(format!("http://agent{target}"))
+        .body(Empty::new())
+    else {
+        return Ok(proxy_error(lost));
+    };
+    if sender.ready().await.is_err() {
+        return Ok(proxy_error(lost));
+    }
+    Ok(match sender.send_request(outgoing).await {
+        Ok(response) => response.map(BodyExt::boxed),
+        Err(_) => proxy_error(lost),
+    })
+}
+
+/// Accepts the Docker client's local connections and sends their requests down the channel.
+pub async fn serve_local_socket(
+    listener: UnixListener,
+    sender: hyper::client::conn::http2::SendRequest<Empty<Bytes>>,
+) {
+    while let Ok((stream, _)) = listener.accept().await {
+        let sender = sender.clone();
+        tokio::spawn(async move {
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(stream),
+                    service_fn(move |request| forward(request, sender.clone())),
+                )
+                .await;
+        });
+    }
+}
+
+struct EngineChannel {
+    child: Child,
+    _driver: AbortOnDrop,
+    _accept: AbortOnDrop,
+    _socket: SocketFile,
+}
+
+async fn open_channel(
     remote: &Remote,
     key: &Path,
     control: &Path,
     engine: &str,
-) -> Result<(AbortOnDrop, SocketFile)> {
+    index: usize,
+    lost: mpsc::Sender<usize>,
+) -> Result<EngineChannel> {
     let address = endpoint(&remote.name, engine);
     let path = local_socket(&address).context("Invalid remote endpoint")?;
+    let mut child = Command::new("ssh")
+        .args(channel_args(remote, key, control, &serve_command(engine)))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context(crate::i18n::t(
+            "Cannot run ssh; install OpenSSH and ensure it is on PATH",
+        ))?;
+    let stdin = child.stdin.take().context("ssh stdin unavailable")?;
+    let stdout = child.stdout.take().context("ssh stdout unavailable")?;
+    let (sender, connection) = connect_channel(tokio::io::join(stdout, stdin)).await?;
+    let driver = tokio::spawn(async move {
+        connection.await;
+        let _ = lost.send(index).await;
+    });
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("Cannot listen on {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    let args = channel_args(remote, key, control, &serve_command(engine));
-    let task = tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
-            };
-            let args = args.clone();
-            tokio::spawn(async move {
-                let _ = pipe_connection(stream, args).await;
-            });
-        }
-    });
-    Ok((AbortOnDrop(task), SocketFile(path)))
+    let accept = tokio::spawn(serve_local_socket(listener, sender));
+    Ok(EngineChannel {
+        child,
+        _driver: AbortOnDrop(driver),
+        _accept: AbortOnDrop(accept),
+        _socket: SocketFile(path),
+    })
 }
 
 async fn open_session(remote: &Remote) -> Result<(Session, crate::agent::Listing), Failure> {
@@ -711,16 +805,20 @@ async fn open_session(remote: &Remote) -> Result<(Session, crate::agent::Listing
     let mut master = spawn_master(remote, &key, &control).map_err(Failure::local)?;
     wait_for_master(&mut master, remote, &control).await?;
     let listing = list_engines(remote, &key, &control).await?;
-    let listeners = listing
-        .engines
-        .iter()
-        .map(|engine| listen(remote, &key, &control, engine))
-        .collect::<Result<Vec<_>>>()
-        .map_err(Failure::local)?;
+    let (lost_tx, lost) = mpsc::channel(listing.engines.len());
+    let mut channels = Vec::with_capacity(listing.engines.len());
+    for (index, engine) in listing.engines.iter().enumerate() {
+        channels.push(
+            open_channel(remote, &key, &control, engine, index, lost_tx.clone())
+                .await
+                .map_err(Failure::local)?,
+        );
+    }
     Ok((
         Session {
             master,
-            _listeners: listeners,
+            channels,
+            lost,
             _control: SocketFile(control),
         },
         listing,
@@ -755,8 +853,13 @@ pub async fn supervise(remote: Remote, generation: u64, events: mpsc::Sender<Eve
                 {
                     return;
                 }
-                let _ = session.master.wait().await;
-                let stderr = read_stderr(&mut session.master).await;
+                // Either end can go: the connection, or the agent behind one channel.
+                let stderr = tokio::select! {
+                    _ = session.master.wait() => read_stderr(&mut session.master).await,
+                    Some(index) = session.lost.recv() => {
+                        read_stderr(&mut session.channels[index].child).await
+                    }
+                };
                 let (reason, retry) = classify_failure(&stderr);
                 drop(session);
                 if !send(Update::Failed {
@@ -1120,14 +1223,16 @@ mod tests {
 
     #[test]
     fn server_listings_are_validated() {
-        let listing = parse_listing(br#"{"engines":["docker"],"allow_delete":false}"#).unwrap();
+        let listing =
+            parse_listing(br#"{"engines":["docker"],"allow_delete":false,"protocol":2}"#).unwrap();
         assert_eq!(listing.engines, ["docker"]);
         for hostile in [
             &b"not json"[..],
-            br#"{"engines":[],"allow_delete":false}"#,
-            br#"{"engines":["../x"],"allow_delete":false}"#,
-            br#"{"engines":["a/b"],"allow_delete":false}"#,
-            br#"{"engines":["list"],"allow_delete":false}"#,
+            br#"{"engines":[],"allow_delete":false,"protocol":2}"#,
+            br#"{"engines":["../x"],"allow_delete":false,"protocol":2}"#,
+            br#"{"engines":["a/b"],"allow_delete":false,"protocol":2}"#,
+            br#"{"engines":["list"],"allow_delete":false,"protocol":2}"#,
+            br#"{"engines":["docker"],"allow_delete":false}"#,
         ] {
             assert!(parse_listing(hostile).is_err());
         }

@@ -2705,7 +2705,7 @@ impl App {
         Some(node(
             machine.anchor,
             Scope::Machine(name.to_owned()),
-            format!("{name}{status}"),
+            format!("{name}{}{status}", crate::i18n::t(" (remote)")),
             children,
         ))
     }

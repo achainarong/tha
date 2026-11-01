@@ -481,9 +481,12 @@ mod server_tests {
         populate(&mut app);
         populate_servers(&mut app);
         let titles: Vec<_> = app.rows.iter().map(|row| row.title.as_str()).collect();
-        assert!(titles.contains(&"prod"), "{titles:?}");
-        assert!(titles.contains(&"staging [not connected]"), "{titles:?}");
-        assert!(titles.contains(&"backup (offline)"), "{titles:?}");
+        assert!(titles.contains(&"prod (remote)"), "{titles:?}");
+        assert!(
+            titles.contains(&"staging (remote) [not connected]"),
+            "{titles:?}"
+        );
+        assert!(titles.contains(&"backup (remote) (offline)"), "{titles:?}");
         let prod = app.machine_engines("prod")[0];
         assert!(app.engines[prod].alias.is_none());
         assert!(app.engines[prod].snapshot.is_some());

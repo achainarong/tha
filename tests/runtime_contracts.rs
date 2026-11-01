@@ -1283,6 +1283,149 @@ mod agent {
         );
     }
 
+    /// Everything real except OpenSSH: the Docker client, the local socket and one channel.
+    async fn through_one_channel(engine: &MockEngine, allow_delete: bool) -> Connection {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "tha-channel-{}-{}.sock",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let socket = engine.path.clone();
+        tokio::spawn(async move {
+            let _ = serve(
+                server,
+                Agent {
+                    allow_delete,
+                    socket,
+                    audit: |_| {},
+                },
+            )
+            .await;
+        });
+        let (sender, connection) = tha::remote::connect_channel(client).await.unwrap();
+        tokio::spawn(connection);
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(tha::remote::serve_local_socket(listener, sender));
+        Connection {
+            name: "one channel".into(),
+            kind: BackendKind::Docker,
+            endpoint: format!("unix://{}", path.display()),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_real_client_works_over_one_shared_channel() {
+        let direct = MockEngine::start(false);
+        let through = MockEngine::start(false);
+        let connection = through_one_channel(&through, false).await;
+        let expected = backend::snapshot(&direct.connection()).await.unwrap();
+        let snapshot = backend::snapshot(&connection).await.unwrap();
+        assert_eq!(snapshot.containers.len(), expected.containers.len());
+        assert_eq!(snapshot.warnings, expected.warnings);
+        assert_eq!(seen(&through), seen(&direct));
+    }
+
+    #[tokio::test]
+    async fn many_requests_share_one_channel_past_the_ssh_session_limit() {
+        let engine = MockEngine::start(false);
+        let connection = through_one_channel(&engine, false).await;
+        let results =
+            futures_util::future::join_all((0..40).map(|_| backend::snapshot(&connection))).await;
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+    }
+
+    #[tokio::test]
+    async fn a_long_lived_stream_does_not_block_other_requests() {
+        let engine = MockEngine::start(false);
+        let connection = through_one_channel(&engine, false).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let container = tha::model::Container {
+            id: "api123".into(),
+            name: "shop-api-1".into(),
+            ..Default::default()
+        };
+        let logs = tha::logs::subscribe(connection.clone(), vec![container], 7, None, 100, tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv()).await;
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            backend::snapshot(&connection),
+        )
+        .await
+        .expect("other requests must keep flowing");
+        logs.abort();
+        assert!(snapshot.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_allowlist_applies_to_every_stream_on_the_channel() {
+        let engine = MockEngine::start(false);
+        let connection = through_one_channel(&engine, false).await;
+        let docker = backend::docker::connect(&connection).unwrap();
+        let refused = docker
+            .create_exec(
+                "api123",
+                bollard::models::ExecConfig {
+                    cmd: Some(vec!["id".to_owned()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("Not allowed by server"), "{refused}");
+        assert!(seen(&engine).iter().all(|line| !line.contains("exec")));
+    }
+
+    /// A hostile client speaking HTTP/2 directly, without any part of `tha`.
+    #[tokio::test]
+    async fn a_raw_http2_client_gets_no_more_than_http1() {
+        use http_body_util::Full;
+        use hyper::{Request, body::Bytes};
+        let engine = MockEngine::start(false);
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let socket = engine.path.clone();
+        tokio::spawn(async move {
+            let _ = serve(
+                server,
+                Agent {
+                    allow_delete: false,
+                    socket,
+                    audit: |_| {},
+                },
+            )
+            .await;
+        });
+        let (mut sender, connection) =
+            hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .handshake::<_, Full<Bytes>>(hyper_util::rt::TokioIo::new(client))
+                .await
+                .unwrap();
+        tokio::spawn(connection);
+        for (method, uri, body) in [
+            ("POST", "http://x/containers/create", ""),
+            ("POST", "http://x/containers/a/exec", ""),
+            ("POST", "http://x/containers/a/%2e%2e/exec", ""),
+            ("DELETE", "http://x/containers/a?force=true", ""),
+            ("POST", "http://x/containers/a/start", "{\"evil\":1}"),
+        ] {
+            sender.ready().await.unwrap();
+            let response = sender
+                .send_request(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Full::new(Bytes::from(body)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 403, "{method} {uri}");
+        }
+        assert_eq!(seen(&engine), Vec::<String>::new());
+    }
+
     #[tokio::test]
     async fn client_headers_are_not_forwarded() {
         let path =

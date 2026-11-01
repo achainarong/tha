@@ -3346,4 +3346,13 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "tha-agent is installed on this server, but not set up. Run the setup command on it.",
         "tha-agent ist auf diesem Server installiert, aber nicht eingerichtet. Den Setup-Befehl dort ausführen.",
     ),
+    (" (remote)", " (Remote)"),
+    (
+        "The connection to the server was lost",
+        "Die Verbindung zum Server wurde unterbrochen",
+    ),
+    (
+        "This server runs an older tha-agent. Update it by running the setup command on it.",
+        "Auf diesem Server läuft ein älterer tha-agent. Zum Aktualisieren den Setup-Befehl dort ausführen.",
+    ),
 ];

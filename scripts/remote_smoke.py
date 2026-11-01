@@ -259,6 +259,7 @@ def main():
             THA_SMOKE_KEY=str(key),
             THA_SMOKE_WRONG_KEY=str(wrong),
             THA_SMOKE_TARGET=TARGET,
+            THA_SMOKE_SERVER=SERVER,
         )
         root_key = scratch / "root_key"
         run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(root_key))
