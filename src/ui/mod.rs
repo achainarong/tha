@@ -2886,9 +2886,15 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         MouseTarget::LogScrollbar,
     ));
-    let mut scrollbar = ScrollbarState::new(total)
-        .position(start)
-        .viewport_content_length(areas[1].height as usize);
+    // Ratatui's content length counts scroll positions, not total display rows.
+    let mut scrollbar = ScrollbarState::new(
+        total
+            .saturating_sub(areas[1].height as usize)
+            .saturating_add(1)
+            .min(total),
+    )
+    .position(start)
+    .viewport_content_length(areas[1].height as usize);
     frame.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("↑"))

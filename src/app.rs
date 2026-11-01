@@ -406,7 +406,8 @@ pub struct App {
     pub mouse_enabled: bool,
     /// Rebuilt by every draw, in paint order, so the last match is on top.
     pub mouse_regions: Vec<(ratatui::layout::Rect, MouseTarget)>,
-    pub log_scrollbar_drag: bool,
+    /// Mouse row and display-row position at the start of a scrollbar drag.
+    pub log_scrollbar_drag: Option<(u16, usize)>,
     pub log_view: LogView,
     pub log_filter_text: String,
     /// The text terms as typed, for reopening the editor.
@@ -563,7 +564,7 @@ impl App {
             network_targets: Vec::new(),
             mouse_enabled: true,
             mouse_regions: Vec::new(),
-            log_scrollbar_drag: false,
+            log_scrollbar_drag: None,
             log_view: LogView::new(true),
             log_filter_text: "{}".into(),
             log_filter_terms: String::new(),

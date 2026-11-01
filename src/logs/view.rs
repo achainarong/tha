@@ -309,6 +309,19 @@ impl LogView {
         (self.start(buffer), self.total_rows())
     }
 
+    /// Thumb start and length, matching Ratatui's rounded scrollbar geometry.
+    pub fn scrollbar_thumb(&self, buffer: &LogBuffer, track: usize) -> (usize, usize) {
+        if track == 0 {
+            return (0, 0);
+        }
+        let range = self.total_rows().saturating_sub(self.height);
+        let extent = range + self.height;
+        let length = ((self.height * track + extent / 2) / extent).clamp(1, track);
+        let start =
+            ((self.start(buffer).min(range) * track + extent / 2) / extent).min(track - length);
+        (start, length)
+    }
+
     fn start(&self, buffer: &LogBuffer) -> usize {
         if buffer.follow {
             return self.total_rows().saturating_sub(self.height);

@@ -2674,11 +2674,11 @@ fn handle_mouse(
 ) -> bool {
     match mouse.kind {
         MouseEventKind::Up(MouseButton::Left) => {
-            app.log_scrollbar_drag = false;
+            app.log_scrollbar_drag = None;
             return false;
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if app.log_scrollbar_drag {
+            if app.log_scrollbar_drag.is_some() {
                 seek_log_scrollbar(app, mouse.row);
             }
             return false;
@@ -2912,8 +2912,9 @@ fn click(
                     app.log_view.scroll(&mut app.logs, 1)
                 }
                 _ => {
-                    app.log_scrollbar_drag = true;
                     seek_log_scrollbar(app, mouse.row);
+                    app.log_scrollbar_drag =
+                        Some((mouse.row, app.log_view.scroll_position(&app.logs).0));
                 }
             }
         }
@@ -3004,12 +3005,33 @@ fn seek_log_scrollbar(app: &mut App, row: u16) {
     if track == 0 {
         return;
     }
-    let offset = row.clamp(area.y + 1, area.y + track) - (area.y + 1);
-    app.log_view.scroll_to_fraction(
-        &mut app.logs,
-        offset as usize,
-        track.saturating_sub(1).max(1) as usize,
-    );
+    let (thumb_start, thumb_length) = app.log_view.scrollbar_thumb(&app.logs, track as usize);
+    let travel = (track as usize).saturating_sub(thumb_length);
+    if travel == 0 {
+        return;
+    }
+    let (position, total) = app.log_view.scroll_position(&app.logs);
+    let range = total.saturating_sub(area.height as usize);
+    let target = if let Some((origin_row, origin_position)) = app.log_scrollbar_drag {
+        let delta = row as isize - origin_row as isize;
+        origin_position
+            .saturating_add_signed(delta * range as isize / travel as isize)
+            .min(range)
+    } else {
+        let offset = row.saturating_sub(area.y + 1) as usize;
+        if (thumb_start..thumb_start + thumb_length).contains(&offset) {
+            // Grabbing the thumb pauses following without repositioning it.
+            app.log_view.scroll(&mut app.logs, 0);
+            return;
+        }
+        offset.saturating_sub(thumb_length / 2).min(travel) * range / travel
+    };
+    if target == position {
+        app.log_view.scroll(&mut app.logs, 0);
+        return;
+    }
+    app.log_view
+        .scroll_to_fraction(&mut app.logs, target, range.max(1));
 }
 
 fn move_by(app: &mut App, amount: isize, _height: usize) {
@@ -5294,6 +5316,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn log_scrollbar_grabbing_the_thumb_does_not_jump() {
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.selected = row_named(&app, "shop-api-2");
+        app.tab = Tab::Logs;
+        app.detail_focus = true;
+        for index in 0..300 {
+            app.logs.push("api", &format!("line {index}"), false);
+        }
+        app.logs.follow = true;
+        let buffer = draw_at(&mut app, 200, 50);
+        let area = app
+            .mouse_regions
+            .iter()
+            .find(|(_, target)| *target == MouseTarget::LogScrollbar)
+            .unwrap()
+            .0;
+        let thumb_row = (area.y + 1..area.bottom() - 1)
+            .find(|&row| buffer[(area.x, row)].symbol() == "█")
+            .expect("scrollbar has a visible thumb");
+        let before = app.log_view.scroll_position(&app.logs).0;
+        mouse_at(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            area.x,
+            thumb_row,
+            &refresh,
+        );
+        assert_eq!(
+            app.log_view.scroll_position(&app.logs).0,
+            before,
+            "grabbing the visible thumb must not change the log position"
+        );
+        mouse_at(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            area.x,
+            thumb_row,
+            &refresh,
+        );
+        assert_eq!(
+            app.log_view.scroll_position(&app.logs).0,
+            before,
+            "a stationary drag must not change the log position"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_scrollbar_thumb_geometry_and_drag_match_the_rendered_track() {
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.selected = row_named(&app, "shop-api-2");
+        app.tab = Tab::Logs;
+        app.detail_focus = true;
+        for index in 0..300 {
+            app.logs.push(
+                "api",
+                &format!("line {index} {}", "text ".repeat(40)),
+                false,
+            );
+        }
+        for wrap in [false, true] {
+            app.log_view.wrap = wrap;
+            for fraction in [0, 1, 2] {
+                draw_at(&mut app, 120, 50);
+                app.log_view.scroll_to_fraction(&mut app.logs, fraction, 2);
+                let buffer = draw_at(&mut app, 120, 50);
+                let area = app
+                    .mouse_regions
+                    .iter()
+                    .find(|(_, target)| *target == MouseTarget::LogScrollbar)
+                    .unwrap()
+                    .0;
+                let thumb: Vec<_> = (area.y + 1..area.bottom() - 1)
+                    .filter(|&row| buffer[(area.x, row)].symbol() == "█")
+                    .collect();
+                let (start, length) = app
+                    .log_view
+                    .scrollbar_thumb(&app.logs, (area.height - 2) as usize);
+                assert_eq!(thumb.len(), length);
+                assert_eq!(thumb[0], area.y + 1 + start as u16);
+                if fraction == 2 {
+                    assert_eq!(
+                        *thumb.last().unwrap(),
+                        area.bottom() - 2,
+                        "the thumb must reach the bottom when the last log row is visible"
+                    );
+                }
+                for row in thumb {
+                    app.log_view.scroll_to_fraction(&mut app.logs, fraction, 2);
+                    let before = app.log_view.scroll_position(&app.logs).0;
+                    mouse_at(
+                        &mut app,
+                        MouseEventKind::Down(MouseButton::Left),
+                        area.x,
+                        row,
+                        &refresh,
+                    );
+                    assert_eq!(app.log_view.scroll_position(&app.logs).0, before);
+                    // Redraw between mouse events, as the real event loop does.
+                    draw_at(&mut app, 120, 50);
+                    mouse_at(
+                        &mut app,
+                        MouseEventKind::Drag(MouseButton::Left),
+                        area.x,
+                        row,
+                        &refresh,
+                    );
+                    assert_eq!(app.log_view.scroll_position(&app.logs).0, before);
+                    mouse_at(
+                        &mut app,
+                        MouseEventKind::Drag(MouseButton::Left),
+                        area.x,
+                        row + 1,
+                        &refresh,
+                    );
+                    assert!(app.log_view.scroll_position(&app.logs).0 >= before);
+                    mouse_at(
+                        &mut app,
+                        MouseEventKind::Drag(MouseButton::Left),
+                        area.x,
+                        row,
+                        &refresh,
+                    );
+                    assert_eq!(
+                        app.log_view.scroll_position(&app.logs).0,
+                        before,
+                        "returning the pointer must restore the original scroll position"
+                    );
+                    mouse_at(
+                        &mut app,
+                        MouseEventKind::Up(MouseButton::Left),
+                        area.x,
+                        row,
+                        &refresh,
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn log_scrollbar_jumps_drags_and_steps_and_the_wheel_scrolls() {
         let mut app = app();
         let (refresh, _) = watch::channel(0);
@@ -5340,7 +5504,7 @@ mod tests {
             area.y + 1,
             &refresh,
         );
-        assert!(app.log_scrollbar_drag);
+        assert!(app.log_scrollbar_drag.is_some());
         assert_eq!(app.log_view.scroll_position(&app.logs).0, 0);
         mouse_at(
             &mut app,
@@ -5357,7 +5521,7 @@ mod tests {
             area.y,
             &refresh,
         );
-        assert!(!app.log_scrollbar_drag);
+        assert!(app.log_scrollbar_drag.is_none());
         mouse_at(
             &mut app,
             MouseEventKind::Drag(MouseButton::Left),
@@ -5375,7 +5539,7 @@ mod tests {
             &refresh,
         );
         assert_eq!(app.log_view.scroll_position(&app.logs).0, end - 1);
-        assert!(!app.log_scrollbar_drag);
+        assert!(app.log_scrollbar_drag.is_none());
     }
 
     #[tokio::test]
