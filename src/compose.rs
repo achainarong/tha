@@ -401,18 +401,156 @@ struct Wire {
     error: Option<String>,
 }
 
-/// Before Compose runs with engine-level access: its files must be plain files nobody else can
-/// change, because anyone who can edit one could mount the host into a container.
-pub fn check_server_files(target: &Target) -> Result<()> {
+/// Who can already drive this engine, and so gains nothing by changing a project's files.
+struct EngineAccess {
+    owner: u32,
+    /// The socket's group, when membership actually opens it. Root's group adds nobody.
+    group: Option<u32>,
+    known: std::collections::HashMap<u32, bool>,
+}
+
+impl EngineAccess {
+    fn new(owner: u32, group: Option<u32>) -> Self {
+        Self {
+            owner,
+            group,
+            known: std::collections::HashMap::new(),
+        }
+    }
+
+    fn of(socket: &std::path::Path) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(socket)
+            .with_context(|| format!("Cannot read the engine socket {}", socket.display()))?;
+        let group = (metadata.mode() & 0o020 != 0 && metadata.gid() != 0).then(|| metadata.gid());
+        Ok(Self::new(metadata.uid(), group))
+    }
+
+    fn trusts_user(&mut self, uid: u32) -> bool {
+        if uid == 0 || uid == self.owner {
+            return true;
+        }
+        let Some(group) = self.group else {
+            return false;
+        };
+        *self
+            .known
+            .entry(uid)
+            .or_insert_with(|| user_in_group(uid, group))
+    }
+
+    fn trusts_group(&self, gid: u32) -> bool {
+        gid == 0 || self.group == Some(gid)
+    }
+}
+
+/// `getent` rather than libc: release binaries are static, and could not see directory users.
+/// An answer that cannot be read counts as not a member.
+fn user_in_group(uid: u32, gid: u32) -> bool {
+    let lookup = |database: &str, key: u32| {
+        std::process::Command::new("getent")
+            .arg(database)
+            .arg(key.to_string())
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    lookup("passwd", uid)
+        .is_some_and(|passwd| member_of(&passwd, lookup("group", gid).as_deref(), gid))
+}
+
+fn member_of(passwd: &str, group: Option<&str>, gid: u32) -> bool {
+    let fields: Vec<_> = passwd.trim().split(':').collect();
+    let [name, _, _, primary, ..] = fields.as_slice() else {
+        return false;
+    };
+    primary.parse() == Ok(gid)
+        || group
+            .and_then(|group| group.trim().split(':').nth(3))
+            .is_some_and(|members| members.split(',').any(|member| member == *name))
+}
+
+/// Refuses an entry someone without engine access could change. A sticky folder is fine above
+/// the project, since others cannot replace what they do not own there, but not as the project
+/// folder, where they could still add a file Compose would read.
+fn check_entry(
+    path: &std::path::Path,
+    metadata: &std::fs::Metadata,
+    access: &mut EngineAccess,
+    sticky_allowed: bool,
+) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
+    anyhow::ensure!(
+        access.trusts_user(metadata.uid()),
+        "{} belongs to a user who cannot reach the engine, so Compose was not run",
+        path.display()
+    );
+    // A link's own mode means nothing. Where it points is checked separately.
+    if metadata.file_type().is_symlink() || (sticky_allowed && metadata.mode() & 0o1000 != 0) {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        metadata.mode() & 0o002 == 0,
+        "{} can be changed by anyone, so Compose was not run",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.mode() & 0o020 == 0 || access.trusts_group(metadata.gid()),
+        "{} can be changed by a group without engine access, so Compose was not run",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Every folder above `path`, as written and as resolved: replacing any of them replaces the file.
+fn check_parents(
+    path: &std::path::Path,
+    access: &mut EngineAccess,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir),
+        "Compose paths must not contain ..: {}",
+        path.display()
+    );
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("Cannot resolve {}", path.display()))?;
+    for parent in path.ancestors().skip(1).chain(resolved.ancestors().skip(1)) {
+        if seen.insert(parent.to_owned()) {
+            let metadata = std::fs::symlink_metadata(parent)
+                .with_context(|| format!("Cannot read {}", parent.display()))?;
+            check_entry(parent, &metadata, access, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_project_files(target: &Target, access: &mut EngineAccess) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
     let folder = std::fs::metadata(&target.working_dir)
         .with_context(|| format!("Project folder not found: {}", target.working_dir.display()))?;
     anyhow::ensure!(folder.is_dir(), "The project folder is not a folder");
-    anyhow::ensure!(
-        folder.mode() & 0o002 == 0,
-        "The project folder can be changed by anyone, so Compose was not run"
-    );
-    for path in target.files.iter().chain(&target.env_files) {
+    check_entry(&target.working_dir, &folder, access, false)?;
+    let spelled = std::fs::symlink_metadata(&target.working_dir)?;
+    check_entry(&target.working_dir, &spelled, access, false)?;
+    check_parents(&target.working_dir, access, &mut seen)?;
+    // Compose reads this one by itself unless told about another, and no label names it.
+    let default_env = target.working_dir.join(".env");
+    let default_env = (target.env_files.is_empty()
+        && std::fs::symlink_metadata(&default_env).is_ok())
+    .then_some(&default_env);
+    for path in target
+        .files
+        .iter()
+        .chain(&target.env_files)
+        .chain(default_env)
+    {
         let metadata = std::fs::symlink_metadata(path)
             .with_context(|| format!("Compose file not found: {}", path.display()))?;
         anyhow::ensure!(
@@ -420,13 +558,16 @@ pub fn check_server_files(target: &Target) -> Result<()> {
             "Compose files must be regular files, not links: {}",
             path.display()
         );
-        anyhow::ensure!(
-            metadata.mode() & 0o002 == 0,
-            "This Compose file can be changed by anyone, so Compose was not run: {}",
-            path.display()
-        );
+        check_entry(path, &metadata, access, false)?;
+        check_parents(path, access, &mut seen)?;
     }
     Ok(())
+}
+
+/// Before Compose runs as root: only someone who can already drive the engine may be able to
+/// change what it reads, because anyone else could use that to mount the host into a container.
+pub fn check_server_files(target: &Target, engine_socket: &std::path::Path) -> Result<()> {
+    check_project_files(target, &mut EngineAccess::of(engine_socket)?)
 }
 
 fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
@@ -499,8 +640,18 @@ pub async fn serve_agent(
             project: project.to_owned(),
         },
     };
-    let built = Request::build(&connection, &scope, &snapshot.containers, action)
-        .and_then(|request| check_server_files(&request.target).map(|()| request));
+    let built = match Request::build(&connection, &scope, &snapshot.containers, action) {
+        Ok(request) => {
+            let socket = agent.socket.clone();
+            tokio::task::spawn_blocking(move || {
+                check_server_files(&request.target, &socket).map(|()| request)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
+        }
+        Err(error) => Err(error),
+    };
     let compose = match built {
         Ok(compose) => compose,
         Err(error) => {
@@ -735,8 +886,11 @@ mod tests {
 
     #[test]
     fn server_files_must_be_plain_and_not_changeable_by_anyone() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let directory = tempfile::tempdir().unwrap();
+        let owner = std::fs::metadata(directory.path()).unwrap().uid();
+        let check_server_files =
+            |target: &Target| check_project_files(target, &mut EngineAccess::new(owner, None));
         let file = directory.path().join("compose.yaml");
         std::fs::write(&file, b"services: {}").unwrap();
         let target = Target {
@@ -780,6 +934,128 @@ mod tests {
             ..target
         };
         assert!(check_server_files(&missing).is_err());
+    }
+
+    /// A project folder that passes, with its Compose file, and the access of its owner.
+    fn trusted_project() -> (tempfile::TempDir, Target, u32, u32) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = directory.path().join("compose.yaml");
+        std::fs::write(&file, b"services: {}").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let metadata = std::fs::metadata(&file).unwrap();
+        let target = Target {
+            project: "shop".into(),
+            service: None,
+            working_dir: directory.path().to_owned(),
+            files: vec![file],
+            env_files: Vec::new(),
+        };
+        (directory, target, metadata.uid(), metadata.gid())
+    }
+
+    #[test]
+    fn files_of_a_user_without_engine_access_are_refused() {
+        let (_directory, target, owner, _) = trusted_project();
+        check_project_files(&target, &mut EngineAccess::new(owner, None)).unwrap();
+        // Root is always trusted, so a run as root cannot show the refusal.
+        if owner != 0 {
+            let error =
+                check_project_files(&target, &mut EngineAccess::new(owner + 1, None)).unwrap_err();
+            assert!(
+                error.to_string().contains("cannot reach the engine"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_write_is_only_fine_for_the_engine_group() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_directory, target, owner, gid) = trusted_project();
+        std::fs::set_permissions(&target.files[0], std::fs::Permissions::from_mode(0o664)).unwrap();
+        check_project_files(&target, &mut EngineAccess::new(owner, Some(gid))).unwrap();
+        if gid != 0 {
+            let error =
+                check_project_files(&target, &mut EngineAccess::new(owner, None)).unwrap_err();
+            assert!(error.to_string().contains("group"), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_env_file_compose_reads_by_itself_is_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let (directory, mut target, owner, _) = trusted_project();
+        let env = directory.path().join(".env");
+        std::fs::write(&env, b"DATA_DIR=/\n").unwrap();
+        std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let error = check_project_files(&target, &mut EngineAccess::new(owner, None)).unwrap_err();
+        assert!(error.to_string().contains(".env"), "{error}");
+
+        std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_file(&env).unwrap();
+        std::os::unix::fs::symlink(&target.files[0], &env).unwrap();
+        assert!(check_project_files(&target, &mut EngineAccess::new(owner, None)).is_err());
+
+        // A label naming another file means Compose does not read this one.
+        let named = directory.path().join("production.env");
+        std::fs::write(&named, b"").unwrap();
+        std::fs::set_permissions(&named, std::fs::Permissions::from_mode(0o644)).unwrap();
+        target.env_files = vec![named];
+        check_project_files(&target, &mut EngineAccess::new(owner, None)).unwrap();
+    }
+
+    #[test]
+    fn a_writable_parent_folder_is_refused_unless_it_is_sticky() {
+        use std::os::unix::fs::PermissionsExt;
+        let (directory, mut target, owner, _) = trusted_project();
+        let project = directory.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = project.join("compose.yaml");
+        std::fs::write(&file, b"services: {}").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        target.working_dir = project.clone();
+        target.files = vec![file];
+        let check =
+            |target: &Target| check_project_files(target, &mut EngineAccess::new(owner, None));
+        check(&target).unwrap();
+
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check(&target).unwrap_err().to_string().contains("anyone"));
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o1777))
+            .unwrap();
+        check(&target).unwrap();
+
+        // Sticky does not help the project folder itself: others could still add files to it.
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(check(&target).is_err());
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A link is followed too: the folder it leads through counts.
+        let open = directory.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let moved = open.join("project");
+        std::fs::rename(&project, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &project).unwrap();
+        assert!(check(&target).unwrap_err().to_string().contains("anyone"));
+
+        target.working_dir = directory.path().join("a/../project");
+        assert!(check(&target).is_err());
+    }
+
+    #[test]
+    fn group_membership_comes_from_the_primary_group_or_the_member_list() {
+        let passwd = "alice:x:1000:1000::/home/alice:/bin/sh\n";
+        assert!(member_of(passwd, None, 1000));
+        assert!(member_of(passwd, Some("docker:x:999:bob,alice\n"), 999));
+        assert!(!member_of(passwd, Some("docker:x:999:bob,alice2\n"), 999));
+        assert!(!member_of(passwd, Some("docker:x:999:\n"), 999));
+        assert!(!member_of(passwd, None, 999));
+        assert!(!member_of("garbage", Some("docker:x:999:garbage"), 999));
     }
 
     #[test]

@@ -98,6 +98,56 @@ async fn uploading_and_network_tests_work_against_a_real_engine() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+/// The whole client path without SSH: the local socket and the channel in front of the agent.
+#[tokio::test]
+#[ignore = "needs a running container; writes one small file under /tmp in it"]
+async fn uploads_reach_the_engine_through_the_client_proxy() {
+    use tha::agent::{Agent, serve};
+    let socket = std::env::var("THA_LIVE_SOCKET").expect("THA_LIVE_SOCKET");
+    let container = std::env::var("THA_LIVE_CONTAINER").expect("THA_LIVE_CONTAINER");
+    let connection = tha::remote::connection("live-proxy", "docker");
+    let path = tha::remote::local_socket(&connection.endpoint).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let (near, far) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(serve(
+        far,
+        Agent {
+            allow_delete: false,
+            allow_exec: false,
+            allow_images: false,
+            allow_download: true,
+            allow_compose: false,
+            allow_upload: true,
+            socket: socket.into(),
+            audit: |_| {},
+            security: None,
+            history: None,
+        },
+    ));
+    let (sender, channel) = tha::remote::connect_channel(near).await.unwrap();
+    tokio::spawn(channel);
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    tokio::spawn(tha::remote::serve_local_socket(listener, sender));
+    let source = Source::Container {
+        connection,
+        id: container.clone(),
+        label: container,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let local = directory.path().join("tha-live-proxy.txt");
+    std::fs::write(&local, vec![b'x'; 300_000]).unwrap();
+    files::upload(&source, &local, "/tmp", |_| {})
+        .await
+        .unwrap();
+    let back = directory.path().join("back.txt");
+    files::download(&source, "/tmp/tha-live-proxy.txt", &back, false, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(std::fs::metadata(&back).unwrap().len(), 300_000);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The server path without SSH: the real agent code in front of the real engine.
 #[tokio::test]
 #[ignore = "needs a running container; writes one small file under /tmp in it"]

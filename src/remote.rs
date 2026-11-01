@@ -978,10 +978,11 @@ async fn forward(
         .path_and_query()
         .map_or("/", |value| value.as_str())
         .to_owned();
-    // Only the dedicated exec protocol accepts a body. Docker API requests remain bodyless.
-    let exec = target == crate::remote_exec::ROUTE;
+    // Only exec and uploads have a body. Docker API requests remain bodyless.
+    let with_body =
+        target == crate::remote_exec::ROUTE || target.starts_with(crate::files::UPLOAD_PREFIX);
     let method = request.method().clone();
-    let body = if exec {
+    let body = if with_body {
         request.into_body().boxed()
     } else {
         Empty::<Bytes>::new()
@@ -1374,6 +1375,78 @@ pub fn save_managed(path: &Path, remotes: &[Remote]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What arrives at the far end of the channel for one request sent to the local socket.
+    async fn body_through_proxy(socket: &Path, target: &str, body: Vec<u8>) -> Vec<u8> {
+        let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        let connection = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .method("POST")
+                    .uri(target)
+                    .header("host", "agent")
+                    .body(Full::new(Bytes::from(body)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        connection.abort();
+        bytes.to_vec()
+    }
+
+    #[tokio::test]
+    async fn only_uploads_and_exec_carry_a_body_through_the_local_socket() {
+        let (near, far) = tokio::io::duplex(64 * 1024);
+        let echo = tokio::spawn(async move {
+            let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                .serve_connection(
+                    TokioIo::new(far),
+                    service_fn(|request: Request<Incoming>| async move {
+                        let bytes = request.into_body().collect().await?.to_bytes();
+                        Ok::<_, hyper::Error>(Response::new(Full::new(bytes)))
+                    }),
+                )
+                .await;
+        });
+        let (sender, channel) = connect_channel(near).await.unwrap();
+        let channel = tokio::spawn(channel);
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("local.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let proxy = tokio::spawn(serve_local_socket(listener, sender));
+
+        // Larger than a default HTTP/2 window, so it also has to pass flow control.
+        let archive = vec![b'x'; 300_000];
+        let upload = format!("{}upload?id=abc&path=2f746d70", crate::files::ROUTE_PREFIX);
+        assert_eq!(
+            body_through_proxy(&socket, &upload, archive.clone()).await,
+            archive
+        );
+        assert_eq!(
+            body_through_proxy(&socket, crate::remote_exec::ROUTE, b"open".to_vec()).await,
+            b"open"
+        );
+        for target in [
+            "/containers/abc/start",
+            "/tha/files/list?id=abc&path=2f",
+            "/tha/files/upload-check?id=abc&path=2f",
+        ] {
+            assert!(
+                body_through_proxy(&socket, target, b"smuggled".to_vec())
+                    .await
+                    .is_empty(),
+                "{target}"
+            );
+        }
+        proxy.abort();
+        channel.abort();
+        echo.abort();
+    }
 
     fn remote() -> Remote {
         Remote {

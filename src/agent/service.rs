@@ -14,6 +14,10 @@ use tokio::{
 };
 
 const DIRECTORY: &str = "/run/tha-agent";
+const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+/// More than 32 clients with 128 streams each can hold, at up to three descriptors a stream, so
+/// a client cannot run the service out of them. The usual default of 1024 is reachable.
+const MAX_OPEN_FILES: u32 = 16_384;
 
 fn socket(engine: &str) -> PathBuf {
     Path::new(DIRECTORY).join(format!("{engine}.sock"))
@@ -68,6 +72,7 @@ StateDirectoryMode=0700
 Environment=HOME=/var/lib/tha-agent
 Environment=XDG_DATA_HOME=/var/lib/tha-agent
 UMask=0077
+LimitNOFILE={MAX_OPEN_FILES}
 Nice=10
 CPUWeight=10
 IOWeight=10
@@ -129,6 +134,40 @@ pub(super) fn validate_executable(executable: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Runs until the service stops. A failed accept, such as running out of file descriptors, is
+/// something a client can cause, so it must never take the service down for everyone else.
+async fn accept_clients<A, F>(
+    mut accept: A,
+    agent: Arc<Agent>,
+    allowed_uid: u32,
+    limits: Arc<Semaphore>,
+) where
+    A: FnMut() -> F,
+    F: std::future::Future<Output = std::io::Result<UnixStream>>,
+{
+    let mut clients = JoinSet::new();
+    loop {
+        tokio::select! {
+            Some(_) = clients.join_next(), if !clients.is_empty() => {}
+            incoming = accept() => {
+                let stream = match incoming {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        eprintln!("tha-agent: cannot accept a client: {error}");
+                        tokio::time::sleep(ACCEPT_RETRY).await;
+                        continue;
+                    }
+                };
+                let Ok(peer) = stream.peer_cred() else { continue; };
+                if peer.uid() != 0 && peer.uid() != allowed_uid { continue; }
+                let Ok(permit) = limits.clone().try_acquire_owned() else { continue; };
+                let agent = agent.clone();
+                clients.spawn(async move { let _permit = permit; let _ = super::serve_shared(stream, agent).await; });
+            }
+        }
+    }
 }
 
 pub async fn run() -> Result<()> {
@@ -233,22 +272,9 @@ pub async fn run() -> Result<()> {
         let allowed_uid = config.service_uid;
         let limits = limits.clone();
         listeners.spawn(async move {
-            let mut clients = JoinSet::new();
-            loop {
-                tokio::select! {
-                    Some(_) = clients.join_next(), if !clients.is_empty() => {}
-                    incoming = listener.accept() => {
-                        let (stream, _) = incoming?;
-                        let peer = stream.peer_cred()?.uid();
-                        if peer != 0 && peer != allowed_uid { continue; }
-                        let Ok(permit) = limits.clone().try_acquire_owned() else { continue; };
-                        let agent = agent.clone();
-                        clients.spawn(async move { let _permit = permit; let _ = super::serve_shared(stream, agent).await; });
-                    }
-                }
-            }
-            #[allow(unreachable_code)]
-            Ok::<(), anyhow::Error>(())
+            let listener = &listener;
+            let accept = move || async move { listener.accept().await.map(|(stream, _)| stream) };
+            accept_clients(accept, agent, allowed_uid, limits).await;
         });
     }
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -293,6 +319,69 @@ mod tests {
         assert!(unit.contains("ExecStart=/usr/local/bin/tha-agent daemon"));
         assert!(unit.contains("StateDirectoryMode=0700"));
         assert!(!unit.contains("ListenStream"));
+        assert!(unit.contains("LimitNOFILE=16384"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_accept_keeps_serving_later_clients() {
+        use http_body_util::Empty;
+        use hyper::body::Bytes;
+        use hyper_util::rt::TokioIo;
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut script = std::collections::VecDeque::from([
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
+            Ok(server),
+        ]);
+        let accept = move || {
+            let next = script.pop_front();
+            async move {
+                match next {
+                    Some(result) => result,
+                    None => std::future::pending().await,
+                }
+            }
+        };
+        let agent = Arc::new(Agent {
+            allow_delete: false,
+            allow_exec: false,
+            allow_images: false,
+            allow_download: false,
+            allow_compose: false,
+            allow_upload: false,
+            socket: "/missing-accept-fixture.sock".into(),
+            audit: |_| {},
+            security: None,
+            history: None,
+        });
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let service = tokio::spawn(accept_clients(
+            accept,
+            agent,
+            uid,
+            Arc::new(Semaphore::new(1)),
+        ));
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        let connection = tokio::spawn(connection);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sender.send_request(
+                hyper::Request::builder()
+                    .uri("/not-on-the-allowlist")
+                    .header("host", "agent")
+                    .body(Empty::<Bytes>::new())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("the client after a failed accept must still be served")
+        .unwrap();
+        assert_eq!(response.status(), hyper::StatusCode::FORBIDDEN);
+        assert!(!service.is_finished());
+        connection.abort();
+        service.abort();
     }
     #[test]
     fn unit_refuses_systemd_expansion_and_command_injection() {

@@ -464,10 +464,13 @@ because Tha removes each unreferenced resource individually.
 
 **Compose actions** are off unless setup ran with `--allow-compose`. The agent finds the project from
 its own engine's labels, runs the Compose CLI on the server (Docker's Compose plugin must be installed
-there), and refuses files that are links or that anyone can change. **Anyone holding the key can then
-restart and recreate those projects, and anyone who can also edit a Compose file effectively has root**,
-because a Compose file can mount the host. With this option the agent service can read home folders,
-read-only, so projects kept there work. Registry credentials are not used.
+there). It refuses files that are links, and it refuses to run if someone without engine access could
+change the Compose files, the `.env` beside them or a folder above them. Owners may be root, the engine
+socket's owner or a member of its group, and group write is fine only for root's or that socket's group.
+Files that a Compose file includes itself are not checked. **Anyone holding the key can then restart and
+recreate those projects, and anyone who can also edit a Compose file effectively has root**, because a
+Compose file can mount the host. With this option the agent service can read home folders, read-only, so
+projects kept there work. Registry credentials are not used.
 
 **Not available on servers:** starting or stopping the engine itself. The agent records
 [background metrics history](remote-history.md) and container events on its own.
