@@ -11,6 +11,9 @@ const MAX_INPUT: usize = 65_536;
 const SCROLLBACK: usize = 500;
 const MAX_OSC_BYTES: usize = 4096;
 const MAX_CSI_BYTES: usize = 1024;
+/// How long an exit waits for the end of its output, and the end of output for an exit. A process
+/// left in the background can hold the terminal open, so the end of output may never come.
+const EXIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
 
 #[derive(Debug, Default, PartialEq, Eq)]
 enum OutputState {
@@ -213,6 +216,10 @@ pub struct Session {
     input: Option<SyncSender<Vec<u8>>>,
     output: tokio::sync::mpsc::Receiver<Output>,
     output_changed: bool,
+    /// When the end of the output was seen.
+    output_ended: Option<std::time::Instant>,
+    /// The exit status, and when it was collected, until the output has caught up with it.
+    exit: Option<(u32, std::time::Instant)>,
     size: (u16, u16),
 }
 
@@ -313,6 +320,8 @@ impl Session {
             input: Some(input),
             output,
             output_changed: false,
+            output_ended: None,
+            exit: None,
             size,
         })
     }
@@ -405,14 +414,13 @@ impl Session {
 
     pub fn poll(&mut self) -> bool {
         let previous_status = self.status();
-        let mut eof = false;
         for _ in 0..64 {
             match self.output.try_recv() {
                 Ok(Output::Data(bytes)) => {
                     self.output_guard.process(&mut self.parser, &bytes);
                     self.output_changed = true;
                 }
-                Ok(Output::Eof) => eof = true,
+                Ok(Output::Eof) => self.output_ended = Some(std::time::Instant::now()),
                 Ok(Output::Error(error)) => {
                     if self.running() {
                         self.state = State::Failed(error);
@@ -428,16 +436,31 @@ impl Session {
         if let Some(child) = &mut self.child {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    self.state = State::Exited(status.exit_code());
+                    self.exit = Some((status.exit_code(), std::time::Instant::now()));
                     self.child = None;
                     self.input = None;
                 }
                 Err(error) => {
                     self.state = State::Failed(format!("Cannot read exec status: {error}"))
                 }
-                Ok(None) if eof && running => self.state = State::Disconnected,
+                // The output of an exiting process ends just before its exit can be collected.
+                Ok(None)
+                    if running
+                        && self
+                            .output_ended
+                            .is_some_and(|at| at.elapsed() >= EXIT_SETTLE) =>
+                {
+                    self.state = State::Disconnected;
+                }
                 _ => {}
             }
+        }
+        // Whoever reacts to an exit reads the screen, so the output has to be there by then.
+        if let Some((code, at)) = self.exit
+            && (self.output_ended.is_some() || at.elapsed() >= EXIT_SETTLE)
+        {
+            self.state = State::Exited(code);
+            self.exit = None;
         }
         previous_status != self.status()
     }
@@ -449,6 +472,7 @@ impl Session {
 
     pub fn close(&mut self) {
         self.input = None;
+        self.exit = None;
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             std::thread::spawn(move || {
@@ -572,6 +596,69 @@ mod tests {
             encode_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), false),
             b"p"
         );
+    }
+
+    fn shell(script: &str) -> Session {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", script]);
+        Session::start(
+            crate::machines::local_tool_request("Test", "test"),
+            command,
+            24,
+            80,
+            std::sync::Arc::default(),
+        )
+        .unwrap()
+    }
+
+    /// Polls with no pause, the worst case for noticing an exit before its output has arrived.
+    fn poll_until_ended(session: &mut Session, limit: std::time::Duration) {
+        let deadline = std::time::Instant::now() + limit;
+        while session.running() {
+            assert!(std::time::Instant::now() < deadline, "the session must end");
+            session.poll();
+        }
+    }
+
+    #[test]
+    fn an_exit_is_reported_only_once_its_output_has_arrived() {
+        for _ in 0..50 {
+            let mut session = shell("printf finished");
+            poll_until_ended(&mut session, std::time::Duration::from_secs(10));
+            assert_eq!(session.status(), "Exited 0");
+            assert!(
+                session.screen().contents().contains("finished"),
+                "{:?}",
+                session.screen().contents()
+            );
+        }
+    }
+
+    #[test]
+    fn a_process_left_holding_the_terminal_cannot_hide_the_exit() {
+        let mut session = shell("sleep 3 & exit 4");
+        poll_until_ended(&mut session, std::time::Duration::from_secs(2));
+        assert_eq!(session.status(), "Exited 4");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn closing_the_terminal_while_still_running_is_a_disconnect() {
+        let mut session = shell("exec </dev/null >/dev/null 2>&1; sleep 3");
+        poll_until_ended(&mut session, std::time::Duration::from_secs(2));
+        assert_eq!(session.status(), "Disconnected");
+    }
+
+    #[test]
+    fn closing_during_the_wait_for_output_stays_closed() {
+        let mut session = shell("sleep 3 & exit 0");
+        while session.child.is_some() {
+            session.poll();
+        }
+        session.close();
+        std::thread::sleep(EXIT_SETTLE * 2);
+        session.poll();
+        assert_eq!(session.status(), "Closed");
     }
 
     #[test]
