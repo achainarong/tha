@@ -45,7 +45,7 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   build:
-    needs: checks
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -135,8 +135,85 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  startup:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            platform: macOS ARM64
+            target: aarch64-apple-darwin
+            asset: tha-macos-arm64.tar.gz
+            image: ''
+          - os: ubuntu-24.04
+            platform: Ubuntu AMD64
+            target: x86_64-unknown-linux-musl
+            asset: tha-linux-amd64.tar.gz
+            image: ubuntu:24.04
+          - os: ubuntu-24.04-arm
+            platform: Ubuntu ARM64
+            target: aarch64-unknown-linux-musl
+            asset: tha-linux-arm64.tar.gz
+            image: ubuntu:24.04
+          - os: ubuntu-24.04
+            platform: Debian AMD64
+            target: x86_64-unknown-linux-musl
+            asset: tha-linux-amd64.tar.gz
+            image: debian:13-slim
+          - os: ubuntu-24.04
+            platform: Fedora AMD64
+            target: x86_64-unknown-linux-musl
+            asset: tha-linux-amd64.tar.gz
+            image: fedora:44
+          - os: ubuntu-24.04
+            platform: Alpine AMD64
+            target: x86_64-unknown-linux-musl
+            asset: tha-linux-amd64.tar.gz
+            image: alpine:3.23
+    name: Startup (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    env:
+      ASSET: ${{ matrix.asset }}
+      IMAGE: ${{ matrix.image }}
+      RELEASE_VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: tha-release-${{ matrix.target }}
+          path: dist
+      - uses: astral-sh/setup-uv@v10.3.3
+        if: runner.os == 'macOS'
+      - name: Start packaged macOS binary in a terminal
+        if: runner.os == 'macOS'
+        run: uv run --with pyte==0.8.2 python scripts/startup_smoke.py --archive "dist/$ASSET" --version "${RELEASE_VERSION#v}"
+      # Run Docker from the host: JavaScript actions cannot run inside musl-only Alpine.
+      - name: Start packaged Linux binary in the distribution
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm --volume "$PWD:/work:ro" --workdir /work \
+            --env ASSET --env RELEASE_VERSION --entrypoint sh "$IMAGE" -ec '
+              . /etc/os-release
+              case "$ID" in
+                ubuntu|debian)
+                  apt-get update
+                  apt-get install -y --no-install-recommends python3 python3-venv ca-certificates ;;
+                fedora) dnf install -y python3 python3-pip ca-certificates ;;
+                alpine) apk add --no-cache python3 py3-pip ca-certificates ;;
+                *) echo "Unsupported distribution: $ID" >&2; exit 1 ;;
+              esac
+              python3 -m venv /tmp/startup-venv
+              /tmp/startup-venv/bin/pip install pyte==0.8.2
+              /tmp/startup-venv/bin/python scripts/startup_smoke.py \
+                --archive "dist/$ASSET" --version "${RELEASE_VERSION#v}"
+            '
+
   publish:
-    needs: [validate, build]
+    needs: [validate, checks, build, startup]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

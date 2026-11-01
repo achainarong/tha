@@ -363,7 +363,36 @@ else: raise SystemExit('unexpected command')
         matrix = self.workflow["jobs"]["build"]["strategy"]["matrix"]["include"]
         self.assertEqual({entry["asset"] for entry in matrix}, set(BUILD_ASSETS))
         self.assertEqual({entry["target"] for entry in matrix}, {"x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin"})
-        self.assertEqual(self.workflow["jobs"]["publish"]["needs"], ["validate", "build"])
+        self.assertEqual(self.workflow["jobs"]["publish"]["needs"], ["validate", "checks", "build", "startup"])
+
+    def test_startup_checks_gate_publishing_not_builds(self):
+        jobs = self.workflow["jobs"]
+        self.assertEqual(jobs["build"]["needs"], "validate")
+        self.assertEqual(jobs["checks"]["needs"], "validate")
+        self.assertEqual(jobs["startup"]["needs"], "build")
+        for job in ("build", "startup"):
+            self.assertEqual(jobs[job]["strategy"]["fail-fast"], "false")
+            self.assertNotIn("continue-on-error", jobs[job])
+        startup = jobs["startup"]
+        matrix = startup["strategy"]["matrix"]["include"]
+        self.assertEqual({entry["asset"] for entry in matrix}, set(BUILD_ASSETS))
+        self.assertEqual({entry["image"] for entry in matrix},
+                         {"", "ubuntu:24.04", "debian:13-slim", "fedora:44", "alpine:3.23"})
+        assets = {entry["target"]: entry["asset"] for entry in jobs["build"]["strategy"]["matrix"]["include"]}
+        for entry in matrix:
+            self.assertEqual(entry["asset"], assets[entry["target"]])
+        download = next(step for step in startup["steps"] if step.get("uses", "").startswith("actions/download-artifact@"))
+        self.assertEqual(download["with"]["name"], "tha-release-${{ matrix.target }}")
+        self.assertFalse(any("cargo " in step.get("run", "") for step in startup["steps"]))
+
+    def test_startup_rejects_wrong_version_before_launching_ui(self):
+        archive = self.directory / "tha-fixture.tar.gz"
+        fixture_archive(archive)
+        result = subprocess.run([sys.executable, str(ROOT / "scripts/startup_smoke.py"),
+                                 "--archive", str(archive), "--version", "0.0.0"],
+                                capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unexpected package version", result.stderr)
 
 
 def check_action_refs():
