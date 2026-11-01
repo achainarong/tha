@@ -43,6 +43,7 @@ async fn connected(rx: &mut mpsc::Receiver<Event>) -> Vec<String> {
             Update::Failed { reason, retrying } => {
                 assert!(retrying, "connecting failed: {reason}");
             }
+            Update::KeyLocked => panic!("the smoke test key has no passphrase"),
         }
     }
 }
@@ -216,6 +217,30 @@ async fn a_key_the_server_does_not_know_stops_without_retrying() {
                 break;
             }
             Update::Connected { .. } => panic!("an unknown key must not connect"),
+            Update::KeyLocked => panic!("the wrong key has no passphrase"),
+        }
+    }
+    session.abort();
+}
+
+#[tokio::test]
+#[ignore = "needs the disposable server from scripts/remote_smoke.py"]
+async fn a_locked_key_stops_before_any_login_attempt() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = directory.path().join("locked");
+    let created = std::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "secret", "-f"])
+        .arg(&key)
+        .status()
+        .unwrap();
+    assert!(created.success());
+    let (tx, mut rx) = mpsc::channel(16);
+    let session = tokio::spawn(remote::supervise(server(key.to_str().unwrap()), 1, tx));
+    loop {
+        match next(&mut rx).await {
+            Update::Connecting => {}
+            Update::KeyLocked => break,
+            other => panic!("a locked key must stop first: {other:?}"),
         }
     }
     session.abort();
@@ -235,6 +260,7 @@ async fn a_missing_key_file_is_reported_without_running_ssh() {
                 break;
             }
             Update::Connected { .. } => panic!("a missing key must not connect"),
+            Update::KeyLocked => panic!("a missing key cannot be locked"),
         }
     }
     session.abort();

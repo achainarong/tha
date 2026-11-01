@@ -41,6 +41,10 @@ pub struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
+    #[command(hide = true)]
+    RemoteExec { socket: PathBuf, request: String },
+    #[command(hide = true)]
+    RemoteShell { remote: String, control: PathBuf },
     /// Install or inspect optional modules (security uses containerized Grype)
     Module {
         #[command(subcommand)]

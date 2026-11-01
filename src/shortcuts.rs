@@ -308,7 +308,7 @@ catalog! {
     PreviousMatch, "Previous match", [], TreeOrLogs, 40, false, ["shift-n"], [];
     WorkspaceBack, "Previous workspace", ["back"], Containers, 40, false, ["backspace"], [];
     AllRuntimes, "All runtimes", ["all"], Containers, 40, false, [], [];
-    OpenExec, "Open container shell", ["exec"], Containers, 8, false, ["e"], [];
+    OpenExec, "Open container or server shell", ["exec"], Containers, 8, false, ["e"], [];
     Actions, "Contextual actions and disabled reasons", ["actions"], Workloads, 7, false, ["a"], [];
     Start, "Start (confirmation required)", [], Workloads, 20, false, ["shift-s"], [];
     Stop, "Stop (confirmation required)", [], Workloads, 20, false, ["s"], [];

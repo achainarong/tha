@@ -9,6 +9,7 @@ Host keys go in a private known_hosts through a PATH shim, never in ~/.ssh/known
 import fcntl
 import os
 import pty
+import re
 import select
 import shlex
 import socket
@@ -163,6 +164,156 @@ def tui_checks(scratch, key, environment):
     print("ok: quitting removes its session directory")
 
 
+class Tui:
+    """Drives the real binary step by step, for flows that must answer what it shows."""
+
+    def __init__(self, scratch, environment, config):
+        environment = dict(
+            environment,
+            XDG_CONFIG_HOME=str(scratch),
+            XDG_STATE_HOME=str(scratch),
+            TERM="xterm-256color",
+        )
+        self.seen = ""
+        self.pid, self.descriptor = pty.fork()
+        if self.pid == 0:
+            os.chdir("/")
+            os.execve(
+                str(ROOT / "target/debug/tha"),
+                ["tha", "--standalone", "--overview", "--config", str(config)],
+                environment,
+            )
+        fcntl.ioctl(self.descriptor, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 140, 0, 0))
+
+    def pump(self, seconds=0.2):
+        ready, _, _ = select.select([self.descriptor], [], [], seconds)
+        if ready:
+            try:
+                raw = os.read(self.descriptor, 65536).decode("utf-8", "replace")
+            except OSError:
+                return
+            self.seen += re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", raw)
+
+    def wait_for(self, text, what, seconds=15):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            self.pump()
+            if text in self.seen:
+                self.seen = ""
+                return
+        sys.exit(f"FAILED: {what}: {self.seen[-600:]!r}")
+
+    def wait_for_master(self, what, seconds=15):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            self.pump()
+            if masters():
+                return
+        sys.exit(f"FAILED: {what}: {self.seen[-600:]!r}")
+
+    def send(self, text):
+        os.write(self.descriptor, text.encode())
+        self.pump(0.3)
+
+    def quit(self):
+        self.send("\x1b")
+        self.send("\x03")
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            self.pump()
+            if os.waitpid(self.pid, os.WNOHANG)[0]:
+                break
+        else:
+            sys.exit("FAILED: tha did not quit")
+        os.close(self.descriptor)
+
+
+def agents_for(path):
+    return run("pgrep", "-f", f"ssh-agent -a {path}", check=False).stdout.split()
+
+
+def locked_key_checks(scratch, public_line, environment):
+    """A key with a passphrase, through the screens a user sees. It must ask exactly once."""
+    passphrase = "correct horse"
+    key = scratch / "locked"
+    run("ssh-keygen", "-q", "-t", "ed25519", "-N", passphrase, "-f", str(key))
+    blob = (scratch / "locked.pub").read_text().strip()
+    line = public_line.rsplit("ssh-ed25519", 1)[0] + blob
+    inside(f"echo {shlex.quote(line)} >> /home/tha/.ssh/authorized_keys")
+    bare = {name: value for name, value in environment.items() if name != "SSH_AUTH_SOCK"}
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()))
+
+    config = scratch / "config-locked.toml"
+    config.write_text(
+        "discover_connections = false\nsave_preferences = false\n[[remotes]]\n"
+        f'name = "smoke"\nhost = "127.0.0.1"\nuser = "tha"\nport = {PORT}\n'
+        f'identity_file = "{key}"\nconnect = "startup"\n'
+    )
+    tui = Tui(scratch, bare, config)
+    tui.wait_for("passphrase", "a startup server with a locked key did not ask")
+    if masters():
+        sys.exit("FAILED: a locked key opened SSH before it was unlocked")
+    tui.send(passphrase + "\r")
+    tui.wait_for_master("the unlocked key did not connect")
+    tui.wait_for("docker", "the connected engine is not shown")
+    print("ok: a locked key asks at startup, then connects")
+    socket = runtime / f"tha-remote-{tui.pid}" / "agent.sock"
+    if not agents_for(socket):
+        sys.exit("FAILED: no private agent was started when none was available")
+    tui.quit()
+    deadline = time.time() + 15
+    while agents_for(socket):
+        if time.time() > deadline:
+            sys.exit("FAILED: the private agent outlived tha, still holding the key")
+        time.sleep(0.5)
+    print("ok: the private agent forgets the key when tha quits")
+
+    config = scratch / "config-form.toml"
+    config.write_text("discover_connections = false\nsave_preferences = false\n")
+    tui = Tui(scratch, bare, config)
+    tui.pump(1)
+    tui.send(".")
+    tui.send("a")
+    tui.send("\t".join(["form", "127.0.0.1", "tha", PORT, str(key)]))
+    tui.send("\t\t\t\t\r")
+    tui.wait_for("passphrase", "Test connection did not ask for the passphrase")
+    tui.send(passphrase + "\r")
+    tui.wait_for("Connection works", "the test did not pass with the passphrase")
+    if masters():
+        sys.exit("FAILED: the test left a session open")
+    tui.send("\t\r")
+    time.sleep(0.5)
+    tui.send("\r")
+    tui.wait_for_master("connecting after the test did not reuse the unlocked key")
+    print("ok: a passphrase typed in Test connection is not asked for again")
+    tui.quit()
+
+    agent = run("ssh-agent", "-s").stdout
+    own = re.search(r"SSH_AUTH_SOCK=([^;]+)", agent).group(1)
+    agent_pid = re.search(r"SSH_AGENT_PID=(\d+)", agent).group(1)
+    try:
+        mine = dict(bare, SSH_AUTH_SOCK=own)
+        config = scratch / "config-locked.toml"
+        tui = Tui(scratch, mine, config)
+        tui.wait_for("passphrase", "a locked key did not ask with an agent running")
+        tui.send(passphrase + "\r")
+        tui.wait_for_master("the key did not connect through the user's agent")
+        if agents_for(runtime / f"tha-remote-{tui.pid}" / "agent.sock"):
+            sys.exit("FAILED: a private agent started although the user has one")
+        tui.quit()
+        time.sleep(1)
+        loaded = run("ssh-add", "-l", env=mine, check=False).stdout
+        fingerprint = run("ssh-keygen", "-l", "-f", str(key)).stdout.split()[1]
+        if fingerprint not in loaded:
+            sys.exit("FAILED: quitting removed a key from the user's own agent")
+        tui = Tui(scratch, mine, config)
+        tui.wait_for_master("a key already in the agent did not connect by itself")
+        print("ok: the user's agent keeps the key, so the next start does not ask")
+        tui.quit()
+    finally:
+        run("kill", agent_pid, check=False)
+
+
 def try_it(scratch, key):
     print(
         f"""
@@ -260,6 +411,11 @@ def main():
 
         environment_for_tui = dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}")
         tui_checks(scratch, key, environment_for_tui)
+        locked_key_checks(
+            scratch,
+            inside("head -n 1 /home/tha/.ssh/authorized_keys").stdout.strip(),
+            environment_for_tui,
+        )
 
         environment = dict(
             os.environ,

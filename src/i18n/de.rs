@@ -1437,8 +1437,8 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("Instruction:", "Anweisung:"),
     ("Comment:", "Kommentar:"),
     (
-        "Embedded container shell\n\nSelect a running container or service and press e.\n{a0} returns keyboard focus to Tha without closing the shell.\nThe session target stays fixed when you browse other containers.",
-        "Eingebettete Container-Shell\n\nLaufenden Container oder Service auswählen und e drücken.\n{a0} gibt den Tastaturfokus an Tha zurück, ohne die Shell zu schließen.\nDas Sitzungsziel bleibt gleich, auch beim Ansehen anderer Container.",
+        "Embedded shell\n\nSelect a running container, service, or connected remote server and press e.\nRemote container and server shells require allow_exec on the server.\n{a0} returns keyboard focus to Tha without closing the shell.\nThe session target stays fixed while browsing.",
+        "Eingebettete Shell\n\nLaufenden Container, Service oder verbundenen Remote-Server auswählen und e drücken.\nRemote-Container- und Server-Shells benötigen allow_exec auf dem Server.\n{a0} gibt den Tastaturfokus an Tha zurück, ohne die Shell zu schließen.\nDas Sitzungsziel bleibt beim Navigieren gleich.",
     ),
     ("Container · {a0} · {a1}", "Container · {a0} · {a1}"),
     ("CPU {a0} · RAM {a1}", "CPU {a0} · RAM {a1}"),
@@ -2354,7 +2354,10 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("Previous match", "Vorheriger Treffer"),
     ("Previous workspace", "Vorheriger Workspace"),
     ("All runtimes", "Alle Runtimes"),
-    ("Open container shell", "Container-Shell öffnen"),
+    (
+        "Open container or server shell",
+        "Container- oder Server-Shell öffnen",
+    ),
     (
         "Contextual actions and disabled reasons",
         "Kontextbezogene Aktionen und Gründe für deaktivierte",
@@ -3128,8 +3131,8 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "Enter fügt Server hinzu, bearbeitet oder entfernt sie.",
     ),
     (
-        "Exec is not available on servers: the agent does not allow running commands",
-        "Exec ist auf Servern nicht verfügbar: Der Agent erlaubt keine Befehle",
+        "Connect to this server before opening a shell.",
+        "Vor dem Öffnen einer Shell mit diesem Server verbinden.",
     ),
     (
         "HOME is not set, so ~/ cannot be expanded",
@@ -3149,8 +3152,36 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "Schlüssel erstellt. Jetzt den Setup-Befehl auf dem Server ausführen.",
     ),
     (
-        "Key refused. Run the setup command on the server; if the key has a passphrase, load it with ssh-add.",
-        "Schlüssel abgelehnt. Setup-Befehl auf dem Server ausführen; einen Schlüssel mit Passphrase mit ssh-add laden.",
+        "Key refused. Run the setup command on the server.",
+        "Schlüssel abgelehnt. Setup-Befehl auf dem Server ausführen.",
+    ),
+    (
+        "SSH key is locked: it has a passphrase and is not loaded in ssh-agent.",
+        "SSH-Schlüssel ist gesperrt: Er hat eine Passphrase und ist nicht im ssh-agent geladen.",
+    ),
+    (
+        "SSH key is locked. Press Enter on this server to unlock it.",
+        "SSH-Schlüssel ist gesperrt. Zum Entsperren Enter auf diesem Server drücken.",
+    ),
+    (
+        "Server {name}: SSH key is locked. Press Enter on it to unlock.",
+        "Server {name}: SSH-Schlüssel ist gesperrt. Zum Entsperren Enter auf dem Server drücken.",
+    ),
+    (
+        "Unlock SSH key for {name}",
+        "SSH-Schlüssel für {name} entsperren",
+    ),
+    (
+        "{status}. Read the output above, then press Enter on the server to try again.",
+        "{status}. Ausgabe oben prüfen, dann für einen neuen Versuch Enter auf dem Server drücken.",
+    ),
+    (
+        "Cannot run ssh-agent; install OpenSSH and ensure it is on PATH",
+        "ssh-agent kann nicht ausgeführt werden; OpenSSH installieren und sicherstellen, dass es im PATH liegt",
+    ),
+    (
+        "ssh-agent did not start",
+        "ssh-agent ließ sich nicht starten",
     ),
     (
         "Machines have no actions; select a workload inside one",

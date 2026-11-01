@@ -32,6 +32,7 @@ pub struct Options {
     pub user: String,
     pub key: Option<String>,
     pub allow_delete: bool,
+    pub allow_exec: bool,
     /// `NAME=/path/to/socket`, to expose only these. When empty, every known socket is exposed.
     pub engines: Vec<String>,
     pub scanner_digest: Option<String>,
@@ -204,6 +205,7 @@ pub fn merge_config(
     let existing = existing.unwrap_or_default();
     AgentConfig {
         allow_delete: allow_delete || existing.allow_delete,
+        allow_exec: existing.allow_exec,
         engines: if engines.is_empty() {
             existing.engines
         } else {
@@ -390,8 +392,9 @@ fn find_engines() -> Vec<AgentEngine> {
 fn finish_root_setup(policy: &Path, config: &AgentConfig) -> Result<()> {
     write_policy(policy, config)?;
     println!(
-        "Agent policy written. tha's traffic goes through the allowlist (delete {}).",
-        if config.allow_delete { "on" } else { "off" }
+        "Agent policy written. tha's traffic goes through the allowlist (delete {}, exec {}).",
+        if config.allow_delete { "on" } else { "off" },
+        if config.allow_exec { "on" } else { "off" }
     );
     println!(
         "Root's SSH keys are not restricted: anyone holding one still has full root access. Use a dedicated user to limit the key itself."
@@ -466,6 +469,7 @@ pub fn run_setup(options: &Options) -> Result<()> {
         )
     };
     let mut config = merge_config(existing, engines, options.allow_delete);
+    config.allow_exec |= options.allow_exec;
     configure_security(&mut config.security, options);
     config.validate()?;
     ensure!(
@@ -564,7 +568,7 @@ fn finish_dedicated_setup(
     }
 
     println!(
-        "Agent ready for user {}: {} (delete {})",
+        "Agent ready for user {}: {} (delete {}, exec {})",
         options.user,
         config
             .engines
@@ -572,7 +576,8 @@ fn finish_dedicated_setup(
             .map(|engine| engine.name.as_str())
             .collect::<Vec<_>>()
             .join(", "),
-        if config.allow_delete { "on" } else { "off" }
+        if config.allow_delete { "on" } else { "off" },
+        if config.allow_exec { "on" } else { "off" }
     );
     println!(
         "If sshd uses AllowUsers or AllowGroups, also allow {}.",
@@ -596,6 +601,7 @@ mod tests {
             user: "root".into(),
             key: None,
             allow_delete: false,
+            allow_exec: false,
             engines: vec![],
             scanner_digest: None,
             security_interval: 86400,
@@ -711,6 +717,7 @@ mod tests {
             user: "tha".into(),
             key: Some(ED25519.into()),
             allow_delete: false,
+            allow_exec: false,
             engines: vec!["docker=/missing-security-test.sock".into()],
             scanner_digest: None,
             security_interval: 86400,
@@ -776,6 +783,7 @@ mod tests {
     fn reruns_keep_the_existing_policy_unless_told_otherwise() {
         let existing = AgentConfig {
             allow_delete: true,
+            allow_exec: true,
             engines: vec![AgentEngine {
                 name: "docker".into(),
                 socket: "/a".into(),

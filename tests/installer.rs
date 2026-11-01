@@ -298,6 +298,19 @@ fn agent_root_setup_passes_no_key() {
 }
 
 #[test]
+fn server_exec_opt_in_reaches_setup_for_dedicated_and_root_users() {
+    for arguments in [
+        vec!["agent", "--key", "K", "--allow-exec"],
+        vec!["agent", "--user", "root", "--allow-exec"],
+    ] {
+        let (temp, output) = run_agent("0", &arguments, "");
+        assert!(output.status.success(), "{output:?}");
+        assert!(agent_calls(&temp).contains("--allow-exec"));
+        assert!(!agent_calls(&temp).contains("--allow-delete"));
+    }
+}
+
+#[test]
 fn agent_custom_user_and_delete_reach_setup() {
     let (temp, output) = run_agent(
         "0",
@@ -362,6 +375,7 @@ fn bad_agent_options_stop_before_downloading() {
         vec!["agent", "--user", "ops"],
         vec!["agent", "--user", "root", "--key", "K"],
         vec!["agent", "--allow-delete"],
+        vec!["agent", "--allow-exec"],
         vec!["agent", "--scanner-digest", "sha256:abc"],
         vec!["agent", "--security-interval", "43200"],
         vec!["agent", "--no-security"],

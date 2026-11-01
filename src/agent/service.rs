@@ -193,6 +193,7 @@ pub async fn run() -> Result<()> {
         };
         let agent = Arc::new(Agent {
             allow_delete: config.allow_delete,
+            allow_exec: config.allow_exec,
             socket: engine.socket.clone(),
             audit: super::syslog,
             security,

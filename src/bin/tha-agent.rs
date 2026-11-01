@@ -22,6 +22,8 @@ enum Command {
     InstallService,
     /// List the engines this server exposes
     List,
+    /// Open a server shell as the SSH login user (requires allow_exec)
+    Shell,
     /// Serve one engine's allowlisted API on stdin and stdout
     Serve { engine: String },
     /// Prepare this server as root: a dedicated user, its restricted key, and the agent policy
@@ -36,6 +38,9 @@ enum Command {
         /// Let this server delete containers, images and volumes (force is always refused)
         #[arg(long)]
         allow_delete: bool,
+        /// Allow container exec and server shells as the SSH login user (disabled by default)
+        #[arg(long)]
+        allow_exec: bool,
         /// Expose only this engine (repeatable); without it, every known socket found is exposed
         #[arg(long, value_name = "NAME=SOCKET")]
         engine: Vec<String>,
@@ -56,6 +61,7 @@ async fn main() {
     let result = match Cli::parse().command {
         None => agent::run(None).await,
         Some(Command::List) => agent::run(Some("list")).await,
+        Some(Command::Shell) => agent::run(Some("tha-agent shell")).await,
         Some(Command::Serve { engine }) => agent::run(Some(&engine)).await,
         Some(Command::Daemon) => {
             if std::env::var_os("SSH_ORIGINAL_COMMAND").is_some() {
@@ -81,6 +87,7 @@ async fn main() {
             user,
             key,
             allow_delete,
+            allow_exec,
             engine,
             scanner_digest,
             security_interval,
@@ -89,6 +96,7 @@ async fn main() {
             user,
             key,
             allow_delete,
+            allow_exec,
             engines: engine,
             scanner_digest,
             security_interval,

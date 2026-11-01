@@ -24,9 +24,7 @@ pub fn prepare(request: &Request) -> Result<Command> {
         bail!(crate::i18n::t("exec_command must contain an executable"));
     }
     if crate::remote::is_remote(&request.connection) {
-        bail!(crate::i18n::t(
-            "Exec is not available on servers: the agent does not allow running commands"
-        ));
+        return crate::remote_exec::command(request);
     }
     let endpoint = &request.connection.endpoint;
     let socket = endpoint.strip_prefix("unix://").unwrap_or(endpoint);

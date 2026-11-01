@@ -1684,7 +1684,7 @@ fn draw_layers(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_exec(frame: &mut Frame, app: &App, area: Rect) {
     let Some(session) = app.sessions.active() else {
-        frame.render_widget(Paragraph::new(crate::tf!("Embedded container shell\n\nSelect a running container or service and press e.\n{a0} returns keyboard focus to Tha without closing the shell.\nThe session target stays fixed when you browse other containers.", a0 = crate::i18n::dynamic(app.keyboard.exec_escape_hint()))).wrap(Wrap { trim:false }), area);
+        frame.render_widget(Paragraph::new(crate::tf!("Embedded shell\n\nSelect a running container, service, or connected remote server and press e.\nRemote container and server shells require allow_exec on the server.\n{a0} returns keyboard focus to Tha without closing the shell.\nThe session target stays fixed while browsing.", a0 = crate::i18n::dynamic(app.keyboard.exec_escape_hint()))).wrap(Wrap { trim:false }), area);
         return;
     };
     let screen = session.screen();

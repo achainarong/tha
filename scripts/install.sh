@@ -15,6 +15,7 @@
 #                         one named by --user. --user root sets it up for an existing root key.
 #                         Without these it only installs or updates; existing setup is kept.
 #                         --allow-delete lets that server delete containers, images and volumes.
+#                         --allow-exec opts in to container exec and host shells as the SSH user.
 #                         Setup enables automatically verified Grype scans; --no-security opts out.
 #
 #   THA_MODE=service      same as passing `service`
@@ -49,6 +50,7 @@ if [ "$MODE" = agent ]; then
     agent_key=
     agent_user=
     agent_delete=
+    agent_exec=
     agent_scanner_digest=
     agent_security_interval=
     agent_no_security=
@@ -57,10 +59,11 @@ if [ "$MODE" = agent ]; then
             --key) [ $# -ge 2 ] || die "--key needs the public key line"; agent_key=$2; shift 2 ;;
             --user) [ $# -ge 2 ] || die "--user needs a name"; agent_user=$2; shift 2 ;;
             --allow-delete) agent_delete=1; shift ;;
+            --allow-exec) agent_exec=1; shift ;;
             --scanner-digest) [ $# -ge 2 ] || die "--scanner-digest needs sha256:DIGEST"; agent_scanner_digest=$2; shift 2 ;;
             --security-interval) [ $# -ge 2 ] || die "--security-interval needs seconds"; agent_security_interval=$2; shift 2 ;;
             --no-security) agent_no_security=1; shift ;;
-            *) die "unknown agent option '$1'; expected --key, --user, --allow-delete, --no-security or --security-interval" ;;
+            *) die "unknown agent option '$1'; expected --key, --user, --allow-delete, --allow-exec, --no-security or --security-interval" ;;
         esac
     done
     if [ "$agent_user" = root ]; then
@@ -69,6 +72,9 @@ if [ "$MODE" = agent ]; then
         die "--user $agent_user needs --key with the public key for that user"
     elif [ -z "$agent_key" ] && [ -n "$agent_delete" ]; then
         die "--allow-delete needs --key or --user root"
+    fi
+    if [ -n "$agent_exec" ] && [ -z "$agent_key$agent_user" ]; then
+        die "--allow-exec needs --key or --user root"
     fi
     if [ -n "$agent_scanner_digest$agent_security_interval$agent_no_security" ] && [ -z "$agent_key$agent_user" ]; then
         die "security options need --key or --user root"
@@ -247,6 +253,7 @@ if [ "$MODE" = agent ]; then
     set -- setup --user "${agent_user:-tha}"
     [ -z "$agent_key" ] || set -- "$@" --key "$agent_key"
     [ -z "$agent_delete" ] || set -- "$@" --allow-delete
+    [ -z "$agent_exec" ] || set -- "$@" --allow-exec
     [ -z "$agent_scanner_digest" ] || set -- "$@" --scanner-digest "$agent_scanner_digest"
     [ -z "$agent_security_interval" ] || set -- "$@" --security-interval "$agent_security_interval"
     [ -z "$agent_no_security" ] || set -- "$@" --no-security

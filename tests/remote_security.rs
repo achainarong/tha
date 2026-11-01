@@ -114,6 +114,7 @@ async fn report_sync_child() {
         server,
         Agent {
             allow_delete: false,
+            allow_exec: false,
             socket: engine_path,
             audit: |_| {},
             security: Some(security),
@@ -133,7 +134,11 @@ async fn report_sync_child() {
                 Request::builder()
                     .method("POST")
                     .uri(format!("http://agent{path}"))
-                    .body(Empty::<Bytes>::new())
+                    .body(
+                        Empty::<Bytes>::new()
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
                     .unwrap(),
             )
             .await
@@ -185,7 +190,11 @@ async fn report_sync_child() {
                 .uri(format!(
                     "http://agent/tha/security/rescan/{image}?runtime={wrong}"
                 ))
-                .body(Empty::<Bytes>::new())
+                .body(
+                    Empty::<Bytes>::new()
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
                 .unwrap(),
         )
         .await
@@ -204,7 +213,11 @@ async fn report_sync_child() {
                     .uri(format!(
                         "http://agent/tha/security/rescan/{image}?runtime={runtime}"
                     ))
-                    .body(Empty::<Bytes>::new())
+                    .body(
+                        Empty::<Bytes>::new()
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
                     .unwrap(),
             )
             .await

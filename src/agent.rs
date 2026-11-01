@@ -36,6 +36,8 @@ type Body = BoxBody<Bytes, hyper::Error>;
 pub struct AgentConfig {
     /// Lets the key remove containers, images and volumes. Force is refused regardless.
     pub allow_delete: bool,
+    /// Allows container exec and host shells as the SSH login user. Root must opt in.
+    pub allow_exec: bool,
     pub engines: Vec<AgentEngine>,
     /// The only non-root local user allowed to reach the service.
     pub service_uid: u32,
@@ -438,6 +440,7 @@ fn screen_headers<B>(request: &Request<B>) -> std::result::Result<(), String> {
 
 pub struct Agent {
     pub allow_delete: bool,
+    pub allow_exec: bool,
     pub socket: PathBuf,
     /// Where writes and refusals are recorded. Stderr is not used: SSH returns it to the client.
     pub audit: fn(&str),
@@ -445,7 +448,7 @@ pub struct Agent {
     pub history: Option<Arc<history::Engine>>,
 }
 
-fn message_response(status: StatusCode, message: &str) -> Response<Body> {
+pub(crate) fn message_response(status: StatusCode, message: &str) -> Response<Body> {
     let body = serde_json::json!({ "message": message }).to_string();
     let mut response = Response::new(
         Full::new(Bytes::from(body))
@@ -461,7 +464,7 @@ fn message_response(status: StatusCode, message: &str) -> Response<Body> {
 }
 
 /// Client-controlled text, bounded and escaped before it reaches the system log.
-fn loggable(target: &str) -> String {
+pub(crate) fn loggable(target: &str) -> String {
     target
         .chars()
         .take(MAX_LOGGED_TARGET)
@@ -479,6 +482,9 @@ async fn handle(
         .path_and_query()
         .map_or("", |value| value.as_str())
         .to_owned();
+    if target == crate::remote_exec::ROUTE {
+        return Ok(crate::remote_exec::serve(request, agent).await);
+    }
     let security_route = crate::security::agent::route(&method, &target);
     let history_route = target.starts_with("/tha/history");
     let history_query = history_route.then(|| history::Query::parse(&method, &target));
@@ -623,6 +629,7 @@ where
 #[derive(Debug, PartialEq, Eq)]
 pub enum Requested<'a> {
     List,
+    Shell,
     Engine(&'a AgentEngine),
 }
 
@@ -635,6 +642,13 @@ pub fn parse_command<'a>(config: &'a AgentConfig, command: Option<&str>) -> Resu
     let command = command.strip_prefix("tha-agent serve ").unwrap_or(command);
     if command == "list" || command == "tha-agent list" {
         return Ok(Requested::List);
+    }
+    if command == "tha-agent shell" {
+        ensure!(
+            config.allow_exec,
+            "Server shells are disabled; set allow_exec = true in /etc/tha/agent.toml"
+        );
+        return Ok(Requested::Shell);
     }
     config
         .engines
@@ -695,6 +709,14 @@ pub async fn run(argument: Option<&str>) -> Result<()> {
             // Tokio's stdin reader blocks a thread that a normal runtime shutdown would wait on.
             std::process::exit(i32::from(result.is_err()));
         }
+        Requested::Shell => {
+            syslog("allowed server shell as SSH login user");
+            let result = crate::remote_exec::serve_host().await;
+            if let Err(error) = &result {
+                eprintln!("tha-agent: {error:#}");
+            }
+            std::process::exit(i32::from(result.is_err()));
+        }
     }
 }
 
@@ -709,6 +731,7 @@ mod tests {
             server,
             Agent {
                 allow_delete: false,
+                allow_exec: false,
                 socket: "/missing-security-fixture.sock".into(),
                 audit: |_| {},
                 security: None,
@@ -721,7 +744,11 @@ mod tests {
             .send_request(
                 Request::builder()
                     .uri("http://agent/tha/security/images")
-                    .body(Empty::<Bytes>::new())
+                    .body(
+                        Empty::<Bytes>::new()
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
                     .unwrap(),
             )
             .await
@@ -1023,7 +1050,8 @@ mod tests {
 
     #[test]
     fn unknown_policy_fields_are_refused() {
-        let parsed: std::result::Result<AgentConfig, _> = toml::from_str("allow_exec = true\n");
+        let parsed: std::result::Result<AgentConfig, _> =
+            toml::from_str("allow_arbitrary_api = true\n");
         assert!(parsed.is_err());
     }
 

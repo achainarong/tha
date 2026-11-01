@@ -27,6 +27,7 @@ pub mod model;
 pub mod platform;
 pub mod preferences;
 pub mod remote;
+pub mod remote_exec;
 pub mod remote_history;
 pub mod runtime;
 pub mod security;

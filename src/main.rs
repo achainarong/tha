@@ -33,10 +33,20 @@ async fn main() {
 
 async fn start() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(tha::cli::Command::RemoteExec { socket, request }) = &cli.command {
+        let code = tha::remote_exec::client(socket, request).await?;
+        std::process::exit(code);
+    }
+    if let Some(tha::cli::Command::RemoteShell { remote, control }) = &cli.command {
+        let code = tha::remote_exec::host_client(&serde_json::from_str(remote)?, control).await?;
+        std::process::exit(code);
+    }
     let mut config = Config::load(cli.config.as_ref())?;
     config.monochrome |= cli.monochrome || std::env::var_os("NO_COLOR").is_some();
     if let Some(command) = &cli.command {
         match command {
+            tha::cli::Command::RemoteExec { .. } => unreachable!(),
+            tha::cli::Command::RemoteShell { .. } => unreachable!(),
             tha::cli::Command::Module { action } => {
                 anyhow::ensure!(
                     !cli.standalone && !cli.demo,
@@ -1039,6 +1049,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     drop(discovery_task);
     drop(workers);
     drop(remote_tasks);
+    tha::remote::stop_private_agent();
     tha::remote::remove_session_directory();
     Ok(())
 }

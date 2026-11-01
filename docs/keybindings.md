@@ -110,7 +110,7 @@ configured keys take precedence.
 | `export-logs` | Open the reviewed export dialog; never exports immediately |
 | `logs-since` | Prompt for a log start time (`15m`, `2h`, `1d`, RFC 3339, or `off`) |
 | `reconnect-logs` | Reload the current logs now; streams also reconnect automatically |
-| `open-exec`, `exec-sessions`, `close-exec` | Open container shell, choose retained session, close active session |
+| `open-exec`, `exec-sessions`, `close-exec` | Open container or remote-server shell (`e`; remote requires server `allow_exec`), choose retained session, close active session |
 | `reload-layers` | Retry the read-only image layer lookup |
 
 ### Lifecycle and inventory

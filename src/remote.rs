@@ -21,6 +21,7 @@ use std::{
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
 use tokio::{
@@ -342,18 +343,199 @@ fn control_command_args(remote: &Remote, control: &Path, action: &str) -> Vec<Os
     with_host(args, remote, None)
 }
 
+/// Capture this in the UI process: the helper has a different process-private directory.
+pub fn shell_control_path(remote: &Remote) -> Result<PathBuf> {
+    remote.validate()?;
+    Ok(control_path(remote, &checked_key(remote)?))
+}
+
+/// Uses the restricted forced command without requesting an SSH PTY or forwarding ports.
+pub fn shell_command(remote: &Remote, control: &Path) -> Result<std::process::Command> {
+    remote.validate()?;
+    let key = checked_key(remote)?;
+    let mut command = std::process::Command::new("ssh");
+    command.args(channel_args(remote, &key, control, "tha-agent shell"));
+    if let Some(socket) = private_agent_socket() {
+        command.env(AGENT_SOCKET_VARIABLE, socket);
+    }
+    Ok(command)
+}
+
 /// The first-contact test. Not in batch mode, so OpenSSH itself shows the host key fingerprint
 /// and records the answer; `tha` never scans or accepts a host key.
 pub fn test_command(remote: &Remote) -> Result<std::process::Command> {
     remote.validate()?;
     let key = checked_key(remote)?;
+    let mut args = common_args(remote, &key, false);
+    // The passphrase typed here also unlocks the key for the real connection, which cannot ask.
+    // Only for a locked key, so a test never copies a key without a passphrase into the agent.
+    if key_locked(&key) && ensure_agent().is_ok() {
+        args.extend(["-o".into(), "AddKeysToAgent=yes".into()]);
+    }
     let mut command = std::process::Command::new("ssh");
-    command.args(with_host(
-        common_args(remote, &key, false),
-        remote,
-        Some(LIST_COMMAND),
-    ));
+    command.args(with_host(args, remote, Some(LIST_COMMAND)));
+    if let Some(socket) = private_agent_socket() {
+        command.env(AGENT_SOCKET_VARIABLE, socket);
+    }
     Ok(command)
+}
+
+/// Runs `ssh-add` in the embedded terminal, so a passphrase goes directly to it and `tha` never
+/// sees it. The agent then holds the key for every later connection.
+pub fn unlock_command(remote: &Remote) -> Result<std::process::Command> {
+    remote.validate()?;
+    let key = checked_key(remote)?;
+    ensure_agent()?;
+    let mut command = std::process::Command::new("ssh-add");
+    command.arg(key);
+    if let Some(socket) = private_agent_socket() {
+        command.env(AGENT_SOCKET_VARIABLE, socket);
+    }
+    Ok(command)
+}
+
+const AGENT_SOCKET_VARIABLE: &str = "SSH_AUTH_SOCK";
+
+/// Started only when a key must be unlocked and the user has no agent of their own.
+struct PrivateAgent {
+    /// `sh`, blocked reading a pipe only this process holds. `ssh-agent` exits within about ten
+    /// seconds of its command ending, so even a crash cannot leave an unlocked key behind.
+    command: std::process::Child,
+    socket: PathBuf,
+}
+
+impl Drop for PrivateAgent {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("ssh-add")
+            .arg("-D")
+            .env(AGENT_SOCKET_VARIABLE, &self.socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = self.command.kill();
+        let _ = self.command.wait();
+    }
+}
+
+static PRIVATE_AGENT: Mutex<Option<PrivateAgent>> = Mutex::new(None);
+
+fn private_agent() -> MutexGuard<'static, Option<PrivateAgent>> {
+    PRIVATE_AGENT.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn private_agent_socket() -> Option<PathBuf> {
+    private_agent().as_ref().map(|agent| agent.socket.clone())
+}
+
+/// Forgets every key this run unlocked in its own agent. The user's own agent is left alone,
+/// because other tools may rely on the keys in it.
+pub fn stop_private_agent() {
+    private_agent().take();
+}
+
+fn agent_listing(socket: Option<&Path>) -> Option<std::process::Output> {
+    let mut command = std::process::Command::new("ssh-add");
+    command.args(["-l", "-E", "sha256"]).stdin(Stdio::null());
+    if let Some(socket) = socket {
+        command.env(AGENT_SOCKET_VARIABLE, socket);
+    }
+    command.output().ok()
+}
+
+/// `ssh-add -l` exits 1 for an agent with no keys and 2 when there is no agent to ask.
+fn agent_reachable(socket: Option<&Path>) -> bool {
+    agent_listing(socket).is_some_and(|output| matches!(output.status.code(), Some(0 | 1)))
+}
+
+fn start_private_agent() -> Result<PrivateAgent> {
+    create_private_directory(&session_directory())?;
+    let socket = session_directory().join("agent.sock");
+    let _ = std::fs::remove_file(&socket);
+    let command = std::process::Command::new("ssh-agent")
+        .arg("-a")
+        .arg(&socket)
+        .args(["sh", "-c", "read _"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context(crate::i18n::t(
+            "Cannot run ssh-agent; install OpenSSH and ensure it is on PATH",
+        ))?;
+    let agent = PrivateAgent { command, socket };
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if agent_reachable(Some(&agent.socket)) {
+            return Ok(agent);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    bail!("{}", crate::i18n::t("ssh-agent did not start"))
+}
+
+/// Uses the agent the user already has, and starts a private one only if there is none.
+fn ensure_agent() -> Result<()> {
+    let mut slot = private_agent();
+    if let Some(agent) = slot.as_ref() {
+        if agent_reachable(Some(&agent.socket)) {
+            return Ok(());
+        }
+        *slot = None;
+    }
+    if !agent_reachable(None) {
+        *slot = Some(start_private_agent()?);
+    }
+    Ok(())
+}
+
+fn probe_found_passphrase(stderr: &str) -> bool {
+    stderr.contains("incorrect passphrase")
+}
+
+/// Compares fingerprints, so the agent can hold the key under any file name or comment.
+fn listing_has_key(fingerprint: &str, listing: &str) -> bool {
+    let hash = |line: &str| line.split_whitespace().nth(1).map(str::to_owned);
+    let Some(wanted) = fingerprint.lines().next().and_then(hash) else {
+        return false;
+    };
+    listing
+        .lines()
+        .any(|line| hash(line).as_ref() == Some(&wanted))
+}
+
+fn agent_has_key(key: &Path) -> bool {
+    let fingerprint = std::process::Command::new("ssh-keygen")
+        .args(["-l", "-E", "sha256", "-f"])
+        .arg(key)
+        .stdin(Stdio::null())
+        .output();
+    let Ok(fingerprint) = fingerprint else {
+        return false;
+    };
+    let Some(listing) = agent_listing(private_agent_socket().as_deref()) else {
+        return false;
+    };
+    listing_has_key(
+        &String::from_utf8_lossy(&fingerprint.stdout),
+        &String::from_utf8_lossy(&listing.stdout),
+    )
+}
+
+/// Whether `ssh` would need a passphrase it has not got. OpenSSH does the reading, with an empty
+/// passphrase and no terminal, so this can never prompt. Any other problem with the key counts
+/// as not locked, so `ssh` reports it in its own words.
+pub fn key_locked(key: &Path) -> bool {
+    let probe = std::process::Command::new("ssh-keygen")
+        .args(["-y", "-P", "", "-f"])
+        .arg(key)
+        .stdin(Stdio::null())
+        .output();
+    probe.is_ok_and(|probe| {
+        !probe.status.success()
+            && probe_found_passphrase(&String::from_utf8_lossy(&probe.stderr))
+            && !agent_has_key(key)
+    })
 }
 
 /// Runs `ssh-keygen` in the embedded terminal, so a passphrase goes directly to it.
@@ -430,10 +612,7 @@ pub fn classify_failure(stderr: &str) -> (String, bool) {
     }
     if lower.contains("permission denied") || lower.contains("too many authentication") {
         return (
-            crate::i18n::t(
-                "Key refused. Run the setup command on the server; if the key has a passphrase, load it with ssh-add.",
-            )
-            .into(),
+            crate::i18n::t("Key refused. Run the setup command on the server.").into(),
             false,
         );
     }
@@ -495,6 +674,8 @@ pub enum Update {
         reason: String,
         retrying: bool,
     },
+    /// The key has a passphrase and is not in the agent. Nothing reached the server.
+    KeyLocked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -529,18 +710,35 @@ struct Session {
 struct Failure {
     reason: String,
     retry: bool,
+    locked: bool,
 }
 
 impl Failure {
     fn from_stderr(stderr: &str) -> Self {
         let (reason, retry) = classify_failure(stderr);
-        Self { reason, retry }
+        Self {
+            reason,
+            retry,
+            locked: false,
+        }
     }
 
     fn local(error: anyhow::Error) -> Self {
         Self {
             reason: crate::model::safe_text(&format!("{error:#}")),
             retry: false,
+            locked: false,
+        }
+    }
+
+    fn locked() -> Self {
+        Self {
+            reason: crate::i18n::t(
+                "SSH key is locked: it has a passphrase and is not loaded in ssh-agent.",
+            )
+            .into(),
+            retry: false,
+            locked: true,
         }
     }
 }
@@ -553,6 +751,9 @@ fn spawn_master(remote: &Remote, key: &Path, control: &Path) -> Result<Child> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(socket) = private_agent_socket() {
+        command.env(AGENT_SOCKET_VARIABLE, socket);
+    }
     // Closes the session if `tha` crashes. PDEATHSIG follows the spawning thread, which is why
     // this runs on a runtime worker and not in `spawn_blocking`, whose threads exit when idle.
     #[cfg(target_os = "linux")]
@@ -610,6 +811,7 @@ async fn wait_for_master(
             return Err(Failure {
                 reason: crate::i18n::t("Timed out connecting over SSH").into(),
                 retry: true,
+                locked: false,
             });
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -633,6 +835,7 @@ async fn list_engines(
     parse_listing(&output.stdout).map_err(|error| Failure {
         reason: crate::model::safe_text(&format!("{error:#}")),
         retry: false,
+        locked: false,
     })
 }
 
@@ -721,7 +924,7 @@ pub fn parse_listing(bytes: &[u8]) -> Result<crate::agent::Listing> {
 pub async fn connect_channel<I>(
     io: I,
 ) -> Result<(
-    hyper::client::conn::http2::SendRequest<Empty<Bytes>>,
+    hyper::client::conn::http2::SendRequest<BoxBody<Bytes, hyper::Error>>,
     impl std::future::Future<Output = ()> + Send + 'static,
 )>
 where
@@ -750,17 +953,28 @@ fn proxy_error(message: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
 
 async fn forward(
     request: Request<Incoming>,
-    mut sender: hyper::client::conn::http2::SendRequest<Empty<Bytes>>,
+    mut sender: hyper::client::conn::http2::SendRequest<BoxBody<Bytes, hyper::Error>>,
 ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
     let lost = crate::i18n::t("The connection to the server was lost");
     let target = request
         .uri()
         .path_and_query()
-        .map_or("/", |value| value.as_str());
+        .map_or("/", |value| value.as_str())
+        .to_owned();
+    // Only the dedicated exec protocol accepts a body. Docker API requests remain bodyless.
+    let exec = target == crate::remote_exec::ROUTE;
+    let method = request.method().clone();
+    let body = if exec {
+        request.into_body().boxed()
+    } else {
+        Empty::<Bytes>::new()
+            .map_err(|never| match never {})
+            .boxed()
+    };
     let Ok(outgoing) = Request::builder()
-        .method(request.method())
+        .method(method)
         .uri(format!("http://agent{target}"))
-        .body(Empty::new())
+        .body(body)
     else {
         return Ok(proxy_error(lost));
     };
@@ -776,7 +990,7 @@ async fn forward(
 /// Accepts the Docker client's local connections and sends their requests down the channel.
 pub async fn serve_local_socket(
     listener: UnixListener,
-    sender: hyper::client::conn::http2::SendRequest<Empty<Bytes>>,
+    sender: hyper::client::conn::http2::SendRequest<BoxBody<Bytes, hyper::Error>>,
 ) {
     while let Ok((stream, _)) = listener.accept().await {
         let sender = sender.clone();
@@ -840,6 +1054,14 @@ async fn open_channel(
 
 async fn open_session(remote: &Remote) -> Result<(Session, crate::agent::Listing), Failure> {
     let key = checked_key(remote).map_err(Failure::local)?;
+    // Checked first: to the server a locked key looks like a refused one, and a failed login.
+    let probe = key.clone();
+    if tokio::task::spawn_blocking(move || key_locked(&probe))
+        .await
+        .unwrap_or(false)
+    {
+        return Err(Failure::locked());
+    }
     create_private_directory(&session_directory()).map_err(Failure::local)?;
     let control = control_path(remote, &key);
     let _ = std::fs::remove_file(&control);
@@ -927,6 +1149,10 @@ pub async fn supervise(remote: Remote, generation: u64, events: mpsc::Sender<Eve
                 {
                     return;
                 }
+            }
+            Err(failure) if failure.locked => {
+                send(Update::KeyLocked).await;
+                return;
             }
             Err(failure) => {
                 if !send(Update::Failed {
@@ -1266,6 +1492,77 @@ mod tests {
                 .any(|arg| arg == "KbdInteractiveAuthentication=no")
         );
         assert_eq!(args.last().unwrap(), LIST_COMMAND);
+    }
+
+    /// `None` where OpenSSH is not installed.
+    fn generated_key(directory: &Path, name: &str, passphrase: &str) -> Option<PathBuf> {
+        let key = directory.join(name);
+        let status = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", passphrase, "-f"])
+            .arg(&key)
+            .stdin(Stdio::null())
+            .status()
+            .ok()?;
+        status.success().then_some(key)
+    }
+
+    #[test]
+    fn only_a_key_with_a_passphrase_counts_as_locked() {
+        let directory = tempfile::tempdir().unwrap();
+        let Some(open) = generated_key(directory.path(), "open", "") else {
+            return;
+        };
+        let locked = generated_key(directory.path(), "locked", "secret").unwrap();
+        assert!(!key_locked(&open));
+        assert!(key_locked(&locked));
+        // ssh words these problems better than "locked" would.
+        let broken = directory.path().join("broken");
+        std::fs::write(&broken, "not a key").unwrap();
+        assert!(!key_locked(&broken));
+        assert!(!key_locked(&directory.path().join("missing")));
+    }
+
+    #[test]
+    fn the_test_keeps_the_unlock_only_for_a_locked_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let Some(open) = generated_key(directory.path(), "open", "") else {
+            return;
+        };
+        let mut candidate = remote();
+        candidate.identity_file = open.display().to_string();
+        let command = test_command(&candidate).unwrap();
+        assert!(
+            !command
+                .get_args()
+                .any(|arg| arg.to_string_lossy().contains("AddKeysToAgent"))
+        );
+    }
+
+    #[test]
+    fn the_agent_is_matched_by_fingerprint_not_by_file_name() {
+        let wanted = "256 SHA256:abc no comment (ED25519)\n";
+        assert!(listing_has_key(
+            wanted,
+            "4096 SHA256:other a (RSA)\n256 SHA256:abc other-name (ED25519)\n"
+        ));
+        assert!(!listing_has_key(wanted, "256 SHA256:other a (ED25519)\n"));
+        assert!(!listing_has_key(wanted, "The agent has no identities.\n"));
+        assert!(!listing_has_key("", "256 SHA256:abc a (ED25519)\n"));
+    }
+
+    #[test]
+    fn a_private_agent_answers_and_is_gone_when_stopped() {
+        let Ok(agent) = start_private_agent() else {
+            return;
+        };
+        let socket = agent.socket.clone();
+        assert!(agent_reachable(Some(&socket)));
+        drop(agent);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while agent_reachable(Some(&socket)) {
+            assert!(std::time::Instant::now() < deadline, "the agent must exit");
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     #[test]

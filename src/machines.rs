@@ -13,6 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub const LOCAL_MACHINE: &str = "";
 
 const LOCAL_TOOL_PREFIX: &str = "local-tool:";
+const UNLOCK_TOOL: &str = "unlock";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachineState {
@@ -33,6 +34,9 @@ pub struct Machine {
     pub engines: Vec<String>,
     pub anchor: usize,
     pub generation: u64,
+    /// The user started this attempt, so a locked key may open the passphrase prompt. A
+    /// background reconnect never takes over the screen.
+    pub prompt_unlock: bool,
 }
 
 impl Machine {
@@ -367,6 +371,7 @@ impl App {
             engines: Vec::new(),
             anchor,
             generation: 0,
+            prompt_unlock: false,
         });
     }
 
@@ -430,6 +435,7 @@ impl App {
         };
         machine.generation = machine.generation.wrapping_add(1);
         machine.state = MachineState::Connecting;
+        machine.prompt_unlock = true;
         let command = RemoteCommand::Connect {
             remote: machine.remote.clone(),
             generation: machine.generation,
@@ -445,6 +451,8 @@ impl App {
         };
         machine.generation = machine.generation.wrapping_add(1);
         machine.state = MachineState::NotConnected;
+        machine.prompt_unlock = false;
+        self.pending_unlocks.retain(|pending| pending != name);
         self.remote_commands
             .push(RemoteCommand::Disconnect(name.to_owned()));
         self.release_engines(name, crate::i18n::t("Not connected"));
@@ -486,6 +494,7 @@ impl App {
             } => {
                 if let Some(machine) = self.machine_mut(&event.server) {
                     machine.state = MachineState::Connected;
+                    machine.prompt_unlock = false;
                     machine.allow_delete = allow_delete;
                     machine.engines = engines.clone();
                 }
@@ -494,11 +503,84 @@ impl App {
             remote::Update::Failed { reason, retrying } => {
                 self.release_engines(&event.server, &reason);
                 if let Some(machine) = self.machine_mut(&event.server) {
+                    machine.prompt_unlock &= retrying;
                     machine.state = MachineState::Offline { reason, retrying };
                 }
             }
+            remote::Update::KeyLocked => self.key_locked(&event.server),
         }
         self.refresh_tree();
+    }
+
+    fn key_locked(&mut self, name: &str) {
+        let reason = crate::i18n::t("SSH key is locked. Press Enter on this server to unlock it.");
+        self.release_engines(name, reason);
+        let Some(machine) = self.machine_mut(name) else {
+            return;
+        };
+        machine.state = MachineState::Offline {
+            reason: reason.to_owned(),
+            retrying: false,
+        };
+        if !std::mem::take(&mut machine.prompt_unlock) {
+            return;
+        }
+        // One prompt at a time. Servers sharing the key need none once it is unlocked.
+        if self.unlock_running() {
+            self.pending_unlocks.push(name.to_owned());
+        } else {
+            self.open_unlock(name);
+        }
+    }
+
+    fn unlock_running(&self) -> bool {
+        self.sessions.iter().any(|(_, session)| {
+            local_tool_kind(&session.request) == Some(UNLOCK_TOOL)
+                && matches!(session.state, crate::terminal::State::Running)
+        })
+    }
+
+    fn open_unlock(&mut self, name: &str) {
+        // Someone typing in a terminal must not have their keys land in a passphrase prompt.
+        if self.exec_input {
+            self.notice = crate::tf!(
+                "Server {name}: SSH key is locked. Press Enter on it to unlock.",
+                name = crate::model::safe_text(name)
+            );
+            return;
+        }
+        let Some(remote) = self.machine(name).map(|machine| machine.remote.clone()) else {
+            return;
+        };
+        let title = crate::tf!(
+            "Unlock SSH key for {name}",
+            name = crate::model::safe_text(name)
+        );
+        if self.open_local_tool(&title, UNLOCK_TOOL, remote::unlock_command(&remote)) {
+            self.unlocking = Some(name.to_owned());
+        }
+    }
+
+    /// The server asked for the prompt connects, and so does anyone waiting behind it: a shared
+    /// key now passes, and a different key opens its own prompt.
+    fn finish_unlock(&mut self) {
+        if let Some(modal) = &mut self.remotes_modal {
+            modal.hidden = false;
+        }
+        if let Some(name) = self.unlocking.take()
+            && self.machine(&name).is_some_and(Machine::waiting_for_user)
+        {
+            self.connect_machine(&name);
+            // Never ask again in a loop if the key still does not pass after this.
+            if let Some(machine) = self.machine_mut(&name) {
+                machine.prompt_unlock = false;
+            }
+        }
+        for name in std::mem::take(&mut self.pending_unlocks) {
+            if self.machine(&name).is_some_and(Machine::waiting_for_user) {
+                self.connect_machine(&name);
+            }
+        }
     }
 
     pub(crate) fn attach_engines(&mut self, server: &str, engines: &[String]) {
@@ -981,13 +1063,14 @@ impl App {
     }
 
     /// OpenSSH needs a real terminal for host key and passphrase prompts, so these run in the
-    /// embedded one. The form waits, hidden, and comes back when the command succeeds.
-    fn open_local_tool(
+    /// embedded one. The form waits, hidden, and comes back when the command succeeds. Returns
+    /// whether the command started.
+    pub(crate) fn open_local_tool(
         &mut self,
         title: &str,
         kind: &str,
         command: anyhow::Result<std::process::Command>,
-    ) {
+    ) -> bool {
         let opened = command.and_then(|command| {
             self.sessions
                 .open_local_tool(title, kind, command, self.exec_dimensions)
@@ -1003,11 +1086,19 @@ impl App {
                 self.performance_focus = false;
                 self.exec_input = true;
                 self.notice.clear();
+                true
             }
             Err(error) => {
+                let message = crate::model::safe_text(&format!("{error:#}"));
                 if let Some(form) = self.form_mut() {
-                    form.error = Some(crate::model::safe_text(&format!("{error:#}")));
+                    form.error = Some(message);
+                } else {
+                    if let Some(modal) = &mut self.remotes_modal {
+                        modal.message = Some(message.clone());
+                    }
+                    self.notice = message;
                 }
+                false
             }
         }
     }
@@ -1020,11 +1111,24 @@ impl App {
         let Some(kind) = local_tool_kind(&session.request) else {
             return false;
         };
+        if kind == "server-shell" {
+            return false; // Retain shell output exactly like container exec, not setup tools.
+        }
         let kind = kind.to_owned();
         let succeeded = matches!(session.state, crate::terminal::State::Exited(0));
         let status = session.status();
         let screen = session.screen().contents();
         self.exec_input = false;
+        if !succeeded && kind == UNLOCK_TOOL {
+            // A declined prompt is an answer, so the servers behind it do not ask as well.
+            self.unlocking = None;
+            self.pending_unlocks.clear();
+            self.notice = crate::tf!(
+                "{status}. Read the output above, then press Enter on the server to try again.",
+                status = status
+            );
+            return true;
+        }
         if !succeeded {
             self.notice = crate::tf!(
                 "{status}. Read the output above, then :servers returns to the form.",
@@ -1038,6 +1142,10 @@ impl App {
         }
         self.detail_focus = false;
         self.tab = Tab::Overview;
+        if kind == UNLOCK_TOOL {
+            self.finish_unlock();
+            return true;
+        }
         let note = if kind == "test" {
             // The screen wraps long lines, so the answer is read without its line breaks.
             let answer: String = screen.lines().map(str::trim).collect();
@@ -1182,6 +1290,36 @@ mod tests {
         app.connect_startup_machines();
         assert!(app.take_remote_commands().is_empty());
         assert!(!app.worker_availability()[1].1, "the anchor has no workers");
+    }
+
+    #[tokio::test]
+    async fn server_exec_tab_requires_a_connected_remote_and_offline_requests_spawn_nothing() {
+        let mut app = with_servers(&["prod"]);
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| row.scope == Scope::Machine("prod".into()))
+            .unwrap();
+        assert!(!app.exec_tab_available());
+        app.request_exec();
+        assert!(app.sessions.is_empty());
+        assert!(app.notice.contains("Connect to this server"));
+        connected(&mut app, "prod");
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| row.scope == Scope::Machine("prod".into()))
+            .unwrap();
+        assert!(app.exec_tab_available());
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| row.scope == Scope::Machine(LOCAL_MACHINE.into()))
+            .unwrap();
+        assert!(
+            !app.exec_tab_available(),
+            "local machine rows do not open host shells"
+        );
     }
 
     #[test]
@@ -1536,6 +1674,146 @@ mod tests {
             "{:?}",
             form.note
         );
+    }
+
+    fn locked_event(app: &mut App, name: &str) {
+        let generation = app.machine(name).unwrap().generation;
+        app.apply_remote_event(remote::Event {
+            server: name.into(),
+            generation,
+            update: Update::KeyLocked,
+        });
+    }
+
+    fn reconnects(app: &mut App) -> Vec<String> {
+        app.take_remote_commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                RemoteCommand::Connect { remote, .. } => Some(remote.name),
+                RemoteCommand::Disconnect(_) => None,
+            })
+            .collect()
+    }
+
+    /// Stands in for `ssh-add`, so these tests need no agent and no terminal to type in.
+    fn fake_unlock(app: &mut App, name: &str, script: &str) {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", script]);
+        assert!(app.open_local_tool("Unlock", UNLOCK_TOOL, Ok(command)));
+        app.unlocking = Some(name.into());
+    }
+
+    async fn finish_tool(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let id = loop {
+            if let Some(notice) = app.sessions.poll().pop() {
+                break notice.id;
+            }
+            assert!(std::time::Instant::now() < deadline, "the tool must end");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(app.local_tool_finished(id));
+    }
+
+    #[test]
+    fn a_background_reconnect_marks_the_key_locked_without_taking_the_screen() {
+        let mut app = with_servers(&["prod"]);
+        connected(&mut app, "prod");
+        app.take_remote_commands();
+        locked_event(&mut app, "prod");
+        assert!(app.sessions.is_empty());
+        assert_eq!(app.tab, Tab::Overview);
+        let machine = app.machine("prod").unwrap();
+        assert!(machine.waiting_for_user());
+        assert!(!machine.session_active());
+        assert!(matches!(
+            &machine.state,
+            MachineState::Offline { reason, .. } if reason.contains("locked")
+        ));
+        // Enter is how the user answers, and that attempt may ask.
+        app.toggle_selected_connection();
+        app.connect_machine("prod");
+        assert!(app.machine("prod").unwrap().prompt_unlock);
+    }
+
+    #[test]
+    fn a_locked_key_never_interrupts_someone_typing_in_a_terminal() {
+        let mut app = with_servers(&["prod"]);
+        app.connect_machine("prod");
+        app.exec_input = true;
+        locked_event(&mut app, "prod");
+        assert!(app.sessions.is_empty());
+        assert!(app.notice.contains("prod"), "{}", app.notice);
+        assert!(app.machine("prod").unwrap().waiting_for_user());
+    }
+
+    #[test]
+    fn an_unlock_that_cannot_start_says_why_and_leaves_the_server_locked() {
+        let mut app = with_servers(&["prod"]);
+        app.connect_machine("prod");
+        locked_event(&mut app, "prod");
+        assert!(app.notice.contains("/keys/k"), "{}", app.notice);
+        assert_eq!(app.unlocking, None);
+        assert!(app.machine("prod").unwrap().waiting_for_user());
+    }
+
+    #[tokio::test]
+    async fn a_successful_unlock_connects_everyone_who_was_waiting_for_it() {
+        let mut app = with_servers(&["prod", "stage", "gone"]);
+        for name in ["prod", "stage", "gone"] {
+            app.connect_machine(name);
+        }
+        fake_unlock(&mut app, "prod", "read _");
+        locked_event(&mut app, "prod");
+        locked_event(&mut app, "stage");
+        locked_event(&mut app, "gone");
+        assert_eq!(app.sessions.len(), 1, "one prompt at a time");
+        assert_eq!(app.pending_unlocks.len(), 3);
+        app.pending_unlocks.retain(|name| name != "prod");
+        app.disconnect_machine("gone");
+        app.take_remote_commands();
+        let id = app.sessions.active_id().unwrap();
+        app.sessions.select(id);
+        app.sessions
+            .active_mut()
+            .unwrap()
+            .send(b"\n".to_vec())
+            .unwrap();
+        finish_tool(&mut app).await;
+        assert_eq!(reconnects(&mut app), ["prod", "stage"]);
+        assert!(app.sessions.is_empty(), "success frees the session slot");
+        assert_eq!(app.tab, Tab::Overview);
+        assert!(!app.exec_input);
+        assert!(app.pending_unlocks.is_empty());
+        // The unlocked server must not prompt in a loop; the next one has not asked yet.
+        assert!(!app.machine("prod").unwrap().prompt_unlock);
+        assert!(app.machine("stage").unwrap().prompt_unlock);
+    }
+
+    #[tokio::test]
+    async fn a_declined_unlock_asks_nobody_else_and_connects_nothing() {
+        let mut app = with_servers(&["prod", "stage"]);
+        app.connect_machine("prod");
+        app.connect_machine("stage");
+        locked_event(&mut app, "prod");
+        fake_unlock(&mut app, "prod", "echo wrong; read _; exit 1");
+        locked_event(&mut app, "stage");
+        assert_eq!(app.pending_unlocks, ["stage"]);
+        app.take_remote_commands();
+        let id = app.sessions.active_id().unwrap();
+        app.sessions.select(id);
+        app.sessions
+            .active_mut()
+            .unwrap()
+            .send(b"\n".to_vec())
+            .unwrap();
+        finish_tool(&mut app).await;
+        assert!(reconnects(&mut app).is_empty());
+        assert!(app.pending_unlocks.is_empty());
+        assert_eq!(app.unlocking, None);
+        assert_eq!(app.sessions.len(), 1, "the output stays readable");
+        assert!(app.machine("prod").unwrap().waiting_for_user());
+        assert!(app.machine("stage").unwrap().waiting_for_user());
     }
 
     #[tokio::test]

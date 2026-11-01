@@ -105,6 +105,18 @@ impl Sessions {
         dimensions: (u16, u16),
     ) -> Result<u64> {
         let _ = self.poll();
+        let request = crate::machines::local_tool_request(title, kind);
+        if kind == "server-shell"
+            && let Some(slot) = self.entries.iter_mut().find(|slot| {
+                slot.terminal.running()
+                    && slot.terminal.same_target(&request)
+                    && slot.terminal.request.container.name == title
+            })
+        {
+            self.active = Some(slot.id);
+            slot.terminal.follow();
+            return Ok(slot.id);
+        }
         if self.entries.len() >= self.limit {
             bail!(crate::tf!(
                 "Exec session limit reached ({open}/{limit} retained). Use F6 to select one and :close-exec to free a slot",
@@ -112,7 +124,6 @@ impl Sessions {
                 limit = self.limit
             ));
         }
-        let request = crate::machines::local_tool_request(title, kind);
         let session = Session::start(request, command, dimensions.0, dimensions.1)?;
         self.insert(session)
     }

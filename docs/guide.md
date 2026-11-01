@@ -425,8 +425,20 @@ setup has not run yet.
 Servers can also be written by hand as `[[remotes]]` in `config.toml`; see
 `tha.example.toml`. Those show as read-only in the modal. Servers added in the modal
 are saved in `remotes.toml` next to it, mode `0600`. Only the path to each key is
-stored; Tha never reads or copies a private key. A key with a passphrase must be
-loaded with `ssh-add`, because Tha cannot prompt for it while running.
+stored; Tha never reads or copies a private key.
+
+**Keys with a passphrase:** when you test or connect and the key is locked, OpenSSH
+asks for the passphrase in the embedded terminal, so Tha never sees it. You are asked
+once: `ssh-agent` then holds the unlocked key, whether or not the server has been saved,
+and servers sharing the key do not ask again. Tha uses your `ssh-agent` if one is
+running, and the key stays loaded there after Tha closes, like any other `ssh-add`.
+Otherwise Tha starts a private agent that forgets the key when Tha closes, so you are
+asked once per run.
+
+A key that is gone from the agent during a background reconnect never interrupts you.
+The server shows that its key is locked until you press Enter on it. The background
+service cannot ask at all, so a server it connects to needs the key already loaded in an
+agent it can reach.
 
 Login is by SSH key only. Tha never asks for or stores a password, and tells `ssh` not
 to use one, even if the server allows it. That is a client setting: to turn password
@@ -898,6 +910,20 @@ metrics cache, and changing engine identity discards old readings.
 
 Select a running container and press `e` or run `:exec`. A service with multiple
 eligible running containers opens a picker—Tha never silently picks a replica.
+For remote containers, an administrator must add `--allow-exec` to the server's
+setup command (or set top-level `allow_exec = true` in `/etc/tha/agent.toml`, followed
+by `sudo systemctl restart tha-agent`). It is disabled by default and independent
+of `allow_delete`. Setup reruns preserve an existing opt-in.
+
+The same opt-in also enables **server shells**: select a connected remote server
+row and press `e`. This opens `/bin/sh` as the configured SSH login user, not as
+the root agent daemon. A root SSH login therefore opens a root shell; the
+dedicated `tha` login opens a shell with that user's permissions. The restricted
+key's forced-command and forwarding restrictions are not relaxed by Tha. Full
+shell access can modify account-owned files and keys; disabling `allow_exec`
+does not undo such changes or close existing host-shell sessions. See the
+[README's enabled/disabled examples](../README.md#remote-container-and-server-shells-server-opt-in).
+
 Exec is disabled for demo workloads, disconnected engines, stopped containers,
 and Kubernetes-managed containers. This is container exec, **not Kubernetes
 `kubectl exec` support**.
@@ -905,9 +931,13 @@ and Kubernetes-managed containers. This is container exec, **not Kubernetes
 Exec stays in the **right pane**, using a native PTY, vt100 terminal emulator,
 and Ratatui terminal widget. Tha never hands off the host terminal or prints
 child control sequences directly to it. The explorer, metrics, and navigation
-remain available. The runtime CLI (`docker`, `podman`, or `nerdctl`) gets the exact
+remain available. For local containers, the runtime CLI (`docker`, `podman`, or `nerdctl`) gets the exact
 endpoint and containerd namespace; ambient context/TLS overrides are removed.
 Your active context is never changed. No host shell interpolation is used.
+Remote container exec uses the agent's Docker API connection instead of a CLI;
+input, raw terminal output, resizing and exit status stay on the authenticated
+SSH transport. Host shells use a separate forced-command SSH channel and a
+server-side PTY, without relaxing the key's no-PTY/no-forwarding restrictions.
 
 Press `4` to select **Exec**, then `Enter` to start/focus shell input. `e` also
 starts or refocuses a shell. The right-pane header always identifies the mode,

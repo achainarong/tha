@@ -1059,6 +1059,7 @@ mod agent {
             while let Ok((stream, _)) = listener.accept().await {
                 let agent = Agent {
                     allow_delete,
+                    allow_exec: false,
                     socket: socket.clone(),
                     audit: |_| {},
                     security: None,
@@ -1300,6 +1301,7 @@ mod agent {
                 server,
                 Agent {
                     allow_delete,
+                    allow_exec: false,
                     socket,
                     audit: |_| {},
                     security: None,
@@ -1395,6 +1397,7 @@ mod agent {
                 server,
                 Agent {
                     allow_delete: false,
+                    allow_exec: false,
                     socket,
                     audit: |_| {},
                     security: None,
@@ -1454,6 +1457,7 @@ mod agent {
                 server,
                 Agent {
                     allow_delete: false,
+                    allow_exec: false,
                     socket,
                     audit: |_| {},
                     security: None,

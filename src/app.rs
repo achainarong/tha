@@ -365,6 +365,9 @@ pub struct App {
     pub remotes_problem: Option<String>,
     pub remotes_modal: Option<crate::machines::RemotesModal>,
     pub remote_commands: Vec<crate::machines::RemoteCommand>,
+    /// The server whose passphrase prompt is open, and those waiting behind it.
+    pub unlocking: Option<String>,
+    pub pending_unlocks: Vec<String>,
     pub remote_availability: Vec<(usize, bool)>,
     pub clipboard_request: Option<String>,
     pending_machine: Option<String>,
@@ -493,6 +496,8 @@ impl App {
             remotes_problem: None,
             remotes_modal: None,
             remote_commands: Vec::new(),
+            unlocking: None,
+            pending_unlocks: Vec::new(),
             remote_availability: Vec::new(),
             clipboard_request: None,
             pending_machine: None,
@@ -1523,6 +1528,12 @@ impl App {
         let Some(row) = self.current() else {
             return false;
         };
+        if let Scope::Machine(name) = &row.scope {
+            return self
+                .machines
+                .iter()
+                .any(|machine| machine.remote.name == *name && machine.connected());
+        }
         let engine = &self.engines[row.engine];
         matches!(row.scope, Scope::Container(_) | Scope::Service { .. })
             && engine.error.is_none()
@@ -3257,6 +3268,26 @@ impl App {
         let Some(row) = self.current().cloned() else {
             return;
         };
+        if let Scope::Machine(name) = &row.scope
+            && let Some(machine) = self
+                .machines
+                .iter()
+                .find(|machine| machine.remote.name == *name)
+        {
+            if !machine.connected() {
+                self.notice =
+                    crate::i18n::t("Connect to this server before opening a shell.").into();
+                return;
+            }
+            let remote = machine.remote.clone();
+            let command = crate::remote_exec::host_command(&remote);
+            self.open_local_tool(
+                &format!("{} · {} · server shell", remote.name, remote.address()),
+                "server-shell",
+                command,
+            );
+            return;
+        }
         if !matches!(row.scope, Scope::Container(_) | Scope::Service { .. }) {
             self.notice =
                 crate::i18n::t("Select a container or service, then press e to exec.").into();
