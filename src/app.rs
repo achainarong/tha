@@ -2138,7 +2138,7 @@ impl App {
                         .is_none_or(|project| project.contains(c))
             }),
             now,
-            self.engine_stale_after(row.engine),
+            self.metrics_stale_after(),
             available,
         );
         // An observed empty workload has a known zero sum. This is distinct
@@ -2150,21 +2150,13 @@ impl App {
         summary
     }
 
+    /// Keep the last successful sample visible through normal polling gaps. All
+    /// views and their redraw deadlines share this policy, independent of cadence.
     pub fn metrics_stale_after(&self) -> std::time::Duration {
         if self.demo {
             return std::time::Duration::MAX;
         }
-        std::time::Duration::from_secs(self.metrics_refresh_seconds.saturating_mul(3).max(3))
-    }
-
-    /// Servers sample more slowly to save traffic, so they also go stale more slowly.
-    fn engine_stale_after(&self, index: usize) -> std::time::Duration {
-        match self.machine(self.machine_name(index)) {
-            Some(machine) if !self.demo => std::time::Duration::from_secs(
-                machine.remote.metrics_seconds().saturating_mul(3).max(3),
-            ),
-            _ => self.metrics_stale_after(),
-        }
+        std::time::Duration::from_secs(30)
     }
 
     /// Totals across the machine's engines. Unmeasured engines add nothing, rather than zero.
@@ -2334,7 +2326,7 @@ impl App {
         let mut summary = engine.metrics.summary(
             &snapshot.containers,
             std::time::Instant::now(),
-            self.engine_stale_after(index),
+            self.metrics_stale_after(),
             available,
         );
         if available && summary.running == 0 {
@@ -2929,27 +2921,33 @@ impl App {
     }
 
     pub fn selected_containers(&self) -> Vec<Container> {
-        let Some(row) = self.current() else {
-            return vec![];
-        };
-        self.containers_for(row)
+        self.selected_container_refs().cloned().collect()
+    }
+
+    /// Read-only selection without copying container metadata. Async workers should
+    /// take an owned snapshot only when their subscription or operation changes.
+    pub fn selected_container_refs(&self) -> impl Iterator<Item = &Container> {
+        self.current()
+            .into_iter()
+            .flat_map(|row| self.container_refs_for(row))
     }
 
     fn containers_for(&self, row: &Row) -> Vec<Container> {
-        let Some(snapshot) = &self.engines[row.engine].snapshot else {
-            return vec![];
-        };
-        snapshot
-            .containers
-            .iter()
+        self.container_refs_for(row).cloned().collect()
+    }
+
+    fn container_refs_for<'a>(&'a self, row: &'a Row) -> impl Iterator<Item = &'a Container> {
+        self.engines[row.engine]
+            .snapshot
+            .as_ref()
+            .into_iter()
+            .flat_map(|snapshot| &snapshot.containers)
             .filter(|c| matches_container(&row.scope, c))
             .filter(|c| {
                 self.project
                     .as_ref()
                     .is_none_or(|project| project.contains(c))
             })
-            .cloned()
-            .collect()
     }
 
     pub fn configure_startup(&mut self, cwd: PathBuf) {
@@ -3775,6 +3773,48 @@ mod tests {
     use crate::config::BackendKind;
 
     #[test]
+    fn borrowed_selection_keeps_membership_order_and_respects_project_focus() {
+        let mut app = App::new(crate::demo::connections(), 100, false, true);
+        crate::demo::populate(&mut app);
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| row.engine == 0 && row.scope == Scope::Engine)
+            .unwrap();
+        assert_eq!(
+            app.selected_container_refs()
+                .map(|container| container.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["api-1", "api-2", "db-1", "scratch"]
+        );
+        app.project = Some(Project {
+            engine: 0,
+            namespace: None,
+            name: "shop".into(),
+        });
+        let selected: Vec<_> = app.selected_container_refs().collect();
+        assert_eq!(selected.len(), 3);
+        assert!(
+            selected
+                .iter()
+                .all(|container| container.project.as_deref() == Some("shop"))
+        );
+        assert!(selected.iter().all(|container| {
+            app.engines[0]
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .containers
+                .iter()
+                .any(|stored| std::ptr::eq(*container, stored))
+        }));
+        app.engines[0].snapshot = None;
+        assert_eq!(app.selected_container_refs().count(), 0);
+        app.rows.clear();
+        assert_eq!(app.selected_container_refs().count(), 0);
+    }
+
+    #[test]
     fn performance_container_navigation_stays_inside_workspace_and_search_when_branches_are_collapsed()
      {
         let mut app = App::new(crate::demo::connections(), 100, false, true);
@@ -3927,7 +3967,7 @@ mod tests {
         let builds = app.presentations.builds;
         assert_eq!(app.row_presentation(&key).cpu, "50.0%");
         for _ in 0..50 {
-            app.prepare_row_presentations(0, 1, now + Duration::from_secs(1), true);
+            app.prepare_row_presentations(0, 1, now + Duration::from_secs(29), true);
         }
         assert_eq!(
             app.presentations.builds, builds,
@@ -3935,9 +3975,11 @@ mod tests {
         );
         assert_eq!(
             app.next_visual_deadline(now),
-            Some(now + Duration::from_secs(3) + Duration::from_nanos(1))
+            Some(now + Duration::from_secs(30) + Duration::from_nanos(1))
         );
-        app.prepare_row_presentations(0, 1, now + Duration::from_secs(4), true);
+        app.prepare_row_presentations(0, 1, now + Duration::from_secs(30), true);
+        assert_eq!(app.row_presentation(&key).cpu, "50.0%");
+        app.prepare_row_presentations(0, 1, now + Duration::from_secs(31), true);
         assert_eq!(app.row_presentation(&key).cpu, "stale");
         assert_eq!(app.presentations.builds, builds + 1);
         app.apply_metrics(Event {
@@ -3945,14 +3987,14 @@ mod tests {
             revision: 0,
             batch: [(
                 "/one".into(),
-                Ok(reading(25.0, now + Duration::from_secs(4))),
+                Ok(reading(25.0, now + Duration::from_secs(31))),
             )]
             .into(),
         });
-        app.prepare_row_presentations(0, 1, now + Duration::from_secs(4), true);
+        app.prepare_row_presentations(0, 1, now + Duration::from_secs(31), true);
         assert_eq!(app.row_presentation(&key).cpu, "25.0%");
         app.update_engine(0, Err("offline".into()));
-        app.prepare_row_presentations(0, 1, now + Duration::from_secs(4), true);
+        app.prepare_row_presentations(0, 1, now + Duration::from_secs(31), true);
         assert_eq!(
             app.row_presentation(&key).condition.unwrap().label,
             "unavailable"

@@ -40,15 +40,19 @@ curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/instal
 `tha-agent`, with no UI, service or modules, as a root-owned binary in `/usr/local/bin`.
 Linux only, and it does need root; see [Remote servers](#remote-servers):
 
-First, on your own machine, create a key for the server and print its public part:
+There are two machines here: **your computer**, where you run `tha`, and **the server** you
+want to manage.
+
+**On your computer**, create the SSH key that `tha` will log in with, and print its public
+part. The private key never leaves your computer:
 
 ```sh
 ssh-keygen -t ed25519 -f ~/.ssh/tha-agent
 cat ~/.ssh/tha-agent.pub
 ```
 
-Then, on the server, run this one command with that public key. It installs the agent and
-sets the server up. The form under `:servers` shows it with your key filled in:
+**On the server**, run this one command with the public key you just printed. It installs
+the agent and sets the server up. The form under `:servers` shows it with your key filled in:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent --key 'ssh-ed25519 AAAA...'
@@ -379,8 +383,8 @@ confirm, and Tha never accepts a host key itself.
 
 **Use a dedicated user instead of root:** you do not create the user yourself; setup does.
 
-1. On your machine, create a key just for this server, or use **Create new key** in the
-   form:
+1. On your computer, not the server, create a key just for this server, or use **Create new
+   key** in the form:
 
    ```sh
    ssh-keygen -t ed25519 -f ~/.ssh/tha-agent
@@ -866,8 +870,10 @@ inventories rotate through the bounded queue to avoid starvation.
   show the runtime-reported memory limit; Performance bars use engine memory
   capacity when available. Limits are never summed into a fictitious total.
 - **Freshness:** `--` means unavailable; `stopped` means not running; `stale` means
-  an old or failed measurement. Measurements older than three sampling intervals
-  are excluded from live totals. `*` marks partial totals, with exact coverage in
+  an old or failed measurement. Successful measurements stay fresh for 30 seconds
+  on both local engines and remote servers; older samples are excluded from live
+  totals. Failed measurements or disconnected engines are stale immediately.
+  `*` marks partial totals, with exact coverage in
   Overview. Last-known failed samples remain visible in container details only,
   explicitly labelled stale. No error is silently converted to zero.
   A connected workload with no running containers has a known zero aggregate;

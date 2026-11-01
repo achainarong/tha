@@ -511,6 +511,115 @@ mod tests {
         assert!(app.notice.contains("turned off"), "{}", app.notice);
     }
 
+    /// A container whose only sample is `age` old, as seen between two refreshes.
+    fn sampled(app: &mut App, index: usize, age: std::time::Duration) {
+        let container = crate::model::Container {
+            id: "abc".into(),
+            name: "api".into(),
+            state: "running".into(),
+            ..Default::default()
+        };
+        app.update_engine(
+            index,
+            Ok(crate::model::Snapshot {
+                engine_id: Some(format!("id-{index}")),
+                containers: vec![container.clone()],
+                ..Default::default()
+            }),
+        );
+        let batch = vec![(
+            container.key(),
+            Ok(crate::metrics::Reading {
+                usage: crate::metrics::Usage {
+                    cpu_percent: Some(12.5),
+                    memory_bytes: Some(1024 * 1024),
+                    ..Default::default()
+                },
+                counters: None,
+                sampled_at: std::time::Instant::now() - age,
+            }),
+        )];
+        let engine = &mut app.engines[index];
+        let containers = engine.snapshot.as_ref().unwrap().containers.clone();
+        engine
+            .metrics
+            .apply(&containers, batch.into_iter().collect());
+        app.expanded
+            .insert(format!("{index}/{:?}", Scope::Standalone(None)));
+        app.refresh_tree();
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| row.engine == index && matches!(row.scope, Scope::Container(_)))
+            .expect("the container row");
+    }
+
+    fn connected(app: &mut App) -> usize {
+        app.connect_machine("prod");
+        let generation = app.machine("prod").unwrap().generation;
+        app.apply_remote_event(remote::Event {
+            server: "prod".into(),
+            generation,
+            update: remote::Update::Connected {
+                engines: vec!["docker".into()],
+                allow_delete: false,
+            },
+        });
+        app.machine_engines("prod")[0]
+    }
+
+    #[test]
+    fn a_server_sample_between_refreshes_never_shows_as_stale() {
+        let mut app = app();
+        let index = connected(&mut app);
+        // Normal for a server's 5 second refresh; never flash stale between samples.
+        sampled(&mut app, index, std::time::Duration::from_secs(5));
+        let screen = render(&mut app, 160, 40);
+        assert!(!screen.contains("stale"), "{screen}");
+        assert!(!screen.contains("Last sample"), "{screen}");
+        assert!(screen.contains("12.5%"), "{screen}");
+    }
+
+    #[test]
+    fn server_samples_remain_fresh_for_thirty_seconds() {
+        let mut app = app();
+        let index = connected(&mut app);
+        sampled(&mut app, index, std::time::Duration::from_secs(29));
+        let screen = render(&mut app, 160, 40);
+        assert!(screen.contains("12.5%"), "{screen}");
+        assert!(!screen.contains("stale"), "{screen}");
+        assert!(!screen.contains("Last sample"), "{screen}");
+    }
+
+    #[test]
+    fn local_samples_remain_fresh_for_thirty_seconds() {
+        let mut app = app();
+        sampled(&mut app, 0, std::time::Duration::from_secs(29));
+        let screen = render(&mut app, 160, 40);
+        assert!(screen.contains("12.5%"), "{screen}");
+        assert!(!screen.contains("stale"), "{screen}");
+        assert!(!screen.contains("Last sample"), "{screen}");
+    }
+
+    #[test]
+    fn a_server_sample_older_than_thirty_seconds_is_stale() {
+        let mut app = app();
+        let index = connected(&mut app);
+        sampled(&mut app, index, std::time::Duration::from_secs(31));
+        let screen = render(&mut app, 160, 40);
+        assert!(screen.contains("stale"), "{screen}");
+        assert!(screen.contains("Last sample"), "{screen}");
+    }
+
+    #[test]
+    fn a_local_sample_older_than_thirty_seconds_is_stale() {
+        let mut app = app();
+        sampled(&mut app, 0, std::time::Duration::from_secs(31));
+        let screen = render(&mut app, 160, 40);
+        assert!(screen.contains("stale"), "{screen}");
+        assert!(screen.contains("Last sample"), "{screen}");
+    }
+
     #[test]
     fn the_machine_summary_shows_state_address_and_next_step() {
         let mut app = app();

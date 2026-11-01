@@ -1172,12 +1172,18 @@ fn update_logs(
         *task = None;
         return;
     };
-    let containers = app.selected_containers();
-    let engine = &app.engines[row.engine];
-    let scope = log_scope_key(&row, engine, &containers, app.log_since);
+    let scope = log_scope_key(
+        &row,
+        &app.engines[row.engine],
+        app.selected_container_refs(),
+        app.log_since,
+    );
     if app.log_scope.as_deref() == Some(&scope) {
         return;
     }
+    // Ownership is needed by the subscription task, not by unchanged frame checks.
+    let containers = app.selected_containers();
+    let engine = &app.engines[row.engine];
     *task = None;
     app.log_generation += 1;
     app.log_scope = Some(scope);
@@ -1260,10 +1266,10 @@ fn update_logs(
     }
 }
 
-fn log_scope_key(
+fn log_scope_key<'a>(
     row: &tha::app::Row,
     engine: &tha::app::Engine,
-    containers: &[tha::model::Container],
+    containers: impl IntoIterator<Item = &'a tha::model::Container>,
     since: Option<i64>,
 ) -> String {
     format!(
@@ -1273,7 +1279,7 @@ fn log_scope_key(
         engine.error,
         since,
         containers
-            .iter()
+            .into_iter()
             .map(|container| container.key())
             .collect::<Vec<_>>()
     )
@@ -1292,7 +1298,7 @@ fn queue_log_export(app: &mut App, path: &str) -> Result<()> {
         .current()
         .context(tha::i18n::t("Log selection disappeared"))?;
     let engine = &app.engines[row.engine];
-    let key = log_scope_key(row, engine, &app.selected_containers(), app.log_since);
+    let key = log_scope_key(row, engine, app.selected_container_refs(), app.log_since);
     if app.tab != Tab::Logs
         || engine.error.is_some()
         || engine.alias.is_some()
@@ -3999,6 +4005,90 @@ mod tests {
         app.engines[engine].connection.endpoint = "unix:///new-podman.sock".into();
         update_logs(&mut app, &mut task, &tx, 100);
         assert!(app.log_generation > before);
+    }
+
+    #[tokio::test]
+    async fn log_subscription_retains_content_until_membership_since_or_availability_changes() {
+        let mut app = app();
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| row.engine == 0 && row.scope == tha::app::Scope::Engine)
+            .unwrap();
+        app.tab = Tab::Logs;
+        let (tx, _rx) = mpsc::channel(8);
+        let mut task = None;
+        update_logs(&mut app, &mut task, &tx, 100);
+        app.logs.push("api", "retained line", false);
+        let before = app.log_generation;
+        // Metadata updates do not replace a subscription to the same containers.
+        app.engines[0].snapshot.as_mut().unwrap().containers[0].status = "new status".into();
+        update_logs(&mut app, &mut task, &tx, 100);
+        assert_eq!(app.log_generation, before);
+        assert_eq!(app.logs.entries.back().unwrap().text, "retained line");
+
+        app.engines[0].snapshot.as_mut().unwrap().containers.pop();
+        update_logs(&mut app, &mut task, &tx, 100);
+        assert_eq!(app.log_generation, before + 1);
+        assert!(app.logs.entries.is_empty());
+        app.log_since = Some(123);
+        update_logs(&mut app, &mut task, &tx, 100);
+        assert_eq!(app.log_generation, before + 2);
+        app.engines[0].error = Some("disconnected".into());
+        update_logs(&mut app, &mut task, &tx, 100);
+        assert_eq!(app.log_generation, before + 3);
+        assert!(task.is_none());
+        app.engines[0].error = None;
+        update_logs(&mut app, &mut task, &tx, 100);
+        assert_eq!(app.log_generation, before + 4);
+        assert!(task.is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "Offline scope benchmark; run explicitly with --release --ignored --nocapture"]
+    async fn benchmark_unchanged_log_scope() {
+        for count in [1, 100, 1000, 5000] {
+            let mut app = App::new(tha::demo::connections(), 100, false, true);
+            app.update_engine(
+                0,
+                Ok(Snapshot {
+                    containers: (0..count)
+                        .map(|i| tha::model::Container {
+                            id: format!("id-{i}"),
+                            name: format!("container-{i}"),
+                            image: "example/image:latest".repeat(4),
+                            state: "running".into(),
+                            project: Some("project".into()),
+                            service: Some(format!("service-{i}")),
+                            networks: vec!["network-a".into(), "network-b".into()],
+                            volumes: vec!["volume-a".into(), "volume-b".into()],
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }),
+            );
+            app.selected = 0;
+            app.tab = Tab::Logs;
+            let (tx, _rx) = mpsc::channel(8);
+            let mut task = None;
+            update_logs(&mut app, &mut task, &tx, 100);
+            let generation = app.log_generation;
+            let mut samples = Vec::new();
+            for _ in 0..21 {
+                let started = std::time::Instant::now();
+                for _ in 0..20 {
+                    update_logs(std::hint::black_box(&mut app), &mut task, &tx, 100);
+                }
+                samples.push(started.elapsed().as_secs_f64() * 1e6 / 20.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            assert_eq!(app.log_generation, generation);
+            println!(
+                "log_scope/{count}/unchanged: median_us={:.3} batch_p95_us={:.3}",
+                samples[10], samples[19]
+            );
+        }
     }
 
     fn lifecycle_app(state: &str) -> App {

@@ -63,6 +63,8 @@ pub struct LogView {
     pub match_count: usize,
     pub match_index: Option<usize>,
     layouts: VecDeque<EntryLayout>,
+    /// Sum of retained layout rows, updated with append/eviction and invalidation.
+    visual_rows: usize,
     /// Newest entry the filter has judged. Rejected entries have no layout to remember them,
     /// and judging them again on every idle frame would rescan the buffer.
     layout_scanned: Option<u64>,
@@ -94,6 +96,7 @@ impl LogView {
             match_count: 0,
             match_index: None,
             layouts: VecDeque::new(),
+            visual_rows: 0,
             layout_scanned: None,
             layout_mode: None,
             search_stamp: None,
@@ -124,6 +127,7 @@ impl LogView {
 
     pub fn reset_content(&mut self) {
         self.layouts.clear();
+        self.visual_rows = 0;
         self.layout_scanned = None;
         self.reset_search_counts();
         self.anchor = None;
@@ -252,16 +256,17 @@ impl LogView {
         );
         if self.layout_mode.as_ref() != Some(&mode) {
             self.layouts.clear();
+            self.visual_rows = 0;
             self.layout_scanned = None;
             self.search_stamp = None;
             self.layout_mode = Some(mode);
         }
         let first = buffer.entries.front().map(|e| e.sequence).unwrap_or(0);
-        while self
-            .layouts
-            .front()
-            .is_some_and(|layout| layout.sequence < first)
-        {
+        while let Some(layout) = self.layouts.front() {
+            if layout.sequence >= first {
+                break;
+            }
+            self.visual_rows -= layout.ranges.len();
             self.layouts.pop_front();
         }
         let start = self.layout_scanned.map_or(0, |scanned| {
@@ -275,9 +280,11 @@ impl LogView {
                 self.layout_scans += 1;
             }
             if self.filter.matches(entry) {
+                let ranges = row_ranges(entry.display(), self.width, self.wrap);
+                self.visual_rows += ranges.len();
                 self.layouts.push_back(EntryLayout {
                     sequence: entry.sequence,
-                    ranges: row_ranges(entry.display(), self.width, self.wrap),
+                    ranges,
                 });
             }
         }
@@ -295,7 +302,7 @@ impl LogView {
     }
 
     fn total_rows(&self) -> usize {
-        self.layouts.iter().map(|layout| layout.ranges.len()).sum()
+        self.visual_rows
     }
 
     pub fn scroll_position(&self, buffer: &LogBuffer) -> (usize, usize) {
@@ -340,23 +347,25 @@ impl LogView {
     }
 
     pub fn visible(&self, buffer: &LogBuffer) -> Vec<VisualRow> {
-        let start = self.start(buffer);
-        self.layouts
-            .iter()
-            .flat_map(|layout| {
-                layout
-                    .ranges
-                    .iter()
-                    .enumerate()
-                    .map(move |(index, range)| VisualRow {
-                        sequence: layout.sequence,
-                        range: range.clone(),
-                        continuation: index > 0,
-                    })
-            })
-            .skip(start)
-            .take(self.height)
-            .collect()
+        let rows = self.layouts.iter().flat_map(|layout| {
+            layout
+                .ranges
+                .iter()
+                .enumerate()
+                .map(move |(index, range)| VisualRow {
+                    sequence: layout.sequence,
+                    range: range.clone(),
+                    continuation: index > 0,
+                })
+        });
+        if buffer.follow {
+            // Follow needs only the tail, regardless of retained wrapped history.
+            let mut visible: Vec<_> = rows.rev().take(self.height).collect();
+            visible.reverse();
+            visible
+        } else {
+            rows.skip(self.start(buffer)).take(self.height).collect()
+        }
     }
 
     pub fn scroll(&mut self, buffer: &mut LogBuffer, amount: isize) {
@@ -878,6 +887,82 @@ mod tests {
         buffer.push("api", "three", false);
         view.sync(&buffer, 2, 2);
         assert_eq!(view.visible(&buffer)[0].sequence, 1);
+    }
+
+    #[test]
+    fn follow_viewport_preserves_partial_entries_unicode_and_continuation_flags() {
+        let mut buffer = LogBuffer::new(3);
+        buffer.push("api", "abcdefgh", false);
+        buffer.push("api", "界界ab", false);
+        let mut view = LogView::new(true);
+        view.sync(&buffer, 4, 3);
+        let rows: Vec<_> = view
+            .visible(&buffer)
+            .into_iter()
+            .map(|row| (row.sequence, row.range, row.continuation))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(0, 4..8, true), (1, 0..6, false), (1, 6..8, true)]
+        );
+
+        view.first(&mut buffer);
+        view.scroll(&mut buffer, 1);
+        buffer.push("api", "ijklmnop", false);
+        buffer.push("api", "qrstuvwx", false);
+        view.sync(&buffer, 4, 3);
+        assert_eq!(view.scroll_position(&buffer), (0, 6));
+        buffer.follow = true;
+        let rows: Vec<_> = view
+            .visible(&buffer)
+            .into_iter()
+            .map(|row| (row.sequence, row.range, row.continuation))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(2, 4..8, true), (3, 0..4, false), (3, 4..8, true)]
+        );
+        assert_eq!(view.scroll_position(&buffer), (3, 6));
+
+        view.sync(&buffer, 8, 10);
+        assert_eq!(view.scroll_position(&buffer), (0, 3));
+        assert!(view.visible(&buffer).iter().all(|row| !row.continuation));
+        view.filter = text_filter("absent");
+        view.sync(&buffer, 8, 10);
+        assert_eq!(view.scroll_position(&buffer), (0, 0));
+        assert!(view.visible(&buffer).is_empty());
+    }
+
+    #[test]
+    fn follow_viewport_tracks_pretty_json_wrap_changes_and_content_reset() {
+        let mut buffer = LogBuffer::new(2);
+        buffer.push("api", r#"{"a":1}"#, false);
+        let mut view = LogView::new(true);
+        view.sync(&buffer, 80, 2);
+        view.toggle_pretty_json(&mut buffer);
+        assert_eq!(view.scroll_position(&buffer), (1, 3));
+        let rows: Vec<_> = view
+            .visible(&buffer)
+            .into_iter()
+            .map(|row| (row.range, row.continuation))
+            .collect();
+        assert_eq!(rows, vec![(2..10, true), (11..12, true)]);
+        view.toggle_wrap(&buffer);
+        assert_eq!(view.scroll_position(&buffer), (1, 3));
+        view.toggle_pretty_json(&mut buffer);
+        assert_eq!(view.scroll_position(&buffer), (0, 1));
+
+        view.reset_content();
+        buffer = LogBuffer::new(2);
+        view.sync(&buffer, 80, 2);
+        assert_eq!(view.scroll_position(&buffer), (0, 0));
+        buffer.push("api", "", false);
+        view.sync(&buffer, 80, 2);
+        assert_eq!(view.scroll_position(&buffer), (0, 1));
+        let rows = view.visible(&buffer);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].range, 0..0);
+        assert!(!rows[0].continuation);
     }
 
     #[test]
