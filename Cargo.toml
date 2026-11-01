@@ -1,6 +1,6 @@
 [package]
 name = "tha"
-version = "0.21.0"
+version = "0.21.1"
 edition = "2024"
 default-run = "tha"
 rust-version = "1.88"

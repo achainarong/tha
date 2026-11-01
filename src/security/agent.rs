@@ -20,6 +20,8 @@ use tokio::sync::{Semaphore, mpsc};
 #[serde(default, deny_unknown_fields)]
 pub struct Policy {
     pub enabled: bool,
+    /// Optional legacy/expert pin. Empty resolves the official registry image automatically.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub scanner_digest: String,
     pub interval_seconds: u64,
     pub limits: Limits,
@@ -54,8 +56,9 @@ impl Policy {
             "Security interval must be between one hour and 30 days"
         );
         ensure!(
-            !self.enabled || crate::platform::immutable_image_id(&self.scanner_digest),
-            "Security requires an approved sha256 manifest digest for docker.io/anchore/grype:latest"
+            self.scanner_digest.is_empty()
+                || crate::platform::immutable_image_id(&self.scanner_digest),
+            "Invalid optional scanner digest pin"
         );
         Ok(())
     }
@@ -316,19 +319,25 @@ impl Engine {
                 && info.pids_limit == Some(true),
             "Server engine cannot enforce scanner CPU/memory/swap/PID limits; scan refused"
         );
-        // Always verify latest against the approved digest, even for a cached scanner.
+        // Resolve and verify the official registry image even when a scanner is cached.
         let scanner = registry::scanner(&self.connection, &self.policy.scanner_digest).await?;
-        registry::database(&self.connection, &scanner, &self.policy.limits, update_db).await?;
+        registry::database(
+            &self.connection,
+            &scanner.image_id,
+            &self.policy.limits,
+            update_db,
+        )
+        .await?;
         let archive = source::export(target).await?;
         let mut report = grype::scan_limited(
             &self.connection,
             &grype::container_name(),
-            &scanner,
+            &scanner.image_id,
             archive.path(),
             &self.policy.limits,
         )
         .await?;
-        report.scanner_digest = Some(self.policy.scanner_digest.clone());
+        report.scanner_digest = Some(scanner.manifest_digest);
         source::verify(target).await?;
         store::save(target, &report)
     }
@@ -428,7 +437,12 @@ impl Engine {
 fn fresh(report: &Report, policy: &Policy, now: u64) -> bool {
     report.scanned <= now
         && now - report.scanned < policy.interval_seconds
-        && report.scanner_digest.as_deref() == Some(policy.scanner_digest.as_str())
+        && report
+            .scanner_digest
+            .as_deref()
+            .is_some_and(crate::platform::immutable_image_id)
+        && (policy.scanner_digest.is_empty()
+            || report.scanner_digest.as_deref() == Some(policy.scanner_digest.as_str()))
 }
 
 pub(super) fn runtime_proof(runtime: &str, host: &str) -> String {
@@ -478,15 +492,31 @@ mod tests {
         assert!(route(&Method::POST, &format!("/tha/security/scan/{image}")).is_none());
     }
     #[test]
-    fn enabled_policy_requires_a_valid_pinned_digest() {
+    fn enabled_policy_does_not_require_manual_scanner_approval() {
         assert!(
             Policy {
                 enabled: true,
                 ..Default::default()
             }
             .validate()
-            .is_err()
+            .is_ok()
         );
+    }
+
+    #[test]
+    fn automatically_verified_reports_are_cached_without_a_configured_pin() {
+        let policy = Policy {
+            enabled: true,
+            ..Default::default()
+        };
+        let report = Report {
+            findings: vec![],
+            scanner: "fixture".into(),
+            database: "fixture-db".into(),
+            scanned: 100,
+            scanner_digest: Some(format!("sha256:{}", "a".repeat(64))),
+        };
+        assert!(fresh(&report, &policy, 101));
     }
 
     #[test]

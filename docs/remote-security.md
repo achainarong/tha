@@ -3,17 +3,18 @@
 ## Enable on a server
 
 The server needs Linux, systemd, the Docker CLI, and a running Docker-compatible
-engine. Install/reconfigure as root, using your dedicated public SSH key and an
-**independently reviewed manifest/index digest** for `docker.io/anchore/grype:latest`:
+engine. Normal agent setup enables scheduled scans and automatically verifies the
+official Grype image. No manual SHA values or registry configuration are required:
 
 ```sh
-sudo tha-agent setup --user tha --key 'ssh-ed25519 AAAA...' \
-  --scanner-digest sha256:APPROVED_MANIFEST_DIGEST
+sudo tha-agent setup --user tha --key 'ssh-ed25519 AAAA...'
+# Or use your existing root SSH key:
+sudo tha-agent setup --user root
 ```
 
-The same `--scanner-digest` option works with the agent installer. It enables
-Security only on that server. Do not use Docker's local image ID as the approval:
-the registry manifest/index digest is a different identity.
+Both forms also work with the agent installer. Use `--no-security` to opt out.
+The main THA installation still needs its optional Security module to display and
+synchronize reports.
 
 Setup installs/enables `tha-agent.service`. Existing installations must rerun
 setup once to migrate dedicated-user socket permissions. Subsequent installer
@@ -29,7 +30,6 @@ The root-owned policy is `/etc/tha/agent.toml`. Example security section:
 ```toml
 [security]
 enabled = true
-scanner_digest = "sha256:APPROVED_MANIFEST_DIGEST"
 interval_seconds = 86400
 max_load_percent = 70
 min_available_memory_mb = 1536
@@ -63,16 +63,25 @@ Very large images can need higher memory limits; OOM is a failure, never a clean
 
 ## Scanner verification
 
-Before every scan, the agent contacts the fixed Docker Hub endpoints over HTTPS,
-hashes the `latest` manifest bytes, and compares them to the approved digest.
+Before every scan, the agent contacts the fixed official
+`docker.io/anchore/grype:latest` repository over authenticated HTTPS, obtains its
+manifest digest, and hashes the actual manifest bytes to verify that digest.
 A mismatch or failed verification prevents both image-layer pulling and execution.
 For a multi-platform index, the selected platform manifest must hash to the digest
-in that approved index. Pulls use that immutable digest, not `latest`; execution
+in that verified index. Pulls use that immutable digest, not `latest`; execution
 uses the verified config/image ID with `--pull=never`.
 
-Approving a digest is the trust decision; matching a hash is not publisher signature
-verification. When Anchore changes `latest`, new scans stop until an administrator
-reviews and approves its new digest. Saved reports remain readable.
+Cached local images are checked against the official config/image ID, not trusted
+because their tag says `anchore/grype`. New official releases are resolved
+automatically. Failed TLS, missing/mismatching digests or image-ID mismatches stop
+the job rather than falling back to an unchecked image.
+
+The trust source is the official Docker Hub repository and HTTPS certificate
+verification. This is source/integrity verification, not malware detection or
+container publisher-signature verification; it cannot guarantee an upstream release
+is free of vulnerabilities or malicious code. Existing optional `scanner_digest`
+pins remain an additional restriction; rerunning normal setup removes the need for
+the old manual pin.
 
 The agent constructs all scanner arguments. Clients cannot choose image names,
 commands, mounts, privileges or limits. General Docker create/pull/export APIs stay

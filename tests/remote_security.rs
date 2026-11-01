@@ -83,7 +83,7 @@ async fn report_sync_child() {
         scanner: "fixture".into(),
         database: "fixture-db".into(),
         scanned: now,
-        scanner_digest: Some(digest.clone()),
+        scanner_digest: Some(digest),
     };
     db.execute(
         "INSERT INTO reports VALUES (?1,'fixture-runtime',?2,?3,?4)",
@@ -103,7 +103,6 @@ async fn report_sync_child() {
         &engine,
         &Policy {
             enabled: true,
-            scanner_digest: digest,
             ..Default::default()
         },
         Arc::new(tokio::sync::Semaphore::new(0)),

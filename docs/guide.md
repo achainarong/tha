@@ -373,7 +373,7 @@ curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/instal
 The persistent systemd service owns the allowlist and optional scan schedules. SSH
 relays requests to root-owned Unix sockets; there is no additional network listener.
 Update agents along with `tha`. See [remote security](remote-security.md) for
-scanner approval, resource limits, scheduling and central report synchronization.
+automatic scanner verification, resource limits, scheduling and central report synchronization.
 
 Setup creates the dedicated user, writes the root-owned policy `/etc/tha/agent.toml`,
 and restricts the key in `authorized_keys` to the agent. It stops if that user already
@@ -435,7 +435,8 @@ login off for everyone, set `PasswordAuthentication no` on the server.
 **What the agent allows:** listing and inspecting containers, images, networks and
 volumes, image history, logs, stats, events, and start, stop and restart. Everything
 else is refused, including general create, exec, pull, build, file copy, prune and image
-export. Opt-in security endpoints can request only agent-constructed, verified scanner jobs.
+export. Security endpoints can request only agent-constructed, verified scanner jobs
+(enabled by setup unless `--no-security` is specified).
 Deleting containers, images and volumes is off unless setup ran with
 `--allow-delete`, and force is always refused. Writes and refusals go to the server's
 system log.

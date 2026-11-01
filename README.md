@@ -64,9 +64,9 @@ curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/instal
 Set the server user to `root` in Tha. Setup leaves root's keys unchanged;
 anyone holding that key retains full root access.
 
-Remote security scans are separately opt-in with an approved Grype manifest digest.
-They run on the server with resource limits and load-aware deferral; only reports
-are sent back and saved centrally. See [remote security setup](docs/remote-security.md).
+Agent setup enables resource-limited, load-aware security scans. The agent verifies
+the official Grype image automatically—no manual SHA setup. Only reports are sent
+back and saved centrally. Use `--no-security` to opt out. See [remote security](docs/remote-security.md).
 
 ## Configuration and development
 

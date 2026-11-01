@@ -26,15 +26,15 @@ async fn bytes(mut response: reqwest::Response) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn verify(bytes: &[u8], approved: &str) -> Result<()> {
+fn verify(bytes: &[u8], expected: &str) -> Result<()> {
     ensure!(
-        crate::platform::immutable_image_id(approved),
-        "Invalid approved manifest digest"
+        crate::platform::immutable_image_id(expected),
+        "Invalid registry manifest digest"
     );
     let actual = format!("sha256:{:x}", Sha256::digest(bytes));
     ensure!(
-        actual == approved,
-        "Scanner digest mismatch: approved {approved}, Docker Hub returned {actual}; no pull or execution allowed"
+        actual == expected,
+        "Scanner digest mismatch: expected {expected}, received {actual}; no pull or execution allowed"
     );
     Ok(())
 }
@@ -61,23 +61,52 @@ struct Platform {
     variant: Option<String>,
 }
 
-async fn manifest(client: &reqwest::Client, token: &str, reference: &str) -> Result<Vec<u8>> {
-    bytes(
-        client
-            .get(format!("{REGISTRY}/{reference}"))
-            .bearer_auth(token)
-            .header("Accept", ACCEPT)
-            .send()
-            .await?,
-    )
-    .await
+async fn manifest(
+    client: &reqwest::Client,
+    token: &str,
+    reference: &str,
+) -> Result<(Vec<u8>, String)> {
+    let response = client
+        .get(format!("{REGISTRY}/{reference}"))
+        .bearer_auth(token)
+        .header("Accept", ACCEPT)
+        .send()
+        .await?;
+    verified_manifest(response).await
 }
 
-pub(super) async fn scanner(connection: &Connection, approved: &str) -> Result<String> {
+async fn verified_manifest(response: reqwest::Response) -> Result<(Vec<u8>, String)> {
     ensure!(
-        crate::platform::immutable_image_id(approved),
-        "Invalid approved scanner digest"
+        response.status().is_success(),
+        "Docker Hub verification failed: {}",
+        response.status()
     );
+    let digest = response
+        .headers()
+        .get("docker-content-digest")
+        .context("Docker Hub did not provide a manifest digest; scan refused")?
+        .to_str()?
+        .to_owned();
+    let body = bytes(response).await?;
+    verify(&body, &digest)?;
+    Ok((body, digest))
+}
+
+pub(super) struct Scanner {
+    pub image_id: String,
+    pub manifest_digest: String,
+}
+
+pub(super) async fn scanner(connection: &Connection, pinned: &str) -> Result<Scanner> {
+    ensure!(
+        pinned.is_empty() || crate::platform::immutable_image_id(pinned),
+        "Invalid optional scanner digest pin"
+    );
+    let (client, token) = registry_client().await?;
+    resolve_and_prepare(connection, pinned, &client, &token).await
+}
+
+async fn registry_client() -> Result<(reqwest::Client, String)> {
     let client = reqwest::Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -90,8 +119,21 @@ pub(super) async fn scanner(connection: &Connection, approved: &str) -> Result<S
         token: String,
     }
     let token: Token = serde_json::from_slice(&token)?;
-    let latest = manifest(&client, &token.token, "latest").await?;
-    verify(&latest, approved)?;
+    Ok((client, token.token))
+}
+
+async fn resolve_and_prepare(
+    connection: &Connection,
+    pinned: &str,
+    client: &reqwest::Client,
+    token: &str,
+) -> Result<Scanner> {
+    let (latest, latest_digest) = manifest(client, token, "latest").await?;
+    // Trust only the fixed official repository over authenticated TLS. Existing
+    // administrator-supplied pins remain an optional, additional restriction.
+    if !pinned.is_empty() {
+        verify(&latest, pinned)?;
+    }
     let document: Manifest = serde_json::from_slice(&latest)?;
     let platform = grype::command(
         connection,
@@ -105,7 +147,7 @@ pub(super) async fn scanner(connection: &Connection, approved: &str) -> Result<S
         .split_once('/')
         .context("Unknown scanner platform")?;
     let (digest, document) = if document.manifests.is_empty() {
-        (approved.to_owned(), document)
+        (latest_digest.clone(), document)
     } else {
         let candidates: Vec<_> = document
             .manifests
@@ -127,7 +169,7 @@ pub(super) async fn scanner(connection: &Connection, approved: &str) -> Result<S
             crate::platform::immutable_image_id(digest),
             "Invalid platform manifest digest"
         );
-        let body = manifest(&client, &token.token, digest).await?;
+        let (body, _) = manifest(client, token, digest).await?;
         verify(&body, digest)?;
         (digest.clone(), serde_json::from_slice::<Manifest>(&body)?)
     };
@@ -140,7 +182,7 @@ pub(super) async fn scanner(connection: &Connection, approved: &str) -> Result<S
         "Invalid scanner config digest"
     );
     let reference = format!("docker.io/anchore/grype@{digest}");
-    // Looking up by approved config ID cannot follow a mutable local tag.
+    // Never trust a local image merely because it is tagged anchore/grype:latest.
     if grype::command(
         connection,
         &["image", "inspect", "--format", "{{.Id}}", &id],
@@ -161,7 +203,10 @@ pub(super) async fn scanner(connection: &Connection, approved: &str) -> Result<S
         String::from_utf8_lossy(&actual).trim() == id,
         "Downloaded scanner identity mismatch; execution refused"
     );
-    Ok(id)
+    Ok(Scanner {
+        image_id: id,
+        manifest_digest: latest_digest,
+    })
 }
 
 pub(super) async fn database(
@@ -210,5 +255,61 @@ mod tests {
     #[test]
     fn malformed_digest_is_not_a_registry_reference() {
         assert!(verify(b"x", "latest").is_err());
+    }
+
+    #[tokio::test]
+    async fn registry_metadata_is_verified_without_an_administrator_digest() {
+        let body = b"official manifest";
+        let digest = format!("sha256:{:x}", Sha256::digest(body));
+        let response = hyper::Response::builder()
+            .header("docker-content-digest", &digest)
+            .body(reqwest::Body::from(body.to_vec()))
+            .unwrap();
+        let (actual, resolved) = verified_manifest(response.into()).await.unwrap();
+        assert_eq!(actual, body);
+        assert_eq!(resolved, digest);
+    }
+
+    #[tokio::test]
+    async fn missing_or_mismatching_registry_digests_fail_closed() {
+        let response = hyper::Response::builder()
+            .body(reqwest::Body::from("manifest"))
+            .unwrap();
+        assert!(verified_manifest(response.into()).await.is_err());
+        let response = hyper::Response::builder()
+            .header(
+                "docker-content-digest",
+                format!("sha256:{}", "a".repeat(64)),
+            )
+            .body(reqwest::Body::from("tampered manifest"))
+            .unwrap();
+        assert!(verified_manifest(response.into()).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "Contacts official Docker Hub; metadata only, no Docker commands or image layer pulls"]
+    async fn live_official_manifest_chain_needs_no_manual_digest() {
+        let (client, token) = registry_client().await.unwrap();
+        let (body, digest) = manifest(&client, &token, "latest").await.unwrap();
+        assert!(crate::platform::immutable_image_id(&digest));
+        let document: Manifest = serde_json::from_slice(&body).unwrap();
+        for architecture in ["amd64", "arm64"] {
+            let selected = document
+                .manifests
+                .iter()
+                .find(|entry| {
+                    entry
+                        .platform
+                        .as_ref()
+                        .is_some_and(|p| p.os == "linux" && p.architecture == architecture)
+                })
+                .unwrap();
+            let (platform, _) = manifest(&client, &token, &selected.digest).await.unwrap();
+            verify(&platform, &selected.digest).unwrap();
+            let platform: Manifest = serde_json::from_slice(&platform).unwrap();
+            assert!(crate::platform::immutable_image_id(
+                &platform.config.unwrap().digest
+            ));
+        }
     }
 }

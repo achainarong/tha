@@ -223,7 +223,7 @@ def main():
                "chmod 755 /usr/local/bin/systemctl")
 
         public = (scratch / "key.pub").read_text().strip()
-        setup = f"tha-agent setup --user tha --key {shlex.quote(public)}"
+        setup = f"tha-agent setup --user tha --key {shlex.quote(public)} --no-security"
         print(inside(setup).stdout.strip())
         inside(setup)
         lines = inside("grep -c . /home/tha/.ssh/authorized_keys").stdout.strip()
@@ -276,7 +276,7 @@ def main():
         inside(
             "mkdir -p /root/.ssh && chmod 700 /root/.ssh && "
             f"echo {shlex.quote(root_public)} >> /root/.ssh/authorized_keys && "
-            "chmod 600 /root/.ssh/authorized_keys && tha-agent setup --user root"
+            "chmod 600 /root/.ssh/authorized_keys && tha-agent setup --user root --no-security"
         )
         if inside("grep -c . /root/.ssh/authorized_keys").stdout.strip() != "1":
             sys.exit("FAILED: root setup changed root's keys")

@@ -36,6 +36,7 @@ pub struct Options {
     pub engines: Vec<String>,
     pub scanner_digest: Option<String>,
     pub security_interval: u64,
+    pub no_security: bool,
 }
 
 /// A public key reduced to its type and data. The comment and any `authorized_keys` options
@@ -465,14 +466,7 @@ pub fn run_setup(options: &Options) -> Result<()> {
         )
     };
     let mut config = merge_config(existing, engines, options.allow_delete);
-    if let Some(digest) = &options.scanner_digest {
-        config.security = crate::security::agent::Policy {
-            enabled: true,
-            scanner_digest: digest.clone(),
-            interval_seconds: options.security_interval,
-            ..Default::default()
-        };
-    }
+    configure_security(&mut config.security, options);
     config.validate()?;
     ensure!(
         !config.engines.is_empty(),
@@ -512,6 +506,14 @@ pub fn run_setup(options: &Options) -> Result<()> {
     );
     finish_dedicated_setup(options, &account, &line, policy, config)?;
     super::service::install(&executable)
+}
+
+fn configure_security(policy: &mut crate::security::agent::Policy, options: &Options) {
+    // Normal setup enables the fixed, automatically verified scanner. Keep an
+    // explicit opt-out, without making users discover or maintain SHA values.
+    policy.enabled = !options.no_security;
+    policy.scanner_digest = options.scanner_digest.clone().unwrap_or_default();
+    policy.interval_seconds = options.security_interval;
 }
 
 fn finish_dedicated_setup(
@@ -586,6 +588,27 @@ fn finish_dedicated_setup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_setup_enables_automatic_scanner_verification_without_a_pin() {
+        let mut policy = crate::security::agent::Policy::default();
+        let mut options = Options {
+            user: "root".into(),
+            key: None,
+            allow_delete: false,
+            engines: vec![],
+            scanner_digest: None,
+            security_interval: 86400,
+            no_security: false,
+        };
+        configure_security(&mut policy, &options);
+        assert!(policy.enabled);
+        assert!(policy.scanner_digest.is_empty());
+        assert!(policy.validate().is_ok());
+        options.no_security = true;
+        configure_security(&mut policy, &options);
+        assert!(!policy.enabled);
+    }
 
     const ED25519: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBUo4CVCKfmH3UjnNfr0F2hsmKRKEFmCJfNDIyVGxsHq";
@@ -691,6 +714,7 @@ mod tests {
             engines: vec!["docker=/missing-security-test.sock".into()],
             scanner_digest: None,
             security_interval: 86400,
+            no_security: true,
         };
         let config = AgentConfig {
             allow_delete: false,

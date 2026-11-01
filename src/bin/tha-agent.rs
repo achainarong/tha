@@ -39,9 +39,12 @@ enum Command {
         /// Expose only this engine (repeatable); without it, every known socket found is exposed
         #[arg(long, value_name = "NAME=SOCKET")]
         engine: Vec<String>,
-        /// Opt in to scheduled security scans with this approved Docker Hub manifest digest
-        #[arg(long)]
+        /// Optional additional digest pin (not required for automatic verification)
+        #[arg(long, hide = true)]
         scanner_digest: Option<String>,
+        /// Disable remote security scanning (enabled by default; Grype is verified automatically)
+        #[arg(long)]
+        no_security: bool,
         /// Rescan interval in seconds (at least one hour)
         #[arg(long, default_value_t = 86400)]
         security_interval: u64,
@@ -81,6 +84,7 @@ async fn main() {
             engine,
             scanner_digest,
             security_interval,
+            no_security,
         }) => agent::setup::run_setup(&agent::setup::Options {
             user,
             key,
@@ -88,6 +92,7 @@ async fn main() {
             engines: engine,
             scanner_digest,
             security_interval,
+            no_security,
         }),
     };
     if let Err(error) = result {

@@ -479,7 +479,9 @@ async fn handle(
         .to_owned();
     let security_route = crate::security::agent::route(&method, &target);
     let decision = screen_headers(&request).and_then(|()| {
-        if security_route.is_some() && agent.security.is_some() {
+        if security_route.is_some() && agent.security.is_none() {
+            Err("security scanning is disabled on this server; rerun tha-agent setup without --no-security, then reconnect".into())
+        } else if security_route.is_some() {
             Ok(if method == Method::GET {
                 Access::Read
             } else {
@@ -681,6 +683,36 @@ pub async fn run(argument: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn disabled_security_reports_the_missing_setup_without_contacting_the_engine() {
+        let (client, server) = tokio::io::duplex(8192);
+        let agent = tokio::spawn(serve(
+            server,
+            Agent {
+                allow_delete: false,
+                socket: "/missing-security-fixture.sock".into(),
+                audit: |_| {},
+                security: None,
+            },
+        ));
+        let (mut sender, connection) = crate::remote::connect_channel(client).await.unwrap();
+        let connection = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri("http://agent/tha/security/images")
+                    .body(Empty::<Bytes>::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&bytes).contains("security scanning is disabled"));
+        connection.abort();
+        agent.abort();
+    }
 
     const ID: &str = "0123456789abcdef";
     const IMAGE: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

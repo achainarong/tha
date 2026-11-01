@@ -15,6 +15,7 @@
 #                         one named by --user. --user root sets it up for an existing root key.
 #                         Without these it only installs or updates; existing setup is kept.
 #                         --allow-delete lets that server delete containers, images and volumes.
+#                         Setup enables automatically verified Grype scans; --no-security opts out.
 #
 #   THA_MODE=service      same as passing `service`
 #   THA_VERSION=v0.6.0    install that release instead of the latest
@@ -50,6 +51,7 @@ if [ "$MODE" = agent ]; then
     agent_delete=
     agent_scanner_digest=
     agent_security_interval=
+    agent_no_security=
     while [ $# -gt 0 ]; do
         case $1 in
             --key) [ $# -ge 2 ] || die "--key needs the public key line"; agent_key=$2; shift 2 ;;
@@ -57,7 +59,8 @@ if [ "$MODE" = agent ]; then
             --allow-delete) agent_delete=1; shift ;;
             --scanner-digest) [ $# -ge 2 ] || die "--scanner-digest needs sha256:DIGEST"; agent_scanner_digest=$2; shift 2 ;;
             --security-interval) [ $# -ge 2 ] || die "--security-interval needs seconds"; agent_security_interval=$2; shift 2 ;;
-            *) die "unknown agent option '$1'; expected --key, --user, --allow-delete, --scanner-digest or --security-interval" ;;
+            --no-security) agent_no_security=1; shift ;;
+            *) die "unknown agent option '$1'; expected --key, --user, --allow-delete, --no-security or --security-interval" ;;
         esac
     done
     if [ "$agent_user" = root ]; then
@@ -67,11 +70,8 @@ if [ "$MODE" = agent ]; then
     elif [ -z "$agent_key" ] && [ -n "$agent_delete" ]; then
         die "--allow-delete needs --key or --user root"
     fi
-    if [ -n "$agent_scanner_digest$agent_security_interval" ] && [ -z "$agent_key$agent_user" ]; then
+    if [ -n "$agent_scanner_digest$agent_security_interval$agent_no_security" ] && [ -z "$agent_key$agent_user" ]; then
         die "security options need --key or --user root"
-    fi
-    if [ -n "$agent_security_interval" ] && [ -z "$agent_scanner_digest" ]; then
-        die "--security-interval needs --scanner-digest"
     fi
 else
     [ $# -eq 0 ] || die "only agent mode takes options, not '$1'"
@@ -249,6 +249,7 @@ if [ "$MODE" = agent ]; then
     [ -z "$agent_delete" ] || set -- "$@" --allow-delete
     [ -z "$agent_scanner_digest" ] || set -- "$@" --scanner-digest "$agent_scanner_digest"
     [ -z "$agent_security_interval" ] || set -- "$@" --security-interval "$agent_security_interval"
+    [ -z "$agent_no_security" ] || set -- "$@" --no-security
     run "$bin" "$@" < /dev/null ||
         die "tha-agent was installed, but setup failed; fix the problem above and run this again"
     exit 0
