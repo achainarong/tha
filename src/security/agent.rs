@@ -19,7 +19,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -151,19 +151,65 @@ impl ActiveSchedule {
         }
     }
 
-    /// `None` while automatic scans are off, otherwise whether a start has passed.
-    fn due(&self, now: u64) -> Option<bool> {
+    /// `None` while automatic scans are off, otherwise the start that has passed, if any.
+    fn due(&self, now: u64) -> Option<Option<u64>> {
         let cron = self.cron.as_ref()?;
-        Some(cron.next(self.last_run).is_some_and(|next| next <= now))
+        Some(cron.next(self.last_run).filter(|next| *next <= now))
+    }
+
+    /// Takes effect only once saved, so a refused change is not quietly active until a restart.
+    fn replace(&mut self, cron: Option<Cron>, ignore_thresholds: bool, now: u64) -> Result<()> {
+        let replacement = Self {
+            cron,
+            ignore_thresholds,
+            // A new schedule starts from now and does not catch up on earlier starts.
+            last_run: now,
+            path: self.path.clone(),
+        };
+        replacement.save()?;
+        *self = replacement;
+        Ok(())
     }
 }
 
-/// Between starts only images without a report are scanned, or failed ones after an hour.
-fn should_enqueue(due: bool, scanned: u64, failed_at: Option<u64>, now: u64) -> bool {
-    due || match failed_at {
-        Some(at) => now.saturating_sub(at) >= 3600,
-        None => scanned == 0,
+/// A passed `start` rescans what predates it, so finishing an interrupted pass repeats nothing.
+/// Otherwise only images without a report are scanned. Failures wait an hour between attempts,
+/// unless they happened before the start.
+fn should_enqueue(start: Option<u64>, scanned: u64, failed_at: Option<u64>, now: u64) -> bool {
+    let backing_off = failed_at
+        .is_some_and(|at| now.saturating_sub(at) < 3600 && start.is_none_or(|start| at >= start));
+    !backing_off
+        && (failed_at.is_some() || scanned == 0 || start.is_some_and(|start| scanned < start))
+}
+
+/// A scan holds the server's one permit only while it may start. Waiting for headroom with the
+/// permit would also block engines that ignore the thresholds.
+async fn admission(
+    may_start: impl Fn() -> bool,
+    waiting: impl Fn(),
+    scans: &Arc<Semaphore>,
+    poll: Duration,
+) -> Option<OwnedSemaphorePermit> {
+    loop {
+        if may_start() {
+            let permit = scans.clone().acquire_owned().await.ok()?;
+            // Another scan may have used up the headroom in the meantime.
+            if may_start() {
+                return Some(permit);
+            }
+        } else {
+            waiting();
+        }
+        tokio::time::sleep(poll).await;
     }
+}
+
+/// The store keeps reports from earlier runtime identities of the same endpoint.
+fn on_runtime(reports: Vec<(Target, u64)>, runtime: &str) -> Vec<(Target, u64)> {
+    reports
+        .into_iter()
+        .filter(|(target, _)| target.runtime == runtime)
+        .collect()
 }
 
 pub enum Route<'a> {
@@ -303,12 +349,14 @@ impl Engine {
                     }
                     work = receiver.recv() => {
                         let Some(Work { target, update_db }) = work else { break; };
-                        let Ok(_permit) = scans.clone().acquire_owned().await else { break; };
-                        worker.set_state(&target, "waiting", None);
                         // Read each time, so turning the checkbox on releases a waiting scan.
-                        while !worker.ignores_thresholds() && !worker.has_headroom() {
-                            tokio::time::sleep(Duration::from_secs(30)).await;
-                        }
+                        let admitted = admission(
+                            || worker.ignores_thresholds() || worker.has_headroom(),
+                            || worker.set_state(&target, "waiting", None),
+                            &scans,
+                            Duration::from_secs(30),
+                        ).await;
+                        let Some(_permit) = admitted else { break; };
                         worker.set_state(&target, "running", None);
                         let result = tokio::time::timeout(Duration::from_secs(1800), worker.scan(&target, update_db)).await
                             .context("Remote scan timed out").and_then(|result| result);
@@ -349,22 +397,6 @@ impl Engine {
             .await?
             .context("Runtime identity unavailable")?;
         Ok((runtime, info.name.unwrap_or_default()))
-    }
-
-    async fn target(&self, image: &str) -> Result<Target> {
-        ensure!(
-            crate::platform::immutable_image_id(image),
-            "An immutable image ID is required"
-        );
-        let (runtime, _) = self.identity().await?;
-        let target = Target {
-            connection: self.connection.clone(),
-            runtime,
-            image: image.into(),
-            label: image.into(),
-        };
-        source::verify(&target).await?;
-        Ok(target)
     }
 
     fn enqueue(&self, target: Target, force: bool, update_db: bool) -> Result<()> {
@@ -426,17 +458,13 @@ impl Engine {
         };
         let now = updates::now();
         let mut schedule = self.schedule_state()?;
-        schedule.cron = cron;
-        schedule.ignore_thresholds = ignore_thresholds;
-        // A new schedule starts from now and does not catch up on earlier starts.
-        schedule.last_run = now;
-        schedule.save()?;
+        schedule.replace(cron, ignore_thresholds, now)?;
         Ok(schedule.status(now))
     }
 
     async fn schedule(&self) -> Result<()> {
         let now = updates::now();
-        let Some(due) = self.schedule_state()?.due(now) else {
+        let Some(start) = self.schedule_state()?.due(now) else {
             return Ok(());
         };
         let docker = crate::backend::docker::connect(&self.connection)?
@@ -452,28 +480,59 @@ impl Engine {
         let mut images: Vec<_> = containers.into_iter().filter_map(|c| c.image_id).collect();
         images.sort();
         images.dedup();
+        let (runtime, _) = self.identity().await?;
+        let mut queued_all = true;
         for image in images {
             if !crate::platform::immutable_image_id(&image) {
                 continue;
             }
-            let failed_at = self
-                .jobs
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Agent job state unavailable"))?
-                .get(&image)
-                .filter(|job| job.state == "failed")
-                .map(|job| job.at);
-            let target = self.target(&image).await?;
-            if should_enqueue(due, store::scanned(&target)?, failed_at, now)
-                && let Err(error) = self.enqueue(target, true, false)
-            {
+            let (active, failed_at) = {
+                let jobs = self
+                    .jobs
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Agent job state unavailable"))?;
+                let job = jobs.get(&image);
+                (
+                    job.is_some_and(|job| {
+                        matches!(job.state.as_str(), "queued" | "waiting" | "running")
+                    }),
+                    job.filter(|job| job.state == "failed").map(|job| job.at),
+                )
+            };
+            if active {
+                continue;
+            }
+            let target = Target {
+                connection: self.connection.clone(),
+                runtime: runtime.clone(),
+                image: image.clone(),
+                label: image,
+            };
+            if !should_enqueue(start, store::scanned(&target)?, failed_at, now) {
+                continue;
+            }
+            // One unusable image, such as a stopped container's deleted one, must not hold up
+            // the others. Recording the failure makes it wait an hour like any failed scan.
+            if let Err(error) = source::verify(&target).await {
+                eprintln!("tha-agent security: {error:#}");
+                self.set_state(
+                    &target,
+                    "failed",
+                    Some(crate::layers::text(&format!("{error:#}"))),
+                );
+                continue;
+            }
+            if let Err(error) = self.enqueue(target, true, false) {
                 eprintln!("tha-agent security queue: {error:#}");
+                queued_all = false;
                 break;
             }
         }
-        if due {
+        // A full queue leaves the start open, and the next pass continues with what is left.
+        if start.is_some() && queued_all {
             let mut schedule = self.schedule_state()?;
-            schedule.last_run = now;
+            // A schedule set during this pass starts from its own, later time.
+            schedule.last_run = schedule.last_run.max(now);
             schedule.save()?;
         }
         Ok(())
@@ -536,9 +595,10 @@ impl Engine {
     /// `(image, scanned, critical findings)` for each saved report, for the alert rules.
     pub async fn critical_counts(&self) -> Result<Vec<(String, u64, usize)>> {
         let connection = self.connection.clone();
+        let (runtime, _) = self.identity().await?;
         tokio::task::spawn_blocking(move || {
             let mut counts = Vec::new();
-            for (target, scanned) in store::list(&connection)? {
+            for (target, scanned) in on_runtime(store::list(&connection)?, &runtime) {
                 if let Some(report) = store::load(&target)? {
                     let critical = report
                         .findings
@@ -566,9 +626,8 @@ impl Engine {
             )?),
             Route::Images => {
                 let (runtime, host) = self.identity().await?;
-                let entries = store::list(&self.connection)?
+                let entries = on_runtime(store::list(&self.connection)?, &runtime)
                     .into_iter()
-                    .filter(|(target, _)| target.runtime == runtime)
                     .map(|(target, scanned)| Entry {
                         runtime: target.runtime,
                         host: host.clone(),
@@ -817,30 +876,133 @@ mod tests {
         let hour = 3600;
         let now = 1_781_524_800; // On a whole hour.
         let hourly = |last_run| schedule(Some("0 * * * *"), last_run, None);
-        assert_eq!(hourly(now - 1).due(now), Some(true));
-        assert_eq!(hourly(now).due(now), Some(false));
-        assert_eq!(hourly(now).due(now + hour - 1), Some(false));
-        assert_eq!(hourly(now - 30 * 24 * hour).due(now), Some(true));
+        assert_eq!(hourly(now - 1).due(now), Some(Some(now)));
+        assert_eq!(hourly(now).due(now), Some(None));
+        assert_eq!(hourly(now).due(now + hour - 1), Some(None));
+        assert!(hourly(now - 30 * 24 * hour).due(now).flatten().is_some());
     }
 
     #[test]
     fn only_new_or_long_failed_images_scan_between_starts() {
         let now = 100_000;
-        assert!(should_enqueue(true, 50, None, now), "a start rescans");
+        let start = Some(now - 60);
+        assert!(should_enqueue(start, 50, None, now), "a start rescans");
         assert!(
-            should_enqueue(true, 50, Some(now), now),
-            "a start overrides the backoff"
+            should_enqueue(start, 50, Some(now - 120), now),
+            "a start overrides an earlier failure's backoff"
         );
-        assert!(should_enqueue(false, 0, None, now), "new image");
-        assert!(!should_enqueue(false, 50, None, now), "scanned images wait");
+        assert!(should_enqueue(None, 0, None, now), "new image");
+        assert!(!should_enqueue(None, 50, None, now), "scanned images wait");
         assert!(
-            !should_enqueue(false, 0, Some(now - 3599), now),
+            !should_enqueue(None, 0, Some(now - 3599), now),
             "failure backs off"
         );
         assert!(
-            should_enqueue(false, 50, Some(now - 3600), now),
+            should_enqueue(None, 50, Some(now - 3600), now),
             "failure retries"
         );
+    }
+
+    #[test]
+    fn a_pass_left_open_does_not_repeat_what_it_already_handled() {
+        let now = 100_000;
+        let start = Some(now - 60);
+        assert!(
+            !should_enqueue(start, now - 30, None, now),
+            "Already scanned since this start"
+        );
+        assert!(
+            !should_enqueue(start, 50, Some(now - 30), now),
+            "Failed since this start, so it waits like other failures"
+        );
+    }
+
+    #[test]
+    fn a_schedule_that_cannot_be_saved_does_not_take_effect() {
+        let mut active = schedule(Some("0 0 * * *"), 123, None);
+        let before = active.cron.clone();
+        assert!(
+            active
+                .replace(Some(Cron::parse("0 1 * * *").unwrap()), true, 456)
+                .is_err()
+        );
+        assert_eq!(active.cron, before);
+        assert!(!active.ignore_thresholds);
+        assert_eq!(active.last_run, 123);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        let mut active = schedule(Some("0 0 * * *"), 123, Some(path.clone()));
+        active.replace(None, true, 456).unwrap();
+        let loaded = ActiveSchedule::load(Some(path));
+        assert_eq!((loaded.cron, loaded.last_run), (None, 456));
+        assert_eq!(active.last_run, 456);
+        assert!(active.ignore_thresholds);
+    }
+
+    #[tokio::test]
+    async fn a_scan_waiting_for_headroom_leaves_the_permit_to_other_engines() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let scans = Arc::new(Semaphore::new(1));
+        let headroom = Arc::new(AtomicBool::new(false));
+        let waits = Arc::new(AtomicUsize::new(0));
+        let waiting = {
+            let (scans, headroom, waits) = (scans.clone(), headroom.clone(), waits.clone());
+            tokio::spawn(async move {
+                admission(
+                    || headroom.load(Ordering::SeqCst),
+                    || {
+                        waits.fetch_add(1, Ordering::SeqCst);
+                    },
+                    &scans,
+                    Duration::from_millis(1),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while waits.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(scans.available_permits(), 1);
+
+        // Another engine's scan runs, and the waiting one still needs it to finish.
+        let other = scans.clone().try_acquire_owned().unwrap();
+        headroom.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!waiting.is_finished());
+        drop(other);
+        let permit = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(permit.is_some());
+        assert_eq!(scans.available_permits(), 0);
+    }
+
+    #[test]
+    fn only_the_current_runtimes_reports_count() {
+        let report = |runtime: &str, scanned| {
+            (
+                Target {
+                    connection: Connection {
+                        name: "fixture".into(),
+                        kind: BackendKind::Docker,
+                        endpoint: "unix:///fixture".into(),
+                    },
+                    runtime: runtime.into(),
+                    image: "image".into(),
+                    label: String::new(),
+                },
+                scanned,
+            )
+        };
+        let reports = on_runtime(vec![report("new", 2), report("old", 1)], "new");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].0.runtime, "new");
     }
 
     #[test]

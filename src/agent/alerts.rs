@@ -5,11 +5,20 @@
 use crate::{alerts::Rules, events::Event};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
-use std::{collections::HashMap, os::unix::fs::MetadataExt, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    future::Future,
+    os::unix::fs::MetadataExt,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 pub const WEBHOOK_PATH: &str = "/etc/tha/alert-webhook";
 const CHECK_EVERY: Duration = Duration::from_secs(30);
 const MAX_PER_CHECK: usize = 20;
+/// How many messages wait for a webhook that is down, before the oldest are given up on.
+const MAX_WAITING: usize = 1000;
 const DISK_LOW_PERCENT: u64 = 5;
 /// Free space has to recover this far before a full disk can be reported again.
 const DISK_OK_PERCENT: u64 = 10;
@@ -255,6 +264,39 @@ async fn send(client: &reqwest::Client, url: &str, body: &serde_json::Value) -> 
     Ok(())
 }
 
+/// The watcher reports each incident only once, so its messages wait here until delivered.
+#[derive(Default)]
+struct Outbox {
+    waiting: VecDeque<Message>,
+}
+
+impl Outbox {
+    /// Returns how many of the oldest messages had to be given up on.
+    fn add(&mut self, messages: impl IntoIterator<Item = Message>) -> usize {
+        self.waiting.extend(messages);
+        let excess = self.waiting.len().saturating_sub(MAX_WAITING);
+        self.waiting.drain(..excess);
+        excess
+    }
+
+    /// Sends in order, up to the limit for one check. A failure keeps that message and the
+    /// ones behind it for the next check.
+    async fn flush<F, Sending>(&mut self, mut send: F) -> Result<()>
+    where
+        F: FnMut(&Message) -> Sending,
+        Sending: Future<Output = Result<()>>,
+    {
+        for _ in 0..MAX_PER_CHECK {
+            let Some(message) = self.waiting.front() else {
+                break;
+            };
+            send(message).await?;
+            self.waiting.pop_front();
+        }
+        Ok(())
+    }
+}
+
 pub fn spawn(
     url: String,
     engine: String,
@@ -271,6 +313,7 @@ pub fn spawn(
         let host = hostname();
         let mut watcher = Watcher::new(Rules::default(), crate::history::now_ms());
         let mut warned = false;
+        let mut outbox = Outbox::default();
         let mut tick = tokio::time::interval(CHECK_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -293,16 +336,24 @@ pub fn spawn(
             {
                 messages.extend(watcher.scans(&reports, now));
             }
-            messages.truncate(MAX_PER_CHECK);
-            for message in messages {
-                match send(&client, &url, &payload(&host, &engine, &message)).await {
-                    Ok(()) => warned = false,
-                    Err(error) => {
-                        if !warned {
-                            eprintln!("tha-agent: could not send an alert: {error:#}");
-                        }
-                        warned = true;
+            let given_up = outbox.add(messages);
+            if given_up > 0 {
+                eprintln!("tha-agent: gave up on {given_up} undelivered alerts");
+            }
+            let delivered = outbox
+                .flush(|message| {
+                    let body = payload(&host, &engine, message);
+                    let (client, url) = (&client, &url);
+                    async move { send(client, url, &body).await }
+                })
+                .await;
+            match delivered {
+                Ok(()) => warned = false,
+                Err(error) => {
+                    if !warned {
+                        eprintln!("tha-agent: could not send an alert, will retry: {error:#}");
                     }
+                    warned = true;
                 }
             }
         }
@@ -428,6 +479,53 @@ mod tests {
             rules(&watcher.scans(&new_image, 0)),
             ["critical_vulnerabilities"]
         );
+    }
+
+    fn numbered(count: usize) -> Vec<Message> {
+        (0..count)
+            .map(|at| Message {
+                rule: "unhealthy",
+                subject: "api".into(),
+                detail: String::new(),
+                at_ms: at as i64,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn undelivered_alerts_wait_for_the_next_check_in_order() {
+        use std::cell::RefCell;
+        let mut outbox = Outbox::default();
+        assert_eq!(outbox.add(numbered(MAX_PER_CHECK + 5)), 0);
+
+        // The limit for one check holds the rest back instead of dropping them.
+        let sent = RefCell::new(Vec::new());
+        let record = |message: &Message| {
+            sent.borrow_mut().push(message.at_ms);
+            async { Ok(()) }
+        };
+        outbox.flush(record).await.unwrap();
+        assert_eq!(sent.borrow().len(), MAX_PER_CHECK);
+        assert_eq!(outbox.waiting.len(), 5);
+
+        // A failure keeps the failed message and everything behind it.
+        let failing = |_: &Message| async { anyhow::bail!("webhook down") };
+        assert!(outbox.flush(failing).await.is_err());
+        assert_eq!(outbox.waiting.len(), 5);
+
+        sent.borrow_mut().clear();
+        outbox.flush(record).await.unwrap();
+        let first = MAX_PER_CHECK as i64;
+        assert_eq!(*sent.borrow(), (first..first + 5).collect::<Vec<_>>());
+        assert!(outbox.waiting.is_empty());
+    }
+
+    #[test]
+    fn a_webhook_that_stays_down_costs_only_the_oldest_alerts() {
+        let mut outbox = Outbox::default();
+        assert_eq!(outbox.add(numbered(MAX_WAITING + 3)), 3);
+        assert_eq!(outbox.waiting.len(), MAX_WAITING);
+        assert_eq!(outbox.waiting[0].at_ms, 3);
     }
 
     #[test]

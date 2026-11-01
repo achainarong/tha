@@ -15,6 +15,9 @@ pub struct Cron {
     weekdays: u8,
     any_day: bool,
     any_weekday: bool,
+    /// Neither minute nor hour starts with a star, so the schedule names a time of day.
+    /// As in cron, only such schedules are adjusted when the clocks change.
+    fixed_time: bool,
 }
 
 const MONTHS: [&str; 12] = [
@@ -76,6 +79,22 @@ struct Local {
     month: u32,
     weekday: u32,
     year: i32,
+    /// Seconds east of UTC at this moment.
+    offset: i64,
+}
+
+impl Local {
+    fn new(tm: &libc::tm, offset: i64) -> Self {
+        Self {
+            minute: tm.tm_min as u32,
+            hour: tm.tm_hour as u32,
+            day: tm.tm_mday as u32,
+            month: tm.tm_mon as u32 + 1,
+            weekday: tm.tm_wday as u32,
+            year: tm.tm_year + 1900,
+            offset,
+        }
+    }
 }
 
 fn local(time: u64) -> Option<Local> {
@@ -89,14 +108,22 @@ fn local(time: u64) -> Option<Local> {
         }
         tm
     };
-    Some(Local {
-        minute: tm.tm_min as u32,
-        hour: tm.tm_hour as u32,
-        day: tm.tm_mday as u32,
-        month: tm.tm_mon as u32 + 1,
-        weekday: tm.tm_wday as u32,
-        year: tm.tm_year + 1900,
-    })
+    Some(Local::new(&tm, tm.tm_gmtoff as i64))
+}
+
+/// What a clock set to `offset` shows at `time`, including times the zone itself skips.
+fn wall_clock(time: u64, offset: i64) -> Option<Local> {
+    let shifted = libc::time_t::try_from(i64::try_from(time).ok()?.checked_add(offset)?).ok()?;
+    // SAFETY: an all-zero `tm` is a valid value, and `gmtime_r` only accesses the two
+    // valid, exclusively borrowed values passed here.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::gmtime_r(&shifted, &mut tm).is_null() {
+            return None;
+        }
+        tm
+    };
+    Some(Local::new(&tm, offset))
 }
 
 impl Cron {
@@ -131,6 +158,7 @@ impl Cron {
             weekdays: ((weekdays & 0x7f) | u64::from(weekdays & 0x80 != 0)) as u8,
             any_day: day.starts_with('*'),
             any_weekday: weekday.starts_with('*'),
+            fixed_time: !minute.starts_with('*') && !hour.starts_with('*'),
             source: text,
         };
         // 31 February is valid field by field but would silently never scan.
@@ -156,18 +184,52 @@ impl Cron {
         }
     }
 
-    /// The first start strictly after `after`, on a whole minute.
+    fn hour_matches(&self, time: &Local) -> bool {
+        self.months & (1 << time.month) != 0
+            && self.day_matches(time)
+            && self.hours & (1 << time.hour) != 0
+    }
+
+    fn minute_matches(&self, time: &Local) -> bool {
+        self.hour_matches(time) && self.minutes & (1 << time.minute) != 0
+    }
+
+    /// The clocks jumped forward at `time`, over a start this schedule names.
+    fn skipped_a_start(
+        &self,
+        time: u64,
+        now: &Local,
+        zone: &impl Fn(u64) -> Option<Local>,
+    ) -> bool {
+        let Some(before) = time.checked_sub(60).and_then(zone) else {
+            return false;
+        };
+        let jump = (now.offset - before.offset) / 60;
+        jump > 0
+            && (0..jump as u64).any(|minute| {
+                wall_clock(time + minute * 60, before.offset)
+                    .is_some_and(|skipped| self.minute_matches(&skipped))
+            })
+    }
+
+    /// The first start strictly after `after`, on a whole minute. A time of day the clocks
+    /// skip runs right after the change, and one they repeat runs only the first time.
     pub fn next(&self, after: u64) -> Option<u64> {
+        self.next_in(after, &local)
+    }
+
+    fn next_in(&self, after: u64, zone: &impl Fn(u64) -> Option<Local>) -> Option<u64> {
         let mut time = (after / 60 + 1) * 60;
         let limit = after.saturating_add(LOOK_AHEAD_SECONDS);
         while time <= limit {
-            let now = local(time)?;
-            if self.months & (1 << now.month) == 0
-                || !self.day_matches(&now)
-                || self.hours & (1 << now.hour) == 0
-            {
+            let now = zone(time)?;
+            if self.fixed_time && self.skipped_a_start(time, &now, zone) {
+                return Some(time);
+            }
+            if !self.hour_matches(&now) {
                 time += 3600 - u64::from(now.minute) * 60;
-            } else if self.minutes & (1 << now.minute) == 0 {
+            } else if !self.minute_matches(&now) || (self.fixed_time && repeated(time, &now, zone))
+            {
                 time += 60;
             } else {
                 return Some(time);
@@ -175,6 +237,19 @@ impl Cron {
         }
         None
     }
+}
+
+/// The clocks went back, and already showed this time of day once.
+fn repeated(time: u64, now: &Local, zone: &impl Fn(u64) -> Option<Local>) -> bool {
+    let Some(earlier) = time.checked_sub(86400).and_then(zone) else {
+        return false;
+    };
+    let back = earlier.offset - now.offset;
+    back > 0
+        && time
+            .checked_sub(back as u64)
+            .and_then(zone)
+            .is_some_and(|first| first.offset == earlier.offset)
 }
 
 /// `2026-11-02 00:00` in the server's time zone.
@@ -264,6 +339,58 @@ mod tests {
             assert!(Cron::parse(schedule).is_err(), "{schedule}");
         }
         assert!(Cron::parse(&format!("0 0 * * {}", "0,".repeat(80) + "0")).is_err());
+    }
+
+    /// Berlin in 2026: 01:00 UTC is 02:00 turning into 03:00, then 03:00 turning into 02:00.
+    const FORWARD: u64 = 1_774_746_000;
+    const BACK: u64 = 1_792_890_000;
+    const HOUR: u64 = 3600;
+    fn berlin(time: u64) -> Option<Local> {
+        let summer = (FORWARD..BACK).contains(&time);
+        wall_clock(time, if summer { 7200 } else { 3600 })
+    }
+    fn next_in_berlin(schedule: &str, after: u64) -> u64 {
+        Cron::parse(schedule)
+            .unwrap()
+            .next_in(after, &berlin)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_time_the_clocks_skip_runs_right_after_the_change_and_only_on_its_day() {
+        assert_eq!(next_in_berlin("30 2 * * *", FORWARD - HOUR), FORWARD);
+        assert_eq!(
+            next_in_berlin("30 2 * * *", FORWARD),
+            FORWARD + 23 * HOUR + 1800,
+            "Back to 02:30 the next day, once"
+        );
+        assert_eq!(next_in_berlin("0 3 * * *", FORWARD - HOUR), FORWARD);
+        assert_ne!(
+            next_in_berlin("30 2 1 * *", FORWARD - HOUR),
+            FORWARD,
+            "Not its day of the month"
+        );
+    }
+
+    #[test]
+    fn a_time_the_clocks_repeat_runs_only_the_first_time() {
+        let first = BACK - 1800;
+        assert_eq!(next_in_berlin("30 2 * * *", first - 60), first);
+        assert_eq!(next_in_berlin("30 2 * * *", first), BACK + 1800 + 24 * HOUR);
+        // 01:30 and 03:30 happen once, on either side of the repeated hour.
+        assert_eq!(
+            next_in_berlin("30 1 * * *", first - HOUR - 60),
+            first - HOUR
+        );
+        assert_eq!(next_in_berlin("30 3 * * *", first - 60), BACK + HOUR + 1800);
+    }
+
+    #[test]
+    fn schedules_with_a_star_follow_real_time_through_clock_changes() {
+        assert_eq!(next_in_berlin("0 * * * *", FORWARD - HOUR), FORWARD);
+        assert_eq!(next_in_berlin("0 * * * *", FORWARD), FORWARD + HOUR);
+        assert_eq!(next_in_berlin("30 * * * *", BACK - 1800), BACK + 1800);
+        assert_eq!(next_in_berlin("* 2 * * *", BACK), BACK + 60);
     }
 
     #[test]

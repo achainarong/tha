@@ -350,7 +350,11 @@ for arg in "$@"; do
 done
 case "$1" in
  pull|run|create|rm) exit 0 ;;
- image) if [ "$2" = inspect ]; then printf '%s\n' "$FIXTURE_SCANNER"; fi; exit 0 ;;
+ image)
+  if [ "$2" = rm ]; then echo 'conflict: image is being used by stopped container' >&2; exit 1; fi
+  if [ "$2" = inspect ]; then printf '%s\n' "$FIXTURE_SCANNER"; fi
+  exit 0
+  ;;
  cp) cp "$2" "$FIXTURE_ROOT/image"; exit 0 ;;
  inspect) echo 0; exit 0 ;;
  start)
@@ -460,7 +464,17 @@ esac
             .lines()
             .all(|line| line == "FAIL-second" || line.starts_with(&format!("--host {endpoint} ")))
     );
-    assert!(calls.contains(&format!("image rm --no-prune {old_scanner}")));
+    // An old scanner that cannot be removed stops neither the queue nor the update's record.
+    assert_eq!(
+        calls
+            .matches(&format!("image rm --no-prune {old_scanner}"))
+            .count(),
+        1
+    );
+    assert_eq!(calls.matches("pull anchore/grype:latest").count(), 1);
+    let updates: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("updates.json")).unwrap()).unwrap();
+    assert_ne!(updates[&endpoint]["scanner"], old_scanner.as_str());
     assert!(calls.contains("--network=none"));
     assert!(calls.contains("rm --force tha-security-"));
     assert!(

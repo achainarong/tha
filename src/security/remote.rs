@@ -215,11 +215,25 @@ async fn enqueue(target: &Target, refresh: bool) -> Result<Snapshot> {
     Ok(snapshot)
 }
 
+/// The report of a job accepted while the saved report was from `baseline`. The agent keeps jobs
+/// in memory, so after a restart it answers with that old report, or with no job at all.
+fn finished_report(snapshot: Snapshot, baseline: u64) -> Result<Report> {
+    const LOST: &str = "The server's agent restarted before this scan finished; start it again";
+    ensure!(snapshot.state != "idle", LOST);
+    let mut report = snapshot
+        .report
+        .context("Remote scan finished without a report")?;
+    ensure!(report.scanned > baseline, LOST);
+    validate_report(&mut report)?;
+    Ok(report)
+}
+
 async fn follow(
     target: &Target,
     mut snapshot: Snapshot,
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<Report> {
+    let baseline = snapshot.entry.scanned;
     loop {
         let actual = self::target(&target.connection, &snapshot.entry)?;
         ensure!(
@@ -229,11 +243,8 @@ async fn follow(
         if let Some(error) = snapshot.error {
             anyhow::bail!("{}", crate::layers::text(&error));
         }
-        if snapshot.state == "complete" {
-            let mut report = snapshot
-                .report
-                .context("Remote scan finished without a report")?;
-            validate_report(&mut report)?;
+        if matches!(snapshot.state.as_str(), "complete" | "idle") {
+            let report = finished_report(snapshot, baseline)?;
             store::save(target, &report)?;
             return Ok(report);
         }
@@ -348,6 +359,41 @@ mod tests {
                 ignore_thresholds: false,
             })
         ));
+    }
+
+    #[test]
+    fn a_scan_lost_in_an_agent_restart_is_not_reported_as_finished() {
+        let snapshot = |state: &str, scanned: Option<u64>| Snapshot {
+            entry: Entry {
+                runtime: "engine".into(),
+                host: "server".into(),
+                image: format!("sha256:{}", "a".repeat(64)),
+                scanned: scanned.unwrap_or(0),
+            },
+            state: state.into(),
+            error: None,
+            report: scanned.map(|scanned| Report {
+                findings: vec![],
+                scanner: "fixture".into(),
+                database: "fixture".into(),
+                scanned,
+                scanner_digest: Some(format!("sha256:{}", "b".repeat(64))),
+            }),
+        };
+        assert_eq!(
+            finished_report(snapshot("complete", Some(200)), 100)
+                .unwrap()
+                .scanned,
+            200
+        );
+        for lost in [
+            snapshot("complete", Some(100)),
+            snapshot("idle", Some(100)),
+            snapshot("idle", None),
+        ] {
+            let error = finished_report(lost, 100).err().unwrap().to_string();
+            assert!(error.contains("restarted"), "{error}");
+        }
     }
 
     #[test]

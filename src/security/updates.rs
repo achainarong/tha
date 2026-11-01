@@ -154,19 +154,7 @@ pub async fn ensure_with_progress(
         grype::update_database(connection, &scanner, update_name, progress),
     )
     .await?;
-    if let Some(previous) = entries.get(&connection.endpoint)
-        && previous.scanner != scanner
-    {
-        anyhow::ensure!(
-            crate::platform::immutable_image_id(&previous.scanner),
-            "Invalid previous scanner identity; refusing image removal"
-        );
-        // Only the previously tracked scanner; never prune shared parent layers or force removal.
-        progress("Removing previously tracked scanner image…");
-        grype::remove_image(connection, &previous.scanner)
-            .await.context("New scanner is ready, but old scanner removal failed (it may still be in use); no forced deletion was attempted")?;
-    }
-    entries.insert(
+    let previous = entries.insert(
         connection.endpoint.clone(),
         Updated {
             at: now(),
@@ -178,6 +166,22 @@ pub async fn ensure_with_progress(
     serde_json::to_writer(file.as_file_mut(), &entries)?;
     file.persist(path)
         .context("Cannot save security update metadata")?;
+    // The new scanner is ready, so tidying up after the old one can no longer stop a scan.
+    if let Some(previous) = previous
+        && previous.scanner != scanner
+        && crate::platform::immutable_image_id(&previous.scanner)
+    {
+        // Only the previously tracked scanner; never prune shared parent layers or force removal.
+        progress("Removing previously tracked scanner image…");
+        if let Err(error) = grype::remove_image(connection, &previous.scanner).await {
+            let warning = crate::layers::text(&format!(
+                "Keeping the old scanner image {}, which may still be in use: {error:#}",
+                previous.scanner
+            ));
+            eprintln!("tha security: {warning}");
+            progress(&warning);
+        }
+    }
     Ok(scanner)
 }
 

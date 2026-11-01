@@ -209,8 +209,8 @@ Opting into the module permits scanner pulls and database refreshes, checked at 
 once per day **on scan use**, not by an always-running container or background scheduler.
 The actual scanner image ID is pinned for each scan. After a successful update, Tha
 removes only the previously tracked Grype image, without force or parent pruning.
-If that old image is still referenced, the queue reports an error rather than force
-deleting it. **`:update-security-db`** forces an update and rescan of the selected image.
+If that old image is still referenced, it stays in place rather than being force deleted,
+and the scan continues. **`:update-security-db`** forces an update and rescan of the selected image.
 Docker-compatible Unix endpoints are supported initially; native containerd is not.
 
 Remote servers scan only on request by default. To scan automatically, select the
@@ -1398,8 +1398,9 @@ message per incident for a crash loop, an out-of-memory kill, a failing health c
 ```
 
 No logs, environment variables or file contents are sent. The URL must be `https://`, redirects are not
-followed, and a failed post is noted in the journal once and not retried. This is the one thing that makes
-the agent start outbound connections on its own. The URL is kept in `/etc/tha/alert-webhook`, readable
+followed, and a failed post is noted in the journal once and retried at the next check. Up to 20 messages
+go out per check, in order, and up to 1,000 wait in memory until the agent restarts. This is the one thing
+that makes the agent start outbound connections on its own. The URL is kept in `/etc/tha/alert-webhook`, readable
 only by root, and a token in it can appear in your shell history and the process list while setup runs, so
 you can also write that file yourself and restart `tha-agent`. Remove it with `--no-alert-webhook`.
 

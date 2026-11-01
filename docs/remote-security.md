@@ -53,8 +53,14 @@ disable scanning without deleting reports or the scanner/database cache.
   running or stopped containers. It scans images without a report right away and
   rescans all of them at each scheduled start. A start missed during downtime runs
   once when the agent is back. Unused images can be requested manually from Tha.
+- When the clocks change, a time of day that gets skipped runs right after the change,
+  and one that repeats runs only the first time. Schedules with a star in the minute
+  or hour field, such as `0 * * * *`, simply follow real time.
+- An image that cannot be verified, such as a stopped container's deleted image, counts
+  as a failed scan and does not hold up the others.
 - Refresh the vulnerability database with the first scan after midnight.
-- One job runs at a time across all engines on a server. Pending jobs are deduplicated.
+- One job runs at a time across all engines on a server. A job waiting for headroom
+  does not block other engines. Pending jobs are deduplicated.
 - Defer jobs when one-minute load exceeds 70% of available cores or `MemAvailable`
   is below 1536 MiB. Unknown pressure also defers. Check again every 30 seconds.
   **Ignore CPU and RAM thresholds** in the schedule dialog skips this check for every
@@ -120,7 +126,8 @@ retroactively reevaluate an existing report; the scheduled rescan does that.
 
 Jobs survive SSH/UI disconnects. Cancelling remote following stops the UI queue,
 not the agent's scan schedule. A service restart stops active work; pending manual
-jobs are not crash-durable, while referenced images are rediscovered. Scans time
+jobs are not crash-durable, while referenced images are rediscovered. Tha reports
+a scan lost this way as failed and keeps the previous report. Scans time
 out after 30 minutes once admitted; waiting for headroom has no deadline.
 
 Reports cover image contents, not writable-container changes or mounted volumes.
