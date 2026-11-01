@@ -212,6 +212,7 @@ pub struct Session {
     child: Option<Box<dyn Child + Send + Sync>>,
     input: Option<SyncSender<Vec<u8>>>,
     output: tokio::sync::mpsc::Receiver<Output>,
+    output_changed: bool,
     size: (u16, u16),
 }
 
@@ -221,6 +222,7 @@ impl Session {
         command: std::process::Command,
         rows: u16,
         cols: u16,
+        output_ready: std::sync::Arc<tokio::sync::Notify>,
     ) -> Result<Self> {
         let size = dimensions(rows, cols);
         let pair = portable_pty::native_pty_system()
@@ -269,6 +271,7 @@ impl Session {
                 match reader.read(&mut buffer) {
                     Ok(0) => {
                         let _ = output_tx.blocking_send(Output::Eof);
+                        output_ready.notify_one();
                         break;
                     }
                     Ok(count) => {
@@ -278,15 +281,18 @@ impl Session {
                         {
                             break;
                         }
+                        output_ready.notify_one();
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(error) if error.raw_os_error() == Some(5) => {
                         let _ = output_tx.blocking_send(Output::Eof);
+                        output_ready.notify_one();
                         break;
                     }
                     Err(error) => {
                         let _ = output_tx
                             .blocking_send(Output::Error(format!("Exec output failed: {error}")));
+                        output_ready.notify_one();
                         break;
                     }
                 }
@@ -306,6 +312,7 @@ impl Session {
             child: Some(child),
             input: Some(input),
             output,
+            output_changed: false,
             size,
         })
     }
@@ -401,7 +408,10 @@ impl Session {
         let mut eof = false;
         for _ in 0..64 {
             match self.output.try_recv() {
-                Ok(Output::Data(bytes)) => self.output_guard.process(&mut self.parser, &bytes),
+                Ok(Output::Data(bytes)) => {
+                    self.output_guard.process(&mut self.parser, &bytes);
+                    self.output_changed = true;
+                }
                 Ok(Output::Eof) => eof = true,
                 Ok(Output::Error(error)) => {
                     if self.running() {
@@ -430,6 +440,11 @@ impl Session {
             }
         }
         previous_status != self.status()
+    }
+
+    /// Whether new output arrived since the last call, so whether the screen needs drawing.
+    pub fn take_output_changed(&mut self) -> bool {
+        std::mem::take(&mut self.output_changed)
     }
 
     pub fn close(&mut self) {

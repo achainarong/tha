@@ -562,6 +562,34 @@ fn sync_workers(
     }
 }
 
+/// Output while typing should echo at once; a noisy command stays batched like logs do.
+const EXEC_ECHO_GAP: Duration = Duration::from_millis(16);
+const EXEC_BATCH_GAP: Duration = Duration::from_millis(70);
+const EXEC_ECHO_WINDOW: Duration = Duration::from_millis(200);
+
+/// Reads every session's output. Returns whether the screen needs drawing.
+fn poll_exec_sessions(app: &mut App) -> bool {
+    let mut redraw = false;
+    for notice in app.sessions.poll() {
+        redraw = true;
+        if app.local_tool_finished(notice.id) {
+            continue;
+        }
+        if Some(notice.id) == app.sessions.active_id() {
+            app.exec_input = false;
+        }
+        app.notice = tha::tf!(
+            "Exec #{a0} {a1} · container was not stopped. F6 switches retained sessions.",
+            a0 = notice.id,
+            a1 = notice.status
+        );
+    }
+    if app.tab == Tab::Exec && app.sessions.take_active_output_changed() {
+        redraw = true;
+    }
+    redraw
+}
+
 async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     // Ratatui installs a panic hook that restores raw mode and the alternate screen.
     let mut terminal = ratatui::try_init().context("Cannot initialize terminal")?;
@@ -687,6 +715,10 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     terminal.draw(|frame| ui::draw(frame, &mut app))?;
     let mut visual_deadline = app.next_visual_deadline(frame_started);
     let mut security_refresh = tokio::time::interval(Duration::from_secs(5));
+    let exec_output = app.sessions.output_ready();
+    let mut exec_poll_at: Option<std::time::Instant> = None;
+    let mut exec_polled = std::time::Instant::now();
+    let mut exec_typed = std::time::Instant::now() - EXEC_ECHO_WINDOW;
     loop {
         let mut redraw_now = false;
         tokio::select! {
@@ -695,6 +727,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
             _ = security_refresh.tick() => { redraw_now = app.security.refresh_saved(); },
             event = async { events.as_mut()?.next().await } => match event {
                 Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
+                    exec_typed = std::time::Instant::now();
                     let height = terminal.size()?.height.saturating_sub(5 + ui::footer_height(&app)) as usize;
                     if handle_key(&mut app, key, height, &refresh_tx) { break; }
                     redraw_now = true;
@@ -705,6 +738,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                     redraw_now = true;
                 },
                 Some(Ok(Event::Paste(text))) => {
+                    exec_typed = std::time::Instant::now();
                     redraw_now = true;
                     app.cancel_startup();
                     if app.servers_modal_visible() {
@@ -728,6 +762,17 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 Some(Ok(Event::Resize(_, _))) => { app.action_review_visible = false; app.log_export_review_visible = false; redraw_now = true; },
                 None => break,
                 _ => {}
+            },
+            _ = exec_output.notified() => {
+                if app.tab == Tab::Exec && exec_poll_at.is_none() {
+                    let gap = if exec_typed.elapsed() < EXEC_ECHO_WINDOW { EXEC_ECHO_GAP } else { EXEC_BATCH_GAP };
+                    exec_poll_at = Some(exec_polled + gap);
+                }
+            },
+            _ = async { tokio::time::sleep_until(exec_poll_at.unwrap_or_else(std::time::Instant::now).into()).await }, if exec_poll_at.is_some() => {
+                exec_poll_at = None;
+                exec_polled = std::time::Instant::now();
+                redraw_now = poll_exec_sessions(&mut app);
             },
             Some(event) = snapshot_rx.recv() => {
                 if !workers.get(event.engine).is_some_and(|slot| slot.accepts(event.generation)) { continue; }
@@ -942,14 +987,13 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                         }
                     }
                 }
-                redraw_now = visual_deadline.is_some_and(|at| std::time::Instant::now() >= at)
-                    || app.tab == Tab::Exec && app.sessions.active().is_some();
+                redraw_now = visual_deadline.is_some_and(|at| std::time::Instant::now() >= at);
                 redraw_now |= app.tab == Tab::History && history_updated.elapsed() >= Duration::from_secs(1);
-                for notice in app.sessions.poll() {
-                    redraw_now = true;
-                    if app.local_tool_finished(notice.id) { continue; }
-                    if Some(notice.id) == app.sessions.active_id() { app.exec_input = false; }
-                    app.notice = tha::tf!("Exec #{a0} {a1} · container was not stopped. F6 switches retained sessions.", a0 = notice.id, a1 = notice.status);
+                // Also catches exits, which print nothing, and sessions on other tabs. Skipped just
+                // after a poll, or a noisy command would be read twice as often as it is batched.
+                if exec_polled.elapsed() >= EXEC_BATCH_GAP - Duration::from_millis(10) {
+                    exec_polled = std::time::Instant::now();
+                    redraw_now |= poll_exec_sessions(&mut app);
                 }
                 // Batch log updates so a noisy container cannot trigger unlimited redraws.
                 for _ in 0..512 {

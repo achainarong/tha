@@ -1,6 +1,8 @@
 //! Bounded, explicitly selected PTY sessions. Selection never changes a session's target.
 use crate::{exec::Request, terminal::Session};
 use anyhow::{Context, Result, bail};
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 struct Slot {
     id: u64,
@@ -11,6 +13,7 @@ pub struct Sessions {
     active: Option<u64>,
     next_id: u64,
     limit: usize,
+    output_ready: Arc<Notify>,
 }
 pub struct Notice {
     pub id: u64,
@@ -24,10 +27,19 @@ impl Default for Sessions {
             active: None,
             next_id: 1,
             limit: 4,
+            output_ready: Arc::default(),
         }
     }
 }
 impl Sessions {
+    /// Signalled when any session has new output, so its echo need not wait for the next tick.
+    pub fn output_ready(&self) -> Arc<Notify> {
+        self.output_ready.clone()
+    }
+    /// Whether the selected session printed anything since the last call.
+    pub fn take_active_output_changed(&mut self) -> bool {
+        self.active_mut().is_some_and(Session::take_output_changed)
+    }
     pub fn set_limit(&mut self, limit: usize) -> Result<()> {
         if !(1..=8).contains(&limit) || self.entries.len() > limit {
             bail!(crate::i18n::t(
@@ -93,7 +105,13 @@ impl Sessions {
             ));
         }
         let command = crate::exec::prepare(&request)?;
-        let session = Session::start(request, command, dimensions.0, dimensions.1)?;
+        let session = Session::start(
+            request,
+            command,
+            dimensions.0,
+            dimensions.1,
+            self.output_ready.clone(),
+        )?;
         self.insert(session)
     }
     /// A command on this machine that needs a terminal, such as `ssh` asking about a host key.
@@ -124,7 +142,13 @@ impl Sessions {
                 limit = self.limit
             ));
         }
-        let session = Session::start(request, command, dimensions.0, dimensions.1)?;
+        let session = Session::start(
+            request,
+            command,
+            dimensions.0,
+            dimensions.1,
+            self.output_ready.clone(),
+        )?;
         self.insert(session)
     }
     fn insert(&mut self, terminal: Session) -> Result<u64> {
@@ -188,7 +212,7 @@ mod tests {
     fn mock(id: &str) -> Session {
         let mut command = std::process::Command::new("/bin/sh");
         command.args(["-c", "exec sleep 30"]);
-        Session::start(request(id), command, 20, 70).unwrap()
+        Session::start(request(id), command, 20, 70, Arc::default()).unwrap()
     }
     #[test]
     fn sessions_keep_ids_targets_and_selection_independent_and_never_evict_at_the_limit() {
@@ -210,5 +234,38 @@ mod tests {
         let third = sessions.insert(mock("third")).unwrap();
         assert!(third > second);
         assert_eq!(sessions.active().unwrap().request.container.id, "third");
+    }
+    #[tokio::test]
+    async fn new_output_wakes_the_loop_and_marks_only_the_selected_session_changed() {
+        let mut sessions = Sessions::default();
+        let ready = sessions.output_ready();
+        let background = sessions.insert(mock("background")).unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "printf ready; exec sleep 30"]);
+        let printing = Session::start(request("printing"), command, 20, 70, ready.clone()).unwrap();
+        let active = sessions.insert(printing).unwrap();
+        assert_ne!(background, active);
+        assert!(!sessions.take_active_output_changed(), "nothing polled yet");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready.notified())
+            .await
+            .expect("output signals without waiting for a tick");
+        sessions.poll();
+        assert!(sessions.take_active_output_changed());
+        assert!(!sessions.take_active_output_changed(), "reported once");
+        assert!(
+            sessions
+                .active()
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("ready")
+        );
+
+        sessions.poll();
+        assert!(
+            !sessions.take_active_output_changed(),
+            "no output, no redraw"
+        );
     }
 }

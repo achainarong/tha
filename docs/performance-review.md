@@ -171,3 +171,19 @@ The baseline's 5,000-container run was stopped because it would have taken more 
 - **Inventory requests:** images, networks and volumes now overlap. A delayed mock engine test confirms they overlap and that a failed request keeps the other results. No live-runtime speedup was measured.
 - **Explorer tree cache: not added.** At 5,000 containers a refresh costs about 6–11 ms, well under the 70 ms log-batching interval. A cached tree would depend on engine, machine, focus, alias and language state changing correctly across the app, and a stale tree is worse than a few milliseconds. Revisit this only if a real workload shows a problem.
 
+## Follow-up: file explorer and exec terminal
+
+Selected release medians from single invocations on a loaded machine, using generated trees rather than real container filesystems. `cargo test --release --lib benchmark_explorer -- --ignored --nocapture` repeats the "after" column.
+
+| Operation (folders × files each) | Before | After |
+| --- | ---: | ---: |
+| `rows()`, 200 × 100 | 1,044 µs | 22.7 µs |
+| `rows()`, 200 × 500 | 3,422 µs | 21.4 µs |
+| `rows()`, 2,000 × 50 | 4,317 µs | 287.6 µs |
+| Idle loop pass, 200 × 100, last row selected | about 1,000 µs | 6.0 µs |
+| Idle loop pass, 2,000 × 50, last row selected | about 4,485 µs | 59.9 µs |
+
+- **Explorer rows:** each row cloned its child folder's whole listing, and every main loop pass rebuilt all rows to find the selected one. Rows now carry a small status, and finding a row stops when it gets there.
+- **Explorer preview:** text is cleaned once on arrival and each frame only touches the lines that fit. A 256 KB preview previously took a frame from 0.3 ms to 1.6 ms; this was not timed again.
+- **Exec output:** output now wakes the loop rather than waiting for the 70 ms tick, and the tab only redraws when the selected session printed something. A poll follows 16 ms after the previous one within 200 ms of typing, and 70 ms otherwise, so a noisy command stays batched at its old rate. `exec_smoke.py` passes, but echo latency was not measured against a live session.
+

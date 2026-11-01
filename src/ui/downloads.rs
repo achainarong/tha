@@ -1,7 +1,7 @@
 //! The download manager panel and its review dialog.
 use super::*;
 use crate::{
-    downloads::{FilePreview, Folder, JobStatus, Pane, Preview, human_size},
+    downloads::{FilePreview, JobStatus, Pane, Preview, RowState, human_size},
     files::Kind,
 };
 
@@ -97,17 +97,20 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
     let preview = Block::new().borders(ratatui::widgets::Borders::LEFT);
     let right = padded(preview.inner(columns[1]));
     frame.render_widget(preview, columns[1]);
-    frame.render_widget(preview_paragraph(app, right.width), right);
+    frame.render_widget(
+        preview_paragraph(app, right.width, right.height as usize),
+        right,
+    );
     frame.render_widget(Paragraph::new(footer), rows[1]);
 }
 
 /// Read-only, and only ever sanitized text: file contents never reach the terminal raw.
-fn preview_paragraph(app: &App, width: u16) -> Paragraph<'static> {
+fn preview_paragraph(app: &App, width: u16, height: usize) -> Paragraph<'_> {
     let warn = accent(app, Color::Yellow);
     let Some(preview) = &app.downloads.preview else {
         return Paragraph::new(crate::i18n::t("Select a file to see it here.")).style(muted());
     };
-    let lines: Vec<Line<'static>> = match &preview.status {
+    let lines: Vec<Line<'_>> = match &preview.status {
         FilePreview::Waiting | FilePreview::Loading => {
             vec![Line::styled(crate::i18n::t("Reading…"), muted())]
         }
@@ -150,17 +153,21 @@ fn preview_paragraph(app: &App, width: u16) -> Paragraph<'static> {
             warn,
         )],
         FilePreview::Text { text, truncated } => {
-            let mut lines: Vec<Line<'static>> = text
-                .lines()
-                .map(|line| Line::from(safe_text(&line.replace('\t', "    "))))
+            // Only what fits, so a frame costs the same whatever the size of the file.
+            let total = text.line_count() + usize::from(*truncated);
+            let first = preview.scroll.min(total.saturating_sub(1));
+            let mut lines: Vec<Line<'_>> = (first..text.line_count())
+                .take(height)
+                .filter_map(|index| text.line(index))
+                .map(Line::from)
                 .collect();
-            if *truncated {
+            if *truncated && lines.len() < height {
                 lines.push(Line::styled(
                     crate::i18n::t("… only the start of this file is shown"),
                     warn,
                 ));
             }
-            lines
+            return Paragraph::new(lines);
         }
     };
     let mut paragraph = Paragraph::new(lines);
@@ -214,8 +221,8 @@ fn browse_lines(app: &App, height: usize, width: usize) -> Vec<Line<'static>> {
         };
         let detail = match (&row.state, row.entry.size) {
             (_, Some(size)) => human_size(size),
-            (Some(Folder::Failed(error)), _) => safe_text(error),
-            (Some(Folder::Loading), _) => crate::i18n::t("reading…").into(),
+            (RowState::Failed(error), _) => safe_text(error),
+            (RowState::Loading, _) => crate::i18n::t("reading…").into(),
             _ => String::new(),
         };
         let name = format!(
@@ -497,14 +504,40 @@ mod tests {
         app.downloads.selected = rows.iter().position(|row| row.path == "/etc").unwrap();
         app.downloads.update_preview(std::time::Instant::now());
         if let Some(preview) = &mut app.downloads.preview {
-            preview.status = FilePreview::Text {
-                text: "before\u{1b}[2Jafter".into(),
-                truncated: false,
-            };
+            preview.status = FilePreview::text("before\u{1b}[2Jafter", false);
         }
         let output = screen(&mut app);
         assert!(output.contains("before"), "{output}");
         assert!(!output.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn a_long_preview_scrolls_to_its_end_and_stops_at_the_truncation_notice() {
+        let mut app = demo_on_container();
+        app.open_file_explorer();
+        app.take_download_requests();
+        settle_preview(&mut app);
+        app.downloads.update_preview(std::time::Instant::now());
+        let raw: String = (0..500).map(|index| format!("line-{index:03}\n")).collect();
+        let preview = app.downloads.preview.as_mut().unwrap();
+        preview.status = FilePreview::text(&raw, true);
+        let output = screen(&mut app);
+        assert!(output.contains("line-000"), "{output}");
+        assert!(!output.contains("line-499"), "{output}");
+        assert!(!output.contains("only the start"), "{output}");
+
+        app.downloads.preview.as_mut().unwrap().scroll = 200;
+        let output = screen(&mut app);
+        assert!(output.contains("line-200"), "{output}");
+        assert!(!output.contains("line-199"), "{output}");
+
+        app.downloads.preview.as_mut().unwrap().scroll = usize::MAX;
+        let output = screen(&mut app);
+        assert!(output.contains("only the start"), "{output}");
+        assert!(
+            !output.contains("line-499"),
+            "only the notice is left: {output}"
+        );
     }
 
     #[test]

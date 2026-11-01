@@ -3,7 +3,9 @@
 use crate::files::{self, Entry, Header, Kind, Listing, Source, Totals};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    ops::ControlFlow,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -52,7 +54,7 @@ pub enum FilePreview {
     Waiting,
     Loading,
     Text {
-        text: String,
+        text: Arc<PreviewText>,
         truncated: bool,
     },
     Binary,
@@ -61,6 +63,48 @@ pub enum FilePreview {
     Folder,
     Special,
     Failed(String),
+}
+
+/// File contents, cleaned once when they arrive so that a frame only touches what it shows.
+/// Offsets rather than a string per line, so a file of empty lines stays small in the cache.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PreviewText {
+    text: String,
+    starts: Vec<usize>,
+}
+
+impl PreviewText {
+    pub fn new(raw: &str) -> Self {
+        let mut preview = Self {
+            text: String::with_capacity(raw.len()),
+            starts: Vec::new(),
+        };
+        for line in raw.lines() {
+            preview.starts.push(preview.text.len());
+            preview.text.push_str(&crate::model::safe_text(line));
+            preview.text.push('\n');
+        }
+        preview
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.starts.len()
+    }
+
+    pub fn line(&self, index: usize) -> Option<&str> {
+        let start = *self.starts.get(index)?;
+        let end = self.starts.get(index + 1).unwrap_or(&self.text.len()) - 1;
+        Some(&self.text[start..end])
+    }
+}
+
+impl FilePreview {
+    pub fn text(raw: &str, truncated: bool) -> Self {
+        Self::Text {
+            text: Arc::new(PreviewText::new(raw)),
+            truncated,
+        }
+    }
 }
 
 pub struct PreviewState {
@@ -178,31 +222,106 @@ impl Tree {
         }
     }
 
-    /// What is on screen, in order, following only open folders.
-    pub fn rows(&self) -> Vec<Row> {
-        fn walk(tree: &Tree, path: &str, level: usize, rows: &mut Vec<Row>) {
+    /// Walks what is on screen, in order, following only open folders. Paths are only built for
+    /// folders, so counting or finding a row costs little even in a large tree.
+    fn visit_rows<B>(&self, mut visit: impl FnMut(RowRef<'_>) -> ControlFlow<B>) -> ControlFlow<B> {
+        fn walk<B>(
+            tree: &Tree,
+            path: &str,
+            level: usize,
+            visit: &mut impl FnMut(RowRef<'_>) -> ControlFlow<B>,
+        ) -> ControlFlow<B> {
             let Some(Folder::Loaded(listing)) = tree.folders.get(path) else {
-                return;
+                return ControlFlow::Continue(());
             };
             for entry in &listing.entries {
-                let child = files::join(path, &entry.name);
-                let open = entry.kind == Kind::Folder && tree.expanded.contains(&child);
-                rows.push(Row {
-                    path: child.clone(),
-                    entry: entry.clone(),
+                let folder = (entry.kind == Kind::Folder).then(|| files::join(path, &entry.name));
+                let open = folder
+                    .as_ref()
+                    .is_some_and(|folder| tree.expanded.contains(folder));
+                visit(RowRef {
+                    parent: path,
+                    folder: folder.as_deref(),
+                    entry,
                     level,
                     open,
-                    state: tree.folders.get(&child).cloned(),
-                });
-                if open {
-                    walk(tree, &child, level + 1, rows);
+                })?;
+                if let Some(folder) = folder.as_deref().filter(|_| open) {
+                    walk(tree, folder, level + 1, visit)?;
                 }
             }
+            ControlFlow::Continue(())
         }
+        walk(self, "/", 0, &mut visit)
+    }
+
+    fn row(&self, found: RowRef<'_>) -> Row {
+        let path = found.folder.map_or_else(
+            || files::join(found.parent, &found.entry.name),
+            str::to_owned,
+        );
+        let state = match self.folders.get(&path) {
+            Some(Folder::Loading) => RowState::Loading,
+            Some(Folder::Failed(error)) => RowState::Failed(error.clone()),
+            _ => RowState::Idle,
+        };
+        Row {
+            path,
+            entry: found.entry.clone(),
+            level: found.level,
+            open: found.open,
+            state,
+        }
+    }
+
+    /// What is on screen, in order, following only open folders.
+    pub fn rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
-        walk(self, "/", 0, &mut rows);
+        let _ = self.visit_rows(|found| {
+            rows.push(self.row(found));
+            ControlFlow::<()>::Continue(())
+        });
         rows
     }
+
+    pub fn row_count(&self) -> usize {
+        let mut count = 0;
+        let _ = self.visit_rows(|_| {
+            count += 1;
+            ControlFlow::<()>::Continue(())
+        });
+        count
+    }
+
+    pub fn row_at(&self, index: usize) -> Option<Row> {
+        let mut left = index;
+        match self.visit_rows(|found| {
+            if left == 0 {
+                return ControlFlow::Break(self.row(found));
+            }
+            left -= 1;
+            ControlFlow::Continue(())
+        }) {
+            ControlFlow::Break(row) => Some(row),
+            ControlFlow::Continue(()) => None,
+        }
+    }
+}
+
+struct RowRef<'a> {
+    parent: &'a str,
+    folder: Option<&'a str>,
+    entry: &'a Entry,
+    level: usize,
+    open: bool,
+}
+
+/// What a row shows about its own folder. Never the listing, which the row does not need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowState {
+    Idle,
+    Loading,
+    Failed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,7 +330,7 @@ pub struct Row {
     pub entry: Entry,
     pub level: usize,
     pub open: bool,
-    pub state: Option<Folder>,
+    pub state: RowState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -846,14 +965,14 @@ impl Manager {
     }
 
     pub fn current_row(&self) -> Option<Row> {
-        self.tree()?.rows().into_iter().nth(self.selected)
+        self.tree()?.row_at(self.selected)
     }
 
     pub fn move_selection(&mut self, amount: isize) {
         self.touch();
         match self.pane {
             Pane::Browse => {
-                let count = self.tree().map_or(0, |tree| tree.rows().len());
+                let count = self.tree().map_or(0, Tree::row_count);
                 self.selected = self
                     .selected
                     .saturating_add_signed(amount)
@@ -1174,10 +1293,9 @@ impl Manager {
                     Ok(start) if files::looks_binary(&start.bytes, start.truncated) => {
                         FilePreview::Binary
                     }
-                    Ok(start) => FilePreview::Text {
-                        text: String::from_utf8_lossy(&start.bytes).into_owned(),
-                        truncated: start.truncated,
-                    },
+                    Ok(start) => {
+                        FilePreview::text(&String::from_utf8_lossy(&start.bytes), start.truncated)
+                    }
                 };
                 preview.status = status.clone();
                 // A transient read/configuration failure must not remain cached after recovery.
@@ -1732,10 +1850,7 @@ mod tests {
         assert!(!manager.update_preview(start + Duration::from_secs(1)));
         assert_eq!(
             manager.preview.as_ref().unwrap().status,
-            FilePreview::Text {
-                text: "hello".into(),
-                truncated: false
-            }
+            FilePreview::text("hello", false)
         );
     }
 
@@ -1758,7 +1873,7 @@ mod tests {
         manager.open_source(source("a"), start);
         manager.update_preview(start);
         assert!(matches!(&manager.preview.as_ref().unwrap().status,
-            FilePreview::Text { text, .. } if text == "container a"));
+            FilePreview::Text { text, .. } if text.line(0) == Some("container a")));
 
         manager.invalidate_preview(&a, "/same.txt");
         manager.update_preview(start);
@@ -1776,9 +1891,9 @@ mod tests {
             start,
         );
         assert!(matches!(&manager.preview.as_ref().unwrap().status,
-            FilePreview::Text { text, .. } if text == "container b"));
+            FilePreview::Text { text, .. } if text.line(0) == Some("container b")));
         assert!(matches!(manager.tree().unwrap().previews.get("/same.txt"),
-            Some(FilePreview::Text { text, .. }) if text == "container b"));
+            Some(FilePreview::Text { text, .. }) if text.line(0) == Some("container b")));
     }
 
     #[test]
@@ -2270,5 +2385,137 @@ mod tests {
     fn sizes_read_naturally() {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(4_700_000_000), "4.7 GB");
+    }
+
+    fn nested_tree() -> (Manager, Instant) {
+        let (mut manager, start) = explorer_with(vec![
+            folder("a"),
+            file("b.txt", 1),
+            folder("c"),
+            folder("d"),
+        ]);
+        let tree = manager.tree_mut().unwrap();
+        tree.queue.clear();
+        tree.in_flight = None;
+        tree.expanded.insert("/a".into());
+        tree.expanded.insert("/a/inner".into());
+        for (path, entries) in [
+            ("/a", vec![folder("inner"), file("x", 2)]),
+            ("/a/inner", vec![file("y", 3)]),
+            ("/c", vec![file("hidden", 4)]),
+        ] {
+            tree.folders.insert(
+                path.into(),
+                Folder::Loaded(Listing {
+                    entries,
+                    truncated: false,
+                }),
+            );
+        }
+        tree.folders
+            .insert("/d".into(), Folder::Failed("denied".into()));
+        (manager, start)
+    }
+
+    #[test]
+    fn counting_and_finding_a_row_agree_with_the_full_list() {
+        let (manager, _) = nested_tree();
+        let tree = manager.tree().unwrap();
+        let rows = tree.rows();
+        assert_eq!(
+            rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            ["/a", "/a/inner", "/a/inner/y", "/a/x", "/b.txt", "/c", "/d"]
+        );
+        assert_eq!(rows[2].level, 2);
+        assert_eq!(tree.row_count(), rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(tree.row_at(index).as_ref(), Some(row));
+        }
+        assert_eq!(tree.row_at(rows.len()), None);
+    }
+
+    #[test]
+    fn a_row_reports_its_folder_state_without_carrying_the_listing() {
+        let (mut manager, _) = nested_tree();
+        manager
+            .tree_mut()
+            .unwrap()
+            .folders
+            .insert("/c".into(), Folder::Loading);
+        let rows = manager.tree().unwrap().rows();
+        let state = |path: &str| &rows.iter().find(|row| row.path == path).unwrap().state;
+        assert_eq!(state("/a"), &RowState::Idle);
+        assert_eq!(state("/b.txt"), &RowState::Idle);
+        assert_eq!(state("/c"), &RowState::Loading);
+        assert_eq!(state("/d"), &RowState::Failed("denied".into()));
+    }
+
+    #[test]
+    fn preview_text_is_cleaned_once_and_read_by_line() {
+        let text = PreviewText::new("one\u{1b}[2J\r\n\n\tthree");
+        assert_eq!(text.line_count(), 3);
+        assert_eq!(text.line(0), Some("one"));
+        assert_eq!(text.line(1), Some(""));
+        assert_eq!(text.line(2), Some("    three"));
+        assert_eq!(text.line(3), None);
+        assert_eq!(PreviewText::new("").line_count(), 0);
+    }
+
+    /// Opt-in timings: `cargo test --release --lib benchmark_explorer -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn benchmark_explorer_rows() {
+        fn time(name: &str, mut action: impl FnMut()) {
+            let mut samples: Vec<f64> = (0..15)
+                .map(|_| {
+                    let started = Instant::now();
+                    for _ in 0..5 {
+                        action();
+                    }
+                    started.elapsed().as_secs_f64() * 1e6 / 5.0
+                })
+                .collect();
+            samples.sort_by(f64::total_cmp);
+            println!("{name}: median_us={:.1}", samples[7]);
+        }
+        for (folders, each) in [(50, 40), (200, 100), (200, 500), (2000, 50)] {
+            let (mut manager, start) = explorer_with(
+                (0..folders)
+                    .map(|index| folder(&format!("folder{index:04}")))
+                    .collect(),
+            );
+            let tree = manager.tree_mut().unwrap();
+            tree.queue.clear();
+            tree.in_flight = None;
+            for index in 0..folders {
+                let entries = (0..each)
+                    .map(|file_index| file(&format!("some-file-name-{file_index:05}.conf"), 1234))
+                    .collect();
+                tree.folders.insert(
+                    format!("/folder{index:04}"),
+                    Folder::Loaded(Listing {
+                        entries,
+                        truncated: false,
+                    }),
+                );
+            }
+            time(&format!("explorer/{folders}x{each}/rows"), || {
+                std::hint::black_box(manager.tree().unwrap().rows());
+            });
+            let later = start + Duration::from_secs(1);
+            manager.update_preview(start);
+            manager.update_preview(later);
+            for selected in [0, folders - 1] {
+                manager.selected = selected;
+                manager.update_preview(later);
+                manager.update_preview(later + PREVIEW_DELAY);
+                time(
+                    &format!("explorer/{folders}x{each}/idle_loop_pass/selected_{selected}"),
+                    || {
+                        std::hint::black_box(manager.update_preview(later + PREVIEW_DELAY));
+                    },
+                );
+            }
+        }
     }
 }

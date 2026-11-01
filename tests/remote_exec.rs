@@ -114,7 +114,7 @@ async fn helper_preserves_terminal_input_resize_output_and_exit_status() {
             .arg("remote-exec")
             .arg(path)
             .arg(json!({"container":"fixture","command":["sh"],"rows":24,"cols":80}).to_string());
-        let mut session = Session::start(request, command, 24, 80).unwrap();
+        let mut session = Session::start(request, command, 24, 80, Default::default()).unwrap();
         loop {
             session.poll();
             if session.screen().contents().contains("CLIENT_READY") {
