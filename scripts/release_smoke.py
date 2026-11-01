@@ -83,7 +83,7 @@ class Contracts(unittest.TestCase):
             "actions/checkout": "v7",
             "actions/upload-artifact": "v7",
             "actions/download-artifact": "v8",
-            "astral-sh/setup-uv": "v10",
+            "astral-sh/setup-uv": "v10.3.3",
             "Swatinem/rust-cache": "v2.9.3",
         }
         seen = set()
@@ -289,11 +289,41 @@ else: raise SystemExit('unexpected command')
         self.assertEqual(self.workflow["jobs"]["publish"]["needs"], ["validate", "build"])
 
 
+def check_action_refs():
+    """Opt-in network check: YAML assertions alone cannot prove an action ref exists."""
+    import yaml
+    references = set()
+    for path in (ROOT / ".github/workflows").glob("*.yml"):
+        workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+        for job in workflow["jobs"].values():
+            for step in job.get("steps", []):
+                action = step.get("uses", "")
+                if "@" in action and not action.startswith("./"):
+                    references.add(action)
+    failed = []
+    for action in sorted(references):
+        repository, ref = action.rsplit("@", 1)
+        result = subprocess.run(["git", "ls-remote", "--exit-code",
+                                 f"https://github.com/{repository}.git",
+                                 f"refs/tags/{ref}", f"refs/heads/{ref}"],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            failed.append(action)
+            print(f"FAIL: cannot resolve action {action}", file=sys.stderr)
+        else:
+            print(f"PASS: action ref exists: {action}")
+    if failed:
+        raise SystemExit(1)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, help="Verify a produced archive without extracting or executing it")
+    parser.add_argument("--check-action-refs", action="store_true", help="Verify action tags/branches against GitHub (requires network)")
     options = parser.parse_args()
-    if options.archive:
+    if options.check_action_refs:
+        check_action_refs()
+    elif options.archive:
         check_archive(options.archive)
         print(f"PASS: exact regular-file archive structure: {options.archive}")
     else:
