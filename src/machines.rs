@@ -29,6 +29,8 @@ pub struct Machine {
     pub managed: bool,
     pub state: MachineState,
     pub allow_delete: bool,
+    /// What the server last reported. It may stop exposing an engine between connections.
+    pub engines: Vec<String>,
     pub anchor: usize,
     pub generation: u64,
 }
@@ -238,10 +240,15 @@ impl App {
         if !remote::is_remote(&self.engines[index].connection) {
             return true;
         }
-        !self.is_anchor(index)
-            && self
-                .machine(self.machine_name(index))
-                .is_some_and(Machine::connected)
+        let Some((server, engine)) =
+            remote::parse_endpoint(&self.engines[index].connection.endpoint)
+        else {
+            return false;
+        };
+        !engine.is_empty()
+            && self.machine(server).is_some_and(|machine| {
+                machine.connected() && machine.engines.iter().any(|name| name == engine)
+            })
     }
 
     /// Engines that have something to poll. A server's engines only do while connected, so a
@@ -252,11 +259,35 @@ impl App {
             .collect()
     }
 
-    pub fn configured_engine_count(&self) -> usize {
+    /// Whether the current view includes this engine. Focusing a machine scopes everything.
+    pub fn engine_in_view(&self, index: usize) -> bool {
+        self.engine_visible(index)
+            && self
+                .machine
+                .as_deref()
+                .is_none_or(|machine| self.machine_name(index) == machine)
+    }
+
+    /// The engines the header counts and the Images and Volumes tabs offer.
+    pub fn engines_in_view(&self) -> Vec<usize> {
         (0..self.engines.len())
-            .filter(|&index| !self.is_anchor(index))
-            .filter(|&index| self.engine_visible(index))
-            .count()
+            .filter(|&index| self.engine_in_view(index))
+            .collect()
+    }
+
+    /// A focus change or disconnect can leave the selection on an engine no longer offered.
+    pub fn clamp_inventory_engine(&mut self) {
+        let engines = self.engines_in_view();
+        if engines.contains(&self.inventory_engine) {
+            return;
+        }
+        if let Some(&first) = engines.first() {
+            self.inventory_engine = first;
+        } else if let Some(machine) = self.machine.as_deref().and_then(|name| self.machine(name)) {
+            // The server's placeholder has no data, so another machine's images cannot show
+            // under a focused server that is not connected.
+            self.inventory_engine = machine.anchor;
+        }
     }
 
     pub fn machine_engines(&self, name: &str) -> Vec<usize> {
@@ -320,6 +351,7 @@ impl App {
             managed,
             state: MachineState::NotConnected,
             allow_delete: false,
+            engines: Vec::new(),
             anchor,
             generation: 0,
         });
@@ -442,6 +474,7 @@ impl App {
                 if let Some(machine) = self.machine_mut(&event.server) {
                     machine.state = MachineState::Connected;
                     machine.allow_delete = allow_delete;
+                    machine.engines = engines.clone();
                 }
                 self.attach_engines(&event.server, &engines);
             }
@@ -455,7 +488,7 @@ impl App {
         self.refresh_tree();
     }
 
-    fn attach_engines(&mut self, server: &str, engines: &[String]) {
+    pub(crate) fn attach_engines(&mut self, server: &str, engines: &[String]) {
         for engine in engines {
             let connection = remote::connection(server, engine);
             let index = match self
@@ -1502,6 +1535,100 @@ mod tests {
         assert_eq!(app.sessions.len(), 1);
         app.open_servers();
         assert!(app.servers_modal_visible());
+    }
+
+    #[test]
+    fn focusing_a_machine_scopes_counts_inventory_and_performance() {
+        let mut app = with_servers(&["prod"]);
+        connected(&mut app, "prod");
+        let local = 0;
+        let server = app.machine_engines("prod")[0];
+        for index in [local, server] {
+            app.update_engine(
+                index,
+                Ok(Snapshot {
+                    engine_id: Some(format!("id-{index}")),
+                    ..Default::default()
+                }),
+            );
+        }
+        assert_eq!(app.engines_in_view(), [local, server]);
+        assert_eq!(app.performance_engines().len(), 2);
+        app.machine = Some("prod".into());
+        assert_eq!(app.engines_in_view(), [server]);
+        assert_eq!(app.performance_engines(), [server]);
+        app.inventory_engine = local;
+        app.clamp_inventory_engine();
+        assert_eq!(app.inventory_engine, server);
+        app.machine = Some(LOCAL_MACHINE.into());
+        assert_eq!(app.engines_in_view(), [local]);
+        assert_eq!(app.performance_engines(), [local]);
+    }
+
+    #[test]
+    fn hidden_and_disconnected_servers_are_not_offered_as_tabs() {
+        let mut app = with_servers(&["prod"]);
+        assert_eq!(app.engines_in_view(), [0], "the placeholder is never a tab");
+        connected(&mut app, "prod");
+        let server = app.machine_engines("prod")[0];
+        assert_eq!(app.engines_in_view(), [0, server]);
+        app.inventory_engine = server;
+        app.disconnect_machine("prod");
+        assert_eq!(app.engines_in_view(), [0]);
+        app.clamp_inventory_engine();
+        assert_eq!(app.inventory_engine, 0);
+    }
+
+    #[test]
+    fn a_focused_disconnected_server_never_shows_another_machines_images() {
+        let mut app = with_servers(&["prod"]);
+        app.update_engine(0, Ok(Snapshot::default()));
+        app.machine = Some("prod".into());
+        app.inventory_engine = 0;
+        app.clamp_inventory_engine();
+        assert_eq!(app.inventory_engine, app.machine("prod").unwrap().anchor);
+        assert!(app.engines[app.inventory_engine].snapshot.is_none());
+    }
+
+    #[test]
+    fn an_engine_the_server_stops_exposing_disappears() {
+        let mut app = with_servers(&["prod"]);
+        connected(&mut app, "prod");
+        let old = app.machine_engines("prod")[0];
+        let generation = app.machine("prod").unwrap().generation;
+        app.apply_remote_event(remote::Event {
+            server: "prod".into(),
+            generation,
+            update: Update::Connected {
+                engines: vec!["podman".into()],
+                allow_delete: false,
+            },
+        });
+        let engines = app.machine_engines("prod");
+        assert_eq!(engines.len(), 1);
+        assert_ne!(engines[0], old);
+        assert!(!app.engine_visible(old));
+        assert!(
+            titles(&app)
+                .iter()
+                .all(|title| !title.starts_with("docker"))
+        );
+    }
+
+    #[test]
+    fn leaving_a_restored_focus_works() {
+        let mut app = with_servers(&["prod"]);
+        app.apply_preferences(
+            crate::preferences::Preferences {
+                machine: Some("prod".into()),
+                ..Default::default()
+            },
+            true,
+        );
+        app.finish_preference_restore();
+        assert_eq!(app.machine.as_deref(), Some("prod"));
+        assert!(app.back(), "Backspace and :all must have somewhere to go");
+        assert!(app.machine.is_none());
     }
 
     #[test]

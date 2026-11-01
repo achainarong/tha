@@ -2410,7 +2410,10 @@ impl App {
             .copied()
             .filter(|&index| {
                 let engine = &self.engines[index];
-                engine.snapshot.is_some() && engine.error.is_none() && engine.alias.is_none()
+                self.engine_in_view(index)
+                    && engine.snapshot.is_some()
+                    && engine.error.is_none()
+                    && engine.alias.is_none()
             })
             .collect()
     }
@@ -2968,6 +2971,8 @@ impl App {
                 || (name == crate::machines::LOCAL_MACHINE && !self.machines.is_empty()))
             && self.project.is_none()
         {
+            // Without this entry, Backspace and :all could never leave the restored focus.
+            self.push_navigation();
             self.machine = Some(name);
             self.refresh_tree();
             self.selected = 0;

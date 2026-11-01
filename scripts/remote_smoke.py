@@ -130,6 +130,16 @@ def run_tui(scratch, key, environment, connect, seconds):
     return output.decode("utf-8", "replace"), during
 
 
+def process_exists(path):
+    try:
+        os.kill(int(path.name.rsplit("-", 1)[1]), 0)
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
 def tui_checks(scratch, key, environment):
     output, during = run_tui(scratch, key, environment, "manual", 3)
     if during:
@@ -147,6 +157,10 @@ def tui_checks(scratch, key, environment):
     if masters():
         sys.exit("FAILED: quitting left an SSH session open")
     print("ok: quitting closes the SSH session")
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()))
+    if any(not path.name.endswith(str(os.getpid())) and not process_exists(path) for path in runtime.glob("tha-remote-*")):
+        sys.exit("FAILED: quitting left a session directory behind")
+    print("ok: quitting removes its session directory")
 
 
 def try_it(scratch, key):

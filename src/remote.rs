@@ -188,7 +188,7 @@ pub fn parse_endpoint(endpoint: &str) -> Option<(&str, &str)> {
 
 /// The remote command. Asking for the agent by name is what keeps a root login behind the
 /// allowlist; for a restricted key the forced command runs instead and receives this text.
-const GATE_INSTALL: &str = "curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent";
+const AGENT_INSTALL: &str = "curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent";
 
 pub const LIST_COMMAND: &str = "tha-agent list";
 
@@ -269,6 +269,9 @@ fn common_args(remote: &Remote, key: &Path, batch: bool) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["-i".into(), key.into()];
     for option in [
         "IdentitiesOnly=yes",
+        // Keys only, even on a server that allows passwords and in the interactive test.
+        "PasswordAuthentication=no",
+        "KbdInteractiveAuthentication=no",
         "ForwardAgent=no",
         "ForwardX11=no",
         "ClearAllForwardings=yes",
@@ -369,7 +372,7 @@ pub fn setup_command(remote: &Remote) -> Result<String> {
     // Root's existing key stays as it is, so only the policy file is needed.
     if unrestricted_login(&remote.user) {
         return Ok(format!(
-            "{GATE_INSTALL} && sudo tha-agent setup --user root"
+            "{AGENT_INSTALL} && sudo /usr/local/bin/tha-agent setup --user root"
         ));
     }
     let key = remote.key_path()?;
@@ -387,7 +390,7 @@ pub fn setup_command(remote: &Remote) -> Result<String> {
 fn render_setup_command(user: &str, public_key: &str) -> Result<String> {
     let key = crate::agent::setup::parse_public_key(public_key)?;
     Ok(format!(
-        "{GATE_INSTALL} && sudo tha-agent setup --user {user} --key '{}'",
+        "{AGENT_INSTALL} && sudo /usr/local/bin/tha-agent setup --user {user} --key '{}'",
         key.as_line()
     ))
 }
@@ -1003,7 +1006,13 @@ mod tests {
             let args = strings(&args);
             let key_at = args.iter().position(|arg| arg == "-i").unwrap();
             assert_eq!(args[key_at + 1], "/keys/prod");
-            for required in ["IdentitiesOnly=yes", "BatchMode=yes", "ForwardAgent=no"] {
+            for required in [
+                "IdentitiesOnly=yes",
+                "BatchMode=yes",
+                "ForwardAgent=no",
+                "PasswordAuthentication=no",
+                "KbdInteractiveAuthentication=no",
+            ] {
                 assert!(args.iter().any(|arg| arg == required), "{required}");
             }
             let host_at = args.iter().position(|arg| arg == "--").unwrap();
@@ -1040,6 +1049,11 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "BatchMode=yes"));
         assert!(!args.iter().any(|arg| arg.contains("StrictHostKeyChecking")));
         assert!(args.iter().any(|arg| arg == "IdentitiesOnly=yes"));
+        assert!(args.iter().any(|arg| arg == "PasswordAuthentication=no"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "KbdInteractiveAuthentication=no")
+        );
         assert_eq!(args.last().unwrap(), LIST_COMMAND);
     }
 
@@ -1116,7 +1130,9 @@ mod tests {
         let command = render_setup_command("tha", &format!("{KEY} me';sh;'\n")).unwrap();
         assert_eq!(
             command,
-            format!("{GATE_INSTALL} && sudo tha-agent setup --user tha --key '{KEY}'")
+            format!(
+                "{AGENT_INSTALL} && sudo /usr/local/bin/tha-agent setup --user tha --key '{KEY}'"
+            )
         );
         assert!(render_setup_command("tha", "command=\"sh\" x y").is_err());
     }
@@ -1128,9 +1144,9 @@ mod tests {
         candidate.validate().unwrap();
         // No .pub file is read: root's key is not touched.
         let command = setup_command(&candidate).unwrap();
-        assert!(command.starts_with(GATE_INSTALL), "{command}");
+        assert!(command.starts_with(AGENT_INSTALL), "{command}");
         assert!(
-            command.ends_with("sudo tha-agent setup --user root"),
+            command.ends_with("sudo /usr/local/bin/tha-agent setup --user root"),
             "{command}"
         );
     }

@@ -330,7 +330,7 @@ server, as an admin:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent \
-  && sudo tha-agent setup --user tha --key 'ssh-ed25519 AAAA...'
+  && sudo /usr/local/bin/tha-agent setup --user tha --key 'ssh-ed25519 AAAA...'
 ```
 
 The command installs `tha-agent` too, so that is all the server needs; the full `tha`
@@ -352,6 +352,10 @@ Servers can also be written by hand as `[[remotes]]` in `config.toml`; see
 are saved in `remotes.toml` next to it, mode `0600`. Only the path to each key is
 stored; Tha never reads or copies a private key. A key with a passphrase must be
 loaded with `ssh-add`, because Tha cannot prompt for it while running.
+
+Login is by SSH key only. Tha never asks for or stores a password, and tells `ssh` not
+to use one, even if the server allows it. That is a client setting: to turn password
+login off for everyone, set `PasswordAuthentication no` on the server.
 
 **What the agent allows:** listing and inspecting containers, images, networks and
 volumes, image history, logs, stats, events, and start, stop and restart. Everything
@@ -387,6 +391,7 @@ usually cannot be shared with a separate user, so setup explains the problem and
 To try it against a disposable server, with Docker installed:
 
 ```sh
+tha --demo --demo-servers              # Shows sample servers; contacts nothing
 python3 scripts/remote_smoke.py --try  # Keeps a test server running until you press Enter
 python3 scripts/remote_smoke.py        # Runs the automated end-to-end checks
 ```

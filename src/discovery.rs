@@ -40,6 +40,11 @@ pub fn discover(
             ),
         ];
         for (name, path) in candidates {
+            // A Docker context already named this. Its socket path can differ from the
+            // well-known one, and a second row would only be the same runtime, offline.
+            if found.iter().any(|connection| connection.name == name) {
+                continue;
+            }
             if (name == "OrbStack" && home.join(".orbstack").is_dir())
                 || (name == "Docker Desktop" && home.join(".docker/desktop").is_dir())
             {
@@ -171,6 +176,40 @@ mod tests {
         assert_eq!(c.name, "OrbStack");
         assert_eq!(c.endpoint, "unix:///orb.sock");
         assert!(context_connection("not json").is_none());
+    }
+
+    #[test]
+    fn a_docker_desktop_context_is_not_listed_twice() {
+        let home = tempfile::tempdir().unwrap();
+        let context = home.path().join(".docker/contexts/meta/abc");
+        std::fs::create_dir_all(&context).unwrap();
+        std::fs::create_dir_all(home.path().join(".docker/desktop")).unwrap();
+        std::fs::write(
+            context.join("meta.json"),
+            r#"{"Name":"desktop-linux","Endpoints":{"docker":{"Host":"unix:///home/a/.docker/desktop/docker.sock"}}}"#,
+        )
+        .unwrap();
+        let found = discover(Some(home.path()), None, None);
+        let desktop: Vec<_> = found
+            .iter()
+            .filter(|c| c.name == "Docker Desktop")
+            .collect();
+        assert_eq!(desktop.len(), 1, "{found:?}");
+        assert_eq!(
+            desktop[0].endpoint,
+            "unix:///home/a/.docker/desktop/docker.sock"
+        );
+    }
+
+    #[test]
+    fn docker_desktop_without_a_context_is_still_found() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".docker/desktop")).unwrap();
+        let found = discover(Some(home.path()), None, None);
+        assert_eq!(
+            found.iter().filter(|c| c.name == "Docker Desktop").count(),
+            1
+        );
     }
 
     #[test]

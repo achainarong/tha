@@ -856,10 +856,11 @@ fn all_update_count(app: &App, engine: usize, snapshot: &Snapshot) -> usize {
 
 fn draw_overview_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: bool) {
     let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
-    let names: Vec<_> = app
-        .engines
+    app.clamp_inventory_engine();
+    let engines = app.engines_in_view();
+    let names: Vec<_> = engines
         .iter()
-        .map(|engine| safe_text(&engine.connection.name))
+        .map(|&index| safe_text(&app.engines[index].connection.name))
         .collect();
     app.inventory_engine = app
         .inventory_engine
@@ -873,7 +874,11 @@ fn draw_overview_inner(frame: &mut Frame, app: &mut App, area: Rect, scan_only: 
         .push((parts[1], MouseTarget::InventoryPane));
     frame.render_widget(
         Tabs::new(names)
-            .select(app.inventory_engine)
+            .select(
+                engines
+                    .iter()
+                    .position(|&index| index == app.inventory_engine),
+            )
             .highlight_style(selected()),
         parts[0],
     );

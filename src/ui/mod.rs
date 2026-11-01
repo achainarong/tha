@@ -267,8 +267,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .split(area);
     let connected = app
-        .engines
-        .iter()
+        .engines_in_view()
+        .into_iter()
+        .map(|index| &app.engines[index])
         .filter(|engine| {
             engine.snapshot.is_some() && engine.error.is_none() && engine.alias.is_none()
         })
@@ -325,7 +326,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             crate::tf!(
                 "{connected} connected / {a0} configured",
                 connected = connected,
-                a0 = app.configured_engine_count()
+                a0 = app.engines_in_view().len()
             ),
             muted(),
         ),

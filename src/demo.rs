@@ -5,6 +5,55 @@ use crate::{
     model::{Container, PortBinding, Resource, Snapshot},
 };
 
+/// Sample servers for `--demo --demo-servers`: one connected, one that never was, one lost.
+pub fn populate_servers(app: &mut App) {
+    use crate::{
+        machines::MachineState,
+        remote::{ConnectMode, Remote},
+    };
+    let remote = |name: &str, host: &str| Remote {
+        name: name.into(),
+        host: host.into(),
+        user: "tha".into(),
+        identity_file: format!("~/.ssh/tha_{name}"),
+        port: None,
+        connect: Some(ConnectMode::Manual),
+        metrics_refresh_seconds: None,
+    };
+    app.load_machines(
+        vec![
+            remote("prod", "prod.example.com"),
+            remote("staging", "staging.example.com"),
+            remote("backup", "backup.example.com"),
+        ],
+        Ok(Vec::new()),
+        None,
+    );
+    let fixture = app
+        .engines
+        .iter()
+        .find_map(|engine| engine.snapshot.clone())
+        .unwrap_or_default();
+    app.machines[0].state = MachineState::Connected;
+    app.machines[0].engines = vec!["docker".to_owned()];
+    app.machines[2].state = MachineState::Offline {
+        reason: crate::i18n::t("Timed out connecting over SSH").into(),
+        retrying: true,
+    };
+    app.attach_engines("prod", &["docker".to_owned()]);
+    app.take_remote_availability();
+    let index = app.machine_engines("prod")[0];
+    app.update_engine(
+        index,
+        Ok(Snapshot {
+            engine_id: Some("demo-prod".into()),
+            ..fixture
+        }),
+    );
+    seed_metrics(&mut app.engines[index]);
+    app.refresh_tree();
+}
+
 pub fn connections() -> Vec<Connection> {
     [
         ("OrbStack", BackendKind::Docker),
@@ -376,37 +425,69 @@ pub fn populate(app: &mut App) {
         }
     }
     for engine in &mut app.engines {
-        if engine.error.is_some() {
-            continue;
-        }
-        let Some(snapshot) = &engine.snapshot else {
-            continue;
-        };
-        for tick in 0..crate::metrics::HISTORY_LENGTH {
-            let batch = snapshot
-                .containers
-                .iter()
-                .filter(|c| c.running())
-                .enumerate()
-                .map(|(index, container)| {
-                    let phase = ((tick + index * 7) % 20) as u64;
-                    (
-                        container.key(),
-                        Ok(crate::metrics::Reading {
-                            usage: crate::metrics::Usage {
-                                cpu_percent: Some(phase as f64 * 3.0 + 2.0),
-                                memory_bytes: Some((128 + phase * 2) * 1024 * 1024),
-                                memory_limit_bytes: Some(1024 * 1024 * 1024),
-                                memory_working_set: true,
-                                ..Default::default()
-                            },
-                            counters: None,
-                            sampled_at: std::time::Instant::now(),
-                        }),
-                    )
-                })
-                .collect();
-            engine.metrics.apply(&snapshot.containers, batch);
-        }
+        seed_metrics(engine);
+    }
+}
+
+fn seed_metrics(engine: &mut crate::app::Engine) {
+    if engine.error.is_some() {
+        return;
+    }
+    let Some(snapshot) = &engine.snapshot else {
+        return;
+    };
+    for tick in 0..crate::metrics::HISTORY_LENGTH {
+        let batch = snapshot
+            .containers
+            .iter()
+            .filter(|c| c.running())
+            .enumerate()
+            .map(|(index, container)| {
+                let phase = ((tick + index * 7) % 20) as u64;
+                (
+                    container.key(),
+                    Ok(crate::metrics::Reading {
+                        usage: crate::metrics::Usage {
+                            cpu_percent: Some(phase as f64 * 3.0 + 2.0),
+                            memory_bytes: Some((128 + phase * 2) * 1024 * 1024),
+                            memory_limit_bytes: Some(1024 * 1024 * 1024),
+                            memory_working_set: true,
+                            ..Default::default()
+                        },
+                        counters: None,
+                        sampled_at: std::time::Instant::now(),
+                    }),
+                )
+            })
+            .collect();
+        engine.metrics.apply(&snapshot.containers, batch);
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+
+    #[test]
+    fn plain_demo_mode_has_no_servers() {
+        let mut app = App::new(connections(), 100, false, true);
+        populate(&mut app);
+        assert!(app.machines.is_empty());
+    }
+
+    #[test]
+    fn demo_servers_show_every_connection_state_and_contact_nothing() {
+        let mut app = App::new(connections(), 100, false, true);
+        populate(&mut app);
+        populate_servers(&mut app);
+        let titles: Vec<_> = app.rows.iter().map(|row| row.title.as_str()).collect();
+        assert!(titles.contains(&"prod"), "{titles:?}");
+        assert!(titles.contains(&"staging [not connected]"), "{titles:?}");
+        assert!(titles.contains(&"backup (offline)"), "{titles:?}");
+        let prod = app.machine_engines("prod")[0];
+        assert!(app.engines[prod].alias.is_none());
+        assert!(app.engines[prod].snapshot.is_some());
+        app.connect_machine("staging");
+        assert!(app.take_remote_commands().is_empty());
     }
 }

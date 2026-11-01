@@ -179,6 +179,9 @@ async fn start() -> Result<()> {
     app.security.enabled = app.service_modules && tha::security::enabled();
     if cli.demo {
         demo::populate(&mut app);
+        if cli.demo_servers {
+            demo::populate_servers(&mut app);
+        }
     }
     if !cli.demo && !cli.standalone {
         let path = tha::history::path(&config)?;
@@ -970,6 +973,8 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     }
     drop(discovery_task);
     drop(workers);
+    drop(remote_tasks);
+    tha::remote::remove_session_directory();
     Ok(())
 }
 
@@ -2110,14 +2115,19 @@ fn dispatch_navigation(
             | A::NextRuntime
             | A::SecurityPreviousRuntime
             | A::SecurityNextRuntime => {
-                app.inventory_engine =
-                    if matches!(action, A::PreviousRuntime | A::SecurityPreviousRuntime) {
-                        app.inventory_engine.saturating_sub(1)
+                // Steps through what the tabs offer, never onto a hidden or disconnected engine.
+                let engines = app.engines_in_view();
+                if let Some(position) = engines.iter().position(|&e| e == app.inventory_engine) {
+                    let next = if matches!(action, A::PreviousRuntime | A::SecurityPreviousRuntime)
+                    {
+                        position.saturating_sub(1)
                     } else {
-                        app.inventory_engine
-                            .saturating_add(1)
-                            .min(app.engines.len().saturating_sub(1))
+                        (position + 1).min(engines.len() - 1)
                     };
+                    app.inventory_engine = engines[next];
+                } else if let Some(&first) = engines.first() {
+                    app.inventory_engine = first;
+                }
             }
             A::Search => {
                 let view = app
@@ -2872,7 +2882,11 @@ fn click(
                 app.detail_focus = false;
             }
         }
-        T::InventoryRuntime(index) => app.inventory_engine = index,
+        T::InventoryRuntime(index) => {
+            if let Some(&engine) = app.engines_in_view().get(index) {
+                app.inventory_engine = engine;
+            }
+        }
         T::InventoryRow(index) => {
             let security = app.overview_mode == OverviewMode::Security;
             let mode = if security {

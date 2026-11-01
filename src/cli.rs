@@ -16,6 +16,9 @@ pub struct Cli {
     /// Explore sample workloads without connecting to any engines
     #[arg(long)]
     pub demo: bool,
+    /// With --demo, also show sample remote servers; nothing is contacted
+    #[arg(long, requires = "demo")]
+    pub demo_servers: bool,
     /// Start with all runtimes instead of matching a Compose project to this directory
     #[arg(long)]
     pub overview: bool,
