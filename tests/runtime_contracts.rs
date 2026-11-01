@@ -447,9 +447,14 @@ async fn docker_inventory_preserves_ownership_and_attachments() {
         "localhost:8080 → 3000/tcp (loopback only · 127.0.0.1)"
     );
     assert_eq!(snapshot.networks[0].containers, ["shop-api-1"]);
-    assert_eq!(snapshot.volumes[0].containers, ["shop-api-1"]);
+    let volume = snapshot
+        .volumes
+        .iter()
+        .find(|volume| volume.name == "shop_data")
+        .expect("the project's volume");
+    assert_eq!(volume.containers, ["shop-api-1"]);
     assert!(snapshot.volumes_available);
-    assert!(snapshot.volumes[0].details.contains("mount: /data"));
+    assert!(volume.details.contains("mount: /data"));
     assert_eq!(snapshot.containers[0].volumes, ["shop_data"]);
     assert_eq!(
         snapshot.containers[0].bind_mounts,

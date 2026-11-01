@@ -237,7 +237,10 @@ async fn list_resources(connection: &Connection, result: &mut Snapshot) {
         output(command)
     };
     match list(None, "network").await {
-        Ok(text) => result.networks = parse_resources(&text, "driver"),
+        Ok(text) => {
+            result.networks = parse_resources(&text, "driver");
+            result.networks.sort_by(|a, b| a.name.cmp(&b.name));
+        }
         Err(error) => result
             .warnings
             .push(format!("Networks unavailable: {error}")),

@@ -590,7 +590,17 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
             .push(format!("Volumes unavailable: {error}")),
     }
     result.containers.sort_by(|a, b| a.name.cmp(&b.name));
+    sort_resources(&mut result.networks);
+    sort_resources(&mut result.volumes);
     Ok(result)
+}
+
+/// Engines return these in no fixed order, which would move rows under the cursor on each refresh.
+fn sort_resources(resources: &mut [Resource]) {
+    resources.sort_by(|a, b| a.name.cmp(&b.name));
+    for resource in resources {
+        resource.containers.sort();
+    }
 }
 
 pub async fn usage(
@@ -783,6 +793,35 @@ mod tests {
             "{:?}",
             snapshot.warnings
         );
+    }
+
+    #[test]
+    fn resources_keep_one_order_whatever_order_the_engine_answers_in() {
+        let resource = |name: &str, containers: &[&str]| Resource {
+            name: name.into(),
+            containers: containers.iter().map(|c| (*c).into()).collect(),
+            ..Default::default()
+        };
+        let mut first = vec![
+            resource("host", &[]),
+            resource("bridge", &["web", "api"]),
+            resource("none", &[]),
+        ];
+        let mut second = vec![
+            resource("bridge", &["api", "web"]),
+            resource("none", &[]),
+            resource("host", &[]),
+        ];
+        sort_resources(&mut first);
+        sort_resources(&mut second);
+        let names = |list: &[Resource]| {
+            list.iter()
+                .map(|resource| (resource.name.clone(), resource.containers.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&first), names(&second));
+        assert_eq!(first[0].name, "bridge");
+        assert_eq!(first[0].containers, ["api", "web"]);
     }
 
     #[test]
