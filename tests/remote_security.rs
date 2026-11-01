@@ -280,7 +280,12 @@ async fn report_sync_child() {
         assert!(response.status().is_success());
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let snapshot: tha::security::agent::Snapshot = serde_json::from_slice(&body).unwrap();
-        assert_eq!(snapshot.state, "queued");
+        // The scan semaphore has no permits, so the worker gets as far as waiting and no further.
+        assert!(
+            matches!(snapshot.state.as_str(), "queued" | "waiting"),
+            "Unexpected job state: {}",
+            snapshot.state
+        );
         assert!(
             snapshot.report.is_none(),
             "Status polling must not transfer old findings repeatedly"
