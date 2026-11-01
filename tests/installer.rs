@@ -243,6 +243,9 @@ fn agent_mode_installs_only_the_gate_and_starts_nothing() {
     assert!(temp.path().join("installed/tha-agent").exists());
     assert!(!temp.path().join("installed/tha").exists());
     assert!(stdout.contains("tha-agent fixture"), "{stdout}");
+    assert!(stdout.contains("still needs setup"), "{stdout}");
+    assert!(stdout.contains("setup --user root"), "{stdout}");
+    assert!(stdout.contains("setup --user tha --key"), "{stdout}");
     let calls = fs::read_to_string(temp.path().join("calls")).unwrap();
     assert!(calls.contains("tha-agent-linux-amd64.tar.gz"), "{calls}");
     assert!(!calls.contains("/tha-linux-amd64"), "{calls}");

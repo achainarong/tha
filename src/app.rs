@@ -2999,10 +2999,12 @@ impl App {
         if let Some(home) = std::env::var_os("HOME") {
             for saved in &preferences.runtimes {
                 if saved.target.validate().is_err()
-                    || self
-                        .engines
-                        .iter()
-                        .any(|engine| engine.runtime.as_ref() == Some(&saved.target))
+                    // A discovered runtime can use another socket than the remembered one, so
+                    // the same name means the same runtime, not a second, offline row.
+                    || self.engines.iter().any(|engine| {
+                        engine.runtime.as_ref() == Some(&saved.target)
+                            || engine.connection.name == saved.name
+                    })
                 {
                     continue;
                 }

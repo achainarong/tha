@@ -82,8 +82,17 @@ pub fn load_config(path: &Path) -> Result<AgentConfig> {
 }
 
 fn load_config_owned_by(path: &Path, owner: u32) -> Result<AgentConfig> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("Cannot read agent configuration {}", path.display()))?;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+            "This server's tha-agent is not set up yet: {} is missing. Run: sudo tha-agent setup --user root, or the setup command Tha shows for a dedicated user",
+            path.display()
+        ),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Cannot read agent configuration {}", path.display()));
+        }
+    };
     ensure!(
         metadata.file_type().is_file(),
         "Agent configuration must be a regular file: {}",
@@ -888,6 +897,16 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(load_config_owned_by(&link, owner).is_err());
+    }
+
+    #[test]
+    fn a_missing_policy_says_setup_has_not_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = load_config_owned_by(&directory.path().join("agent.toml"), 0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not set up yet"), "{error}");
+        assert!(error.contains("tha-agent setup"), "{error}");
     }
 
     #[test]

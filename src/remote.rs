@@ -443,6 +443,15 @@ pub fn classify_failure(stderr: &str) -> (String, bool) {
             false,
         );
     }
+    if lower.contains("not set up yet") {
+        return (
+            crate::i18n::t(
+                "tha-agent is installed on this server, but not set up. Run the setup command on it.",
+            )
+            .into(),
+            false,
+        );
+    }
     if lower.contains("only runs the tha-agent") || lower.contains("agent configuration") {
         return (
             crate::tf!("Server agent problem: {detail}", detail = last_line(stderr)),
@@ -1090,6 +1099,7 @@ mod tests {
             "Load key \"/k\": bad permissions",
             "This key only runs the tha-agent; no shell is available",
             "bash: line 1: tha-agent: command not found",
+            "tha-agent: This server's tha-agent is not set up yet: /etc/tha/agent.toml is missing.",
         ] {
             assert!(!classify_failure(stderr).1, "{stderr}");
         }

@@ -3342,4 +3342,8 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("<user>", "<Benutzer>"),
     ("<port>", "<Port>"),
     ("<path>", "<Pfad>"),
+    (
+        "tha-agent is installed on this server, but not set up. Run the setup command on it.",
+        "tha-agent ist auf diesem Server installiert, aber nicht eingerichtet. Den Setup-Befehl dort ausführen.",
+    ),
 ];

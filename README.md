@@ -44,6 +44,9 @@ Linux only, and it does need root; see [Remote servers](#remote-servers):
 curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent
 ```
 
+This only installs the binary. The server is not ready until you also run
+`tha-agent setup`; the commands are under [Remote servers](#remote-servers).
+
 The [script](scripts/install.sh) downloads the release archive and `SHA256SUMS`,
 verifies the checksum, and installs `tha` into `~/.local/bin`. It needs `curl` or
 `wget`, `tar`, and `sha256sum` (Linux) or `shasum` (macOS). Optional settings:
@@ -216,7 +219,6 @@ make install                # Standalone: install tha into ~/.cargo/bin (or your
 make install MODE=service   # Also install and start the per-user background collector
 make install:full           # Service + security; requires Docker CLI and a running engine
 make install:agent           # Only tha-agent, for a server; uses sudo
-make install:agent           # Only tha-agent, for a server; uses sudo
 tha
 ```
 
@@ -326,26 +328,39 @@ has stolen the key and does not use Tha.
 
 **Add a server:** press `.` or type `:servers`, then `a`. Enter the host, user and
 key path, or create a key from the form. It shows the command to run once on the
-server, as an admin:
+server, as an admin. It has two parts, and the server needs both: installing
+`tha-agent`, then `tha-agent setup`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent \
   && sudo /usr/local/bin/tha-agent setup --user tha --key 'ssh-ed25519 AAAA...'
 ```
 
-The command installs `tha-agent` too, so that is all the server needs; the full `tha`
-stays on your own machine. The agent is not a service: it opens no port and uses nothing
-while idle. SSH starts it for each connection, and it exits when the connection ends. Setup creates the dedicated user, writes the
-root-owned policy `/etc/tha/agent.toml`, and restricts the key in `authorized_keys`
-to the agent. It stops if that user already has a key that could bypass the agent.
-Then use **Test connection**: OpenSSH shows the host key fingerprint for you to
-confirm, and Tha never accepts a host key itself. Do not give the agent user any
-other key, password or sudo rule.
+`tha-agent` is all the server needs; the full `tha` stays on your own machine. The
+agent is not a service: it opens no port and uses nothing while idle. SSH starts it for
+each connection, and it exits when the connection ends.
 
-You can also connect as `root` with an existing key, after running
-`tha-agent setup --user root`, which only writes the policy. `tha`'s own traffic still
-goes through the allowlist, but the key is not restricted: anyone holding it has full
-root access on the server. Use a dedicated user if the limit must hold for a stolen key.
+Setup creates the dedicated user, writes the root-owned policy `/etc/tha/agent.toml`,
+and restricts the key in `authorized_keys` to the agent. It stops if that user already
+has a key that could bypass the agent. Do not give the agent user any other key,
+password or sudo rule.
+
+Then use **Test connection**: OpenSSH shows the host key fingerprint for you to
+confirm, and Tha never accepts a host key itself.
+
+You can also connect as `root` with an existing key. Setup then only writes the policy:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent
+sudo /usr/local/bin/tha-agent setup --user root
+```
+
+`tha`'s own traffic still goes through the allowlist, but the key is not restricted:
+anyone holding it has full root access on the server. Use a dedicated user if the limit
+must hold for a stolen key.
+
+If Test connection says it cannot read `/etc/tha/agent.toml`, the agent is installed but
+setup has not run yet.
 
 Servers can also be written by hand as `[[remotes]]` in `config.toml`; see
 `tha.example.toml`. Those show as read-only in the modal. Servers added in the modal

@@ -188,7 +188,9 @@ if [ "$MODE" = agent ]; then
     run mkdir -p "$BIN_DIR"
     run install -m 755 "$tmp/tha-agent" "$bin"
     say "installed $(run "$bin" --version) to $bin"
-    say "next: run the setup command shown in Tha under Servers, on this server"
+    say "not ready yet: this server still needs setup. Run one of these next:"
+    say "  dedicated user (recommended): sudo $bin setup --user tha --key 'PUBLIC_KEY'"
+    say "  existing root key:            sudo $bin setup --user root"
     exit 0
 fi
 running=0

@@ -217,6 +217,19 @@ pub struct RemotesModal {
     pub message: Option<String>,
 }
 
+impl Machine {
+    /// Stopped on something the user had to fix, so nothing retries until they act.
+    fn waiting_for_user(&self) -> bool {
+        matches!(
+            self.state,
+            MachineState::Offline {
+                retrying: false,
+                ..
+            }
+        )
+    }
+}
+
 impl App {
     pub fn is_anchor(&self, index: usize) -> bool {
         remote::parse_endpoint(&self.engines[index].connection.endpoint)
@@ -876,7 +889,9 @@ impl App {
         } else {
             self.add_machine(remote.clone(), true);
         }
-        if reconnect {
+        // A change can be the fix for what stopped the last attempt, so that error must not stay.
+        let retry = existing.as_ref().is_some_and(Machine::waiting_for_user);
+        if reconnect || retry {
             self.connect_machine(&remote.name);
         }
         let problem = self.persist_servers();
@@ -1040,6 +1055,15 @@ impl App {
         };
         if let Some(modal) = &mut self.remotes_modal {
             modal.hidden = false;
+        }
+        // A passing test disproves the error that stopped an earlier attempt.
+        if kind == "test" {
+            let saved = self.form_mut().and_then(|form| form.editing.clone());
+            if let Some(name) = saved
+                && self.machine(&name).is_some_and(Machine::waiting_for_user)
+            {
+                self.connect_machine(&name);
+            }
         }
         if let Some(form) = self.form_mut() {
             form.refresh_setup();
@@ -1613,6 +1637,94 @@ mod tests {
                 .iter()
                 .all(|title| !title.starts_with("docker"))
         );
+    }
+
+    #[test]
+    fn a_remembered_runtime_does_not_duplicate_a_discovered_one() {
+        let mut app = App::new(
+            vec![Connection {
+                name: "Docker Desktop".into(),
+                kind: BackendKind::Docker,
+                endpoint: "unix:///home/a/.docker/desktop/docker.sock".into(),
+            }],
+            100,
+            false,
+            false,
+        );
+        app.apply_preferences(
+            crate::preferences::Preferences {
+                runtimes: vec![crate::runtime::Saved {
+                    name: "Docker Desktop".into(),
+                    target: crate::runtime::Target::DockerDesktop,
+                }],
+                ..Default::default()
+            },
+            true,
+        );
+        assert_eq!(app.engines.len(), 1);
+        assert!(
+            app.preferences().runtimes.is_empty(),
+            "the stale entry goes away"
+        );
+    }
+
+    fn stopped(app: &mut App, name: &str) {
+        app.connect_machine(name);
+        let generation = app.machine(name).unwrap().generation;
+        app.apply_remote_event(remote::Event {
+            server: name.into(),
+            generation,
+            update: Update::Failed {
+                reason: "tha-agent is not installed on this server.".into(),
+                retrying: false,
+            },
+        });
+        app.take_remote_commands();
+    }
+
+    #[test]
+    fn saving_a_server_retries_one_that_stopped_on_an_error() {
+        let mut app = with_servers(&["prod"]);
+        stopped(&mut app, "prod");
+        app.open_servers();
+        press(&mut app, KeyCode::Char('e'));
+        app.servers_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(app.machine("prod").unwrap().state, MachineState::Connecting);
+        assert_eq!(app.take_remote_commands().len(), 1);
+    }
+
+    #[test]
+    fn saving_a_healthy_disconnected_server_still_sends_nothing() {
+        let mut app = with_servers(&["prod"]);
+        app.open_servers();
+        press(&mut app, KeyCode::Char('e'));
+        app.servers_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.take_remote_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_passing_test_clears_an_earlier_failure() {
+        let mut app = with_servers(&["prod"]);
+        stopped(&mut app, "prod");
+        app.open_servers();
+        press(&mut app, KeyCode::Char('e'));
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            r#"printf '%s\n' '{"engines":["docker"],"allow_delete":false}'"#,
+        ]);
+        app.open_local_tool("Test", "test", Ok(command));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let id = loop {
+            if let Some(notice) = app.sessions.poll().pop() {
+                break notice.id;
+            }
+            assert!(std::time::Instant::now() < deadline, "the tool must end");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(app.local_tool_finished(id));
+        assert_eq!(app.machine("prod").unwrap().state, MachineState::Connecting);
+        assert_eq!(app.take_remote_commands().len(), 1);
     }
 
     #[test]
