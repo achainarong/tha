@@ -61,7 +61,7 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
     let preview = Block::new().borders(ratatui::widgets::Borders::LEFT);
     let right = padded(preview.inner(columns[1]));
     frame.render_widget(preview, columns[1]);
-    frame.render_widget(preview_paragraph(app), right);
+    frame.render_widget(preview_paragraph(app, right.width), right);
     if let Some(command) = &manager.command {
         frame.render_widget(Paragraph::new(format!(":{}▏", safe_text(command))), rows[1]);
     } else if let Some(message) = &manager.message {
@@ -73,7 +73,7 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Read-only, and only ever sanitized text: file contents never reach the terminal raw.
-fn preview_paragraph(app: &App) -> Paragraph<'static> {
+fn preview_paragraph(app: &App, width: u16) -> Paragraph<'static> {
     let warn = accent(app, Color::Yellow);
     let Some(preview) = &app.downloads.preview else {
         return Paragraph::new(crate::i18n::t("Select a file to see it here.")).style(muted());
@@ -134,9 +134,13 @@ fn preview_paragraph(app: &App) -> Paragraph<'static> {
             lines
         }
     };
-    let limit = lines.len().saturating_sub(1);
+    let mut paragraph = Paragraph::new(lines);
+    if matches!(preview.status, FilePreview::Failed(_)) {
+        paragraph = paragraph.wrap(ratatui::widgets::Wrap { trim: false });
+    }
+    let limit = paragraph.line_count(width).saturating_sub(1);
     let scroll = preview.scroll.min(limit);
-    Paragraph::new(lines).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
+    paragraph.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
 }
 
 fn browse_lines(app: &App, height: usize, width: usize) -> Vec<Line<'static>> {
@@ -472,6 +476,20 @@ mod tests {
         let output = screen(&mut app);
         assert!(output.contains("before"), "{output}");
         assert!(!output.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn long_preview_errors_wrap_so_the_recovery_hint_is_visible() {
+        let mut app = demo_on_container();
+        app.open_file_explorer();
+        app.take_download_requests();
+        app.downloads.update_preview(std::time::Instant::now());
+        app.downloads.preview.as_mut().unwrap().status = FilePreview::Failed(format!(
+            "Invalid agent configuration: {} REPAIR-USING-SSH",
+            "unknown field test_param ".repeat(8)
+        ));
+        let output = screen(&mut app);
+        assert!(output.contains("REPAIR-USING-SSH"), "{output}");
     }
 
     #[test]

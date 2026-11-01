@@ -110,6 +110,22 @@ fn writable(path: &Path) -> bool {
 /// Replaces the file only if it is still what was downloaded, keeping one backup beside it, and
 /// keeps its owner and mode. A reader sees the old file or the new one, never part of one.
 pub fn write_checked(path: &Path, expected: &str, contents: &[u8], any: bool) -> Result<()> {
+    write_checked_for_config(
+        path,
+        expected,
+        contents,
+        any,
+        Path::new(crate::agent::CONFIG_PATH),
+    )
+}
+
+fn write_checked_for_config(
+    path: &Path,
+    expected: &str,
+    contents: &[u8],
+    any: bool,
+    config_path: &Path,
+) -> Result<()> {
     let metadata = regular_file(path, any)?;
     ensure!(
         contents.len() as u64 <= MAX_FILE_BYTES,
@@ -118,6 +134,19 @@ pub fn write_checked(path: &Path, expected: &str, contents: &[u8], any: bool) ->
     let current = std::fs::read(path)?;
     if hash(&current) != expected {
         bail!("The file changed on the server while it was being edited; nothing was overwritten");
+    }
+    // Match the actual file as well as its spelling, so parent-directory aliases and hard links
+    // cannot bypass validation of the policy that authorizes the next SSH request.
+    let edits_policy = path == config_path
+        || std::fs::metadata(config_path)
+            .is_ok_and(|policy| policy.dev() == metadata.dev() && policy.ino() == metadata.ino());
+    if edits_policy {
+        std::str::from_utf8(contents)
+            .context("Agent configuration must be UTF-8 text")
+            .and_then(crate::agent::parse_config)
+            .context(
+                "Invalid agent configuration; the original file and backup were not changed",
+            )?;
     }
     let parent = path.parent().context("This path has no folder")?;
     let name = path.file_name().context("This path has no file name")?;
@@ -521,6 +550,65 @@ mod tests {
         let error = write_checked(&path, &hash(b"what I downloaded"), b"mine", false).unwrap_err();
         assert!(error.to_string().contains("changed"));
         assert_eq!(std::fs::read(&path).unwrap(), b"someone else's edit");
+    }
+
+    #[test]
+    fn invalid_agent_config_edits_preserve_the_working_policy_and_existing_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("agent.toml");
+        let backup = directory.path().join("agent.toml.tha-backup");
+        let original = b"allow_server_edit = true\n";
+        for invalid in [
+            "[security.limits]\ntest_param = 0\n",
+            "allow_server_edit = ",
+            "[[engines]]\nname = 'docker'\nsocket = 'relative.sock'\n",
+        ] {
+            std::fs::write(&path, original).unwrap();
+            std::fs::write(&backup, b"previous known-good backup").unwrap();
+            let result =
+                write_checked_for_config(&path, &hash(original), invalid.as_bytes(), true, &path);
+            assert!(result.is_err(), "Invalid policy was saved: {invalid}");
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(
+                std::fs::read(&backup).unwrap(),
+                b"previous known-good backup"
+            );
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+        }
+    }
+
+    #[test]
+    fn valid_agent_config_edits_still_save_and_keep_a_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("agent.toml");
+        let original = b"allow_server_edit = true\n";
+        let edited = b"allow_server_edit = true\nallow_server_download = true\n";
+        std::fs::write(&path, original).unwrap();
+        write_checked_for_config(&path, &hash(original), edited, true, &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), edited);
+        assert_eq!(
+            std::fs::read(directory.path().join("agent.toml.tha-backup")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn agent_config_aliases_cannot_skip_validation_but_other_toml_files_are_unrestricted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("agent.toml");
+        let original = b"allow_server_edit = true\n";
+        std::fs::write(&path, original).unwrap();
+        let alias = directory.path().join("alias.toml");
+        std::fs::hard_link(&path, &alias).unwrap();
+        assert!(
+            write_checked_for_config(&alias, &hash(original), b"test_param = 0", true, &path)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let other = directory.path().join("other.toml");
+        std::fs::write(&other, b"old").unwrap();
+        write_checked_for_config(&other, &hash(b"old"), b"test_param = 0", true, &path).unwrap();
+        assert_eq!(std::fs::read(&other).unwrap(), b"test_param = 0");
     }
 
     #[test]

@@ -110,6 +110,13 @@ pub fn load_config(path: &Path) -> Result<AgentConfig> {
     load_config_owned_by(path, 0)
 }
 
+/// Parse and validate the same policy for loading and before accepting an edited replacement.
+pub(crate) fn parse_config(text: &str) -> Result<AgentConfig> {
+    let config: AgentConfig = toml::from_str(text)?;
+    config.validate()?;
+    Ok(config)
+}
+
 fn load_config_owned_by(path: &Path, owner: u32) -> Result<AgentConfig> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -134,10 +141,10 @@ fn load_config_owned_by(path: &Path, owner: u32) -> Result<AgentConfig> {
     );
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("Cannot read agent configuration {}", path.display()))?;
-    let config: AgentConfig = toml::from_str(&text)
-        .with_context(|| format!("Invalid agent configuration {}", path.display()))?;
-    config.validate()?;
-    Ok(config)
+    parse_config(&text).with_context(|| format!(
+        "Invalid agent configuration {}. Repair it using an independent SSH login; Tha file access remains blocked until the policy is valid",
+        path.display()
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1452,6 +1459,20 @@ mod tests {
         let parsed: std::result::Result<AgentConfig, _> =
             toml::from_str("allow_arbitrary_api = true\n");
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn an_invalid_policy_still_fails_closed_and_explains_independent_ssh_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("agent.toml");
+        std::fs::write(&path, "[security.limits]\ntest_param = 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let owner = std::fs::metadata(&path).unwrap().uid();
+        let error = load_config_owned_by(&path, owner).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("independent SSH login"), "{message}");
+        assert!(message.contains("test_param"), "{message}");
     }
 
     #[test]

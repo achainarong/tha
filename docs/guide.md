@@ -1200,6 +1200,13 @@ The old version is kept beside the file as `<file>.tha-backup`. If the file chan
 overwrite it and tells you where your copy is. Files stay limited to 1 MiB of text. Nothing is restarted or applied.
 Changes to a container's own files are lost when it is recreated, unless the file is on a volume.
 
+When editing the server's own `/etc/tha/agent.toml`, Tha validates the replacement before writing it.
+An invalid edit leaves the working policy and its backup untouched, and keeps your local edited copy.
+If that policy was already broken outside this check, repair it through an independent SSH login;
+Tha deliberately refuses file access while its policy is invalid. Afterwards, press `r` to retry the
+folder, or move away from a failed preview and back to read it again. Configuration changes do not
+automatically restart the persistent agent service.
+
 If `code` is not on your `PATH`, set `vscode_path` in `config.toml` to its full path.
 
 On a server, what you can do depends on its options:

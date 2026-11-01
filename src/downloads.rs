@@ -543,9 +543,7 @@ impl Manager {
         let Some(tree) = self.tree_mut() else {
             return;
         };
-        if tree.stopped.is_some() {
-            return;
-        }
+        tree.stopped = None;
         let prefix = if folder == "/" {
             "/".to_owned()
         } else {
@@ -891,7 +889,10 @@ impl Manager {
                     },
                 };
                 preview.status = status.clone();
-                if let Some(tree) = self.tree_mut() {
+                // A transient read/configuration failure must not remain cached after recovery.
+                if !matches!(status, FilePreview::Failed(_))
+                    && let Some(tree) = self.tree_mut()
+                {
                     if tree.previews.len() >= MAX_CACHED_PREVIEWS {
                         tree.previews.clear();
                     }
@@ -1390,6 +1391,58 @@ mod tests {
         );
         let rows = manager.tree().unwrap().rows();
         assert!(rows.iter().any(|row| row.path == "/new.txt"));
+    }
+
+    #[test]
+    fn refresh_retries_a_failed_root_listing_after_the_server_is_repaired() {
+        let mut manager = Manager::default();
+        let key = source("a").key();
+        manager.open_source(source("a"), Instant::now());
+        lists(&mut manager);
+        answer(
+            &mut manager,
+            &key,
+            "/",
+            Err("Invalid agent configuration".into()),
+        );
+        manager.refresh_selected();
+        assert_eq!(lists(&mut manager), ["/"]);
+        answer(
+            &mut manager,
+            &key,
+            "/",
+            listing(vec![file("recovered.txt", 1)]),
+        );
+        assert!(manager.tree().unwrap().stopped.is_none());
+        assert_eq!(manager.current_row().unwrap().path, "/recovered.txt");
+    }
+
+    #[test]
+    fn reselecting_a_failed_preview_retries_instead_of_reusing_a_cached_error() {
+        let (mut manager, start) = explorer_with(vec![file("a.txt", 10), file("b.txt", 10)]);
+        manager.update_preview(start);
+        manager.update_preview(start + Duration::from_secs(1));
+        let preview = manager.preview.as_ref().unwrap();
+        manager.apply(
+            Event::Previewed {
+                key: source("a").key(),
+                generation: preview.generation,
+                path: preview.path.clone(),
+                result: Err("Invalid agent configuration".into()),
+            },
+            start,
+        );
+        manager.selected = 1;
+        manager.update_preview(start);
+        manager.selected = 0;
+        manager.update_preview(start);
+        assert_eq!(
+            manager.preview.as_ref().unwrap().status,
+            FilePreview::Waiting
+        );
+        manager.requests.clear();
+        manager.update_preview(start + Duration::from_secs(1));
+        assert_eq!(previews(&mut manager), ["/a.txt"]);
     }
 
     #[test]
