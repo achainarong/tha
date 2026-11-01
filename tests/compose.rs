@@ -43,7 +43,7 @@ fn calls(log: &Path) -> Vec<String> {
     calls
 }
 
-// One test, because PATH is process-wide and this binary has no other tests.
+// Only this test changes PATH; the ignored helper runs in its own process.
 #[tokio::test]
 async fn operations_run_the_exact_commands_and_stop_at_the_first_failure() {
     let directory = tempfile::tempdir().unwrap();
@@ -153,4 +153,106 @@ async fn operations_run_the_exact_commands_and_stop_at_the_first_failure() {
             .unwrap_err()
             .contains("Install the Docker Compose plugin")
     );
+
+    // A failed plugin probe still falls back to the standalone tool.
+    fs::write(&cli, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(&standalone, CLI).unwrap();
+    fs::set_permissions(&standalone, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(run(request(Action::Up)).await.1, Ok(()));
+
+    // Run with a real runtime shutdown: cancelling just a JoinHandle is not sufficient proof.
+    fs::write(
+        &cli,
+        "#!/bin/sh\n/bin/sleep 60 &\nprintf '%s' \"$$\" > \"$THA_PROBE_READY\"\nwait\n",
+    )
+    .unwrap();
+    for mode in ["cancel", "timeout"] {
+        use std::os::unix::process::CommandExt;
+        let ready = directory.path().join(format!("ready-{mode}"));
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "stalled_probe_child", "--ignored", "--nocapture"])
+            .env("PATH", &bin)
+            .env("THA_PROBE_READY", &ready)
+            .env("THA_PROBE_MODE", mode)
+            .current_dir(&project)
+            .process_group(0);
+        let child = tokio::process::Command::from(command)
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let group = i32::try_from(child.id().unwrap()).unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+                .await;
+        let probe_group: i32 = fs::read_to_string(&ready).unwrap().parse().unwrap();
+        let cleaned = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            // SAFETY: signal 0 only checks these fixture-owned process groups.
+            while unsafe { libc::kill(-group, 0) == 0 || libc::kill(-probe_group, 0) == 0 } {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        // Clean up only this fixture's group if the regression left its CLI behind.
+        if cleaned.is_err() {
+            // SAFETY: group belongs exclusively to the child fixture created above.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+                libc::kill(-probe_group, libc::SIGKILL);
+            }
+        }
+        let output = result
+            .expect("Compose probe must not block runtime shutdown")
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            cleaned.is_ok(),
+            "Compose probe left a subprocess behind ({mode})"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "Run by the parent with an isolated PATH and runtime"]
+async fn stalled_probe_child() {
+    let request = Request {
+        connection: Connection {
+            name: "fixture".into(),
+            kind: BackendKind::Docker,
+            endpoint: "unix:///unused-fixture.sock".into(),
+        },
+        action: Action::Up,
+        target: tha::compose::Target {
+            project: "fixture".into(),
+            service: None,
+            working_dir: std::env::current_dir().unwrap(),
+            files: vec![],
+            env_files: vec![],
+        },
+        before: vec![],
+    };
+    if std::env::var("THA_PROBE_MODE").unwrap() == "timeout" {
+        let error = run(request).await.1.unwrap_err();
+        assert!(error.contains("probe timed out"), "{error}");
+    } else {
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let task = tokio::spawn(tha::compose::run(request, tx));
+        let ready = std::path::PathBuf::from(std::env::var_os("THA_PROBE_READY").unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
 }

@@ -281,8 +281,8 @@ pub enum Location {
 
 /// A server's file, copied here for the editor.
 pub struct Fetched {
-    /// Owns the private folder holding the copy. Dropping it removes the copy.
-    pub folder: tempfile::TempDir,
+    folder: Option<tempfile::TempDir>,
+    preserve: bool,
     pub path: PathBuf,
     pub hash: String,
     pub writable: bool,
@@ -291,14 +291,68 @@ pub struct Fetched {
     pub original: Vec<u8>,
 }
 
+impl Fetched {
+    /// Arm before giving the copy to an editor or moving it into a cancellable task.
+    pub fn preserve_on_drop(&mut self) {
+        self.preserve = true;
+    }
+
+    pub fn discard_on_drop(&mut self) {
+        self.preserve = false;
+    }
+
+    pub fn recovery_folder(&self) -> &Path {
+        self.path
+            .parent()
+            .expect("Fetched files live in a private folder")
+    }
+}
+
+impl Drop for Fetched {
+    fn drop(&mut self) {
+        if self.preserve
+            && let Some(folder) = self.folder.take()
+        {
+            // Cancellation skips the save-error branch, but still runs this destructor.
+            let _ = folder.keep();
+        }
+    }
+}
+
+const SSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_SSH_STDERR: u64 = 64 * 1024;
+
 async fn run_ssh(
     remote: &Remote,
     control: &Path,
     request: &str,
     input: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    use tokio::io::AsyncWriteExt;
     let command = crate::remote::files_command(remote, control, request)?;
+    let mutates = request.starts_with("tha-agent edit write ")
+        || request.starts_with("tha-agent edit create ")
+        || request.starts_with("tha-agent edit delete ");
+    run_ssh_command(command, input, mutates, SSH_TIMEOUT).await
+}
+
+async fn read_ssh_output(pipe: impl tokio::io::AsyncRead + Unpin, limit: u64) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    pipe.take(limit + 1).read_to_end(&mut bytes).await?;
+    ensure!(
+        bytes.len() as u64 <= limit,
+        "SSH edit output exceeded its size limit"
+    );
+    Ok(bytes)
+}
+
+async fn run_ssh_command(
+    command: std::process::Command,
+    input: Option<&[u8]>,
+    mutates: bool,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>> {
+    use tokio::io::AsyncWriteExt;
     let mut child = tokio::process::Command::from(command)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -307,20 +361,46 @@ async fn run_ssh(
         .spawn()
         .context("Cannot start ssh")?;
     let mut stdin = child.stdin.take().context("SSH input unavailable")?;
-    if let Some(input) = input {
-        stdin.write_all(input).await?;
+    let stdout = child.stdout.take().context("SSH output unavailable")?;
+    let stderr = child.stderr.take().context("SSH diagnostics unavailable")?;
+    let result = tokio::time::timeout(timeout, async {
+        let ((), stdout, stderr, status) = tokio::try_join!(
+            async {
+                if let Some(input) = input {
+                    stdin.write_all(input).await?;
+                }
+                drop(stdin);
+                Ok::<_, anyhow::Error>(())
+            },
+            read_ssh_output(stdout, MAX_FILE_BYTES),
+            read_ssh_output(stderr, MAX_SSH_STDERR),
+            async { Ok::<_, anyhow::Error>(child.wait().await?) },
+        )?;
+        Ok::<_, anyhow::Error>((stdout, stderr, status))
+    })
+    .await
+    .context("SSH edit operation timed out")
+    .and_then(|result| result);
+    if result.is_err() {
+        // kill_on_drop also covers cancellation of this future.
+        let _ = child.kill().await;
     }
-    drop(stdin);
-    let output = child.wait_with_output().await?;
-    if !output.status.success() {
-        let reason = String::from_utf8_lossy(&output.stderr);
+    let (stdout, stderr, status) = result.with_context(|| {
+        if mutates {
+            "Remote edit outcome unknown; refresh before retrying"
+        } else {
+            "Cannot complete remote file request"
+        }
+    })?;
+    if !status.success() {
+        let reason = String::from_utf8_lossy(&stderr);
         let reason = reason.trim();
         bail!(
             "{}",
             crate::model::safe_text(reason.strip_prefix("tha-agent: ").unwrap_or(reason))
         );
     }
-    Ok(output.stdout)
+    Ok(stdout)
 }
 
 /// An older agent refuses the words it has not heard of, which would otherwise read as a mystery.
@@ -414,7 +494,8 @@ pub async fn fetch(location: &Location) -> Result<Fetched> {
         .open(&local)?;
     file.write_all(&bytes)?;
     Ok(Fetched {
-        folder,
+        folder: Some(folder),
+        preserve: false,
         path: local,
         hash: hash(&bytes),
         writable,
@@ -481,6 +562,155 @@ fn check_unchanged(current: &crate::files::FileStart, expected: &str) -> Result<
 mod tests {
     use super::*;
 
+    fn fetched_copy() -> Fetched {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("compose.yaml");
+        std::fs::write(&path, b"original").unwrap();
+        Fetched {
+            folder: Some(folder),
+            preserve: false,
+            path,
+            hash: hash(b"original"),
+            writable: true,
+            header: None,
+            original: b"original".to_vec(),
+        }
+    }
+
+    #[test]
+    fn an_editor_failure_keeps_the_edited_copy() {
+        let mut fetched = fetched_copy();
+        let folder = fetched.recovery_folder().to_owned();
+        fetched.preserve_on_drop();
+        let status = std::process::Command::new("sh")
+            .args(["-c", "printf edited > \"$1\"; exit 1", "editor"])
+            .arg(&fetched.path)
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        drop(fetched);
+        assert_eq!(
+            std::fs::read(folder.join("compose.yaml")).unwrap(),
+            b"edited"
+        );
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_save_keeps_the_copy() {
+        let mut fetched = fetched_copy();
+        let folder = fetched.recovery_folder().to_owned();
+        fetched.preserve_on_drop();
+        std::fs::write(&fetched.path, b"edited").unwrap();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let copy = fetched;
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(copy);
+        });
+        started.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            std::fs::read(folder.join("compose.yaml")).unwrap(),
+            b"edited"
+        );
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_and_unchanged_edits_can_clean_up_but_save_errors_keep_the_copy() {
+        for changed in [false, true] {
+            let mut fetched = fetched_copy();
+            let folder = fetched.recovery_folder().to_owned();
+            fetched.preserve_on_drop();
+            if changed {
+                std::fs::write(&fetched.path, b"edited").unwrap();
+            }
+            let result = send_back(&Location::Local(fetched.path.clone()), &fetched).await;
+            if let Ok(saved) = result {
+                assert!(!saved);
+                fetched.discard_on_drop();
+            } else {
+                assert!(changed);
+            }
+            drop(fetched);
+            assert_eq!(folder.exists(), changed);
+            if changed {
+                std::fs::remove_dir_all(folder).unwrap();
+            }
+        }
+        let mut fetched = fetched_copy();
+        let folder = fetched.recovery_folder().to_owned();
+        fetched.preserve_on_drop();
+        fetched.discard_on_drop();
+        drop(fetched);
+        assert!(!folder.exists());
+    }
+
+    #[tokio::test]
+    async fn ssh_output_accepts_the_limit_and_rejects_overflow() {
+        for length in [0, 16, 17] {
+            let result = read_ssh_output(std::io::Cursor::new(vec![b'x'; length]), 16).await;
+            assert_eq!(result.is_ok(), length <= 16);
+        }
+    }
+
+    fn shell(script: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[tokio::test]
+    async fn ssh_edits_bound_waiting_and_report_unknown_mutation_outcomes() {
+        let error = run_ssh_command(
+            shell("exec sleep 60"),
+            None,
+            true,
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("outcome unknown"), "{message}");
+        assert!(message.contains("timed out"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn ssh_edits_reject_both_output_overflows_and_preserve_diagnostics() {
+        for script in ["exec yes x", "exec yes x >&2"] {
+            let error = run_ssh_command(shell(script), None, false, SSH_TIMEOUT)
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("size limit"));
+        }
+        let error = run_ssh_command(
+            shell("printf 'tha-agent: refused' >&2; exit 1"),
+            None,
+            false,
+            SSH_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "refused");
+    }
+
+    #[tokio::test]
+    async fn ssh_edits_drain_output_while_sending_input() {
+        let input = vec![b'x'; 256 * 1024];
+        let output = run_ssh_command(
+            shell("head -c 65536 /dev/zero >&2; cat"),
+            Some(&input),
+            true,
+            SSH_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, input);
+    }
+
     #[test]
     fn folders_of_paths_and_binary_files_are_handled() {
         assert_eq!(folder_of("/etc/nginx/nginx.conf"), "/etc/nginx");
@@ -499,7 +729,8 @@ mod tests {
             let path = folder.path().join("file.txt");
             std::fs::write(&path, &contents).unwrap();
             let fetched = Fetched {
-                folder,
+                folder: Some(folder),
+                preserve: false,
                 path: path.clone(),
                 hash: hash(b"original"),
                 writable: true,

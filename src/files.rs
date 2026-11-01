@@ -611,7 +611,7 @@ fn write_tree(
             skipped.push(name.to_owned());
             return Ok(());
         };
-        let mut items: Vec<_> = items.flatten().collect();
+        let mut items: Vec<_> = items.collect::<std::io::Result<Vec<_>>>()?;
         items.sort_by_key(std::fs::DirEntry::file_name);
         for item in items {
             let child = format!("{name}/{}", item.file_name().to_string_lossy());
@@ -624,21 +624,13 @@ fn write_tree(
         };
         let size = metadata.len();
         write_entry_header(out, name.as_bytes(), b'0', size, mode, modified)?;
-        // A file can change while it is read, but the archive must keep the size it announced.
+        // A short read must fail, not silently substitute zeros for the missing contents.
         let mut left = size;
         let mut buffer = vec![0; 64 * 1024];
         while left > 0 {
             let want = left.min(buffer.len() as u64) as usize;
-            let read = file.read(&mut buffer[..want]).unwrap_or(0);
-            if read == 0 {
-                break;
-            }
-            out.write_all(&buffer[..read])?;
-            left -= read as u64;
-        }
-        while left > 0 {
-            let want = left.min(buffer.len() as u64) as usize;
-            buffer[..want].fill(0);
+            file.read_exact(&mut buffer[..want])
+                .with_context(|| format!("Cannot read archive entry {name}"))?;
             out.write_all(&buffer[..want])?;
             left -= want as u64;
         }
@@ -1429,7 +1421,7 @@ pub async fn upload_bytes(source: &Source, folder: &str, archive: Vec<u8>) -> Re
     let Source::Container { connection, id, .. } = source else {
         bail!("{}", crate::i18n::t("Select a single container"));
     };
-    let chunks = futures_util::stream::iter(vec![Bytes::from(archive)]);
+    let chunks = futures_util::stream::iter(vec![Ok(Bytes::from(archive))]);
     send_archive(connection, id, folder, chunks).await
 }
 
@@ -1437,7 +1429,7 @@ async fn send_archive(
     connection: &Connection,
     id: &str,
     folder: &str,
-    chunks: impl Stream<Item = Bytes> + Send + 'static,
+    chunks: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
 ) -> Result<()> {
     if let Some(socket) = crate::remote::local_socket(&connection.endpoint) {
         // A refusal mid-transfer would only surface as a broken pipe, so ask before sending.
@@ -1453,7 +1445,7 @@ async fn send_archive(
                 path: folder.to_owned(),
                 ..Default::default()
             }),
-            bollard::body_stream(chunks),
+            bollard::body_try_stream(chunks),
         )
         .await?;
     Ok(())
@@ -1465,19 +1457,25 @@ async fn send_archive(
 fn file_chunks(
     file: tokio::fs::File,
     mut progress: impl FnMut(u64) + Send + 'static,
-) -> impl Stream<Item = Bytes> + Send + 'static {
-    futures_util::stream::unfold((file, 0u64), move |(mut file, sent)| async move {
+) -> impl Stream<Item = std::io::Result<Bytes>> + Send + 'static {
+    futures_util::stream::unfold(Some(file), move |file| async move {
         use tokio::io::AsyncReadExt;
+        let mut file = file?;
         let mut buffer = vec![0; 256 * 1024];
-        let count = file.read(&mut buffer).await.ok()?;
+        let count = match file.read(&mut buffer).await {
+            Ok(count) => count,
+            Err(error) => return Some((Err(error), None)),
+        };
         if count == 0 {
             return None;
         }
         buffer.truncate(count);
-        Some((Bytes::from(buffer), (file, sent + count as u64)))
+        Some((Ok(Bytes::from(buffer)), Some(file)))
     })
     .map(move |chunk| {
-        progress(chunk.len() as u64);
+        if let Ok(bytes) = &chunk {
+            progress(bytes.len() as u64);
+        }
         chunk
     })
 }
@@ -1496,7 +1494,11 @@ pub async fn upload(
     let (local_path, tar_path) = (local.to_owned(), archive.path().to_owned());
     let total = tokio::task::spawn_blocking(move || -> Result<u64> {
         let mut out = std::io::BufWriter::new(std::fs::File::create(&tar_path)?);
-        write_tar(&mut out, &local_path)?;
+        let skipped = write_tar(&mut out, &local_path)?;
+        ensure!(
+            skipped.is_empty(),
+            "Upload contains unreadable files; nothing was uploaded"
+        );
         drop(out);
         Ok(std::fs::metadata(&tar_path)?.len())
     })
@@ -1516,7 +1518,7 @@ async fn upload_through_agent(
     socket: &Path,
     id: &str,
     folder: &str,
-    chunks: impl Stream<Item = Bytes> + Send + 'static,
+    chunks: impl Stream<Item = std::io::Result<Bytes>> + Send + 'static,
 ) -> Result<()> {
     use http_body_util::StreamBody;
     use hyper::body::Frame;
@@ -1528,11 +1530,7 @@ async fn upload_through_agent(
     let _driver = AbortOnDrop(tokio::spawn(async move {
         let _ = driver.await;
     }));
-    let body = StreamBody::new(
-        chunks
-            .map(|chunk| Ok::<_, std::convert::Infallible>(Frame::data(chunk)))
-            .boxed(),
-    );
+    let body = StreamBody::new(chunks.map(|chunk| chunk.map(Frame::data)).boxed());
     let response = sender
         .send_request(
             Request::builder()
@@ -2100,6 +2098,100 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    #[test]
+    fn a_file_shrinking_during_archiving_is_an_error_not_zero_filled_success() {
+        struct TruncateOnHeader {
+            path: PathBuf,
+            bytes: Vec<u8>,
+            truncated: bool,
+        }
+        impl Write for TruncateOnHeader {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if !self.truncated && !bytes.is_empty() {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&self.path)?
+                        .set_len(0)?;
+                    self.truncated = true;
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("data.txt");
+        std::fs::write(&path, b"important payload").unwrap();
+        let mut out = TruncateOnHeader {
+            path: path.clone(),
+            bytes: Vec::new(),
+            truncated: false,
+        };
+        let error = write_tar(&mut out, &path).unwrap_err();
+        assert!(format!("{error:#}").contains("Cannot read archive entry"));
+        assert_eq!(out.bytes.len(), BLOCK, "No fabricated payload was written");
+    }
+
+    #[tokio::test]
+    async fn unreadable_uploads_are_rejected_before_contacting_the_engine() {
+        // Root can read mode-000 files; do not claim to inject a permission error there.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("data.txt");
+        std::fs::write(&path, b"important payload").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let source = Source::Container {
+            connection: Connection {
+                name: "unavailable".into(),
+                kind: crate::config::BackendKind::Docker,
+                endpoint: format!("unix://{}", folder.path().join("missing.sock").display()),
+            },
+            id: "container".into(),
+            label: "container".into(),
+        };
+        let result = upload(&source, &path, "/", |_| {}).await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("unreadable files"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn upload_archive_read_errors_are_not_end_of_stream() {
+        let folder = tempfile::tempdir().unwrap();
+        let file = tokio::fs::File::open(folder.path()).await.unwrap();
+        let chunks = file_chunks(file, |_| panic!("Failed reads are not progress"));
+        futures_util::pin_mut!(chunks);
+        assert!(chunks.next().await.unwrap().is_err());
+        assert!(chunks.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_archive_chunks_preserve_bytes_and_report_progress() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("archive.tar");
+        let bytes = vec![7u8; 300_000];
+        std::fs::write(&path, &bytes).unwrap();
+        let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reported = progress.clone();
+        let chunks = file_chunks(tokio::fs::File::open(path).await.unwrap(), move |count| {
+            reported.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        });
+        futures_util::pin_mut!(chunks);
+        let mut actual = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            actual.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(actual, bytes);
+        assert_eq!(
+            progress.load(std::sync::atomic::Ordering::Relaxed),
+            bytes.len() as u64
+        );
+    }
     fn temp(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("tha-files-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);

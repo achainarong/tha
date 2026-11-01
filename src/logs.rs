@@ -598,7 +598,7 @@ pub const WINDOW_MAX_LINES: usize = 300;
 const WINDOW_MAX_BYTES: usize = 1024 * 1024;
 
 /// One bounded read of a container's logs, with no follow and nothing saved. `since` and `until`
-/// are Unix seconds. Reading stops at the byte limit, and the result says if it did.
+/// are Unix seconds. Reading stops at the byte limit.
 pub async fn load_window(
     connection: &Connection,
     container: &Container,
@@ -657,14 +657,9 @@ pub async fn load_window(
                 let until = OffsetDateTime::from_unix_timestamp(until)?.format(&Rfc3339)?;
                 command.args(["--until", &until]);
             }
-            command.arg(&container.id).kill_on_drop(true);
-            let output = command.output().await?;
-            anyhow::ensure!(
-                output.status.success(),
-                "nerdctl exited with {}; check its logging configuration",
-                output.status
-            );
-            'read: for (stream, error) in [(&output.stdout, false), (&output.stderr, true)] {
+            command.arg(&container.id);
+            let (stdout, stderr) = containerd_window_output(command).await?;
+            'read: for (stream, error) in [(&stdout, false), (&stderr, true)] {
                 for chunk in stream.chunks(MAX_LINE_BYTES) {
                     for line in String::from_utf8_lossy(chunk).lines() {
                         if !push(line, error, &mut buffer) {
@@ -676,6 +671,53 @@ pub async fn load_window(
         }
     }
     Ok(buffer)
+}
+
+/// Bound the combined raw output before allocating it, not after `Command::output` collected it.
+/// The caller owns the overall diagnostic deadline. Cancellation also kills the CLI.
+async fn containerd_window_output(
+    mut command: tokio::process::Command,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let (mut out_done, mut err_done) = (false, false);
+    let (mut out_buffer, mut err_buffer) = ([0; 8192], [0; 8192]);
+    while !out_done || !err_done {
+        let remaining = WINDOW_MAX_BYTES - out.len() - err.len();
+        // Read one extra byte to distinguish exactly-at-limit EOF from truncated output.
+        let want = (remaining + 1).min(out_buffer.len());
+        let (bytes, target) = tokio::select! {
+            read = stdout.read(&mut out_buffer[..want]), if !out_done => {
+                let count = read?;
+                out_done = count == 0;
+                (&out_buffer[..count], &mut out)
+            },
+            read = stderr.read(&mut err_buffer[..want]), if !err_done => {
+                let count = read?;
+                err_done = count == 0;
+                (&err_buffer[..count], &mut err)
+            },
+        };
+        target.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        if bytes.len() > remaining {
+            // This is deliberate truncation, not a CLI failure. Kill and reap before returning.
+            let _ = child.kill().await;
+            return Ok((out, err));
+        }
+    }
+    let status = child.wait().await?;
+    anyhow::ensure!(
+        status.success(),
+        "nerdctl exited with {status}; check its logging configuration"
+    );
+    Ok((out, err))
 }
 
 async fn fetch(
@@ -782,6 +824,52 @@ async fn containerd_logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn window_command(script: &str) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", script]).env("PATH", "/usr/bin:/bin");
+        tokio::time::timeout(Duration::from_secs(5), containerd_window_output(command))
+            .await
+            .expect("The bounded log collector must terminate")
+    }
+
+    #[tokio::test]
+    async fn diagnostic_log_window_preserves_both_streams_and_reports_cli_failures() {
+        let (stdout, stderr) = window_command("printf 'out\\n'; printf 'err\\n' >&2")
+            .await
+            .unwrap();
+        assert_eq!(stdout, b"out\n");
+        assert_eq!(stderr, b"err\n");
+        let error = window_command("printf broken >&2; exit 3")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("nerdctl exited with"));
+        let (stdout, stderr) = window_command("exit 0").await.unwrap();
+        assert!(stdout.is_empty() && stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn diagnostic_log_window_stops_and_reaps_an_unending_cli_on_either_stream() {
+        for script in ["exec yes x", "exec yes x >&2"] {
+            let (stdout, stderr) = window_command(script).await.unwrap();
+            assert_eq!(stdout.len() + stderr.len(), WINDOW_MAX_BYTES);
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_log_window_has_one_combined_limit_and_accepts_exact_boundary() {
+        let (stdout, stderr) =
+            window_command("head -c 524288 /dev/zero; head -c 524288 /dev/zero >&2")
+                .await
+                .unwrap();
+        assert_eq!(stdout.len(), WINDOW_MAX_BYTES / 2);
+        assert_eq!(stderr.len(), WINDOW_MAX_BYTES / 2);
+        let (stdout, stderr) = window_command("head -c 524288 /dev/zero; exec yes x >&2")
+            .await
+            .unwrap();
+        assert_eq!(stdout.len(), WINDOW_MAX_BYTES / 2);
+        assert_eq!(stdout.len() + stderr.len(), WINDOW_MAX_BYTES);
+    }
 
     #[test]
     fn keywords_match_whole_words_in_any_case_and_a_stack_trace_is_one_issue() {

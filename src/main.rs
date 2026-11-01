@@ -921,7 +921,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
             },
             Some(event) = edit_rx.recv() => {
                 match event {
-                    EditEvent::Fetched { location, fetched } => {
+                    EditEvent::Fetched { location, mut fetched } => {
                         let editor = app.editor;
                         let vscode = app.vscode_path.clone();
                         if !fetched.writable {
@@ -930,26 +930,33 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                             )
                             .into();
                         }
+                        fetched.preserve_on_drop();
                         match hand_off(&mut terminal, &mut events, editor, vscode.as_deref(), &fetched.path, mouse_captured).await {
                             Err(error) => {
-                                app.notice = tha::tf!("{error}", error = format!("{error:#}"));
+                                app.notice = tha::tf!(
+                                    "Not saved: {error}. Your copy is kept in {folder}",
+                                    error = tha::model::safe_text(&format!("{error:#}")),
+                                    folder = fetched.recovery_folder().display().to_string()
+                                );
                             }
-                            Ok(()) if !fetched.writable => {}
+                            Ok(()) if !fetched.writable => fetched.discard_on_drop(),
                             Ok(()) => {
                                 let sender = edit_tx.clone();
                                 app.notice = tha::i18n::t("Sending the file back…").into();
                                 edit_tasks.push(AbortTask(tokio::spawn(async move {
                                     let result = tha::compose_edit::send_back(&location, &fetched).await;
+                                    if result.is_ok() {
+                                        fetched.discard_on_drop();
+                                    }
                                     let message = match result {
                                         Ok(true) => tha::i18n::t("Saved. Nothing was restarted or applied.").to_owned(),
                                         Ok(false) => tha::i18n::t("No changes, so nothing was sent.").to_owned(),
                                         Err(error) => {
                                             // The edits must not be lost with the temporary folder.
-                                            let kept = fetched.folder.keep();
                                             tha::tf!(
                                                 "Not saved: {error}. Your copy is kept in {folder}",
                                                 error = tha::model::safe_text(&format!("{error:#}")),
-                                                folder = kept.display().to_string()
+                                                folder = fetched.recovery_folder().display().to_string()
                                             )
                                         }
                                     };

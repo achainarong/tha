@@ -782,8 +782,47 @@ async fn run_remote(
     result
 }
 
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Docker can launch the Compose plugin as a child. Own an isolated process group so cancelling
+/// the probe stops the plugin too, rather than only killing its Docker parent.
+struct ProbeGroup(i32);
+
+impl Drop for ProbeGroup {
+    fn drop(&mut self) {
+        // SAFETY: this group was created exclusively for our probe; the ID is positive.
+        unsafe { libc::kill(-self.0, libc::SIGKILL) };
+    }
+}
+
+async fn plugin_available(path: &std::path::Path) -> Result<bool> {
+    use std::os::unix::process::CommandExt;
+    let mut probe = tokio::process::Command::new(path);
+    probe
+        .args(["compose", "version"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    probe.as_std_mut().process_group(0);
+    let Ok(mut child) = probe.spawn() else {
+        return Ok(false);
+    };
+    let group = ProbeGroup(i32::try_from(
+        child.id().context("Compose probe has no process ID")?,
+    )?);
+    match tokio::time::timeout(PROBE_TIMEOUT, child.wait()).await {
+        Ok(status) => Ok(status.is_ok_and(|status| status.success())),
+        Err(_) => {
+            drop(group);
+            let _ = child.kill().await;
+            bail!("Compose version probe timed out after 5 seconds");
+        }
+    }
+}
+
 /// How Compose is installed for this connection, tried in the order users expect.
-fn program(connection: &Connection) -> Result<std::process::Command> {
+async fn program(connection: &Connection) -> Result<std::process::Command> {
     // The final guard: this would run local Compose files against the server's engine.
     if crate::remote::is_remote(connection) {
         bail!(crate::i18n::t(
@@ -791,19 +830,13 @@ fn program(connection: &Connection) -> Result<std::process::Command> {
         ));
     }
     let cli = crate::exec::runtime_cli(connection);
-    if let Some((name, path)) = &cli {
-        let mut probe = std::process::Command::new(path);
-        probe
-            .args(["compose", "version"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if probe.status().is_ok_and(|status| status.success()) {
-            let mut command = std::process::Command::new(path);
-            crate::exec::pin_endpoint(&mut command, name, connection, None);
-            command.arg("compose");
-            return Ok(command);
-        }
+    if let Some((name, path)) = &cli
+        && plugin_available(path).await?
+    {
+        let mut command = std::process::Command::new(path);
+        crate::exec::pin_endpoint(&mut command, name, connection, None);
+        command.arg("compose");
+        return Ok(command);
     }
     if let Some(path) = crate::exec::find_program("docker-compose") {
         // The standalone tool has no --host option, only the environment variable.
@@ -822,8 +855,7 @@ fn program(connection: &Connection) -> Result<std::process::Command> {
 }
 
 async fn run_step(request: &Request, step: &[&str], tx: &mpsc::Sender<Event>) -> Result<()> {
-    let connection = request.connection.clone();
-    let mut command = tokio::task::spawn_blocking(move || program(&connection)).await??;
+    let mut command = program(&request.connection).await?;
     command
         .args(request.target.arguments(step))
         .current_dir(&request.target.working_dir)

@@ -167,9 +167,9 @@ pub fn merge_authorized_keys(existing: &str, line: &str) -> Result<String> {
         let current = current.trim();
         if !current.is_empty()
             && !current.starts_with('#')
-            && !current
+            && current
                 .strip_prefix(&prefix)
-                .is_some_and(|key| parse_public_key(key).is_ok())
+                .is_none_or(|key| parse_public_key(key).is_err())
         {
             bail!(
                 "authorized_keys line {} is not restricted to the agent, so it could bypass the allowlist. Remove it or choose a dedicated user.",
