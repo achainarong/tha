@@ -35,6 +35,8 @@ pub struct Tree {
     pub expanded: BTreeSet<String>,
     queue: VecDeque<String>,
     in_flight: Option<String>,
+    /// An explicit search has already replaced this outstanding ordinary listing.
+    superseded_in_flight: bool,
     entries: usize,
     /// The background walk reached a limit, so the tree is incomplete.
     pub limited: bool,
@@ -81,6 +83,7 @@ impl Tree {
             expanded: BTreeSet::from(["/".to_owned()]),
             queue: VecDeque::new(),
             in_flight: None,
+            superseded_in_flight: false,
             entries: 0,
             limited: false,
             stopped: None,
@@ -106,10 +109,17 @@ impl Tree {
     fn listed(&mut self, path: &str, result: Result<Listing, String>) {
         if self.in_flight.as_deref() == Some(path) {
             self.in_flight = None;
+            if std::mem::take(&mut self.superseded_in_flight) {
+                return;
+            }
         }
         match result {
             Ok(listing) => {
-                self.entries += listing.entries.len();
+                let old = match self.folders.get(path) {
+                    Some(Folder::Loaded(old)) => old.entries.len(),
+                    _ => 0,
+                };
+                self.entries = self.entries.saturating_sub(old) + listing.entries.len();
                 for entry in &listing.entries {
                     if entry.kind != Kind::Folder {
                         continue;
@@ -274,6 +284,8 @@ impl Job {
 }
 
 pub enum Request {
+    Search(crate::file_search::Request),
+    CancelSearch,
     List {
         key: String,
         source: Source,
@@ -316,6 +328,19 @@ pub enum Request {
 }
 
 pub enum Event {
+    SearchListed {
+        key: String,
+        generation: u64,
+        path: String,
+        listing: Listing,
+    },
+    SearchFinished {
+        key: String,
+        generation: u64,
+        incomplete: bool,
+        unreadable: usize,
+        error: Option<String>,
+    },
     Listed {
         key: String,
         path: String,
@@ -351,6 +376,17 @@ pub enum Pane {
     Downloads,
 }
 
+pub struct FileSearch {
+    pub query: String,
+    pub root: String,
+    pub matches: Vec<String>,
+    pub running: bool,
+    pub incomplete: bool,
+    pub unreadable: usize,
+    pub error: Option<String>,
+    generation: u64,
+}
+
 pub struct Manager {
     /// The tree on screen, by key. `None` while the panel is closed.
     pub open: Option<String>,
@@ -363,6 +399,9 @@ pub struct Manager {
     pub preview: Option<PreviewState>,
     /// Text typed after `:` in the explorer, as in vim.
     pub command: Option<String>,
+    pub search_input: Option<String>,
+    pub search_root: String,
+    pub search: Option<FileSearch>,
     /// Why the last key did nothing.
     pub message: Option<String>,
     pub jobs: Vec<Job>,
@@ -383,6 +422,9 @@ impl Default for Manager {
             upload: None,
             preview: None,
             command: None,
+            search_input: None,
+            search_root: "/".into(),
+            search: None,
             message: None,
             jobs: Vec::new(),
             requests: Vec::new(),
@@ -435,14 +477,179 @@ impl Manager {
             .or_insert_with(|| Tree::new(source, now))
             .last_used = now;
         if self.open.as_deref() != Some(&key) {
+            self.cancel_search();
             self.selected = 0;
             self.preview = None;
             self.command = None;
+            self.search_input = None;
+            self.search = None;
             self.message = None;
         }
         self.open = Some(key);
         self.pane = Pane::Browse;
         self.pump();
+    }
+
+    pub fn begin_search(&mut self, system: bool) {
+        self.touch();
+        self.search_root = if system {
+            "/".to_owned()
+        } else {
+            self.current_row().map_or_else(
+                || "/".to_owned(),
+                |row| {
+                    if row.entry.kind == Kind::Folder {
+                        row.path
+                    } else {
+                        row.path
+                            .rsplit_once('/')
+                            .map_or(
+                                "/",
+                                |(parent, _)| if parent.is_empty() { "/" } else { parent },
+                            )
+                            .to_owned()
+                    }
+                },
+            )
+        };
+        self.search_input = Some(
+            self.search
+                .as_ref()
+                .map_or_else(String::new, |search| search.query.clone()),
+        );
+        self.message = None;
+    }
+
+    /// Shared by typed and pasted input. Search text never reaches a shell or engine.
+    pub fn append_search(&mut self, text: &str) {
+        if let Some(input) = &mut self.search_input {
+            for character in crate::model::safe_text(text).chars() {
+                if input.len() + character.len_utf8() > 1024 {
+                    break;
+                }
+                input.push(character);
+            }
+        }
+    }
+
+    pub fn confirm_search(&mut self) {
+        let Some(input) = self.search_input.take() else {
+            return;
+        };
+        let query = input.trim().to_owned();
+        self.cancel_search();
+        self.search = None;
+        if query.is_empty() {
+            self.pump();
+            return;
+        }
+        let Some(source) = self.tree().map(|tree| tree.source.clone()) else {
+            return;
+        };
+        let generation = self.id();
+        let root = self.search_root.clone();
+        let selected = self.current_row().map(|row| row.path);
+        // Drop old subtrees between searches, keeping the scope and current selection reachable.
+        if let Some(tree) = self.tree_mut() {
+            tree.folders.retain(|path, _| {
+                path == "/"
+                    || *path == root
+                    || root.starts_with(&format!("{path}/"))
+                    || selected
+                        .as_ref()
+                        .is_some_and(|selected| selected.starts_with(&format!("{path}/")))
+            });
+            tree.entries = tree
+                .folders
+                .values()
+                .map(|folder| match folder {
+                    Folder::Loaded(listing) => listing.entries.len(),
+                    _ => 0,
+                })
+                .sum();
+            tree.queue.clear();
+            tree.limited = true;
+            if let Some(path) = &selected
+                && let Some(index) = tree.rows().iter().position(|row| &row.path == path)
+            {
+                self.selected = index;
+            }
+        }
+        self.search = Some(FileSearch {
+            query: query.clone(),
+            root: root.clone(),
+            matches: Vec::new(),
+            running: true,
+            incomplete: false,
+            unreadable: 0,
+            error: None,
+            generation,
+        });
+        self.requests
+            .push(Request::Search(crate::file_search::Request {
+                generation,
+                source,
+                root,
+                query,
+                demo: self.demo,
+            }));
+    }
+
+    fn cancel_search(&mut self) {
+        if self.search.as_ref().is_some_and(|search| search.running) {
+            self.requests.push(Request::CancelSearch);
+        }
+    }
+
+    pub fn stop_search(&mut self) {
+        self.cancel_search();
+        if let Some(search) = &mut self.search {
+            if search.running {
+                search.incomplete = true;
+            }
+            search.running = false;
+        }
+        self.pump();
+    }
+
+    pub fn next_search_match(&mut self, backwards: bool) {
+        self.touch();
+        let current = self.current_row().map(|row| row.path);
+        let Some(search) = &self.search else {
+            return;
+        };
+        let count = search.matches.len();
+        if count == 0 {
+            return;
+        }
+        let position =
+            current.and_then(|path| search.matches.iter().position(|found| *found == path));
+        let next = match (position, backwards) {
+            (Some(index), false) => (index + 1) % count,
+            (Some(index), true) => (index + count - 1) % count,
+            (None, false) => 0,
+            (None, true) => count - 1,
+        };
+        self.select_search_result(next);
+    }
+
+    fn select_search_result(&mut self, index: usize) {
+        let Some(path) = self
+            .search
+            .as_ref()
+            .and_then(|search| search.matches.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(tree) = self.tree_mut() {
+            for (end, _) in path.match_indices('/').skip(1) {
+                tree.expanded.insert(path[..end].to_owned());
+            }
+            if let Some(selected) = tree.rows().iter().position(|row| row.path == path) {
+                self.selected = selected;
+            }
+        }
     }
 
     /// Follows the selection. Waits briefly so that moving through the tree reads nothing, and
@@ -553,6 +760,8 @@ impl Manager {
         tree.folders.remove(&folder);
         tree.prioritize(&folder);
         self.preview = None;
+        self.cancel_search();
+        self.search = None;
         self.pump();
     }
 
@@ -596,14 +805,20 @@ impl Manager {
 
     /// Leaves downloads running. The walk pauses, since nobody is looking at it.
     pub fn close(&mut self) {
+        self.cancel_search();
         self.open = None;
         self.preview = None;
         self.command = None;
+        self.search_input = None;
+        self.search = None;
         self.message = None;
     }
 
     /// Queues the next folder for the open tree only.
     pub fn pump(&mut self) {
+        if self.search.as_ref().is_some_and(|search| search.running) {
+            return;
+        }
         let Some(key) = self.open.clone() else {
             return;
         };
@@ -862,6 +1077,82 @@ impl Manager {
 
     pub fn apply(&mut self, event: Event, now: Instant) {
         match event {
+            Event::SearchListed {
+                key,
+                generation,
+                path,
+                listing,
+            } => {
+                if self.open.as_deref() != Some(&key)
+                    || !self
+                        .search
+                        .as_ref()
+                        .is_some_and(|search| search.running && search.generation == generation)
+                {
+                    return;
+                }
+                let selected = self.current_row().map(|row| row.path);
+                let Some(search) = self.search.as_mut() else {
+                    return;
+                };
+                let first = search.matches.is_empty();
+                let query = search.query.to_lowercase();
+                for entry in &listing.entries {
+                    let child = files::join(&path, &entry.name);
+                    if child.to_lowercase().contains(&query)
+                        && search.matches.len() < crate::file_search::MAX_RESULTS
+                    {
+                        search.matches.push(child);
+                    }
+                }
+                let first = first && !search.matches.is_empty();
+                if let Some(tree) = self.tree_mut() {
+                    if path == "/" {
+                        tree.stopped = None;
+                    }
+                    if tree.in_flight.as_deref() == Some(&path) {
+                        tree.superseded_in_flight = true;
+                    }
+                    let old = match tree.folders.get(&path) {
+                        Some(Folder::Loaded(old)) => old.entries.len(),
+                        _ => 0,
+                    };
+                    tree.entries = tree.entries.saturating_sub(old) + listing.entries.len();
+                    tree.queue.retain(|queued| queued != &path);
+                    tree.folders.insert(path, Folder::Loaded(listing));
+                }
+                if first {
+                    self.select_search_result(0);
+                } else if let Some(path) = selected
+                    && let Some(index) = self
+                        .tree()
+                        .and_then(|tree| tree.rows().iter().position(|row| row.path == path))
+                {
+                    self.selected = index;
+                }
+            }
+            Event::SearchFinished {
+                key,
+                generation,
+                incomplete,
+                unreadable,
+                error,
+            } => {
+                if self.open.as_deref() != Some(&key) {
+                    return;
+                }
+                if let Some(search) = self
+                    .search
+                    .as_mut()
+                    .filter(|search| search.running && search.generation == generation)
+                {
+                    search.running = false;
+                    search.incomplete = incomplete;
+                    search.unreadable = unreadable;
+                    search.error = error;
+                }
+                self.pump();
+            }
             Event::Previewed {
                 key,
                 generation,
@@ -900,8 +1191,21 @@ impl Manager {
                 }
             }
             Event::Listed { key, path, result } => {
+                let selected = self
+                    .search
+                    .as_ref()
+                    .and_then(|_| self.current_row())
+                    .map(|row| row.path);
                 if let Some(tree) = self.trees.get_mut(&key) {
                     tree.listed(&path, result);
+                }
+                if self.open.as_deref() == Some(&key)
+                    && let Some(path) = selected
+                    && let Some(index) = self
+                        .tree()
+                        .and_then(|tree| tree.rows().iter().position(|row| row.path == path))
+                {
+                    self.selected = index;
                 }
                 self.pump();
             }
@@ -1238,6 +1542,170 @@ mod tests {
             },
             Instant::now(),
         );
+    }
+
+    fn search_answer(manager: &mut Manager, path: &str, entries: Vec<Entry>) {
+        let generation = manager.search.as_ref().unwrap().generation;
+        manager.apply(
+            Event::SearchListed {
+                key: manager.open.clone().unwrap(),
+                generation,
+                path: path.into(),
+                listing: Listing {
+                    entries,
+                    truncated: false,
+                },
+            },
+            Instant::now(),
+        );
+    }
+
+    #[test]
+    fn folder_and_system_search_have_distinct_scopes_and_reveal_collapsed_matches() {
+        let (mut manager, start) = explorer_with(vec![folder("etc"), folder("var")]);
+        manager.begin_search(false);
+        assert_eq!(manager.search_root, "/etc");
+        manager.append_search("CONF");
+        manager.confirm_search();
+        assert!(
+            manager
+                .requests
+                .iter()
+                .any(|request| matches!(request, Request::Search(target) if target.root == "/etc"))
+        );
+        search_answer(
+            &mut manager,
+            "/etc",
+            vec![file("a.conf", 1), file("b.conf", 2)],
+        );
+        assert_eq!(manager.current_row().unwrap().path, "/etc/a.conf");
+        manager.next_search_match(false);
+        assert_eq!(manager.current_row().unwrap().path, "/etc/b.conf");
+        manager.next_search_match(false);
+        assert_eq!(manager.current_row().unwrap().path, "/etc/a.conf");
+        manager.next_search_match(true);
+        assert_eq!(manager.current_row().unwrap().path, "/etc/b.conf");
+
+        manager.begin_search(true);
+        assert_eq!(manager.search_root, "/");
+        manager.search_input = Some("/var/log".into());
+        manager.confirm_search();
+        search_answer(&mut manager, "/", vec![folder("etc"), folder("var")]);
+        search_answer(&mut manager, "/var", vec![folder("log")]);
+        search_answer(&mut manager, "/var/log", vec![file("app.log", 2)]);
+        assert!(
+            manager
+                .search
+                .as_ref()
+                .unwrap()
+                .matches
+                .contains(&"/var/log/app.log".into())
+        );
+        manager.next_search_match(false);
+        assert_eq!(manager.current_row().unwrap().path, "/var/log/app.log");
+        manager.dialog_selected();
+        let dialog = manager.dialog.as_ref().unwrap();
+        assert_eq!(dialog.path, "/var/log/app.log");
+        assert_eq!(dialog.save_to, default_destination("app.log"));
+        assert_eq!(dialog.source, source("a"));
+        manager.close_dialog();
+        manager.update_preview(start);
+    }
+
+    #[test]
+    fn search_input_is_bounded_and_clearing_it_cancels_without_changing_the_source() {
+        let (mut manager, _) = explorer_with(vec![file("test.txt", 1)]);
+        manager.begin_search(true);
+        manager.append_search(&"ü".repeat(1024));
+        assert_eq!(manager.search_input.as_ref().unwrap().len(), 1024);
+        manager.confirm_search();
+        let key = manager.open.clone();
+        manager.begin_search(false);
+        manager.search_input = Some(String::new());
+        manager.confirm_search();
+        assert!(manager.search.is_none());
+        assert_eq!(manager.open, key);
+        assert!(
+            manager
+                .requests
+                .iter()
+                .any(|request| matches!(request, Request::CancelSearch))
+        );
+    }
+
+    #[test]
+    fn cancelled_and_replaced_searches_cannot_deliver_results_into_the_current_tree() {
+        let (mut manager, _) = explorer_with(vec![file("a.txt", 1)]);
+        manager.begin_search(true);
+        manager.append_search("old");
+        manager.confirm_search();
+        let old = manager.search.as_ref().unwrap().generation;
+        manager.begin_search(true);
+        manager.search_input = Some("new".into());
+        manager.confirm_search();
+        manager.apply(
+            Event::SearchListed {
+                key: source("a").key(),
+                generation: old,
+                path: "/".into(),
+                listing: Listing {
+                    entries: vec![file("old.txt", 1)],
+                    truncated: false,
+                },
+            },
+            Instant::now(),
+        );
+        assert!(manager.search.as_ref().unwrap().matches.is_empty());
+        assert_eq!(manager.current_row().unwrap().path, "/a.txt");
+        let current = manager.search.as_ref().unwrap().generation;
+        manager.stop_search();
+        manager.apply(
+            Event::SearchFinished {
+                key: source("a").key(),
+                generation: current,
+                incomplete: false,
+                unreadable: 0,
+                error: None,
+            },
+            Instant::now(),
+        );
+        assert!(manager.search.as_ref().unwrap().incomplete);
+        manager.close();
+        assert!(manager.search.is_none());
+    }
+
+    #[test]
+    fn search_matches_literal_unicode_paths_and_does_not_treat_queries_as_regexes() {
+        let (mut manager, _) = explorer_with(vec![file("ÜBER[1].txt", 1)]);
+        manager.begin_search(true);
+        manager.append_search("über[1]");
+        manager.confirm_search();
+        search_answer(
+            &mut manager,
+            "/",
+            vec![file("ÜBER[1].txt", 1), file("über1.txt", 1)],
+        );
+        assert_eq!(manager.search.as_ref().unwrap().matches, ["/ÜBER[1].txt"]);
+    }
+
+    #[test]
+    fn a_background_listing_cannot_overwrite_a_newer_search_listing() {
+        let mut manager = Manager::default();
+        let now = Instant::now();
+        manager.open_source(source("a"), now);
+        manager.begin_search(true);
+        manager.append_search("config");
+        manager.confirm_search();
+        search_answer(&mut manager, "/", vec![file("config.txt", 10)]);
+        // The older ordinary root request failed before the server recovered, but arrived late.
+        answer(
+            &mut manager,
+            &source("a").key(),
+            "/",
+            Err("old configuration failure".into()),
+        );
+        assert!(manager.tree().unwrap().stopped.is_none());
+        assert_eq!(manager.current_row().unwrap().path, "/config.txt");
     }
 
     #[test]

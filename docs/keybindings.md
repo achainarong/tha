@@ -65,6 +65,11 @@ configured keys take precedence.
 
 ## Complete action reference
 
+Inside `:file-explorer`, `/` finds in the selected folder (or a selected file's parent), and
+`Ctrl-f` finds across the source filesystem. Enter starts the search, `n`/`N` jump between matches,
+and `x` cancels a running search. `d` opens a prefilled download dialog for the selected match.
+These modal keys do not trigger global navigation or workload actions while typing a search.
+
 ### General navigation
 
 | Action names | Behavior |

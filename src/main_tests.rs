@@ -146,6 +146,67 @@ fn explorer_download_path_reports_invalid_paths_in_the_panel() {
 }
 
 #[test]
+fn explorer_search_keys_keep_input_modal_and_download_prefills_the_selected_result() {
+    let mut app = app();
+    let (tx, _) = watch::channel(0);
+    app.selected = app
+        .rows
+        .iter()
+        .position(|row| matches!(row.scope, tha::app::Scope::Container(_)))
+        .unwrap();
+    app.open_file_explorer();
+    app.take_download_requests();
+    handle_key(&mut app, KeyEvent::from(KeyCode::Char('/')), 20, &tx);
+    assert_eq!(app.downloads.search_root, "/etc");
+    // These keys must be search text, never download/edit/quit actions.
+    for ch in "hostname".chars() {
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char(ch)), 20, &tx);
+    }
+    assert!(app.downloads.dialog.is_none());
+    assert!(app.edit_request.is_none());
+    handle_key(&mut app, KeyEvent::from(KeyCode::Enter), 20, &tx);
+    let request = app
+        .take_download_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            tha::downloads::Request::Search(request) => Some(request),
+            _ => None,
+        })
+        .unwrap();
+    app.downloads.apply(
+        tha::downloads::Event::SearchListed {
+            key: request.source.key(),
+            generation: request.generation,
+            path: "/etc".into(),
+            listing: tha::downloads::demo_listing("/etc"),
+        },
+        std::time::Instant::now(),
+    );
+    handle_key(&mut app, KeyEvent::from(KeyCode::Char('d')), 20, &tx);
+    let dialog = app.downloads.dialog.as_ref().unwrap();
+    assert_eq!(dialog.path, "/etc/hostname");
+    assert_eq!(
+        dialog.save_to,
+        tha::downloads::default_destination("hostname")
+    );
+    assert_eq!(dialog.source, request.source);
+    app.downloads.close_dialog();
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        20,
+        &tx,
+    );
+    assert_eq!(app.downloads.search_root, "/");
+    handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 20, &tx);
+    assert!(
+        app.downloads.open.is_some(),
+        "Esc cancels the input, not the explorer"
+    );
+    assert!(app.downloads.search_input.is_none());
+}
+
+#[test]
 fn search_input_does_not_trigger_navigation_or_quit() {
     let mut app = app();
     let (tx, _) = watch::channel(0);

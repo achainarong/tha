@@ -432,6 +432,28 @@ pub(super) fn handle_key(
     }
     if app.downloads.open.is_some() {
         use tha::downloads::Pane;
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if app.downloads.search_input.is_some() {
+            match key.code {
+                KeyCode::Esc => app.downloads.search_input = None,
+                KeyCode::Enter => app.downloads.confirm_search(),
+                KeyCode::Char('u') if control => {
+                    if let Some(input) = &mut app.downloads.search_input {
+                        input.clear();
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(input) = &mut app.downloads.search_input {
+                        input.pop();
+                    }
+                }
+                KeyCode::Char(character) if !control => {
+                    app.downloads.append_search(&character.to_string())
+                }
+                _ => {}
+            }
+            return false;
+        }
         if let Some(command) = app.downloads.command.clone() {
             match key.code {
                 KeyCode::Esc => app.downloads.command = None,
@@ -460,11 +482,18 @@ pub(super) fn handle_key(
                                 app.downloads.message = Some(app.notice.clone());
                             }
                         }
+                        ("find" | "find-all", query) => {
+                            app.downloads.begin_search(name == "find-all");
+                            if !query.is_empty() {
+                                app.downloads.search_input = Some(query.to_owned());
+                                app.downloads.confirm_search();
+                            }
+                        }
                         ("q" | "quit", "") => app.downloads.close(),
                         ("", "") => {}
                         _ => {
                             app.downloads.message = Some(tha::tf!(
-                                "Unknown command: {command}. Try :edit, :download or :q",
+                                "Unknown command: {command}. Try :edit, :download, :find, :find-all or :q",
                                 command = tha::model::safe_text(command)
                             ));
                         }
@@ -489,6 +518,13 @@ pub(super) fn handle_key(
             KeyCode::PageDown => app.downloads.scroll_preview(height.max(1) as isize),
             KeyCode::PageUp => app.downloads.scroll_preview(-(height.max(1) as isize)),
             KeyCode::Char('x') if pane == Pane::Downloads => app.downloads.cancel_selected(),
+            KeyCode::Char('/') if pane == Pane::Browse => app.downloads.begin_search(false),
+            KeyCode::Char('f') if pane == Pane::Browse && control => {
+                app.downloads.begin_search(true)
+            }
+            KeyCode::Char('n') if pane == Pane::Browse => app.downloads.next_search_match(false),
+            KeyCode::Char('N') if pane == Pane::Browse => app.downloads.next_search_match(true),
+            KeyCode::Char('x') if pane == Pane::Browse => app.downloads.stop_search(),
             KeyCode::Char(':') if pane == Pane::Browse => {
                 app.downloads.command = Some(String::new());
             }

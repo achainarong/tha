@@ -18,6 +18,7 @@ pub mod downloads;
 pub mod editor;
 pub mod events;
 pub mod exec;
+pub mod file_search;
 pub mod files;
 pub mod fleet;
 pub mod history;

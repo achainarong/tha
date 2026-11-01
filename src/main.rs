@@ -587,8 +587,8 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let (diagnostics_tx, mut diagnostics_rx) = mpsc::channel::<tha::diagnostics::Event>(4);
     let (downloads_tx, mut downloads_rx) = mpsc::channel::<tha::downloads::Event>(64);
     let mut download_lists: Vec<AbortTask> = Vec::new();
-    // Inspecting and counting for the dialog, and the file preview.
-    let mut download_dialog: [Option<AbortTask>; 3] = [None, None, None];
+    // Inspecting and counting for the dialog, the preview, and an explicit file search.
+    let mut download_dialog: [Option<AbortTask>; 4] = [None, None, None, None];
     let mut download_jobs: std::collections::HashMap<u64, AbortTask> = Default::default();
     if app.check_updates {
         let sender = edit_tx.clone();
@@ -717,6 +717,8 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                         }
                     } else if app.exec_input && app.tab == Tab::Exec {
                         if let Some(session) = app.sessions.active_mut() && let Err(error) = session.paste(&text) { app.notice = tha::tf!("{error}", error = format!("{error:#}")); }
+                    } else if app.downloads.open.is_some() && app.downloads.search_input.is_some() {
+                        app.downloads.append_search(&text);
                     } else if app.input_mode != InputMode::Normal {
                         let text = tha::model::safe_text(&text);
                         for ch in text.chars() { if app.input.len() + ch.len_utf8() > 1024 { break; } app.input.push(ch); }
@@ -1487,7 +1489,7 @@ fn run_download_request(
     request: tha::downloads::Request,
     tx: &mpsc::Sender<tha::downloads::Event>,
     lists: &mut Vec<AbortTask>,
-    dialog: &mut [Option<AbortTask>; 3],
+    dialog: &mut [Option<AbortTask>; 4],
     jobs: &mut std::collections::HashMap<u64, AbortTask>,
 ) {
     use tha::downloads::{Event, Request};
@@ -1495,6 +1497,12 @@ fn run_download_request(
     const QUICK: Duration = Duration::from_secs(15);
     let sender = tx.clone();
     match request {
+        Request::Search(request) => {
+            dialog[3] = Some(AbortTask(tokio::spawn(tha::file_search::run(
+                request, sender,
+            ))));
+        }
+        Request::CancelSearch => dialog[3] = None,
         Request::List { key, source, path } => {
             lists.retain(|task| !task.0.is_finished());
             lists.push(AbortTask(tokio::spawn(async move {

@@ -3998,8 +3998,10 @@ impl App {
             return requests;
         }
         let now = std::time::Instant::now();
+        let mut external = Vec::new();
         for request in requests {
             match request {
+                Request::Search(_) | Request::CancelSearch => external.push(request),
                 Request::List { key, path, .. } => {
                     let result = Ok(demo_listing(&path));
                     self.downloads
@@ -4078,9 +4080,9 @@ impl App {
         }
         // Answering a listing can queue the next folder.
         if !self.downloads.requests.is_empty() {
-            return self.take_download_requests();
+            external.extend(self.take_download_requests());
         }
-        Vec::new()
+        external
     }
 
     pub fn evaluate_alerts(&mut self) {

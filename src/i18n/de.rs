@@ -3135,8 +3135,8 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "Dateien auf diesem Server bearbeiten",
     ),
     (
-        "Unknown command: {command}. Try :edit, :download or :q",
-        "Unbekannter Befehl: {command}. Versuche :edit, :download oder :q",
+        "Unknown command: {command}. Try :edit, :download, :find, :find-all or :q",
+        "Unbekannter Befehl: {command}. Versuche :edit, :download, :find, :find-all oder :q",
     ),
     (
         "Select a file to see it here.",
@@ -3458,8 +3458,26 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ),
     (" File explorer · {label} ", " Datei-Explorer · {label} "),
     (
-        " j/k Move · Enter Open folder · e Edit · d Download · r Refresh · : Command · Tab Downloads · Esc Close ",
-        " j/k Bewegen · Enter Ordner öffnen · e Bearbeiten · d Laden · r Neu laden · : Befehl · Tab Downloads · Esc Schließen ",
+        " j/k Move · Enter Folder · / Find in folder · Ctrl-f Find in system · e Edit · d Download · r Refresh · Tab Downloads · Esc Close ",
+        " j/k Bewegen · Enter Ordner · / Im Ordner suchen · Strg-f Im System suchen · e Bearbeiten · d Laden · r Neu laden · Tab Downloads · Esc Schließen ",
+    ),
+    (
+        "Searching · n/N Matches · x Cancel",
+        "Suche läuft · n/N Treffer · x Abbrechen",
+    ),
+    ("Incomplete · n/N Matches", "Unvollständig · n/N Treffer"),
+    ("Complete · n/N Matches", "Vollständig · n/N Treffer"),
+    (
+        "Find in {root}: {query} · {count} matches · {status}",
+        "Suche in {root}: {query} · {count} Treffer · {status}",
+    ),
+    (
+        "Find in {root}: /{query}▏ · Enter Find · Esc Cancel",
+        "Suche in {root}: /{query}▏ · Enter Suchen · Esc Abbrechen",
+    ),
+    (
+        "{count} folders could not be read",
+        "{count} Ordner konnten nicht gelesen werden",
     ),
     (
         " j/k Move · x Cancel · Tab Files · Esc Close; downloads keep running ",

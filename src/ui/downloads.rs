@@ -33,7 +33,7 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
         .title(crate::tf!(" File explorer · {label} ", label = label))
         .title_bottom(match manager.pane {
             Pane::Browse => crate::i18n::t(
-                " j/k Move · Enter Open folder · e Edit · d Download · r Refresh · : Command · Tab Downloads · Esc Close ",
+                " j/k Move · Enter Folder · / Find in folder · Ctrl-f Find in system · e Edit · d Download · r Refresh · Tab Downloads · Esc Close ",
             ),
             Pane::Downloads => {
                 crate::i18n::t(" j/k Move · x Cancel · Tab Files · Esc Close; downloads keep running ")
@@ -46,8 +46,44 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(job_lines(app, height)), inner);
         return;
     }
-    let footer = u16::from(manager.command.is_some() || manager.message.is_some());
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(footer)]).split(inner);
+    let mut footer = Vec::new();
+    if let Some(search) = &manager.search {
+        let status = if search.running {
+            crate::i18n::t("Searching · n/N Matches · x Cancel")
+        } else if search.incomplete {
+            crate::i18n::t("Incomplete · n/N Matches")
+        } else {
+            crate::i18n::t("Complete · n/N Matches")
+        };
+        footer.push(Line::from(crate::tf!(
+            "Find in {root}: {query} · {count} matches · {status}",
+            root = safe_text(&search.root),
+            query = safe_text(&search.query),
+            count = search.matches.len(),
+            status = status,
+        )));
+        if let Some(error) = &search.error {
+            footer.push(Line::styled(safe_text(error), accent(app, Color::Yellow)));
+        } else if search.unreadable > 0 {
+            footer.push(Line::from(crate::tf!(
+                "{count} folders could not be read",
+                count = search.unreadable
+            )));
+        }
+    }
+    if let Some(input) = &manager.search_input {
+        footer.push(Line::from(crate::tf!(
+            "Find in {root}: /{query}▏ · Enter Find · Esc Cancel",
+            root = safe_text(&manager.search_root),
+            query = safe_text(input),
+        )));
+    } else if let Some(command) = &manager.command {
+        footer.push(Line::from(format!(":{}▏", safe_text(command))));
+    } else if let Some(message) = &manager.message {
+        footer.push(Line::styled(safe_text(message), accent(app, Color::Yellow)));
+    }
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(footer.len() as u16)])
+        .split(inner);
     let columns =
         Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(rows[0]);
     frame.render_widget(
@@ -62,14 +98,7 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
     let right = padded(preview.inner(columns[1]));
     frame.render_widget(preview, columns[1]);
     frame.render_widget(preview_paragraph(app, right.width), right);
-    if let Some(command) = &manager.command {
-        frame.render_widget(Paragraph::new(format!(":{}▏", safe_text(command))), rows[1]);
-    } else if let Some(message) = &manager.message {
-        frame.render_widget(
-            Paragraph::new(safe_text(message)).style(accent(app, Color::Yellow)),
-            rows[1],
-        );
-    }
+    frame.render_widget(Paragraph::new(footer), rows[1]);
 }
 
 /// Read-only, and only ever sanitized text: file contents never reach the terminal raw.
@@ -490,6 +519,26 @@ mod tests {
         ));
         let output = screen(&mut app);
         assert!(output.contains("REPAIR-USING-SSH"), "{output}");
+    }
+
+    #[test]
+    fn file_search_shows_its_scope_and_never_labels_cancelled_results_complete() {
+        let mut app = demo_on_container();
+        app.open_file_explorer();
+        app.take_download_requests();
+        app.downloads.begin_search(false);
+        app.downloads.append_search("config");
+        let output = screen(&mut app);
+        assert!(output.contains("Find in /etc: /config"), "{output}");
+        app.downloads.confirm_search();
+        let output = screen(&mut app);
+        assert!(output.contains("Searching"), "{output}");
+        app.downloads.stop_search();
+        let output = screen(&mut app);
+        assert!(output.contains("Incomplete"), "{output}");
+        app.downloads.begin_search(true);
+        let output = screen(&mut app);
+        assert!(output.contains("Find in /: /config"), "{output}");
     }
 
     #[test]

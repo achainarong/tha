@@ -1178,6 +1178,10 @@ background so the panel never waits for it, and the selected file shows read-onl
 | `Enter` / `Space` | Open or close a folder |
 | `e` or `:edit` | Open the file in your editor |
 | `d` or `:download` | Download the file or folder |
+| `/` or `:find` | Find recursively in the selected folder, or the selected file's parent |
+| `Ctrl-f` or `:find-all` | Find across the container's or server's filesystem, starting at `/` |
+| `n` / `N` | Jump to the next / previous match, wrapping at the ends |
+| `x` while finding | Cancel the search, keeping its partial results |
 | `PageUp`/`PageDown` | Scroll the file on the right |
 | `p` | Show the start of a big file |
 | `r` | Read the selected folder again; the tree shows each folder as it was when read |
@@ -1187,6 +1191,18 @@ background so the panel never waits for it, and the selected file shows read-onl
 **What gets shown:** a file over 256 KiB is not read while you browse. You get a warning with its size, and `p`
 shows its first 256 KiB. A binary file gets a warning instead of its contents. Moving quickly through the tree
 reads nothing, because a file is only read once the cursor rests on it.
+
+**Finding files:** type part of a filename or path and press `Enter`; matching is literal and
+case-insensitive. `Esc` cancels the prompt, and `Ctrl-u` clears it. You can also use `:find QUERY`
+or `:find-all QUERY`. Matches inside closed folders are revealed automatically; `d` or `:download`
+prefills the selected match's remote path and local destination, and still requires confirmation.
+
+Find runs in the background using the same directory-listing permissions as browsing, including
+folders the background tree has not loaded yet. It never searches file contents or follows symbolic
+links. System searches skip `/proc`, `/sys`, and `/dev`. Each search is limited to 30 seconds, 2,000
+folders, 100,000 directory entries, and 500 matches; unreadable or truncated folders and any reached
+limit are reported as **Incomplete**, not as proof that no other files exist. Closing the explorer
+cancels the search but leaves downloads running. `r` refreshes the folder and clears the search.
 
 ### Editing a file
 
