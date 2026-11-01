@@ -112,7 +112,7 @@ pub fn parse_public_key(text: &str) -> Result<PublicKey> {
     })
 }
 
-fn valid_user(name: &str) -> bool {
+pub(crate) fn valid_user(name: &str) -> bool {
     name != "root"
         && name.len() <= 32
         && name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
@@ -137,16 +137,27 @@ pub fn authorized_line(executable: &Path, key: &PublicKey) -> Result<String> {
     Ok(format!("restrict,command=\"{path}\" {}", key.as_line()))
 }
 
-fn is_agent_line(line: &str) -> bool {
-    line.starts_with("restrict,command=\"") && line.contains("agent\" ")
-}
-
 /// New `authorized_keys` content. Any other active line would be a way around the agent, so
 /// setup stops and names it instead of leaving a key that looks restricted but is not.
 pub fn merge_authorized_keys(existing: &str, line: &str) -> Result<String> {
+    let (command, key) = line
+        .strip_prefix("restrict,command=\"")
+        .and_then(|line| line.split_once("\" "))
+        .context("Expected a restricted agent key line")?;
+    let key = parse_public_key(key)?;
+    ensure!(
+        authorized_line(Path::new(command), &key)? == line,
+        "Expected a canonical restricted agent key line"
+    );
+    let prefix = format!("restrict,command=\"{command}\" ");
     for (number, current) in existing.lines().enumerate() {
         let current = current.trim();
-        if !current.is_empty() && !current.starts_with('#') && !is_agent_line(current) {
+        if !current.is_empty()
+            && !current.starts_with('#')
+            && !current
+                .strip_prefix(&prefix)
+                .is_some_and(|key| parse_public_key(key).is_ok())
+        {
             bail!(
                 "authorized_keys line {} is not restricted to the agent, so it could bypass the allowlist. Remove it or choose a dedicated user.",
                 number + 1
@@ -239,9 +250,9 @@ fn account(user: &str) -> Result<Option<Account>> {
     }))
 }
 
-/// Socket access decided from its real owner: rootful Podman and rootless engines usually
-/// cannot be reached through group membership, and saying so beats an agent that always fails.
-fn grant_socket(user: &str, account: &Account, engine: &AgentEngine) -> Result<()> {
+/// Plan socket access without changing groups. Provisioning must validate and install
+/// restricted keys and policy before granting any engine privileges.
+fn socket_group(account: &Account, engine: &AgentEngine) -> Result<Option<String>> {
     let metadata = std::fs::metadata(&engine.socket)
         .with_context(|| format!("Cannot find {}", engine.socket.display()))?;
     ensure!(
@@ -250,7 +261,7 @@ fn grant_socket(user: &str, account: &Account, engine: &AgentEngine) -> Result<(
         engine.socket.display()
     );
     if metadata.uid() == account.uid || metadata.gid() == account.gid {
-        return Ok(());
+        return Ok(None);
     }
     ensure!(
         metadata.mode() & 0o020 != 0 && metadata.gid() != 0,
@@ -280,12 +291,7 @@ fn grant_socket(user: &str, account: &Account, engine: &AgentEngine) -> Result<(
         "{} belongs to group {group}, which grants far more than engine access. Give the socket a dedicated group such as docker first.",
         engine.socket.display()
     );
-    run(Command::new("usermod").args(["-aG", &group, user]))?;
-    println!(
-        "Added {user} to group {group} for {}",
-        engine.socket.display()
-    );
-    Ok(())
+    Ok(Some(group))
 }
 
 fn atomic_write(path: &Path, text: &str, mode: u32, owner: Option<(u32, u32)>) -> Result<()> {
@@ -318,14 +324,9 @@ fn refuse_symlink(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn install_key(account: &Account, line: &str) -> Result<()> {
+fn prepare_key(account: &Account, line: &str) -> Result<String> {
     let directory = account.home.join(".ssh");
     refuse_symlink(&directory)?;
-    if !directory.exists() {
-        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
-    }
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-    std::os::unix::fs::chown(&directory, Some(account.uid), Some(account.gid))?;
     let path = directory.join("authorized_keys");
     refuse_symlink(&path)?;
     let existing = match std::fs::read_to_string(&path) {
@@ -333,7 +334,19 @@ fn install_key(account: &Account, line: &str) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error).context("Cannot read authorized_keys"),
     };
-    let merged = merge_authorized_keys(&existing, line)?;
+    merge_authorized_keys(&existing, line)
+}
+
+fn install_key(account: &Account, line: &str) -> Result<()> {
+    // Revalidate immediately before installation, without modifying invalid existing files.
+    let merged = prepare_key(account, line)?;
+    let directory = account.home.join(".ssh");
+    if !directory.exists() {
+        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+    }
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    std::os::unix::fs::chown(&directory, Some(account.uid), Some(account.gid))?;
+    let path = directory.join("authorized_keys");
     atomic_write(&path, &merged, 0o600, Some((account.uid, account.gid)))
 }
 
@@ -440,7 +453,7 @@ pub fn run_setup(options: &Options) -> Result<()> {
             find_engines(),
         )
     };
-    let mut config = merge_config(existing, engines, options.allow_delete);
+    let config = merge_config(existing, engines, options.allow_delete);
     config.validate()?;
     ensure!(
         !config.engines.is_empty(),
@@ -475,13 +488,34 @@ pub fn run_setup(options: &Options) -> Result<()> {
         options.user,
         account.shell
     );
+    finish_dedicated_setup(options, &account, &line, policy, config)
+}
+
+fn finish_dedicated_setup(
+    options: &Options,
+    account: &Account,
+    line: &str,
+    policy: &Path,
+    mut config: AgentConfig,
+) -> Result<()> {
+    // Reject unsafe existing authentication before touching policy or engine privileges.
+    prepare_key(account, line)?;
+    let explicit = !options.engines.is_empty();
     // An engine asked for by name must work. One merely found must not block the others, as a
     // root-only Podman socket beside a normal Docker one would.
     let mut reachable = Vec::new();
+    let mut groups = Vec::new();
     let mut skipped = None;
     for engine in std::mem::take(&mut config.engines) {
-        match grant_socket(&options.user, &account, &engine) {
-            Ok(()) => reachable.push(engine),
+        match socket_group(account, &engine) {
+            Ok(group) => {
+                if let Some(group) = group
+                    && !groups.contains(&group)
+                {
+                    groups.push(group);
+                }
+                reachable.push(engine);
+            }
             Err(error) if !explicit => {
                 println!("Skipping {}: {error:#}", engine.name);
                 skipped = Some(error);
@@ -493,9 +527,14 @@ pub fn run_setup(options: &Options) -> Result<()> {
         return Err(skipped.unwrap_or_else(|| anyhow::anyhow!("No engine could be exposed")));
     }
     config.engines = reachable;
-    // Written last: the key must not start working before the policy it depends on exists.
+    // Policy precedes key activation; both must succeed before any group mutation.
+    // A later group failure can leave only validated, agent-restricted keys in place.
     write_policy(policy, &config)?;
-    install_key(&account, &line)?;
+    install_key(account, line)?;
+    for group in groups {
+        run(Command::new("usermod").args(["-aG", &group, &options.user]))?;
+        println!("Added {} to group {group} for engine access", options.user);
+    }
 
     println!(
         "Agent ready for user {}: {} (delete {})",
@@ -570,22 +609,25 @@ mod tests {
 
     #[test]
     fn rerunning_with_the_same_key_changes_nothing() {
-        let line = format!("restrict,command=\"/t agent\" {ED25519}");
+        let line = format!("restrict,command=\"/usr/local/bin/tha-agent\" {ED25519}");
         let once = merge_authorized_keys("", &line).unwrap();
         assert_eq!(merge_authorized_keys(&once, &line).unwrap(), once);
     }
 
     #[test]
     fn a_second_agent_key_is_added() {
-        let first = format!("restrict,command=\"/t agent\" {ED25519}\n");
-        let second = "restrict,command=\"/t agent\" ssh-ed25519 OTHER";
-        let merged = merge_authorized_keys(&first, second).unwrap();
+        let first = format!("restrict,command=\"/usr/local/bin/tha-agent\" {ED25519}\n");
+        let second = format!(
+            "restrict,command=\"/usr/local/bin/tha-agent\" {}",
+            ED25519.replace("xsHq", "xsHr")
+        );
+        let merged = merge_authorized_keys(&first, &second).unwrap();
         assert_eq!(merged.lines().count(), 2);
     }
 
     #[test]
     fn unrestricted_existing_keys_stop_setup() {
-        let line = format!("restrict,command=\"/t agent\" {ED25519}");
+        let line = format!("restrict,command=\"/usr/local/bin/tha-agent\" {ED25519}");
         for existing in [
             format!("{ED25519} admin@host\n"),
             format!("command=\"/t agent\" {ED25519}\n"),
@@ -598,6 +640,84 @@ mod tests {
             );
         }
         assert!(merge_authorized_keys("# only a comment\n\n", &line).is_ok());
+    }
+
+    #[test]
+    fn security_setup_rejects_keys_before_attempting_socket_access() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".ssh")).unwrap();
+        let keys = home.path().join(".ssh/authorized_keys");
+        std::fs::write(&keys, ED25519).unwrap();
+        std::fs::set_permissions(
+            home.path().join(".ssh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let account = Account {
+            uid: 12345,
+            gid: 12345,
+            home: home.path().into(),
+            shell: "/bin/sh".into(),
+        };
+        let options = Options {
+            user: "tha".into(),
+            key: Some(ED25519.into()),
+            allow_delete: false,
+            engines: vec!["docker=/missing-security-test.sock".into()],
+        };
+        let config = AgentConfig {
+            allow_delete: false,
+            engines: vec![parse_engine(&options.engines[0]).unwrap()],
+        };
+        let line = authorized_line(
+            Path::new("/usr/local/bin/tha-agent"),
+            &parse_public_key(ED25519).unwrap(),
+        )
+        .unwrap();
+        let policy = home.path().join("policy.toml");
+        let error = finish_dedicated_setup(&options, &account, &line, &policy, config).unwrap_err();
+        assert!(
+            error.to_string().contains("authorized_keys line 1"),
+            "{error:#}"
+        );
+        assert!(!policy.exists());
+        assert_eq!(std::fs::read_to_string(keys).unwrap(), ED25519);
+        assert_eq!(
+            std::fs::metadata(home.path().join(".ssh")).unwrap().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn security_existing_keys_must_use_the_exact_trusted_command() {
+        let line = authorized_line(
+            Path::new("/usr/local/bin/tha-agent"),
+            &parse_public_key(ED25519).unwrap(),
+        )
+        .unwrap();
+        for command in [
+            "/bin/sh -i #agent",
+            "/tmp/evil-agent",
+            "/usr/local/bin/tha-agent;sh #agent",
+            "/usr/local/bin/tha-agent --extra #agent",
+        ] {
+            let existing = format!("restrict,command=\"{command}\" {ED25519}");
+            assert!(
+                merge_authorized_keys(&existing, &line).is_err(),
+                "{command}"
+            );
+        }
+        let extra_option =
+            format!("restrict,command=\"/bin/sh\",command=\"/usr/local/bin/tha-agent\" {ED25519}");
+        assert!(merge_authorized_keys(&extra_option, &line).is_err());
+        let commented = format!("{line} workstation comment\n");
+        assert!(merge_authorized_keys(&commented, &line).is_ok());
+        for malformed in [
+            format!("restrict,command=\"/bin/sh -i #agent\" {ED25519}"),
+            format!("restrict,command=\"/usr/local/bin/tha-agent\",pty {ED25519}"),
+        ] {
+            assert!(merge_authorized_keys("", &malformed).is_err());
+        }
     }
 
     #[test]

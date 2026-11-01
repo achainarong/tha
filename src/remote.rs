@@ -376,6 +376,7 @@ pub fn keygen_command(path: &str) -> Result<std::process::Command> {
 
 /// The admin command for the server, or why it cannot be built yet.
 pub fn setup_command(remote: &Remote) -> Result<String> {
+    remote.validate()?;
     // Root's existing key stays as it is, so only the policy file is needed.
     if unrestricted_login(&remote.user) {
         return Ok(format!("{AGENT_INSTALL} --user root"));
@@ -393,9 +394,13 @@ pub fn setup_command(remote: &Remote) -> Result<String> {
 }
 
 fn render_setup_command(user: &str, public_key: &str) -> Result<String> {
+    ensure!(
+        crate::agent::setup::valid_user(user),
+        "Choose a user name made of lowercase letters, digits, - and _"
+    );
     let key = crate::agent::setup::parse_public_key(public_key)?;
     Ok(format!(
-        "{AGENT_INSTALL} --user {user} --key '{}'",
+        "{AGENT_INSTALL} --user '{user}' --key '{}'",
         key.as_line()
     ))
 }
@@ -616,20 +621,10 @@ async fn list_engines(
     key: &Path,
     control: &Path,
 ) -> Result<crate::agent::Listing, Failure> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(15),
-        Command::new("ssh")
-            .args(channel_args(remote, key, control, LIST_COMMAND))
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| Failure {
-        reason: crate::i18n::t("The server did not answer the engine list request").into(),
-        retry: true,
-    })?
-    .map_err(|error| Failure::local(error.into()))?;
+    let output =
+        listing_output(Command::new("ssh").args(channel_args(remote, key, control, LIST_COMMAND)))
+            .await
+            .map_err(Failure::local)?;
     if !output.status.success() {
         return Err(Failure::from_stderr(&String::from_utf8_lossy(
             &output.stderr,
@@ -639,6 +634,54 @@ async fn list_engines(
         reason: crate::model::safe_text(&format!("{error:#}")),
         retry: false,
     })
+}
+
+async fn listing_output(command: &mut Command) -> Result<std::process::Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("Cannot run engine list request")?;
+    let stdout = child.stdout.take().context("Missing engine list stdout")?;
+    let stderr = child.stderr.take().context("Missing engine list stderr")?;
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        let (stdout, stderr, status) = tokio::try_join!(
+            read_listing_pipe(stdout),
+            read_listing_pipe(stderr),
+            async { Ok::<_, anyhow::Error>(child.wait().await?) },
+        )?;
+        Ok::<_, anyhow::Error>(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await
+    .context(crate::i18n::t(
+        "The server did not answer the engine list request",
+    ))
+    .and_then(|result| result);
+    if result.is_err() {
+        // Reap on overflow, timeout or I/O errors; kill_on_drop also covers cancellation.
+        let _ = child.kill().await;
+    }
+    result
+}
+
+async fn read_listing_pipe(input: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    input
+        .take(MAX_LIST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    ensure!(
+        bytes.len() as u64 <= MAX_LIST_BYTES,
+        "{}",
+        crate::i18n::t("The server's engine list is too large")
+    );
+    Ok(bytes)
 }
 
 /// A server is not trusted to name local files or endpoints, so its answer is checked here too.
@@ -1241,8 +1284,65 @@ mod tests {
         const KEY: &str =
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBUo4CVCKfmH3UjnNfr0F2hsmKRKEFmCJfNDIyVGxsHq";
         let command = render_setup_command("tha", &format!("{KEY} me';sh;'\n")).unwrap();
-        assert_eq!(command, format!("{AGENT_INSTALL} --user tha --key '{KEY}'"));
+        assert_eq!(
+            command,
+            format!("{AGENT_INSTALL} --user 'tha' --key '{KEY}'")
+        );
         assert!(render_setup_command("tha", "command=\"sh\" x y").is_err());
+    }
+
+    #[test]
+    fn security_setup_commands_refuse_shell_usernames() {
+        const KEY: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBUo4CVCKfmH3UjnNfr0F2hsmKRKEFmCJfNDIyVGxsHq";
+        for user in [
+            "tha;id;#", "$(id)", "a`id`", "tha&", "tha|id", "-option", "", "A", "a.b",
+        ] {
+            assert!(render_setup_command(user, KEY).is_err(), "{user}");
+        }
+    }
+
+    #[tokio::test]
+    async fn security_listing_limits_both_streams_before_eof() {
+        for redirect in ["", " >&2"] {
+            let mut command = Command::new("/bin/sh");
+            command.args([
+                "-c",
+                &format!("while :; do printf '0123456789abcdef0123456789abcdef'{redirect}; done"),
+            ]);
+            let result =
+                tokio::time::timeout(Duration::from_secs(3), listing_output(&mut command)).await;
+            assert!(
+                result.is_ok(),
+                "unbounded output was not rejected before EOF: {redirect}"
+            );
+            assert!(
+                result
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("too large")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn security_listing_accepts_exact_limits_and_preserves_exit_status() {
+        for count in [0, MAX_LIST_BYTES as usize, MAX_LIST_BYTES as usize + 1] {
+            let input = vec![b'x'; count];
+            let result = read_listing_pipe(input.as_slice()).await;
+            if count as u64 <= MAX_LIST_BYTES {
+                assert_eq!(result.unwrap(), input);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'listing'; printf 'diagnostic' >&2; exit 7"]);
+        let output = listing_output(&mut command).await.unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"listing");
+        assert_eq!(output.stderr, b"diagnostic");
     }
 
     #[test]

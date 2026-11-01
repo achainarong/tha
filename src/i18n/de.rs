@@ -1564,10 +1564,6 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "  Container ist gestoppt; veröffentlichte Ports sind nicht aktiv.",
     ),
     (
-        "  Reported bindings; localhost/VM forwarding reachability not verified.",
-        "  Gemeldete Bindungen; Erreichbarkeit über localhost/VM-Weiterleitung nicht geprüft.",
-    ),
-    (
         "  Ports      No port mappings reported",
         "  Ports      Kein Port zugeordnet",
     ),

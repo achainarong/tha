@@ -2454,16 +2454,19 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
                         a0 = safe_text(&port.overview())
                     )));
                 }
-                lines.push(Line::styled(
-                    if engine.error.is_some() {
-                        crate::i18n::t("  Last-known bindings (offline); localhost reachability not verified.")
-                    } else if !container.running() {
-                        crate::i18n::t("  Container is stopped; published ports are not active.")
-                    } else {
-                        crate::i18n::t("  Reported bindings; localhost/VM forwarding reachability not verified.")
-                    },
-                    muted(),
-                ));
+                if engine.error.is_some() {
+                    lines.push(Line::styled(
+                        crate::i18n::t(
+                            "  Last-known bindings (offline); localhost reachability not verified.",
+                        ),
+                        muted(),
+                    ));
+                } else if !container.running() {
+                    lines.push(Line::styled(
+                        crate::i18n::t("  Container is stopped; published ports are not active."),
+                        muted(),
+                    ));
+                }
             } else if container.ports.is_empty() {
                 lines.push(Line::styled(
                     crate::i18n::t("  Ports      No port mappings reported"),
@@ -3854,7 +3857,13 @@ mod tests {
         assert!(text.contains("localhost:8080 → 80/tcp (loopback only"));
         assert!(text.contains("0.0.0.0:5353 → 53/udp (all interfaces"));
         assert!(text.contains("443/tcp — exposed, no host port"));
-        assert!(text.contains("reachability not verified"));
+        assert!(!text.contains("reachability not verified"));
+        app.engines[0].snapshot.as_mut().unwrap().containers[0].state = "exited".into();
+        let text: String = overview_lines(&app)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(text.contains("Container is stopped; published ports are not active."));
         app.update_engine(0, Err("fixture offline".into()));
         let text: String = overview_lines(&app)
             .iter()
