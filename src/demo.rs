@@ -71,6 +71,29 @@ pub fn connections() -> Vec<Connection> {
 }
 
 /// What a real inspect would report for the seeded containers.
+/// What loading logs from the diagnostics view would return, close to a known failure.
+pub fn diagnostic_logs(
+    container: &Container,
+    failure: Option<time::OffsetDateTime>,
+) -> crate::logs::LogBuffer {
+    use time::format_description::well_known::Rfc3339;
+    let mut buffer = crate::logs::LogBuffer::new(crate::logs::WINDOW_MAX_LINES);
+    let end = failure.unwrap_or_else(time::OffsetDateTime::now_utc);
+    for (seconds, text) in [
+        (
+            20,
+            "INFO request completed method=GET path=/health duration=2ms",
+        ),
+        (8, "WARN upstream retry attempt=2"),
+        (2, "ERROR connection refused upstream=backend1"),
+    ] {
+        let at = end - time::Duration::seconds(seconds);
+        let stamp = at.format(&Rfc3339).unwrap_or_default();
+        buffer.push(&container.name, &format!("{stamp} {text}"), false);
+    }
+    buffer
+}
+
 pub fn inspection(container: &Container) -> Inspection {
     let stamp = |ago: i64| {
         (time::OffsetDateTime::now_utc() - time::Duration::seconds(ago))
@@ -329,8 +352,7 @@ pub fn populate(app: &mut App) {
             namespaces: vec!["default".into(), "k8s.io".into()],
             containers: vec![native, managed],
             warnings: vec![
-                "Network/volume inventory is unavailable for the native containerd MVP adapter."
-                    .into(),
+                "Network/volume inventory is unavailable for the native containerd adapter.".into(),
             ],
             ..Default::default()
         }),

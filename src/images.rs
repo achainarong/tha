@@ -223,11 +223,9 @@ pub async fn check(targets: Vec<Target>, tx: mpsc::Sender<Event>) {
 }
 
 async fn pull_tag(request: &PullRequest, tag: &str, tx: &mpsc::Sender<Event>) -> Result<()> {
-    anyhow::ensure!(
-        !crate::remote::is_remote(&request.connection),
-        "{}",
-        crate::i18n::t("Pulling images is not available on servers: the agent does not allow it")
-    );
+    if crate::remote::is_remote(&request.connection) {
+        return pull_tag_through_agent(request, tag, tx).await;
+    }
     let (program, path) = crate::exec::runtime_cli(&request.connection).context(crate::i18n::t(
         "Install the Docker or Podman CLI and add it to PATH to pull images",
     ))?;
@@ -285,6 +283,36 @@ async fn pull_tag(request: &PullRequest, tag: &str, tx: &mpsc::Sender<Event>) ->
             last_error
         }
     );
+    Ok(())
+}
+
+/// A server has no CLI to call here, so the engine pulls through the agent's allowlist. The
+/// agent passes no credentials, so only images that allow anonymous pulls work.
+async fn pull_tag_through_agent(
+    request: &PullRequest,
+    tag: &str,
+    tx: &mpsc::Sender<Event>,
+) -> Result<()> {
+    let docker = crate::backend::docker::connect(&request.connection)?
+        .negotiate_version()
+        .await?;
+    let options = bollard::query_parameters::CreateImageOptionsBuilder::default()
+        .from_image(tag)
+        .build();
+    let mut progress = docker.create_image(Some(options), None, None);
+    while let Some(update) = progress.next().await {
+        let update = update.map_err(|error| anyhow::anyhow!(registry_error(&error)))?;
+        let line = safe_text(update.status.as_deref().unwrap_or_default().trim());
+        if !line.is_empty() {
+            let _ = tx
+                .send(Event::PullProgress(crate::tf!(
+                    "Pulling {tag}: {line}",
+                    tag = tag,
+                    line = line
+                )))
+                .await;
+        }
+    }
     Ok(())
 }
 

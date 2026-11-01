@@ -75,6 +75,7 @@ pub struct Response {
 
 pub struct Engine {
     path: PathBuf,
+    events_path: PathBuf,
     connection_key: String,
     claims: collector::Claims,
     queries: Arc<Semaphore>,
@@ -100,7 +101,34 @@ impl Worker {
 }
 
 impl Engine {
+    /// Saved events, newest first, for the same 24 hours as metrics. Read-only and bounded.
+    pub async fn events(&self, since_ms: i64) -> Result<serde_json::Value> {
+        let _permit = self
+            .queries
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("Too many history queries"))?;
+        let path = self.events_path.clone();
+        let since_ms = since_ms.max(history::now_ms() - history::RETENTION_MS);
+        let events = tokio::task::spawn_blocking(move || {
+            crate::events::read_all(&path, since_ms, crate::events::MAX_IN_MEMORY)
+        })
+        .await??;
+        Ok(serde_json::to_value(events)?)
+    }
+
+    /// The last day's events, for the agent's own alert rules.
+    pub async fn saved_events(&self) -> Result<Vec<crate::events::Event>> {
+        let path = self.events_path.clone();
+        let since = history::now_ms() - history::RETENTION_MS;
+        tokio::task::spawn_blocking(move || {
+            crate::events::read_all(&path, since, crate::events::MAX_IN_MEMORY)
+        })
+        .await?
+    }
+
     pub async fn start(engine: &super::AgentEngine, path: PathBuf) -> Result<(Arc<Self>, Worker)> {
+        let events_path = path.with_file_name(format!("events-{}.sqlite3", engine.name));
         let open_path = path.clone();
         let store = tokio::task::spawn_blocking(move || {
             let store = history::Store::open(&open_path, DISK_BYTES)?;
@@ -118,6 +146,7 @@ impl Engine {
         let claims: collector::Claims = Arc::new(Mutex::new(HashMap::new()));
         let this = Arc::new(Self {
             path: path.clone(),
+            events_path: events_path.clone(),
             connection_key: connection.key(),
             claims: claims.clone(),
             queries: Arc::new(Semaphore::new(2)),
@@ -134,7 +163,7 @@ impl Engine {
             claims,
             Arc::new(Semaphore::new(2)),
             live,
-            None,
+            Some(crate::events::spawn_writer(events_path.clone())),
         ));
         let (stop, mut shutdown) = watch::channel(false);
         let task = tokio::spawn(async move {

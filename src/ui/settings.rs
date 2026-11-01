@@ -11,7 +11,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     let on_off = |value: bool| if value { t("On") } else { t("Off") };
-    let area = centered(area, 72, 17);
+    let area = centered(area, 72, 18);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
         .title(t(" Settings "))
@@ -25,6 +25,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             SettingRow::Theme => (t("Theme"), Some(t(app.theme.label()))),
             SettingRow::Language => (t("Language"), Some(app.language.label())),
             SettingRow::Keyboard => (t("Keyboard layout"), Some(t(app.keyboard.label()))),
+            SettingRow::Editor => (t("Editor"), Some(app.editor.label())),
             SettingRow::Mouse => (t("Mouse"), Some(on_off(app.mouse_enabled))),
             SettingRow::WrapLogs => (t("Wrap logs"), Some(on_off(app.log_view.wrap))),
             SettingRow::RemoteConnect => {
@@ -64,6 +65,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             muted(),
         )),
         SettingRow::Keyboard => lines.push(Line::styled(t(app.keyboard.summary()), muted())),
+        SettingRow::Editor => lines.push(Line::styled(
+            t("Opens Compose files with :compose-edit. It must be installed on this computer."),
+            muted(),
+        )),
         SettingRow::Mouse => lines.push(Line::styled(
             t("Hold Shift to select terminal text while the mouse is on."),
             muted(),

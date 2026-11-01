@@ -3,7 +3,7 @@
 ## 1. Gather typed bounded evidence
 
 - [x] 1.1 Add the focused diagnostic result and capability states; verify tests distinguish reported zero/false from missing/unsupported fields and document these semantics.
-- [ ] 1.2 Add on-demand Docker-compatible inspection with deadline, response/output bounds, and bounded health history; verify fixtures for healthy, unhealthy, no configured check, restarting, OOM, nonzero exit, missing fields, and malformed/oversized output.
+- [x] 1.2 Add on-demand Docker-compatible inspection with deadline, response/output bounds, and bounded health history; verify fixtures for healthy, unhealthy, no configured check, restarting, OOM, nonzero exit, missing fields, and malformed/oversized output.
 - [x] 1.3 Bind requests to runtime/endpoint/container generations and reject stale results; verify tests for selection changes, recreated names, removed targets, offline engines, and partial errors without stopping inventory.
 
 ## 2. Present evidence and navigation
@@ -32,3 +32,7 @@
 
 - Review proposed commands, limits, and evidence wording before implementation is considered complete.
 - Archive only after implementation, checks, and user review.
+
+## Response cap (2026-11-01)
+
+- 1.2 is now closed. `diagnostics::inspect` reads the response through `backend::docker::get_json_capped`, which stops at `MAX_RESPONSE_BYTES` (8 MiB) before parsing and works over local sockets and the remote relay. Container IDs are validated before they enter the request path. Tests cover a normal response, an oversized response, and IDs that could change the path. The image comparison on the Overview tab still uses Bollard's `inspect_image`.

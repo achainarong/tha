@@ -1,6 +1,6 @@
 [package]
 name = "tha"
-version = "0.23.1"
+version = "0.24.0"
 edition = "2024"
 default-run = "tha"
 rust-version = "1.88"
@@ -29,7 +29,7 @@ serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 time = { version = "0.3", features = ["parsing", "formatting"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "io-std", "sync", "time", "signal", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "io-util", "io-std", "sync", "time", "signal", "net"] }
 toml = "0.9"
 unicode-segmentation = "1"
 unicode-width = "0.2"

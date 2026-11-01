@@ -413,6 +413,7 @@ mod tests {
             update: remote::Update::Connected {
                 engines: vec!["docker".into()],
                 allow_delete: false,
+                capabilities: None,
             },
         });
         let index = app.machine_engines("prod")[0];
@@ -439,6 +440,7 @@ mod tests {
             update: remote::Update::Connected {
                 engines: vec!["docker".into()],
                 allow_delete: false,
+                capabilities: None,
             },
         });
         let index = app.machine_engines("prod")[0];
@@ -482,6 +484,7 @@ mod tests {
             update: remote::Update::Connected {
                 engines: vec!["docker".into()],
                 allow_delete: false,
+                capabilities: None,
             },
         });
         let index = app.machine_engines("prod")[0];
@@ -563,6 +566,7 @@ mod tests {
             update: remote::Update::Connected {
                 engines: vec!["docker".into()],
                 allow_delete: false,
+                capabilities: None,
             },
         });
         app.machine_engines("prod")[0]

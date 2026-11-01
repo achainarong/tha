@@ -152,3 +152,22 @@ Selected release median comparison (same machine, separate invocations):
 | Long-entry 512-arrival stream frame | 12.465 ms | 11.153 ms |
 
 These are single-invocation comparisons, not controlled statistical claims. Unchanged Explorer code also measured faster in the follow-up, demonstrating machine/run variance; do not attribute all full-frame or streaming differences to these changes. The viewport result directly supports removal of retained-history traversal. Remaining work: Explorer structural caching, attachment indexes, and overlapping inventory requests still require their own benchmarks and implementation passes.
+
+## Follow-up: Explorer, attachments and inventory requests
+
+Added benchmarks for Explorer search and for resource-rich fixtures with one network and volume per project plus one shared network. Selected release medians from single invocations on the same machine:
+
+| Operation | Before | After |
+| --- | ---: | ---: |
+| Explorer refresh, 100 containers with resources | 385.5 µs | 210.1 µs |
+| Explorer refresh, 1,000 containers with resources | 146.1 ms | 2.1 ms |
+| Explorer refresh, 5,000 containers with resources | stopped; not measured | 10.7 ms |
+
+The baseline's 5,000-container run was stopped because it would have taken more than 20 minutes. These are single-invocation comparisons, not controlled statistical claims. The "after" column predates the final change that skips the index when a snapshot has no resources; that change was added because refreshes without resources measured about 8% slower, and that case was not measured again.
+
+- **Explorer resources:** each project scanned every resource and container on every refresh. A `ResourceIndex` built once per tree replaced this, and it is the change behind the table above.
+- **Explorer search:** each node is now checked once rather than once per ancestor. Search timings did not improve measurably because tree depth is small; the rewrite is simpler but is not a measured gain.
+- **Attachments:** snapshot construction indexes network and volume attachments in one pass.
+- **Inventory requests:** images, networks and volumes now overlap. A delayed mock engine test confirms they overlap and that a failed request keeps the other results. No live-runtime speedup was measured.
+- **Explorer tree cache: not added.** At 5,000 containers a refresh costs about 6–11 ms, well under the 70 ms log-batching interval. A cached tree would depend on engine, machine, focus, alias and language state changing correctly across the app, and a stale tree is worse than a few milliseconds. Revisit this only if a real workload shows a problem.
+

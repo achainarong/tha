@@ -2,7 +2,7 @@ use crate::{
     config::Connection,
     logs::LogBuffer,
     logs::view::LogView,
-    model::{Condition, Container, Snapshot, Tone},
+    model::{Condition, Container, Resource, Snapshot, Tone},
     workspace::Project,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -147,6 +147,58 @@ pub enum OverviewMode {
     Security,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyField {
+    Id,
+    Name,
+    Image,
+}
+
+/// One explicit connectivity test, shown with where it ran and what it contacted.
+pub struct NetworkTestView {
+    pub source: crate::files::Source,
+    pub host: String,
+    pub port: u16,
+    pub result: Option<Result<crate::files::NetTest, String>>,
+}
+
+/// Review before a diagnostic bundle is written. Nothing is uploaded.
+pub struct DiagnosticExport {
+    pub path: String,
+    pub redact: bool,
+    pub error: Option<String>,
+}
+
+/// A Compose file to open in the editor, once `main` can hand over the terminal.
+#[derive(Debug, Clone)]
+pub struct EditRequest {
+    pub location: crate::compose_edit::Location,
+    pub label: String,
+}
+
+/// The incident list for what was selected when it opened. Its contents stay current.
+pub struct TimelineView {
+    pub engine: usize,
+    pub title: String,
+    pub containers: Vec<Container>,
+    pub selected: usize,
+}
+
+/// The fleet list. Its contents are recomputed on each frame, so they stay current.
+#[derive(Default)]
+pub struct FleetView {
+    pub selected: usize,
+    pub vulnerabilities: crate::fleet::Vulnerabilities,
+}
+
+/// What the capability dialog is about, kept by name so it follows no later selection.
+pub struct CapabilitiesView {
+    pub title: String,
+    pub engine: Option<usize>,
+    pub server: Option<String>,
+    pub scroll: usize,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct InventoryView {
     pub zoom: bool,
@@ -266,6 +318,8 @@ pub enum Choice {
     Diagnose(crate::diagnostics::Kind),
     DiagnosticPeer(Box<Container>),
     DiagnosticPeerNone,
+    SavedView(String),
+    ComposeFile(Box<EditRequest>),
 }
 
 pub struct Picker {
@@ -323,6 +377,9 @@ impl ActionFeedback {
             Action::Stop => crate::i18n::t("Stopping"),
             Action::Restart => crate::i18n::t("Restarting"),
             Action::Delete => crate::i18n::t("Deleting"),
+            Action::Pause => crate::i18n::t("Pausing"),
+            Action::Unpause => crate::i18n::t("Unpausing"),
+            Action::Kill => crate::i18n::t("Killing"),
         };
         RowActionFeedback {
             symbol: FRAMES[((elapsed.as_millis() / 100) % FRAMES.len() as u128) as usize],
@@ -385,6 +442,28 @@ pub struct App {
     pub settings_save_error: Option<String>,
     pub custom_bindings: std::collections::BTreeMap<String, String>,
     pub preferences_path: Option<PathBuf>,
+    pub capabilities_view: Option<CapabilitiesView>,
+    pub downloads: crate::downloads::Manager,
+    pub fleet_view: Option<FleetView>,
+    pub fleet_vulnerability_request: Option<Vec<crate::security::Target>>,
+    pub timeline_view: Option<TimelineView>,
+    pub alerts: crate::alerts::Alerts,
+    pub alert_rules: crate::alerts::Rules,
+    /// When the running review of the last Compose operation stops updating.
+    pub compose_review_until: Option<std::time::Instant>,
+    pub compose_before: Option<(usize, String, Vec<crate::compose::ServiceImage>)>,
+    pub editor: crate::editor::Editor,
+    pub edit_request: Option<EditRequest>,
+    pub config_path: Option<PathBuf>,
+    pub config_modified: Option<std::time::SystemTime>,
+    pub check_updates: bool,
+    pub network_test: Option<NetworkTestView>,
+    pub network_test_request: bool,
+    pub diagnostic_export: Option<DiagnosticExport>,
+    pub diagnostic_export_request: Option<(PathBuf, String)>,
+    pub saved_views: Vec<crate::saved_views::SavedView>,
+    /// `None` keeps saved views for this session only, as in demo mode.
+    pub saved_views_path: Option<PathBuf>,
     pending_preferences: Option<crate::preferences::Preferences>,
     /// Machine identity is provider + machine name, never its temporary socket path.
     podman_machines: BTreeMap<String, usize>,
@@ -434,6 +513,7 @@ pub struct App {
     pub log_scope_targets: Option<(usize, Vec<String>)>,
     pub diagnostics: Option<crate::diagnostics::View>,
     pub diagnostics_requests: Vec<crate::diagnostics::Request>,
+    pub diagnostics_log_request: Option<crate::diagnostics::LogRequest>,
     /// Inspect details for the one container the Overview tab is showing.
     pub overview_details: Option<crate::diagnostics::Side>,
     overview_details_at: Option<std::time::Instant>,
@@ -522,6 +602,32 @@ impl App {
             settings_save_error: None,
             custom_bindings: Default::default(),
             preferences_path: None,
+            capabilities_view: None,
+            downloads: crate::downloads::Manager {
+                demo,
+                ..Default::default()
+            },
+            fleet_view: None,
+            fleet_vulnerability_request: None,
+            timeline_view: None,
+            alerts: crate::alerts::Alerts {
+                started_ms: crate::history::now_ms(),
+                ..Default::default()
+            },
+            alert_rules: Default::default(),
+            compose_review_until: None,
+            compose_before: None,
+            editor: Default::default(),
+            edit_request: None,
+            config_path: None,
+            config_modified: None,
+            check_updates: false,
+            network_test: None,
+            network_test_request: false,
+            diagnostic_export: None,
+            diagnostic_export_request: None,
+            saved_views: Vec::new(),
+            saved_views_path: None,
             pending_preferences: None,
             podman_machines: BTreeMap::new(),
             engines: connections
@@ -590,6 +696,7 @@ impl App {
             log_scope_targets: None,
             diagnostics: None,
             diagnostics_requests: Vec::new(),
+            diagnostics_log_request: None,
             overview_details: None,
             overview_details_at: None,
             diagnostics_generation: 0,
@@ -1119,6 +1226,7 @@ impl App {
             peer: None,
             scroll: 0,
             message: None,
+            loaded_logs: None,
         });
         self.load_diagnostics(crate::diagnostics::Role::Main);
     }
@@ -1225,8 +1333,65 @@ impl App {
         }
     }
 
+    /// Reads a bounded range of this exact container's logs into the open view, on request only.
+    /// They do not touch the Logs tab or any filter, and nothing is saved.
+    pub fn load_diagnostic_logs(&mut self) {
+        use crate::diagnostics::{Freshness, LoadedLogs, LogLoad, LogRequest};
+        let Some(view) = &self.diagnostics else {
+            return;
+        };
+        let target = view.main.target.clone();
+        let container = view.main.container.clone();
+        let failure = view
+            .main
+            .evidence
+            .as_ref()
+            .and_then(|(inspection, _)| crate::diagnostics::failure_time(inspection));
+        let blocked = match self.diagnostics_freshness(&target) {
+            Freshness::Current => None,
+            Freshness::EngineOffline => Some(crate::i18n::t(
+                "Connection unavailable; logs cannot be loaded right now",
+            )),
+            Freshness::Removed | Freshness::RuntimeChanged => Some(crate::i18n::t(
+                "This container no longer exists here; close and select the current one",
+            )),
+        };
+        if let Some(reason) = blocked {
+            if let Some(view) = &mut self.diagnostics {
+                view.message = Some(reason.into());
+            }
+            return;
+        }
+        self.diagnostics_generation = self.diagnostics_generation.wrapping_add(1);
+        let generation = self.diagnostics_generation;
+        let connection = self.engines[target.engine].connection.clone();
+        let status = if self.demo {
+            LogLoad::Ready(crate::demo::diagnostic_logs(&container, failure))
+        } else {
+            let (since, until) = crate::diagnostics::log_window(failure);
+            self.diagnostics_log_request = Some(LogRequest {
+                generation,
+                target: target.clone(),
+                connection,
+                container,
+                since,
+                until,
+            });
+            LogLoad::Loading
+        };
+        if let Some(view) = &mut self.diagnostics {
+            view.message = None;
+            view.loaded_logs = Some(LoadedLogs {
+                target,
+                generation,
+                status,
+            });
+        }
+    }
+
     pub fn diagnostics_close(&mut self) {
         self.diagnostics = None;
+        self.diagnostics_log_request = None;
         self.diagnostics_requests
             .retain(|request| request.role == crate::diagnostics::Role::Overview);
     }
@@ -1371,17 +1536,28 @@ impl App {
                 crate::i18n::t("Demo mode: Compose operations are disabled")
             );
         }
-        // Stops here, before the local path check could match a same-named local project.
-        if self
-            .current()
-            .is_some_and(|row| crate::remote::is_remote(&self.engines[row.engine].connection))
+        if let Some(row) = self.current()
+            && let Some((server, _)) =
+                crate::remote::parse_endpoint(&self.engines[row.engine].connection.endpoint)
         {
-            anyhow::bail!(
-                "{}",
-                crate::i18n::t(
-                    "Compose is not available on servers: its files are on the server, not here"
-                )
-            );
+            match self
+                .machine(server)
+                .and_then(|machine| machine.capabilities.as_ref())
+            {
+                Some(reported) if reported.allow_compose => {}
+                Some(_) => anyhow::bail!(
+                    "{}",
+                    crate::i18n::t(
+                        "Compose actions are turned off on this server; rerun setup with --allow-compose"
+                    )
+                ),
+                None => anyhow::bail!(
+                    "{}",
+                    crate::i18n::t(
+                        "This server's agent does not support Compose actions; update tha-agent"
+                    )
+                ),
+            }
         }
         if self.compose_busy() {
             anyhow::bail!(
@@ -1459,6 +1635,14 @@ impl App {
             request.target.name()
         )));
         self.compose_output_visible = true;
+        self.compose_review_until = None;
+        self.compose_before = request.action.changes_images().then(|| {
+            (
+                self.current().map_or(0, |row| row.engine),
+                request.target.project.clone(),
+                request.before.clone(),
+            )
+        });
         self.compose_request = Some(request);
     }
 
@@ -2765,14 +2949,9 @@ impl App {
             self.reorder_contexts();
         }
         let mut rows = Vec::new();
+        let query = self.tree_query.to_lowercase();
         for tree in self.explorer_nodes() {
-            flatten(
-                &tree,
-                0,
-                &self.expanded,
-                &self.tree_query.to_lowercase(),
-                &mut rows,
-            );
+            flatten(&tree, 0, &self.expanded, &query, &mut rows);
         }
         self.rows = rows;
         self.selected = previous
@@ -3377,6 +3556,8 @@ impl App {
                     crate::tf!("Context order: {a0} · o to sort again", a0 = mode.label());
             }
             Choice::Project(project) => self.open_project(project),
+            Choice::SavedView(name) => self.apply_saved_view(&name),
+            Choice::ComposeFile(request) => self.edit_request = Some(*request),
             Choice::Diagnose(kind) => self.open_diagnostics(kind),
             Choice::DiagnosticPeerNone => {
                 if let Some(view) = &mut self.diagnostics {
@@ -3415,6 +3596,1000 @@ impl App {
                 });
             }
         }
+    }
+
+    /// Everything the view shows right now, by name so it survives runtimes changing order.
+    pub fn capture_view(&self, name: &str) -> crate::saved_views::SavedView {
+        use crate::saved_views::{SavedInventory, SavedProject, SavedView};
+        let inventory = (self.overview_mode != OverviewMode::Containers
+            && self.inventory_engine < self.engines.len())
+        .then(|| {
+            let view = self
+                .inventory_views
+                .get(&(self.inventory_engine, self.overview_mode));
+            SavedInventory {
+                connection: self.preference_connection(self.inventory_engine),
+                query: view.map(|view| view.query.clone()).unwrap_or_default(),
+                filter: view.map_or(0, |view| view.filter),
+                sort: view.map_or(0, |view| view.sort),
+            }
+        });
+        SavedView {
+            name: name.into(),
+            overview: self.overview_mode.into(),
+            // A shell is never restored.
+            tab: if self.tab == Tab::Exec {
+                Tab::Overview
+            } else {
+                self.tab
+            },
+            machine: self.machine.clone(),
+            project: self.project.as_ref().map(|project| SavedProject {
+                connection: self.preference_connection(project.engine),
+                namespace: project.namespace.clone(),
+                name: project.name.clone(),
+            }),
+            selected: self.current().map(|row| crate::preferences::Row {
+                connection: self.preference_connection(row.engine),
+                scope: format!("{:?}", row.scope),
+            }),
+            tree_query: self.tree_query.clone(),
+            log_terms: self.log_filter_terms.clone(),
+            log_advanced: self.log_filter_text.clone(),
+            inventory,
+        }
+    }
+
+    fn write_saved_views(&mut self) -> Result<(), String> {
+        let Some(path) = &self.saved_views_path else {
+            return Ok(());
+        };
+        crate::saved_views::save(path, &self.saved_views).map_err(|error| {
+            crate::tf!(
+                "Could not write saved views: {error}",
+                error = format!("{error:#}")
+            )
+        })
+    }
+
+    /// Saving under an existing name replaces that view, as the notice says.
+    pub fn save_view(&mut self, name: &str) {
+        let name = name.trim();
+        if let Err(error) = crate::saved_views::validate_name(name) {
+            self.notice = error.to_string();
+            return;
+        }
+        let view = self.capture_view(name);
+        let existing = self.saved_views.iter().position(|view| view.name == name);
+        let replaced = match existing {
+            Some(index) => {
+                self.saved_views[index] = view;
+                true
+            }
+            None if self.saved_views.len() >= crate::saved_views::MAX_VIEWS => {
+                self.notice =
+                    crate::i18n::t("Saved view limit reached; delete one with :delete-view").into();
+                return;
+            }
+            None => {
+                self.saved_views.push(view);
+                self.saved_views.sort_by(|a, b| a.name.cmp(&b.name));
+                false
+            }
+        };
+        self.notice = match self.write_saved_views() {
+            Err(error) => error,
+            Ok(()) if replaced => crate::tf!("Replaced saved view {name}", name = name),
+            Ok(()) => crate::tf!(
+                "Saved view {name}, including its filter text · :saved-views opens it",
+                name = name
+            ),
+        };
+    }
+
+    pub fn delete_view(&mut self, name: &str) {
+        let name = name.trim();
+        let count = self.saved_views.len();
+        self.saved_views.retain(|view| view.name != name);
+        if self.saved_views.len() == count {
+            self.notice = crate::tf!(
+                "No saved view is named {name}",
+                name = crate::model::safe_text(name)
+            );
+            return;
+        }
+        self.notice = match self.write_saved_views() {
+            Err(error) => error,
+            Ok(()) => crate::tf!("Deleted saved view {name}", name = name),
+        };
+    }
+
+    pub fn pick_saved_view(&mut self) {
+        if self.saved_views.is_empty() {
+            self.notice =
+                crate::i18n::t("No saved views yet; :save-view NAME saves the current one").into();
+            return;
+        }
+        self.picker = Some(Picker {
+            title: crate::i18n::t("Saved views").into(),
+            choices: self
+                .saved_views
+                .iter()
+                .map(|view| Choice::SavedView(view.name.clone()))
+                .collect(),
+            selected: 0,
+        });
+    }
+
+    fn engine_named(&self, connection: &str) -> Option<usize> {
+        let mut found =
+            (0..self.engines.len()).filter(|&i| self.preference_connection(i) == connection);
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
+    }
+
+    /// Restores what still exists and names what does not. This changes only what is shown:
+    /// no server connects, no shell opens, and `back` returns to where you were.
+    pub fn apply_saved_view(&mut self, name: &str) {
+        let Some(view) = self
+            .saved_views
+            .iter()
+            .find(|view| view.name == name)
+            .cloned()
+        else {
+            self.notice = crate::tf!(
+                "No saved view is named {name}",
+                name = crate::model::safe_text(name)
+            );
+            return;
+        };
+        self.push_navigation();
+        let mut missing = Vec::new();
+        self.machine = view.machine.clone().filter(|machine| {
+            let known =
+                machine == crate::machines::LOCAL_MACHINE || self.machine(machine).is_some();
+            if !known {
+                missing.push(crate::model::safe_text(machine));
+            }
+            known
+        });
+        self.project = view.project.as_ref().and_then(|saved| {
+            let engine = self.engine_named(&saved.connection);
+            if engine.is_none() {
+                missing.push(crate::model::safe_text(&saved.name));
+            }
+            engine.map(|engine| Project {
+                engine,
+                namespace: saved.namespace.clone(),
+                name: saved.name.clone(),
+            })
+        });
+        if let Some(project) = &self.project {
+            let scope = Scope::Project {
+                namespace: project.namespace.clone(),
+                project: project.name.clone(),
+            };
+            self.expanded
+                .insert(format!("{}/{scope:?}", project.engine));
+        }
+        let overview = OverviewMode::from(view.overview);
+        self.overview_mode = if overview == OverviewMode::Security && !self.security.enabled {
+            missing.push(crate::i18n::t("Security").into());
+            OverviewMode::Containers
+        } else {
+            overview
+        };
+        if let Some(saved) = &view.inventory {
+            match self.engine_named(&saved.connection) {
+                Some(engine) => {
+                    self.inventory_engine = engine;
+                    let inventory = self.inventory_views.entry((engine, overview)).or_default();
+                    inventory.query = saved.query.clone();
+                    inventory.filter = saved.filter;
+                    inventory.sort = saved.sort;
+                }
+                None => missing.push(crate::model::safe_text(&saved.connection)),
+            }
+        }
+        self.tab = if view.tab == Tab::Exec {
+            Tab::Overview
+        } else {
+            view.tab
+        };
+        self.tree_query = view.tree_query.clone();
+        self.log_view.filter.set_text(&view.log_terms);
+        self.log_filter_terms = view.log_terms.clone();
+        let advanced = if view.log_advanced.is_empty() {
+            "{}"
+        } else {
+            view.log_advanced.as_str()
+        };
+        match crate::logs::filter::Filter::parse(advanced) {
+            Ok(filter) => {
+                self.log_view.filter.set_advanced(filter);
+                self.log_filter_text = advanced.to_owned();
+            }
+            Err(_) => missing.push(crate::i18n::t("advanced log filter").into()),
+        }
+        self.performance_focus = false;
+        self.exec_input = false;
+        self.detail_focus = false;
+        self.tree_offset = 0;
+        self.detail_scroll = 0;
+        self.refresh_tree();
+        let selected = view
+            .selected
+            .as_ref()
+            .and_then(|saved| resolve_preference_key(self, saved))
+            .and_then(|key| self.rows.iter().position(|row| row.key == key));
+        self.selected = selected.unwrap_or(0);
+        self.notice = if missing.is_empty() {
+            crate::tf!("Opened saved view {name} · Backspace returns", name = name)
+        } else {
+            crate::tf!(
+                "Opened saved view {name}, but these are unavailable: {missing}",
+                name = name,
+                missing = missing.join(", ")
+            )
+        };
+    }
+
+    /// What the selection points at, for reading files. It never changes what is selected.
+    fn download_source(&self) -> Result<crate::files::Source, String> {
+        use crate::files::Source;
+        let Some(row) = self.current() else {
+            return Err(crate::i18n::t("Select a container or server first").into());
+        };
+        if let Scope::Machine(name) = &row.scope {
+            let Some(machine) = self.machine(name) else {
+                return Err(crate::i18n::t("Select a container or server first").into());
+            };
+            if !machine.connected() {
+                return Err(crate::i18n::t("Connect to this server first").into());
+            }
+            match machine.capabilities.as_ref() {
+                Some(reported) if reported.allow_server_download => {}
+                Some(_) => {
+                    return Err(crate::i18n::t(
+                        "Server file access is turned off; rerun setup with --allow-server-download",
+                    )
+                    .into());
+                }
+                None => {
+                    return Err(crate::i18n::t(
+                        "This server's agent does not support file access; update tha-agent",
+                    )
+                    .into());
+                }
+            }
+            let control = crate::remote::shell_control_path(&machine.remote)
+                .map_err(|error| crate::model::safe_text(&format!("{error:#}")))?;
+            return Ok(Source::Server {
+                remote: machine.remote.clone(),
+                control,
+                label: name.clone(),
+            });
+        }
+        let Some(container) = self.diagnostic_container() else {
+            return Err(crate::i18n::t("Select a single container or a server").into());
+        };
+        let engine = &self.engines[row.engine];
+        if engine.alias.is_some() || engine.error.is_some() {
+            return Err(crate::i18n::t("Select a connected primary runtime").into());
+        }
+        if engine.connection.kind != crate::config::BackendKind::Docker {
+            return Err(crate::i18n::t("Native containerd has no file access").into());
+        }
+        if container.managed {
+            return Err(crate::i18n::t("Kubernetes-managed containers are excluded").into());
+        }
+        Ok(Source::Container {
+            connection: engine.connection.clone(),
+            id: container.id.clone(),
+            label: format!("{} ({})", container.name, engine.connection.name),
+        })
+    }
+
+    /// Opens the panel. The tree starts building now, and only for this choice: selecting a
+    /// container anywhere else never runs anything in it.
+    pub fn open_download_manager(&mut self) {
+        match self.download_source() {
+            Ok(source) => self
+                .downloads
+                .open_source(source, std::time::Instant::now()),
+            Err(notice) => self.notice = notice,
+        }
+    }
+
+    /// `:download PATH`, the direct route that needs no browsing and runs no command.
+    pub fn download_path(&mut self, path: &str) {
+        let path = match crate::files::clean_path(path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.notice = error.to_string();
+                return;
+            }
+        };
+        if path == "/" {
+            self.notice =
+                crate::i18n::t("Choose a folder below /, not the whole filesystem").into();
+            return;
+        }
+        match self.download_source() {
+            Ok(source) => self.downloads.open_dialog(source, path),
+            Err(notice) => self.notice = notice,
+        }
+    }
+
+    /// Hands real work to the event loop. Demo mode answers from fixtures and reaches nothing.
+    pub fn take_download_requests(&mut self) -> Vec<crate::downloads::Request> {
+        use crate::downloads::{Event, Request, demo_listing};
+        let requests = std::mem::take(&mut self.downloads.requests);
+        if !self.demo {
+            return requests;
+        }
+        let now = std::time::Instant::now();
+        for request in requests {
+            match request {
+                Request::List { key, path, .. } => {
+                    let result = Ok(demo_listing(&path));
+                    self.downloads
+                        .apply(Event::Listed { key, path, result }, now);
+                }
+                Request::Inspect { dialog, path, .. } => {
+                    let parent = path.rsplit_once('/').map_or("/", |(parent, _)| {
+                        if parent.is_empty() { "/" } else { parent }
+                    });
+                    let found = demo_listing(parent)
+                        .entries
+                        .into_iter()
+                        .find(|entry| entry.name == crate::files::file_name(&path));
+                    let result = found
+                        .map(|entry| crate::files::Header {
+                            name: entry.name,
+                            kind: entry.kind,
+                            size: entry.size.unwrap_or(0),
+                            modified: 0,
+                        })
+                        .ok_or_else(|| crate::i18n::t("No such file or folder").to_owned());
+                    self.downloads
+                        .apply(Event::Inspected { dialog, result }, now);
+                }
+                Request::Count { dialog, path, .. } => {
+                    let entries = demo_listing(&path).entries;
+                    let totals = crate::files::Totals {
+                        bytes: entries.iter().filter_map(|entry| entry.size).sum(),
+                        files: entries.len() as u64,
+                        done: true,
+                    };
+                    self.downloads.apply(
+                        Event::Counted {
+                            dialog,
+                            result: Ok(totals),
+                        },
+                        now,
+                    );
+                }
+                Request::Start { .. }
+                | Request::Upload { .. }
+                | Request::Cancel { .. }
+                | Request::CloseDialog => {}
+            }
+        }
+        // Answering a listing can queue the next folder.
+        if !self.downloads.requests.is_empty() {
+            return self.take_download_requests();
+        }
+        Vec::new()
+    }
+
+    pub fn evaluate_alerts(&mut self) {
+        if !self.alert_rules.enabled {
+            return;
+        }
+        let now = crate::history::now_ms();
+        let evaluation = crate::alerts::evaluate(self, &self.alert_rules, now);
+        self.alerts.update(evaluation, now);
+    }
+
+    pub fn open_alert_selection(&mut self) {
+        let Some((_, alert)) = self.alerts.open.get(self.alerts.selected) else {
+            return;
+        };
+        let Some((engine, key)) = alert.finding.target.clone() else {
+            self.notice =
+                crate::i18n::t("This alert has no workload to open; press . to manage servers")
+                    .into();
+            return;
+        };
+        self.alerts.view_open = false;
+        self.reveal_container(engine, &key);
+    }
+
+    /// Keeps the last Compose operation's review current for a short while after it ends.
+    pub fn update_compose_review(&mut self) {
+        let Some(job) = &self.compose_job else {
+            return;
+        };
+        if !matches!(job.outcome, Some(Ok(()))) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let until = *self.compose_review_until.get_or_insert_with(|| {
+            now + std::time::Duration::from_secs(crate::compose::REVIEW_SECONDS)
+        });
+        if now > until {
+            return;
+        }
+        let Some((engine, project, before)) = &self.compose_before else {
+            return;
+        };
+        let Some(snapshot) = self
+            .engines
+            .get(*engine)
+            .and_then(|engine| engine.snapshot.as_ref())
+        else {
+            return;
+        };
+        let review = crate::compose::review(before, project, &snapshot.containers);
+        if let Some(job) = &mut self.compose_job {
+            job.review = review;
+        }
+    }
+
+    /// Opens the selected project's Compose file. Several files ask which one first.
+    pub fn request_compose_edit(&mut self) {
+        use crate::compose_edit::Location;
+        let Some(row) = self.current().cloned() else {
+            self.notice = crate::i18n::t("Select a Compose project or service").into();
+            return;
+        };
+        if self.demo {
+            self.notice = crate::i18n::t("Demo mode: files are not edited").into();
+            return;
+        }
+        let containers = self.containers_for(&row);
+        let target = match crate::compose::Target::resolve(&row.scope, &containers) {
+            Ok(target) => target,
+            Err(error) => {
+                self.notice = crate::tf!("{error}", error = format!("{error:#}"));
+                return;
+            }
+        };
+        if !self.editor.available() {
+            self.notice = crate::tf!(
+                "{editor} is not installed; choose another editor in Settings (,)",
+                editor = self.editor.label()
+            );
+            return;
+        }
+        let endpoint = &self.engines[row.engine].connection.endpoint;
+        let server = crate::remote::parse_endpoint(endpoint).map(|(server, _)| server.to_owned());
+        if let Some(server) = &server {
+            match self
+                .machine(server)
+                .and_then(|machine| machine.capabilities.as_ref())
+            {
+                Some(reported) if reported.allow_compose_edit => {}
+                Some(_) => {
+                    self.notice = crate::i18n::t(
+                        "Compose file editing is turned off on this server; rerun setup with --allow-compose-edit",
+                    )
+                    .into();
+                    return;
+                }
+                None => {
+                    self.notice = crate::i18n::t(
+                        "This server's agent does not support Compose file editing; update tha-agent",
+                    )
+                    .into();
+                    return;
+                }
+            }
+        }
+        let locations: Vec<Result<Location, String>> = target
+            .files
+            .iter()
+            .map(
+                |file| match server.as_ref().and_then(|name| self.machine(name)) {
+                    Some(machine) => crate::remote::shell_control_path(&machine.remote)
+                        .map(|control| Location::Server {
+                            remote: machine.remote.clone(),
+                            control,
+                            path: file.to_string_lossy().into_owned(),
+                        })
+                        .map_err(|error| crate::model::safe_text(&format!("{error:#}"))),
+                    None => Ok(Location::Local(file.clone())),
+                },
+            )
+            .collect();
+        let mut choices = Vec::new();
+        for (file, location) in target.files.iter().zip(locations) {
+            match location {
+                Ok(location) => choices.push(Choice::ComposeFile(Box::new(EditRequest {
+                    location,
+                    label: crate::model::safe_text(&file.to_string_lossy()),
+                }))),
+                Err(error) => {
+                    self.notice = error;
+                    return;
+                }
+            }
+        }
+        match choices.len() {
+            0 => {}
+            1 => {
+                if let Some(Choice::ComposeFile(request)) = choices.pop() {
+                    self.edit_request = Some(*request);
+                }
+            }
+            _ => {
+                self.picker = Some(Picker {
+                    title: crate::i18n::t("Which Compose file?").into(),
+                    choices,
+                    selected: 0,
+                });
+            }
+        }
+    }
+
+    fn copy_text(&mut self, text: String) {
+        // Terminals drop larger OSC 52 requests silently, which would look like a copy that worked.
+        if text.len() > 64 * 1024 {
+            self.notice = crate::i18n::t("This is too long to copy through the terminal").into();
+            return;
+        }
+        self.clipboard_request = Some(text);
+        self.notice = crate::i18n::t("Sent to the clipboard, if your terminal allows it.").into();
+    }
+
+    pub fn copy_selected(&mut self, field: CopyField) {
+        let containers = self.selected_containers();
+        let [container] = containers.as_slice() else {
+            self.notice = crate::i18n::t("Select a single container").into();
+            return;
+        };
+        let text = match field {
+            CopyField::Id => container.id.clone(),
+            CopyField::Name => container.name.clone(),
+            CopyField::Image => container.image.clone(),
+        };
+        self.copy_text(crate::model::safe_text(&text));
+    }
+
+    /// The log view has no line cursor, so this takes what is at the bottom of what is showing.
+    pub fn copy_log_line(&mut self) {
+        let Some(row) = self.log_view.visible(&self.logs).pop() else {
+            self.notice = crate::i18n::t("No log line is showing").into();
+            return;
+        };
+        let line = self
+            .logs
+            .entries
+            .iter()
+            .find(|entry| entry.sequence == row.sequence)
+            .map(|entry| crate::model::safe_text(&entry.text));
+        match line {
+            Some(line) => self.copy_text(line),
+            None => self.notice = crate::i18n::t("No log line is showing").into(),
+        }
+    }
+
+    /// Picks up changes to the configuration file. Only settings that are safe to change live
+    /// apply; connections need a restart. A broken file changes nothing and says why.
+    pub fn reload_config(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        let modified = std::fs::metadata(&path)
+            .and_then(|data| data.modified())
+            .ok();
+        if modified == self.config_modified {
+            return;
+        }
+        self.config_modified = modified;
+        let loaded = crate::config::Config::load(Some(&path)).and_then(|config| {
+            crate::keymap::Keymap::parse(&config.bindings)?;
+            Ok(config)
+        });
+        match loaded {
+            Ok(config) => {
+                self.custom_bindings = config.bindings.clone();
+                self.alert_rules = config.alerts.clone();
+                let saved = self.saved_settings;
+                self.apply_base_settings(crate::settings::BaseSettings {
+                    theme: config.theme,
+                    keyboard: config.keyboard,
+                    mouse: config.mouse,
+                    log_wrap: self.log_view.wrap,
+                    language: config.language,
+                    remote_connect: config.remote_connect,
+                    editor: config.editor,
+                });
+                self.apply_saved_settings(saved);
+                self.notice =
+                    crate::i18n::t("Configuration reloaded. Connections apply after a restart.")
+                        .into();
+            }
+            Err(error) => {
+                self.notice = crate::tf!(
+                    "Configuration not reloaded, keeping the current one: {error}",
+                    error = crate::model::safe_text(&format!("{error:#}"))
+                );
+            }
+        }
+    }
+
+    /// `:upload LOCAL /container/folder`, reviewed in a dialog before anything is written.
+    pub fn request_upload(&mut self, arguments: &str) {
+        let Some((local, folder)) = arguments.trim().rsplit_once(char::is_whitespace) else {
+            self.notice = crate::i18n::t("Use :upload LOCAL-PATH /folder/in/the/container").into();
+            return;
+        };
+        let folder = match crate::files::clean_path(folder) {
+            Ok(folder) => folder,
+            Err(error) => {
+                self.notice = error.to_string();
+                return;
+            }
+        };
+        let source = match self.download_source() {
+            Ok(source @ crate::files::Source::Container { .. }) => source,
+            Ok(_) => {
+                self.notice = crate::i18n::t("Uploads go into containers; select one").into();
+                return;
+            }
+            Err(notice) => {
+                self.notice = notice;
+                return;
+            }
+        };
+        if let Err(notice) = self.downloads.open_upload(source, local, folder) {
+            self.notice = notice;
+        }
+    }
+
+    /// `:network-test host:port` runs in the selected container, so it is always explicit.
+    pub fn request_network_test(&mut self, destination: &str) {
+        let (host, port) = match crate::files::parse_destination(destination) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.notice = error.to_string();
+                return;
+            }
+        };
+        let source = match self.download_source() {
+            Ok(source @ crate::files::Source::Container { .. }) => source,
+            Ok(_) => {
+                self.notice = crate::i18n::t("Network tests run in a container; select one").into();
+                return;
+            }
+            Err(notice) => {
+                self.notice = notice;
+                return;
+            }
+        };
+        let demo = self.demo;
+        self.network_test = Some(NetworkTestView {
+            source,
+            host,
+            port,
+            result: demo.then(|| Err(crate::i18n::t("Demo mode: nothing is contacted").to_owned())),
+        });
+        self.network_test_request = !demo;
+    }
+
+    /// The bundle: what the open health view shows, from this container only. It never holds
+    /// environment variables or commands, and redaction is a best effort that is labeled so.
+    pub fn diagnostic_bundle(&self, redact: bool) -> Option<String> {
+        let view = self.diagnostics.as_ref()?;
+        let side = &view.main;
+        let clean = |text: &str| {
+            if redact {
+                crate::diagnostics::redact(text)
+            } else {
+                text.to_owned()
+            }
+        };
+        let engine = self.engines.get(side.target.engine)?;
+        let events: Vec<_> = engine
+            .events
+            .newest_first()
+            .filter(|event| event.key == side.target.container_key())
+            .take(200)
+            .map(|event| {
+                serde_json::json!({
+                    "at_ms": event.at_ms,
+                    "event": event.label(),
+                })
+            })
+            .collect();
+        let loaded = view
+            .loaded_logs
+            .as_ref()
+            .and_then(|loaded| match &loaded.status {
+                crate::diagnostics::LogLoad::Ready(buffer) if loaded.target == side.target => {
+                    Some(buffer)
+                }
+                _ => None,
+            });
+        let buffer = loaded.or_else(|| self.logs_cover(&side.target).then_some(&self.logs));
+        let logs: Vec<_> = buffer
+            .map(|buffer| {
+                buffer
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.source != "Tha")
+                    .rev()
+                    .take(300)
+                    .map(|entry| clean(&entry.text))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let inspection = side.evidence.as_ref().map(|(inspection, _)| {
+            let endpoints: Vec<_> = inspection
+                .endpoints
+                .iter()
+                .flatten()
+                .map(|endpoint| endpoint.network.clone())
+                .collect();
+            serde_json::json!({
+                "state": inspection.state,
+                "restart_count": inspection.restart_count,
+                "exit_code": inspection.exit_code,
+                "oom_killed": inspection.oom_killed,
+                "error": inspection.error.as_deref().map(clean),
+                "started_at": inspection.started_at,
+                "finished_at": inspection.finished_at,
+                "network_mode": inspection.network_mode,
+                "networks": endpoints,
+            })
+        });
+        let bundle = serde_json::json!({
+            "format": "tha-diagnostics-1",
+            "created_ms": crate::history::now_ms(),
+            "redaction": if redact { "best effort; may have missed secrets" } else { "off" },
+            "container": {
+                "id": side.target.id,
+                "name": side.target.name,
+                "image": side.container.image,
+                "state": side.container.state,
+                "status": side.container.status,
+            },
+            "inspection": inspection,
+            "events": events,
+            "logs": logs,
+        });
+        serde_json::to_string_pretty(&bundle).ok()
+    }
+
+    pub fn confirm_diagnostic_export(&mut self) {
+        let Some(export) = &self.diagnostic_export else {
+            return;
+        };
+        let (path, redact) = (export.path.clone(), export.redact);
+        let destination = crate::downloads::expand_home(path.trim());
+        let parent_exists = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .is_none_or(std::path::Path::is_dir);
+        let problem = if path.trim().is_empty() || !parent_exists {
+            Some(crate::i18n::t("The destination folder does not exist"))
+        } else if destination.symlink_metadata().is_ok() {
+            Some(crate::i18n::t("A file with this name already exists"))
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            if let Some(export) = &mut self.diagnostic_export {
+                export.error = Some(problem.into());
+            }
+            return;
+        }
+        if let Some(bundle) = self.diagnostic_bundle(redact) {
+            self.diagnostic_export_request = Some((destination, bundle));
+            self.diagnostic_export = None;
+        }
+    }
+
+    /// Whether this engine's events outlast Tha, which decides what the timeline can claim.
+    pub fn events_saved(&self, engine: usize) -> bool {
+        let Some(engine) = self.engines.get(engine) else {
+            return false;
+        };
+        match crate::remote::parse_endpoint(&engine.connection.endpoint) {
+            Some((server, _)) => self
+                .machine(server)
+                .and_then(|machine| machine.capabilities.as_ref())
+                .is_some_and(|reported| reported.history),
+            None => self.metrics_database.is_some(),
+        }
+    }
+
+    pub fn open_timeline(&mut self) {
+        let Some(row) = self.current().cloned() else {
+            self.notice = crate::i18n::t("Select a workload first").into();
+            return;
+        };
+        if matches!(row.scope, Scope::Machine(_)) {
+            self.notice = crate::i18n::t("Select a runtime or workload inside this server").into();
+            return;
+        }
+        self.timeline_view = Some(TimelineView {
+            engine: row.engine,
+            title: crate::model::safe_text(&row.title),
+            containers: self.containers_for(&row),
+            selected: 0,
+        });
+    }
+
+    /// What the open timeline shows, flattened for selection: each entry with its incident.
+    pub fn timeline_incidents(&self) -> Vec<crate::timeline::Incident> {
+        let Some(view) = &self.timeline_view else {
+            return Vec::new();
+        };
+        let Some(engine) = self.engines.get(view.engine) else {
+            return Vec::new();
+        };
+        let keys: HashSet<String> = view.containers.iter().map(Container::key).collect();
+        let events: Vec<_> = engine
+            .events
+            .newest_first()
+            .filter(|event| keys.contains(&event.key))
+            .collect();
+        let points: Vec<_> = view
+            .containers
+            .iter()
+            .map(|container| {
+                let key = container.key();
+                let points = engine.metrics.session_points(&key);
+                (key, container.name.as_str(), points)
+            })
+            .collect();
+        let readings: Vec<_> = points
+            .iter()
+            .map(|(key, name, points)| crate::timeline::Readings { key, name, points })
+            .collect();
+        crate::timeline::build(&events, &readings)
+    }
+
+    /// Shows logs from shortly before the selected moment, for the container it happened to.
+    pub fn open_timeline_logs(&mut self) {
+        let Some(view) = &self.timeline_view else {
+            return;
+        };
+        let (engine, selected) = (view.engine, view.selected);
+        let incidents = self.timeline_incidents();
+        let Some(entry) = incidents
+            .iter()
+            .flat_map(|incident| &incident.entries)
+            .nth(selected)
+            .cloned()
+        else {
+            return;
+        };
+        self.timeline_view = None;
+        self.reveal_container(engine, &entry.key);
+        let since = entry.at_ms.div_euclid(1000) - 60;
+        self.log_since = Some(since);
+        self.tab = Tab::Logs;
+        self.detail_focus = true;
+        self.performance_focus = false;
+        self.notice = crate::tf!(
+            "Logs from 60 s before {name}'s entry · :logs-since off shows all · Backspace returns",
+            name = entry.name
+        );
+    }
+
+    /// Opens the fleet list. Saved scan results load separately, so it never waits for disk.
+    pub fn open_fleet(&mut self) {
+        self.fleet_view = Some(FleetView::default());
+        if !self.security.enabled {
+            return;
+        }
+        let mut seen = HashSet::new();
+        let mut targets = Vec::new();
+        for engine in &self.engines {
+            let Some(snapshot) = &engine.snapshot else {
+                continue;
+            };
+            let Some(runtime) = snapshot.engine_id.clone() else {
+                continue;
+            };
+            for container in snapshot.containers.iter().filter(|c| c.running()) {
+                let Some(image) = &container.image_id else {
+                    continue;
+                };
+                if seen.insert((engine.connection.endpoint.clone(), image.clone())) {
+                    targets.push(crate::security::Target {
+                        connection: engine.connection.clone(),
+                        runtime: runtime.clone(),
+                        image: image.clone(),
+                        label: container.image.clone(),
+                    });
+                }
+            }
+        }
+        self.fleet_vulnerability_request = Some(targets);
+    }
+
+    pub fn fleet_summary(&self) -> crate::fleet::Summary {
+        let empty = crate::fleet::Vulnerabilities::new();
+        let found = self
+            .fleet_view
+            .as_ref()
+            .map_or(&empty, |view| &view.vulnerabilities);
+        crate::fleet::summarize(self, found)
+    }
+
+    /// Jumps to the selected problem's workload and leaves the list. `Backspace` comes back to
+    /// where you were. A problem with no workload stays open and says why nothing happened.
+    pub fn open_fleet_selection(&mut self) {
+        let selected = self.fleet_view.as_ref().map_or(0, |view| view.selected);
+        let Some(problem) = self.fleet_summary().problems.into_iter().nth(selected) else {
+            return;
+        };
+        let Some((engine, key)) = problem.target else {
+            self.notice =
+                crate::i18n::t("This row is a server or runtime; press . to manage servers").into();
+            return;
+        };
+        self.fleet_view = None;
+        self.reveal_container(engine, &key);
+    }
+
+    fn reveal_container(&mut self, engine: usize, key: &str) {
+        self.push_navigation();
+        self.machine = None;
+        self.project = None;
+        self.tree_query.clear();
+        self.overview_mode = OverviewMode::Containers;
+        let Some(tree) = self.explorer_tree(engine) else {
+            return;
+        };
+        let mut path = Vec::new();
+        if !container_path(&tree, key, &mut path) {
+            return;
+        }
+        let Some((target, ancestors)) = path.split_last() else {
+            return;
+        };
+        let target = target.clone();
+        self.expanded.extend(ancestors.iter().cloned());
+        self.refresh_tree();
+        if let Some(index) = self.rows.iter().position(|row| row.key == target) {
+            self.selected = index;
+            self.detail_focus = false;
+            self.detail_scroll = 0;
+            self.performance_focus = false;
+            self.tab = Tab::Overview;
+        }
+    }
+
+    pub fn open_capabilities(&mut self) {
+        let Some(row) = self.current() else {
+            self.notice = crate::i18n::t("Select a connection to check").into();
+            return;
+        };
+        let server = match &row.scope {
+            Scope::Machine(name) if name != crate::machines::LOCAL_MACHINE => Some(name.clone()),
+            _ => None,
+        };
+        let engine = server.is_none().then_some(row.engine);
+        let title = server.clone().unwrap_or_else(|| {
+            self.engines
+                .get(row.engine)
+                .map_or_else(String::new, |engine| engine.connection.name.clone())
+        });
+        self.capabilities_view = Some(CapabilitiesView {
+            title: crate::model::safe_text(&title),
+            engine,
+            server,
+            scroll: 0,
+        });
     }
 
     pub fn pick_context_sort(&mut self) {
@@ -3570,6 +4745,7 @@ fn workload_tree(index: usize, snapshot: &Snapshot, namespace: Option<&String>) 
                 .push(container);
         }
     }
+    let resource_index = ResourceIndex::new(snapshot);
     let mut nodes = Vec::new();
     for (project, services) in projects {
         let scope = Scope::Project {
@@ -3608,7 +4784,12 @@ fn workload_tree(index: usize, snapshot: &Snapshot, namespace: Option<&String>) 
             service_nodes,
         )];
         if namespace.is_none() {
-            project_nodes.extend(resource_nodes(index, snapshot, Some(project)));
+            project_nodes.extend(resource_nodes(
+                index,
+                snapshot,
+                Some(project),
+                &resource_index,
+            ));
         }
         nodes.push(node(
             index,
@@ -3632,42 +4813,106 @@ fn workload_tree(index: usize, snapshot: &Snapshot, namespace: Option<&String>) 
         ));
     }
     if namespace.is_none() {
-        nodes.extend(resource_nodes(index, snapshot, None));
+        nodes.extend(resource_nodes(index, snapshot, None, &resource_index));
     }
     nodes
 }
 
-fn resource_nodes(index: usize, snapshot: &Snapshot, project: Option<&String>) -> Vec<Node> {
+/// Which project shows which resource, built once per tree. Without it, every project scans
+/// every resource and container, which takes minutes with thousands of containers.
+struct ResourceIndex<'a> {
+    networks: std::collections::HashMap<&'a str, Vec<&'a Resource>>,
+    volumes: std::collections::HashMap<&'a str, Vec<&'a Resource>>,
+    unnamespaced_projects: HashSet<Option<&'a str>>,
+}
+
+impl<'a> ResourceIndex<'a> {
+    fn new(snapshot: &'a Snapshot) -> Self {
+        // Nothing to place, so building the lookups would only slow every refresh down.
+        if snapshot.networks.is_empty() && snapshot.volumes.is_empty() {
+            return Self {
+                networks: HashMap::new(),
+                volumes: HashMap::new(),
+                unnamespaced_projects: HashSet::new(),
+            };
+        }
+        let mut projects_of = std::collections::HashMap::<&str, Vec<&str>>::new();
+        for container in &snapshot.containers {
+            if let Some(project) = &container.project {
+                projects_of
+                    .entry(&container.name)
+                    .or_default()
+                    .push(project);
+            }
+        }
+        let by_project = |resources: &'a [Resource]| {
+            let mut index = std::collections::HashMap::<&str, Vec<&Resource>>::new();
+            for resource in resources {
+                let mut projects: HashSet<&str> = resource.project.as_deref().into_iter().collect();
+                for name in &resource.containers {
+                    if let Some(found) = projects_of.get(name.as_str()) {
+                        projects.extend(found.iter().copied());
+                    }
+                }
+                for project in projects {
+                    index.entry(project).or_default().push(resource);
+                }
+            }
+            index
+        };
+        Self {
+            networks: by_project(&snapshot.networks),
+            volumes: by_project(&snapshot.volumes),
+            unnamespaced_projects: snapshot
+                .containers
+                .iter()
+                .filter(|container| container.namespace.is_none())
+                .map(|container| container.project.as_deref())
+                .collect(),
+        }
+    }
+}
+
+fn resource_nodes(
+    index: usize,
+    snapshot: &Snapshot,
+    project: Option<&String>,
+    resource_index: &ResourceIndex,
+) -> Vec<Node> {
     [
         (
             ResourceKind::Network,
             crate::i18n::t("Networks"),
             &snapshot.networks,
+            &resource_index.networks,
         ),
         (
             ResourceKind::Volume,
             crate::i18n::t("Volumes"),
             &snapshot.volumes,
+            &resource_index.volumes,
         ),
     ]
     .into_iter()
-    .filter_map(|(kind, label, resources)| {
-        let children: Vec<_> = resources
-            .iter()
-            .filter(|r| {
-                if let Some(project) = project {
-                    r.project.as_ref() == Some(project)
-                        || snapshot.containers.iter().any(|c| {
-                            c.project.as_ref() == Some(project) && r.containers.contains(&c.name)
-                        })
-                } else {
+    .filter_map(|(kind, label, resources, by_project)| {
+        let selected: Vec<&Resource> = match project {
+            Some(project) => by_project
+                .get(project.as_str())
+                .cloned()
+                .unwrap_or_default(),
+            None => resources
+                .iter()
+                .filter(|r| {
                     r.project.is_none()
                         || r.external
-                        || !snapshot.containers.iter().any(|container| {
-                            container.namespace.is_none() && container.project == r.project
-                        })
-                }
-            })
+                        || !resource_index
+                            .unnamespaced_projects
+                            .contains(&r.project.as_deref())
+                })
+                .collect(),
+        };
+        let children: Vec<_> = selected
+            .into_iter()
             .map(|r| {
                 node(
                     index,
@@ -3749,14 +4994,6 @@ fn container_path(node: &Node, key: &str, path: &mut Vec<String>) -> bool {
     found
 }
 
-fn contains_match(node: &Node, query: &str) -> bool {
-    node.row.title.to_lowercase().contains(query)
-        || node
-            .children
-            .iter()
-            .any(|child| contains_match(child, query))
-}
-
 fn flatten(
     node: &Node,
     depth: usize,
@@ -3764,28 +5001,91 @@ fn flatten(
     query: &str,
     rows: &mut Vec<Row>,
 ) {
-    if !query.is_empty() && !contains_match(node, query) {
+    let row = |depth| {
+        let mut row = node.row.clone();
+        row.depth = depth;
+        row
+    };
+    if query.is_empty() {
+        rows.push(row(depth));
+        if expanded.contains(&node.row.key) {
+            for child in &node.children {
+                flatten(child, depth + 1, expanded, "", rows);
+            }
+        }
         return;
     }
-    let mut row = node.row.clone();
-    row.depth = depth;
-    rows.push(row);
-    if expanded.contains(&node.row.key) || !query.is_empty() {
+    if node.row.title.to_lowercase().contains(query) {
         // A matching parent exposes its complete subtree during search.
-        let child_query = if node.row.title.to_lowercase().contains(query) {
-            ""
-        } else {
-            query
-        };
+        rows.push(row(depth));
         for child in &node.children {
-            flatten(
-                child,
-                depth + 1,
-                expanded,
-                if query.is_empty() { "" } else { child_query },
-                rows,
-            );
+            flatten(child, depth + 1, expanded, "", rows);
         }
+        return;
+    }
+    // Each node is checked once: a parent appears only if a descendant added a row.
+    let start = rows.len();
+    for child in &node.children {
+        flatten(child, depth + 1, expanded, query, rows);
+    }
+    if rows.len() > start {
+        rows.insert(start, row(depth));
+    }
+}
+
+#[cfg(test)]
+mod resource_index_tests {
+    use super::*;
+
+    fn titles(nodes: &[Node]) -> Vec<String> {
+        nodes
+            .iter()
+            .flat_map(|group| group.children.iter().map(|child| child.row.title.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn projects_show_owned_and_attached_resources_and_the_rest_stay_shared() {
+        let resource =
+            |name: &str, project: Option<&str>, external: bool, containers: &[&str]| Resource {
+                name: name.into(),
+                project: project.map(Into::into),
+                external,
+                containers: containers.iter().map(|c| (*c).into()).collect(),
+                ..Default::default()
+            };
+        let container = |name: &str, project: Option<&str>| Container {
+            name: name.into(),
+            project: project.map(Into::into),
+            ..Default::default()
+        };
+        let snapshot = Snapshot {
+            containers: vec![
+                container("web", Some("shop")),
+                container("api", Some("blog")),
+                container("solo", None),
+            ],
+            networks: vec![
+                resource("owned-unused", Some("shop"), false, &[]),
+                resource("attached", None, true, &["web"]),
+                resource("orphan", Some("gone"), false, &[]),
+                resource("loose", None, false, &["solo"]),
+            ],
+            ..Default::default()
+        };
+        let index = ResourceIndex::new(&snapshot);
+        let shop = "shop".to_owned();
+        let blog = "blog".to_owned();
+        assert_eq!(
+            titles(&resource_nodes(0, &snapshot, Some(&shop), &index)),
+            ["owned-unused", "attached [shared/external]"]
+        );
+        assert!(titles(&resource_nodes(0, &snapshot, Some(&blog), &index)).is_empty());
+        // A resource whose project has no containers here would otherwise be unreachable.
+        assert_eq!(
+            titles(&resource_nodes(0, &snapshot, None, &index)),
+            ["attached [shared/external]", "orphan", "loose"]
+        );
     }
 }
 
@@ -3803,1578 +5103,4 @@ mod group_title_tests {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::BackendKind;
-
-    #[test]
-    fn borrowed_selection_keeps_membership_order_and_respects_project_focus() {
-        let mut app = App::new(crate::demo::connections(), 100, false, true);
-        crate::demo::populate(&mut app);
-        app.selected = app
-            .rows
-            .iter()
-            .position(|row| row.engine == 0 && row.scope == Scope::Engine)
-            .unwrap();
-        assert_eq!(
-            app.selected_container_refs()
-                .map(|container| container.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["api-1", "api-2", "db-1", "scratch"]
-        );
-        app.project = Some(Project {
-            engine: 0,
-            namespace: None,
-            name: "shop".into(),
-        });
-        let selected: Vec<_> = app.selected_container_refs().collect();
-        assert_eq!(selected.len(), 3);
-        assert!(
-            selected
-                .iter()
-                .all(|container| container.project.as_deref() == Some("shop"))
-        );
-        assert!(selected.iter().all(|container| {
-            app.engines[0]
-                .snapshot
-                .as_ref()
-                .unwrap()
-                .containers
-                .iter()
-                .any(|stored| std::ptr::eq(*container, stored))
-        }));
-        app.engines[0].snapshot = None;
-        assert_eq!(app.selected_container_refs().count(), 0);
-        app.rows.clear();
-        assert_eq!(app.selected_container_refs().count(), 0);
-    }
-
-    #[test]
-    fn performance_container_navigation_stays_inside_workspace_and_search_when_branches_are_collapsed()
-     {
-        let mut app = App::new(crate::demo::connections(), 100, false, true);
-        crate::demo::populate(&mut app);
-        app.performance_scope = PerformanceScope::Container;
-        app.project = Some(Project {
-            engine: 0,
-            namespace: None,
-            name: "shop".into(),
-        });
-        app.expanded.clear();
-        app.refresh_tree();
-        assert!(app.performance_container().is_none());
-        for amount in [1, isize::MAX, isize::MIN, -1] {
-            app.move_performance_selection(amount);
-            let (index, container) = app.performance_container().unwrap();
-            assert_eq!(index, 0);
-            assert_eq!(container.project.as_deref(), Some("shop"));
-        }
-        app.tree_query = "shop-api-1".into();
-        app.refresh_tree();
-        for amount in [isize::MAX, isize::MIN, 1] {
-            app.move_performance_selection(amount);
-            assert_eq!(app.performance_container().unwrap().1.name, "shop-api-1");
-        }
-        app.performance_scope = PerformanceScope::Runtime;
-        app.performance_scroll = usize::MAX;
-        app.move_performance_selection(isize::MIN);
-        assert_eq!(app.performance_scroll, 0);
-    }
-
-    #[test]
-    fn performance_container_navigation_handles_group_positions_empty_lists_and_aliases() {
-        let mut app = app();
-        app.performance_scope = PerformanceScope::Container;
-        assert!(
-            !app.rows
-                .iter()
-                .any(|row| matches!(row.scope, Scope::Container(_)))
-        );
-        app.move_performance_selection(1);
-        assert!(
-            app.performance_container().is_some(),
-            "Collapsed ancestors are revealed automatically"
-        );
-        app.tree_query = "no-matching-container".into();
-        app.refresh_tree();
-        let selected = app.selected;
-        app.move_performance_selection(1);
-        assert_eq!(app.selected, selected);
-        assert!(app.notice.contains("No containers"));
-        app.tree_query = "api-1".into();
-        app.refresh_tree();
-        let container = app
-            .rows
-            .iter()
-            .position(|row| matches!(row.scope, Scope::Container(_)))
-            .unwrap();
-        app.selected = 0;
-        app.move_performance_selection(1);
-        assert_eq!(app.selected, container);
-        app.move_performance_selection(-1);
-        assert_eq!(app.selected, container);
-        app.move_performance_selection(isize::MAX);
-        app.move_performance_selection(isize::MIN);
-        assert_eq!(app.selected, container);
-        app.engines[0].alias = Some("primary".into());
-        app.selected = 0;
-        app.move_performance_selection(1);
-        assert_eq!(
-            app.selected, 0,
-            "An alias cannot become the Performance target"
-        );
-    }
-
-    #[test]
-    fn container_performance_tracks_only_the_current_container_and_keeps_zoom_transient() {
-        let mut app = app();
-        assert_eq!(app.performance_scope, PerformanceScope::Runtime);
-        assert!(!app.performance_expanded);
-        app.switch_performance_scope();
-        assert!(app.performance_open && app.performance_focus);
-        assert!(app.performance_container().is_none());
-        app.tree_query = "api-1".into();
-        app.refresh_tree();
-        app.selected = app
-            .rows
-            .iter()
-            .position(|row| matches!(row.scope, Scope::Container(_)))
-            .unwrap();
-        let (index, container) = app.performance_container().unwrap();
-        assert_eq!(container.key(), app.selected_containers()[0].key());
-        app.engines[index].error = Some("offline".into());
-        assert!(
-            app.performance_container().is_some(),
-            "Offline history remains inspectable"
-        );
-        app.selected = 0;
-        assert!(
-            app.performance_container().is_none(),
-            "Never fall back to the previous container"
-        );
-        app.performance_expanded = true;
-        app.toggle_performance();
-        assert!(!app.performance_open && !app.performance_expanded);
-        app.toggle_performance();
-        assert!(!app.performance_expanded);
-    }
-
-    #[test]
-    fn narrow_row_cache_defers_metrics_until_columns_become_visible() {
-        let mut app = app();
-        let now = std::time::Instant::now();
-        let key = app.rows[0].key.clone();
-        app.prepare_row_presentations(0, 1, now, false);
-        assert!(app.row_presentation(&key).cpu.is_empty());
-        let builds = app.presentations.builds;
-        app.prepare_row_presentations(0, 1, now, true);
-        assert_eq!(app.row_presentation(&key).cpu, "0.0%");
-        assert_eq!(app.presentations.builds, builds + 1);
-        app.prepare_row_presentations(0, 1, now, false);
-        assert_eq!(app.presentations.builds, builds + 1);
-    }
-
-    #[test]
-    fn row_presentations_reuse_work_and_expire_without_new_metric_events() {
-        use crate::metrics::{Event, Reading, Usage};
-        use std::time::{Duration, Instant};
-        let mut app = app();
-        app.demo = false;
-        app.tab = Tab::Logs; // No Overview age clock; test the freshness deadline itself.
-        app.engines[0].snapshot.as_mut().unwrap().containers[0].state = "running".into();
-        let now = Instant::now();
-        let reading = |value, at| Reading {
-            usage: Usage {
-                cpu_percent: Some(value),
-                memory_bytes: Some(1024),
-                ..Default::default()
-            },
-            counters: None,
-            sampled_at: at,
-        };
-        app.apply_metrics(Event {
-            engine: 0,
-            revision: 0,
-            batch: [("/one".into(), Ok(reading(50.0, now)))].into(),
-        });
-        app.prepare_row_presentations(0, 1, now, true);
-        let key = app.rows[0].key.clone();
-        let builds = app.presentations.builds;
-        assert_eq!(app.row_presentation(&key).cpu, "50.0%");
-        for _ in 0..50 {
-            app.prepare_row_presentations(0, 1, now + Duration::from_secs(29), true);
-        }
-        assert_eq!(
-            app.presentations.builds, builds,
-            "Unchanged frames must not rescan workloads"
-        );
-        assert_eq!(
-            app.next_visual_deadline(now),
-            Some(now + Duration::from_secs(30) + Duration::from_nanos(1))
-        );
-        app.prepare_row_presentations(0, 1, now + Duration::from_secs(30), true);
-        assert_eq!(app.row_presentation(&key).cpu, "50.0%");
-        app.prepare_row_presentations(0, 1, now + Duration::from_secs(31), true);
-        assert_eq!(app.row_presentation(&key).cpu, "stale");
-        assert_eq!(app.presentations.builds, builds + 1);
-        app.apply_metrics(Event {
-            engine: 0,
-            revision: 0,
-            batch: [(
-                "/one".into(),
-                Ok(reading(25.0, now + Duration::from_secs(31))),
-            )]
-            .into(),
-        });
-        app.prepare_row_presentations(0, 1, now + Duration::from_secs(31), true);
-        assert_eq!(app.row_presentation(&key).cpu, "25.0%");
-        app.update_engine(0, Err("offline".into()));
-        app.prepare_row_presentations(0, 1, now + Duration::from_secs(31), true);
-        assert_eq!(
-            app.row_presentation(&key).condition.unwrap().label,
-            "unavailable"
-        );
-        assert_ne!(app.row_presentation(&key).cpu, "25.0%");
-    }
-
-    #[test]
-    fn row_cache_invalidates_for_workspace_changes_and_is_lazy_on_large_inventories() {
-        use crate::metrics::{Event, Reading, Usage};
-        use std::time::Instant;
-        let mut app = app();
-        let now = Instant::now();
-        let containers: Vec<_> = (0..1000)
-            .map(|index| Container {
-                id: format!("member-{index}"),
-                name: format!("member-{index}"),
-                state: "running".into(),
-                project: Some(if index == 0 { "alpha" } else { "beta" }.into()),
-                ..Default::default()
-            })
-            .collect();
-        app.update_engine(
-            0,
-            Ok(Snapshot {
-                containers,
-                ..Default::default()
-            }),
-        );
-        let reading = |cpu| Reading {
-            usage: Usage {
-                cpu_percent: Some(cpu),
-                ..Default::default()
-            },
-            counters: None,
-            sampled_at: now,
-        };
-        app.apply_metrics(Event {
-            engine: 0,
-            revision: 0,
-            batch: [
-                ("/member-0".into(), Ok(reading(10.0))),
-                ("/member-1".into(), Ok(reading(20.0))),
-            ]
-            .into(),
-        });
-        app.prepare_row_presentations(0, 1, now, true);
-        let key = app.rows[0].key.clone();
-        let initial = app.row_presentation(&key).cpu.clone();
-        let builds = app.presentations.builds;
-        for _ in 0..100 {
-            app.prepare_row_presentations(0, 1, now, true);
-        }
-        assert_eq!(app.presentations.builds, builds);
-        assert_eq!(
-            app.presentations.rows.len(),
-            1,
-            "Only visible rows should be calculated"
-        );
-        app.project = Some(Project {
-            engine: 0,
-            namespace: None,
-            name: "alpha".into(),
-        });
-        app.prepare_row_presentations(0, 1, now, true);
-        assert_eq!(app.row_presentation(&key).cpu, "10.0%");
-        assert_ne!(initial, app.row_presentation(&key).cpu);
-        assert_eq!(app.presentations.builds, builds + 1);
-        app.project = None;
-        app.prepare_row_presentations(0, 1, now, true);
-        assert_eq!(app.row_presentation(&key).cpu, initial);
-    }
-
-    #[test]
-    fn security_status_ticks_only_while_scanning_and_visible() {
-        use std::time::{Duration, Instant};
-        let mut app = app();
-        let now = Instant::now();
-        app.overview_mode = OverviewMode::Security;
-        assert!(app.next_visual_deadline(now).is_none());
-        app.security.start(2);
-        assert_eq!(
-            app.next_visual_deadline(now),
-            Some(now + Duration::from_secs(1))
-        );
-        app.overview_mode = OverviewMode::Images;
-        assert!(app.next_visual_deadline(now).is_none());
-        app.overview_mode = OverviewMode::Security;
-        app.security.busy = false;
-        assert!(app.next_visual_deadline(now).is_none());
-    }
-
-    #[test]
-    fn idle_views_have_no_redraw_deadline_but_actions_and_badge_expiry_do() {
-        use crate::{
-            actions::{Action, Event, Status, Update},
-            runtime::Target,
-        };
-        use std::time::{Duration, Instant};
-        let mut app = app();
-        assert!(app.next_visual_deadline(Instant::now()).is_none());
-        app.demo = false;
-        app.engines[0].runtime = Some(Target::Colima {
-            profile: "fixture".into(),
-        });
-        app.selected = 0;
-        app.request_action(Action::Start);
-        app.action_review_visible = true;
-        app.confirm_action();
-        let operation = app.action_request.take().unwrap().operation;
-        let now = Instant::now();
-        assert_eq!(
-            app.next_visual_deadline(now),
-            Some(now + Duration::from_millis(100))
-        );
-        app.apply_action_update(Update {
-            operation,
-            event: Event::Result {
-                index: 0,
-                status: Status::Succeeded,
-            },
-        });
-        app.apply_action_update(Update {
-            operation,
-            event: Event::Finished,
-        });
-        assert!(app.next_visual_deadline(Instant::now()).is_some());
-        assert!(
-            app.next_visual_deadline(Instant::now() + Duration::from_secs(6))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn action_feedback_animates_frozen_targets_and_tracks_member_completion() {
-        use crate::actions::{Action, Event, Status, Update};
-        use std::time::{Duration, Instant};
-        let mut app = app();
-        app.demo = false;
-        app.engines[0].snapshot.as_mut().unwrap().engine_id = Some("fixture".into());
-        app.engines[0].snapshot.as_mut().unwrap().containers[0].state = "running".into();
-        app.tree_query = "api-1".into();
-        app.refresh_tree();
-        app.selected = app
-            .rows
-            .iter()
-            .position(|row| matches!(row.scope, Scope::Project { .. }))
-            .unwrap();
-        let project = app.current().unwrap().clone();
-        let container = app
-            .rows
-            .iter()
-            .find(|row| matches!(row.scope, Scope::Container(_)))
-            .unwrap()
-            .clone();
-        app.request_action(Action::Restart);
-        app.selected = 0; // Changing selection must not retarget the feedback.
-        app.action_review_visible = true;
-        app.confirm_action();
-        let operation = app.action_request.take().unwrap().operation;
-        let started = app.action_feedback[&operation].started_at;
-        let initial = app.row_action_feedback(&project, started).unwrap();
-        assert_eq!(initial.label, "Restarting… 0s");
-        assert!(initial.active);
-        assert_ne!(
-            initial.symbol,
-            app.row_action_feedback(&project, started + Duration::from_millis(100))
-                .unwrap()
-                .symbol
-        );
-        assert_eq!(
-            app.row_action_feedback(&container, started + Duration::from_secs(3))
-                .unwrap()
-                .label,
-            "Restarting… 3s"
-        );
-
-        let mut refreshed = app.engines[0].snapshot.clone().unwrap();
-        let mut late = refreshed.containers[0].clone();
-        late.id = "new-replica".into();
-        late.name = "new-replica".into();
-        refreshed.containers.push(late);
-        app.update_engine(0, Ok(refreshed));
-        app.tree_query = "new-replica".into();
-        app.refresh_tree();
-        let late_row = app
-            .rows
-            .iter()
-            .find(|row| matches!(&row.scope, Scope::Container(key) if key == "/new-replica"))
-            .unwrap();
-        assert!(app.row_action_feedback(late_row, Instant::now()).is_none());
-        assert!(
-            app.row_action_feedback(&app.rows[0], Instant::now())
-                .is_none()
-        );
-
-        app.apply_action_update(Update {
-            operation,
-            event: Event::Result {
-                index: 0,
-                status: Status::Succeeded,
-            },
-        });
-        assert!(
-            !app.row_action_feedback(&container, Instant::now())
-                .unwrap()
-                .active
-        );
-        assert!(
-            app.row_action_feedback(&project, Instant::now())
-                .unwrap()
-                .active
-        );
-        app.apply_action_update(Update {
-            operation,
-            event: Event::Finished,
-        });
-        assert_eq!(
-            app.row_action_feedback(&project, Instant::now())
-                .unwrap()
-                .label,
-            "Restart completed"
-        );
-        assert!(
-            app.row_action_feedback(&project, Instant::now() + Duration::from_secs(6))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn runtime_feedback_never_claims_readiness_and_errors_do_not_disappear() {
-        use crate::{
-            actions::{Action, Event, Status, Update},
-            runtime::Target,
-        };
-        use std::time::{Duration, Instant};
-        let mut app = App::new(
-            vec![Connection {
-                name: "fixture".into(),
-                kind: BackendKind::Docker,
-                endpoint: "unix:///fixture.sock".into(),
-            }],
-            100,
-            false,
-            false,
-        );
-        app.engines[0].runtime = Some(Target::Colima {
-            profile: "fixture".into(),
-        });
-        app.update_engine(0, Err("offline".into()));
-        let row = app.current().unwrap().clone();
-        for (status, expected) in [
-            (Status::Succeeded, "Start command completed"),
-            (Status::Failed("denied".into()), "Start failed"),
-            (Status::Unknown("timeout".into()), "Outcome unknown"),
-            (
-                Status::Skipped("previous outcome unknown".into()),
-                "Not attempted",
-            ),
-        ] {
-            app.request_action(Action::Start);
-            app.action_review_visible = true;
-            app.confirm_action();
-            let operation = app.action_request.take().unwrap().operation;
-            assert_eq!(
-                app.action_feedback.len(),
-                1,
-                "Old animation metadata must be evicted with old results"
-            );
-            assert_eq!(
-                app.row_action_feedback(&row, Instant::now()).unwrap().label,
-                "Starting… 0s"
-            );
-            app.apply_action_update(Update {
-                operation,
-                event: Event::Result {
-                    index: 0,
-                    status: status.clone(),
-                },
-            });
-            app.apply_action_update(Update {
-                operation,
-                event: Event::Finished,
-            });
-            let feedback = app.row_action_feedback(&row, Instant::now()).unwrap();
-            assert_eq!(feedback.label, expected);
-            assert!(!feedback.active);
-            if status != Status::Succeeded {
-                assert!(
-                    app.row_action_feedback(&row, Instant::now() + Duration::from_secs(3600))
-                        .is_some()
-                );
-            }
-            assert!(app.engines[0].error.is_some());
-            assert!(app.engines[0].snapshot.is_none());
-            assert!(app.current().unwrap().title.contains("(offline)"));
-            assert!(!app.action_results_visible);
-        }
-    }
-
-    #[test]
-    fn performance_lists_only_connected_primary_runtimes_including_idle_ones() {
-        let mut app = App::new(
-            (0..4)
-                .map(|index| Connection {
-                    name: format!("runtime-{index}"),
-                    kind: BackendKind::Docker,
-                    endpoint: format!("unix:///runtime-{index}.sock"),
-                })
-                .collect(),
-            100,
-            false,
-            true,
-        );
-        app.update_engine(
-            0,
-            Ok(Snapshot {
-                engine_id: Some("offline".into()),
-                ..Default::default()
-            }),
-        );
-        app.update_engine(0, Err("stopped".into()));
-        for index in [1, 2] {
-            app.update_engine(
-                index,
-                Ok(Snapshot {
-                    engine_id: Some("shared".into()),
-                    ..Default::default()
-                }),
-            );
-        }
-        assert!(app.engines[2].alias.is_some());
-        assert!(app.engines[3].snapshot.is_none());
-        assert_eq!(app.performance_engines(), [1]);
-        assert_eq!(app.engine_metrics(1).cpu_percent, Some(0.0));
-        assert!(
-            app.rows
-                .iter()
-                .any(|row| row.engine == 0 && row.title.contains("(offline)"))
-        );
-    }
-
-    #[test]
-    fn performance_focus_survives_sorting_new_connections_and_availability_changes() {
-        let mut app = App::new(
-            ["Zeta", "Beta", "Alpha"]
-                .into_iter()
-                .map(|name| Connection {
-                    name: name.into(),
-                    kind: BackendKind::Docker,
-                    endpoint: format!("unix:///{name}.sock"),
-                })
-                .collect(),
-            100,
-            false,
-            true,
-        );
-        let snapshot = |index| Snapshot {
-            engine_id: Some(format!("runtime-{index}")),
-            ..Default::default()
-        };
-        app.update_engine(0, Ok(snapshot(0)));
-        app.update_engine(1, Ok(snapshot(1)));
-        assert_eq!(app.performance_engine(), Some(0));
-        app.performance_scroll = app
-            .performance_engines()
-            .iter()
-            .position(|&index| index == 1)
-            .unwrap();
-        app.update_engine(2, Ok(snapshot(2)));
-        assert_eq!(app.performance_engine(), Some(1));
-        app.context_sort = crate::context_sort::ContextSort::Name;
-        app.context_pins = vec!["Zeta".into()];
-        app.refresh_tree();
-        assert_eq!(app.performance_engine(), Some(1));
-        app.update_engine(0, Err("stopped".into()));
-        assert_eq!(app.performance_engine(), Some(1));
-        app.update_engine(1, Err("stopped".into()));
-        assert_eq!(app.performance_engine(), Some(2));
-        app.update_engine(1, Ok(snapshot(1)));
-        assert_eq!(app.performance_engine(), Some(2));
-        app.update_engine(1, Err("stopped".into()));
-        app.update_engine(2, Err("stopped".into()));
-        assert!(app.performance_engines().is_empty());
-        assert_eq!(app.performance_scroll, 0);
-        assert!(app.performance_engine().is_none());
-    }
-
-    #[test]
-    fn independent_runtimes_run_concurrently_with_isolated_results_and_alias_locks() {
-        use crate::{
-            actions::{Action, Event, Status, Update},
-            runtime::Target,
-        };
-        let mut app = App::new(
-            vec![
-                Connection {
-                    name: "First".into(),
-                    kind: BackendKind::Docker,
-                    endpoint: "unix:///one.sock".into(),
-                },
-                Connection {
-                    name: "Second".into(),
-                    kind: BackendKind::Docker,
-                    endpoint: "unix:///two.sock".into(),
-                },
-            ],
-            100,
-            false,
-            false,
-        );
-        let first_target = Target::Colima {
-            profile: "first".into(),
-        };
-        let second_target = Target::Colima {
-            profile: "second".into(),
-        };
-        app.engines[0].runtime = Some(first_target.clone());
-        app.engines[1].runtime = Some(second_target.clone());
-        app.update_engine(
-            1,
-            Ok(Snapshot {
-                engine_id: Some("second".into()),
-                ..Default::default()
-            }),
-        );
-        app.selected = app
-            .rows
-            .iter()
-            .position(|row| row.engine == 0 && row.scope == Scope::Engine)
-            .unwrap();
-        app.request_action(Action::Start);
-        app.action_review_visible = true;
-        app.confirm_action();
-        let first = app.action_request.take().unwrap().operation;
-        assert!(
-            app.plan_action(Action::Start)
-                .unwrap_err()
-                .to_string()
-                .contains("already active")
-        );
-
-        app.selected = app
-            .rows
-            .iter()
-            .position(|row| row.engine == 1 && row.scope == Scope::Engine)
-            .unwrap();
-        app.engines[1].runtime = Some(first_target);
-        assert!(
-            app.plan_action(Action::Restart)
-                .unwrap_err()
-                .to_string()
-                .contains("already active")
-        );
-        app.engines[1].runtime = Some(second_target);
-        app.request_action(Action::Restart);
-        assert!(app.action_confirmation.is_some());
-        app.action_review_visible = true;
-        app.confirm_action();
-        let second = app.action_request.take().unwrap().operation;
-        assert_ne!(first, second);
-        assert_eq!(app.action_jobs.len(), 2);
-        assert!(app.action_status().unwrap().contains("2 running"));
-
-        assert!(app.apply_action_update(Update {
-            operation: second,
-            event: Event::Result {
-                index: 0,
-                status: Status::Failed("fixture denied".into())
-            }
-        }));
-        assert!(app.apply_action_update(Update {
-            operation: second,
-            event: Event::Finished
-        }));
-        assert!(!app.action_jobs[&first].finished);
-        assert!(app.action_jobs[&first].results[0].is_none());
-        assert!(matches!(
-            app.action_jobs[&second].results[0],
-            Some(Status::Failed(_))
-        ));
-        app.open_action_results();
-        assert_eq!(app.picker.as_ref().unwrap().choices.len(), 2);
-        app.picker.as_mut().unwrap().selected = 1;
-        app.choose();
-        assert_eq!(app.action_selected, Some(first));
-        assert!(app.action_results_visible);
-        app.action_results_visible = false;
-
-        app.apply_action_update(Update {
-            operation: first,
-            event: Event::Result {
-                index: 0,
-                status: Status::Succeeded,
-            },
-        });
-        app.apply_action_update(Update {
-            operation: first,
-            event: Event::Finished,
-        });
-        app.selected = app
-            .rows
-            .iter()
-            .position(|row| row.engine == 0 && row.scope == Scope::Engine)
-            .unwrap();
-        app.request_action(Action::Start);
-        app.action_review_visible = true;
-        app.confirm_action();
-        let next = app.action_request.take().unwrap().operation;
-        assert!(!app.action_jobs.contains_key(&first));
-        assert!(!app.apply_action_update(Update {
-            operation: first,
-            event: Event::Result {
-                index: 0,
-                status: Status::Unknown("late".into())
-            }
-        }));
-        assert!(app.action_jobs[&next].results[0].is_none());
-        assert!(app.action_jobs[&second].finished);
-    }
-
-    #[test]
-    fn runtime_rows_target_the_provider_not_workloads_and_offline_start_is_allowed() {
-        use crate::{actions::Action, runtime::Target};
-        let mut app = app();
-        app.demo = false;
-        app.engines[0].runtime = Some(Target::Colima {
-            profile: "fixture".into(),
-        });
-        app.selected = app
-            .rows
-            .iter()
-            .position(|row| row.scope == Scope::Engine)
-            .unwrap();
-        for action in [Action::Start, Action::Stop, Action::Restart] {
-            let request = app.plan_action(action).unwrap();
-            assert!(request.runtime.is_some());
-            assert!(request.containers.is_empty());
-            assert_eq!(request.target_count(), 1);
-        }
-        assert!(app.plan_action(Action::Delete).is_err());
-        app.update_engine(0, Err("Runtime stopped".into()));
-        app.selected = app
-            .rows
-            .iter()
-            .position(|row| row.scope == Scope::Engine)
-            .unwrap();
-        assert!(app.current().unwrap().title.contains("(offline)"));
-        assert!(app.plan_action(Action::Stop).is_err());
-        assert!(app.plan_action(Action::Restart).is_err());
-        app.request_action(Action::Start);
-        app.action_review_visible = true;
-        app.confirm_action();
-        assert!(app.action_confirmation.is_none());
-        assert!(app.action_request.as_ref().unwrap().runtime.is_some());
-        assert_eq!(app.action_progress().unwrap().results.len(), 1);
-        assert!(!app.action_results_visible);
-    }
-
-    #[test]
-    fn saved_runtime_rows_survive_relaunch_without_sockets_and_rejoin_native_discovery() {
-        use crate::runtime::Target;
-        let mut original = app();
-        original.engines[0].runtime = Some(Target::Podman {
-            machine: "fixture".into(),
-        });
-        let text = toml::to_string(&original.preferences()).unwrap();
-        assert!(!text.contains("unix:///test"));
-        let preferences = toml::from_str(&text).unwrap();
-        let mut restored = App::new(vec![], 100, false, false);
-        restored.apply_preferences(preferences, false);
-        assert_eq!(restored.engines.len(), 1);
-        assert!(restored.rows[0].title.contains("(offline)"));
-        assert!(restored.engines[0].connection.endpoint.is_empty());
-        restored.reconcile_podman(&crate::discovery::podman::Discovery {
-            machines: vec![crate::discovery::podman::Machine {
-                name: "fixture".into(),
-                endpoint: Ok("unix:///new-forwarded.sock".into()),
-            }],
-            warning: None,
-        });
-        assert_eq!(restored.engines.len(), 1);
-        assert_eq!(
-            restored.engines[0].connection.endpoint,
-            "unix:///new-forwarded.sock"
-        );
-        restored.update_engine(0, Ok(Snapshot::default()));
-        assert!(!restored.rows[0].title.contains("(offline)"));
-    }
-
-    #[test]
-    fn generic_context_never_falls_back_to_bulk_container_actions() {
-        let mut app = app();
-        app.demo = false;
-        app.selected = 0;
-        let error = app
-            .plan_action(crate::actions::Action::Stop)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("unsupported"));
-    }
-
-    #[test]
-    fn preferences_restore_navigation_without_restoring_shells_or_input_and_cancel_on_interaction()
-    {
-        let mut original = app();
-        original.open_project(Project {
-            engine: 0,
-            namespace: None,
-            name: "shop".into(),
-        });
-        original.tab = Tab::Layers;
-        original.performance_open = true;
-        original.log_view.wrap = false;
-        let preferences = original.preferences();
-        let serialized = toml::to_string(&preferences).unwrap();
-        assert!(!serialized.contains("unix:///test"));
-        assert!(!serialized.contains("exec_command"));
-        let mut restored = app();
-        restored.apply_preferences(preferences.clone(), true);
-        restored.restore_navigation();
-        assert_eq!(restored.project.as_ref().unwrap().name, "shop");
-        assert_eq!(restored.tab, Tab::Layers);
-        assert!(restored.performance_open);
-        assert!(!restored.log_view.wrap);
-        assert!(!restored.exec_input);
-        assert!(restored.sessions.is_empty());
-        let mut canceled = app();
-        canceled.apply_preferences(preferences, true);
-        canceled.cancel_startup();
-        canceled.restore_navigation();
-        assert!(canceled.project.is_none());
-        original.tab = Tab::Exec;
-        assert_eq!(original.preferences().tab, Tab::Overview);
-    }
-
-    fn app() -> App {
-        let mut app = App::new(
-            vec![Connection {
-                name: "test".into(),
-                kind: BackendKind::Docker,
-                endpoint: "unix:///test".into(),
-            }],
-            100,
-            false,
-            true,
-        );
-        app.update_engine(
-            0,
-            Ok(Snapshot {
-                containers: vec![Container {
-                    id: "one".into(),
-                    name: "api-1".into(),
-                    project: Some("shop".into()),
-                    service: Some("api".into()),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }),
-        );
-        app
-    }
-
-    #[test]
-    fn runtime_is_parent_of_projects_and_vim_navigation_works() {
-        let mut app = app();
-        assert_eq!(app.rows[0].scope, Scope::Engine);
-        assert_eq!(app.rows[1].title, "shop [stopped]");
-        app.move_selection(1);
-        app.expand();
-        app.move_selection(1);
-        app.expand();
-        app.move_selection(1);
-        app.expand();
-        assert!(app.rows.iter().any(|r| r.title.starts_with("api-1")));
-        app.collapse();
-        app.collapse();
-        assert!(matches!(
-            app.current().unwrap().scope,
-            Scope::Services { .. }
-        ));
-    }
-
-    #[test]
-    fn refresh_preserves_selection_and_search_finds_descendants() {
-        let mut app = app();
-        app.move_selection(1);
-        let key = app.current().unwrap().key.clone();
-        app.refresh_tree();
-        assert_eq!(app.current().unwrap().key, key);
-        app.tree_query = "api-1".into();
-        app.refresh_tree();
-        assert!(app.rows.iter().any(|r| r.title.starts_with("api-1")));
-    }
-
-    #[test]
-    fn grouped_workloads_preserve_sorted_groups_replica_order_and_missing_service_counts() {
-        let container = |name: &str,
-                         project: Option<&str>,
-                         service: Option<&str>,
-                         namespace: Option<&str>,
-                         state: &str| Container {
-            id: name.into(),
-            name: name.into(),
-            project: project.map(str::to_owned),
-            service: service.map(str::to_owned),
-            namespace: namespace.map(str::to_owned),
-            state: state.into(),
-            ..Default::default()
-        };
-        let snapshot = Snapshot {
-            containers: vec![
-                container("z-replica-2", Some("z"), Some("api"), None, "running"),
-                container("standalone", None, None, None, "exited"),
-                container("z-replica-1", Some("z"), Some("api"), None, "exited"),
-                container("a-missing", Some("a"), None, None, "running"),
-                container(
-                    "a-explicit",
-                    Some("a"),
-                    Some("Unassigned service"),
-                    None,
-                    "exited",
-                ),
-                container("foreign", Some("a"), Some("api"), Some("other"), "running"),
-                container("z-worker", Some("z"), Some("worker"), None, "running"),
-            ],
-            ..Default::default()
-        };
-        let nodes = workload_tree(0, &snapshot, None);
-        assert_eq!(
-            nodes
-                .iter()
-                .map(|node| node.row.title.as_str())
-                .collect::<Vec<_>>(),
-            ["a [1/2 running]", "z [2/3 running]", "Standalone (1)"]
-        );
-        let a_services = &nodes[0].children[0];
-        assert_eq!(a_services.row.title, "Services (1)");
-        assert_eq!(
-            a_services.children[0].row.title,
-            "Unassigned service [1/2 running]"
-        );
-        assert_eq!(
-            a_services.children[0]
-                .children
-                .iter()
-                .map(|node| node.row.title.as_str())
-                .collect::<Vec<_>>(),
-            ["a-missing", "a-explicit"]
-        );
-        let z_services = &nodes[1].children[0];
-        assert_eq!(z_services.row.title, "Services (2)");
-        assert_eq!(z_services.children[0].row.title, "api [1/2 running]");
-        assert_eq!(z_services.children[1].row.title, "worker [1/1 running]");
-        assert_eq!(
-            z_services.children[0]
-                .children
-                .iter()
-                .map(|node| node.row.title.as_str())
-                .collect::<Vec<_>>(),
-            ["z-replica-2", "z-replica-1"]
-        );
-        let other = workload_tree(0, &snapshot, Some(&"other".into()));
-        assert_eq!(other.len(), 1);
-        assert_eq!(other[0].row.title, "a [1/1 running]");
-    }
-
-    #[test]
-    fn duplicate_engine_identity_does_not_duplicate_workloads() {
-        let mut app = app();
-        let mut connection = app.engines[0].connection.clone();
-        connection.name = "alias".into();
-        app.engines.push(Engine {
-            connection,
-            runtime: None,
-            snapshot: None,
-            error: None,
-            alias: None,
-            metrics: Default::default(),
-            metrics_revision: 0,
-            events: Default::default(),
-        });
-        let snapshot = Snapshot {
-            engine_id: Some("same".into()),
-            ..Default::default()
-        };
-        app.update_engine(0, Ok(snapshot.clone()));
-        app.update_engine(1, Ok(snapshot));
-        assert_eq!(app.engines[1].alias.as_deref(), Some("test"));
-    }
-
-    #[test]
-    fn failure_preserves_last_known_snapshot_but_marks_it_stale() {
-        let mut app = app();
-        app.update_engine(0, Err("offline".into()));
-        assert!(app.engines[0].snapshot.is_some());
-        assert!(app.rows[0].title.contains("(offline)"));
-    }
-
-    #[test]
-    fn next_search_match_skips_ancestors_and_wraps() {
-        let mut app = app();
-        app.tree_query = "api-1".into();
-        app.refresh_tree();
-        app.selected = 0;
-        app.next_tree_match(false);
-        assert!(app.current().unwrap().title.contains("api-1"));
-        let selected = app.selected;
-        app.next_tree_match(false);
-        assert_eq!(app.selected, selected);
-        app.next_tree_match(true);
-        assert_eq!(app.selected, selected);
-    }
-
-    #[test]
-    fn counts_distinct_services_and_running_instances() {
-        let mut app = app();
-        let stopped = app.engines[0].snapshot.as_ref().unwrap().containers[0].clone();
-        let running = Container {
-            id: "two".into(),
-            state: "running".into(),
-            ..stopped.clone()
-        };
-        let replica = Container {
-            id: "three".into(),
-            ..running.clone()
-        };
-        let postgres = Container {
-            id: "four".into(),
-            service: Some("postgres".into()),
-            ..running.clone()
-        };
-        app.update_engine(
-            0,
-            Ok(Snapshot {
-                containers: vec![stopped, running, replica, postgres],
-                ..Default::default()
-            }),
-        );
-        let tree = engine_tree(0, &app.engines[0]);
-        let project = &tree.children[0];
-        assert_eq!(project.row.title, "shop [3/4 running]");
-        let services = &project.children[0];
-        assert_eq!(services.row.title, "Services (2)");
-        assert_eq!(services.children[0].row.title, "api [2/3 running]");
-        assert_eq!(services.children[1].row.title, "postgres [1/1 running]");
-    }
-
-    #[test]
-    fn metric_updates_are_engine_scoped_and_stale_revisions_are_ignored() {
-        let mut app = App::new(crate::demo::connections(), 100, false, true);
-        crate::demo::populate(&mut app);
-        let row = app
-            .rows
-            .iter()
-            .find(|row| matches!(row.scope, Scope::Engine) && row.engine == 0)
-            .unwrap()
-            .clone();
-        let other = app
-            .rows
-            .iter()
-            .find(|row| matches!(row.scope, Scope::Engine) && row.engine == 1)
-            .unwrap()
-            .clone();
-        let before_other = app.metrics_for(&other).cpu_percent;
-        app.engines[0].metrics_revision = 3;
-        let batch = || {
-            std::collections::HashMap::from([(
-                "/api-1".into(),
-                Ok(crate::metrics::Reading {
-                    usage: crate::metrics::Usage {
-                        cpu_percent: Some(123.0),
-                        memory_bytes: Some(1024),
-                        ..Default::default()
-                    },
-                    counters: None,
-                    sampled_at: std::time::Instant::now(),
-                }),
-            )])
-        };
-        let before = app.metrics_for(&row).cpu_percent;
-        app.apply_metrics(crate::metrics::Event {
-            engine: 0,
-            revision: 2,
-            batch: batch(),
-        });
-        assert_eq!(app.metrics_for(&row).cpu_percent, before);
-        app.apply_metrics(crate::metrics::Event {
-            engine: 0,
-            revision: 3,
-            batch: batch(),
-        });
-        assert_ne!(app.metrics_for(&row).cpu_percent, before);
-        assert_eq!(app.metrics_for(&other).cpu_percent, before_other);
-        app.engines[0].error = Some("offline".into());
-        assert_eq!(app.metrics_for(&row).cpu_percent, None);
-    }
-
-    #[test]
-    fn known_empty_runtime_is_zero_but_disconnected_runtime_is_not() {
-        let mut app = app();
-        app.update_engine(0, Ok(Snapshot::default()));
-        let row = app.rows[0].clone();
-        assert_eq!(app.metrics_for(&row).cpu_label(), "0.0%");
-        assert_eq!(app.metrics_for(&row).memory_label(), "0 B");
-        app.update_engine(0, Err("offline".into()));
-        assert_eq!(app.metrics_for(&row).cpu_label(), "--");
-    }
-
-    #[test]
-    fn native_podman_reconciliation_keeps_machine_indices_across_restarts_and_failures() {
-        use crate::discovery::podman::{Discovery, Machine};
-        let mut app = app();
-        let before = app.engines[0].connection.clone();
-        let report = |socket: &str| Discovery {
-            machines: vec![
-                Machine {
-                    name: "first".into(),
-                    endpoint: Ok(socket.into()),
-                },
-                Machine {
-                    name: "second".into(),
-                    endpoint: Err("stopped".into()),
-                },
-            ],
-            warning: None,
-        };
-        let availability = app.reconcile_podman(&report("unix:///one.sock"));
-        let index = app.podman_machines["first"];
-        let stopped = app.podman_machines["second"];
-        assert!(availability.contains(&(index, true)));
-        assert!(availability.contains(&(stopped, false)));
-        app.update_engine(
-            index,
-            Ok(Snapshot {
-                engine_id: Some("podman-id".into()),
-                ..Default::default()
-            }),
-        );
-        app.selected = app.rows.iter().position(|row| row.engine == index).unwrap();
-        let selected = app.current().unwrap().key.clone();
-        app.reconcile_podman(&report("unix:///two.sock"));
-        assert_eq!(app.podman_machines["first"], index);
-        assert_eq!(app.current().unwrap().key, selected);
-        assert_eq!(app.engines[index].connection.endpoint, "unix:///two.sock");
-        assert!(app.engines[index].error.is_some());
-        assert_eq!(app.engines[0].connection, before);
-        let failed_scan = Discovery {
-            machines: vec![],
-            warning: Some("invalid JSON".into()),
-        };
-        assert!(
-            app.reconcile_podman(&failed_scan)
-                .iter()
-                .all(|(_, available)| !available)
-        );
-        assert_eq!(app.engines[index].connection.endpoint, "unix:///two.sock");
-        app.reconcile_podman(&Discovery::default());
-        assert!(
-            app.engines[index]
-                .error
-                .as_ref()
-                .unwrap()
-                .contains("no longer listed")
-        );
-        assert_eq!(app.reconcile_podman(&report("unix:///three.sock")).len(), 2);
-        assert_eq!(app.podman_machines["first"], index);
-    }
-
-    #[test]
-    fn native_podman_and_docker_context_aliases_do_not_duplicate_metrics() {
-        use crate::discovery::podman::{Discovery, Machine};
-        let mut app = app();
-        let identity = app.engines[0].snapshot.as_ref().unwrap().engine_id.clone();
-        app.reconcile_podman(&Discovery {
-            machines: vec![Machine {
-                name: "fixture".into(),
-                endpoint: Ok("unix:///podman.sock".into()),
-            }],
-            warning: None,
-        });
-        let index = app.podman_machines["fixture"];
-        app.update_engine(
-            index,
-            Ok(Snapshot {
-                engine_id: identity,
-                ..Default::default()
-            }),
-        );
-        // Seed the same nonempty identity explicitly, independent of the app fixture.
-        app.update_engine(
-            0,
-            Ok(Snapshot {
-                engine_id: Some("same-podman".into()),
-                ..Default::default()
-            }),
-        );
-        app.update_engine(
-            index,
-            Ok(Snapshot {
-                engine_id: Some("same-podman".into()),
-                ..Default::default()
-            }),
-        );
-        assert!(app.engines[index].alias.is_some());
-        assert_eq!(app.engine_metrics(index).cpu_percent, None);
-    }
-
-    #[test]
-    fn startup_matching_waits_for_native_discovery_and_uses_machine_project_labels() {
-        use crate::discovery::podman::{Discovery, Machine};
-        let mut app = app();
-        let cwd = std::env::current_dir().unwrap();
-        app.configure_startup(cwd.clone());
-        app.wait_for_machine_discovery();
-        app.update_engine(0, Ok(Snapshot::default()));
-        assert!(app.startup_cwd.is_some());
-        app.reconcile_podman(&Discovery {
-            machines: vec![Machine {
-                name: "fixture".into(),
-                endpoint: Ok("unix:///podman.sock".into()),
-            }],
-            warning: None,
-        });
-        let index = app.podman_machines["fixture"];
-        assert!(app.project.is_none());
-        app.update_engine(
-            index,
-            Ok(Snapshot {
-                containers: vec![Container {
-                    id: "native-api".into(),
-                    project: Some("native-project".into()),
-                    service: Some("api".into()),
-                    compose_working_dir: Some(cwd),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }),
-        );
-        assert_eq!(app.project.as_ref().unwrap().engine, index);
-        assert_eq!(app.project.as_ref().unwrap().name, "native-project");
-    }
-
-    #[test]
-    fn matching_podman_socket_is_aliased_even_when_the_api_omits_engine_identity() {
-        use crate::discovery::podman::{Discovery, Machine};
-        let mut app = app();
-        app.reconcile_podman(&Discovery {
-            machines: vec![Machine {
-                name: "fixture".into(),
-                endpoint: Ok("/test".into()),
-            }],
-            warning: None,
-        });
-        let index = app.podman_machines["fixture"];
-        app.update_engine(index, Ok(Snapshot::default()));
-        assert!(app.engines[index].alias.is_some());
-    }
-
-    #[test]
-    fn late_native_machine_respects_pins_without_resorting_usage_or_moving_focus() {
-        use crate::discovery::podman::{Discovery, Machine};
-        let mut app = app();
-        app.context_sort = crate::context_sort::ContextSort::Cpu;
-        app.context_pins = vec!["Podman / preferred".into()];
-        let selected = app.current().unwrap().key.clone();
-        app.reconcile_podman(&Discovery {
-            machines: vec![Machine {
-                name: "preferred".into(),
-                endpoint: Ok("unix:///podman.sock".into()),
-            }],
-            warning: None,
-        });
-        assert_eq!(app.context_order[0], app.podman_machines["preferred"]);
-        assert_eq!(app.performance_engine(), Some(0));
-        assert_eq!(app.current().unwrap().key, selected);
-    }
-
-    #[test]
-    fn sorting_preserves_backend_indices_selection_expansion_and_log_targets() {
-        use crate::context_sort::ContextSort;
-        let mut app = App::new(crate::demo::connections(), 100, false, true);
-        crate::demo::populate(&mut app);
-        let identities: Vec<_> = app
-            .engines
-            .iter()
-            .map(|engine| engine.connection.clone())
-            .collect();
-        let selection = app.current().unwrap().key.clone();
-        let expanded = app.expanded.clone();
-        app.log_scope = Some("fixed-log-target".into());
-        app.performance_scroll = app
-            .performance_engines()
-            .iter()
-            .position(|&engine| engine == 0)
-            .unwrap();
-        app.pick_context_sort();
-        app.picker.as_mut().unwrap().selected = 2;
-        app.choose();
-        assert_eq!(app.context_sort, ContextSort::Cpu);
-        assert_eq!(app.current().unwrap().key, selection);
-        assert_eq!(app.expanded, expanded);
-        assert_eq!(app.log_scope.as_deref(), Some("fixed-log-target"));
-        assert_eq!(app.performance_engine(), Some(0));
-        assert_eq!(
-            app.engines
-                .iter()
-                .map(|engine| engine.connection.clone())
-                .collect::<Vec<_>>(),
-            identities
-        );
-        let order = app.context_order.clone();
-        app.update_engine(0, Err("disconnected".into()));
-        app.refresh_tree();
-        assert_eq!(
-            app.context_order, order,
-            "usage sort must not jump on refresh"
-        );
-        app.pick_context_sort();
-        app.picker.as_mut().unwrap().selected = 0;
-        app.choose();
-        assert_ne!(app.context_order, order);
-    }
-
-    #[test]
-    fn project_workspace_excludes_other_engines_and_back_restores_navigation() {
-        let mut app = App::new(crate::demo::connections(), 100, false, true);
-        crate::demo::populate(&mut app);
-        let selected = app.current().unwrap().key.clone();
-        let rows = app.rows.len();
-        let expanded = app.expanded.clone();
-        app.open_selected();
-        assert_eq!(app.project.as_ref().unwrap().name, "shop");
-        assert!(app.rows.iter().all(|row| row.engine == 0));
-        assert!(
-            !app.rows
-                .iter()
-                .any(|row| matches!(row.scope, Scope::Engine | Scope::Standalone(_)))
-        );
-        assert_eq!(app.rows[0].depth, 0);
-        assert_eq!(app.selected_containers().len(), 3);
-        assert!(app.back());
-        assert!(app.project.is_none());
-        assert_eq!(app.rows.len(), rows);
-        assert_eq!(app.current().unwrap().key, selected);
-        assert_eq!(app.expanded, expanded);
-    }
-
-    #[test]
-    fn workspace_includes_attached_external_network_but_not_other_workloads() {
-        let mut app = app();
-        let mut snapshot = app.engines[0].snapshot.as_ref().unwrap().clone();
-        snapshot.containers[0].networks.push("shared".into());
-        snapshot.containers.push(Container {
-            id: "other".into(),
-            name: "other-api".into(),
-            project: Some("other".into()),
-            networks: vec!["shared".into()],
-            ..Default::default()
-        });
-        snapshot.networks.push(crate::model::Resource {
-            name: "shared".into(),
-            external: true,
-            containers: vec!["api-1".into(), "other-api".into()],
-            ..Default::default()
-        });
-        app.update_engine(0, Ok(snapshot));
-        app.selected = app
-            .rows
-            .iter()
-            .position(
-                |row| matches!(&row.scope, Scope::Project { project, .. } if project == "shop"),
-            )
-            .unwrap();
-        app.open_selected();
-        app.tree_query = "shared".into();
-        app.refresh_tree();
-        app.selected = app
-            .rows
-            .iter()
-            .position(|row| matches!(&row.scope, Scope::Resource { name, .. } if name == "shared"))
-            .unwrap();
-        assert!(app.current().unwrap().title.contains("shared/external"));
-        assert_eq!(app.selected_containers().len(), 1);
-        assert_eq!(app.selected_containers()[0].name, "api-1");
-    }
-
-    #[test]
-    fn service_exec_requires_replica_choice_and_rejects_offline_engines() {
-        let mut app = App::new(crate::demo::connections(), 100, false, true);
-        crate::demo::populate(&mut app);
-        app.demo = false;
-        app.selected = app
-            .rows
-            .iter()
-            .position(
-                |row| matches!(&row.scope, Scope::Service { service, .. } if service == "api"),
-            )
-            .unwrap();
-        app.request_exec();
-        assert!(app.exec_request.is_none());
-        assert_eq!(app.picker.as_ref().unwrap().choices.len(), 2);
-        app.picker.as_mut().unwrap().selected = 1;
-        app.choose();
-        let request = app.exec_request.take().unwrap();
-        assert_eq!(request.container.name, "shop-api-2");
-        assert_eq!(request.connection.name, "OrbStack");
-        app.engines[0].error = Some("offline".into());
-        app.request_exec();
-        assert!(app.exec_request.is_none());
-        assert!(app.notice.contains("disconnected"));
-    }
-
-    #[test]
-    fn resource_only_projects_do_not_create_ghost_workloads_and_resources_remain_visible() {
-        let mut app = app();
-        app.update_engine(
-            0,
-            Ok(Snapshot {
-                networks: vec![crate::model::Resource {
-                    name: "empty_default".into(),
-                    project: Some("empty".into()),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }),
-        );
-        let tree = engine_tree(0, &app.engines[0]);
-        assert!(
-            !tree
-                .children
-                .iter()
-                .any(|node| matches!(node.row.scope, Scope::Project { .. }))
-        );
-        assert!(tree.children.iter().any(|node| {
-            node.children
-                .iter()
-                .any(|resource| resource.row.title.contains("empty_default"))
-        }));
-    }
-
-    #[test]
-    fn deleting_last_compose_container_leaves_resources_but_exits_workspace_on_successful_refresh()
-    {
-        let mut app = app();
-        app.engines[0]
-            .snapshot
-            .as_mut()
-            .unwrap()
-            .volumes
-            .push(crate::model::Resource {
-                name: "shop_data".into(),
-                project: Some("shop".into()),
-                ..Default::default()
-            });
-        app.open_project(Project {
-            engine: 0,
-            namespace: None,
-            name: "shop".into(),
-        });
-        let original = app.engines[0].snapshot.clone().unwrap();
-        app.update_engine(0, Err("temporary failure".into()));
-        assert!(
-            app.project.is_some(),
-            "A failed refresh must not claim a stack was removed"
-        );
-        let mut remaining = original.clone();
-        remaining
-            .containers
-            .retain(|container| container.project.as_deref() != Some("shop"));
-        app.update_engine(0, Ok(remaining));
-        assert!(app.project.is_none());
-        let tree = engine_tree(0, &app.engines[0]);
-        assert!(
-            !tree.children.iter().any(
-                |node| matches!(&node.row.scope,Scope::Project {project,..} if project=="shop")
-            )
-        );
-        assert!(!app.engines[0].snapshot.as_ref().unwrap().volumes.is_empty());
-        let mut stopped = original;
-        for container in &mut stopped.containers {
-            container.state = "exited".into();
-        }
-        app.update_engine(0, Ok(stopped));
-        assert!(
-            engine_tree(0, &app.engines[0]).children.iter().any(
-                |node| matches!(&node.row.scope,Scope::Project {project,..} if project=="shop")
-            ),
-            "Stopped containers must remain visible"
-        );
-    }
-
-    #[test]
-    fn toggling_a_search_expanded_branch_collapses_it_and_preserves_selection() {
-        let mut app = app();
-        app.tree_query = "api-1".into();
-        app.refresh_tree();
-        app.selected = app
-            .rows
-            .iter()
-            .position(|row| matches!(row.scope, Scope::Service { .. }))
-            .unwrap();
-        let key = app.current().unwrap().key.clone();
-        app.toggle_branch();
-        assert!(app.tree_query.is_empty());
-        assert_eq!(app.current().unwrap().key, key);
-        assert!(!app.expanded.contains(&key));
-        assert!(
-            !app.rows
-                .iter()
-                .any(|row| matches!(row.scope, Scope::Container(_)))
-        );
-        app.toggle_branch();
-        assert!(
-            app.rows
-                .iter()
-                .any(|row| matches!(row.scope, Scope::Container(_)))
-        );
-    }
-
-    #[test]
-    fn counts_do_not_mix_namespaces_or_reset_selection_on_refresh() {
-        let mut app = app();
-        let mut snapshot = app.engines[0].snapshot.as_ref().unwrap().clone();
-        snapshot.containers[0].namespace = Some("first".into());
-        let other = Container {
-            namespace: Some("second".into()),
-            state: "running".into(),
-            ..snapshot.containers[0].clone()
-        };
-        snapshot.containers.push(other);
-        snapshot.namespaces = vec!["first".into(), "second".into()];
-        app.update_engine(0, Ok(snapshot.clone()));
-        let tree = engine_tree(0, &app.engines[0]);
-        assert_eq!(tree.children[0].children[0].row.title, "shop [stopped]");
-        assert_eq!(tree.children[1].children[0].row.title, "shop [1/1 running]");
-        app.selected = 1;
-        app.expand();
-        app.move_selection(1);
-        app.expand();
-        let key = app.current().unwrap().key.clone();
-        snapshot.containers[0].state = "running".into();
-        app.update_engine(0, Ok(snapshot));
-        assert_eq!(app.current().unwrap().key, key);
-        assert_eq!(app.current().unwrap().title, "shop [1/1 running]");
-        assert!(app.expanded.contains(&key));
-    }
-}
+mod tests;

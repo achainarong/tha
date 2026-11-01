@@ -113,6 +113,10 @@ async fn agent_collects_without_clients_and_history_survives_restart() {
         Agent {
             allow_delete: false,
             allow_exec: false,
+            allow_images: false,
+            allow_download: false,
+            allow_compose: false,
+            allow_upload: false,
             socket: engine_path.clone(),
             audit: |_| {},
             security: None,

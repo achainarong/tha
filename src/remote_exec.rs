@@ -74,7 +74,7 @@ enum Output {
     Error(String),
 }
 
-fn body_channel() -> (mpsc::Sender<Bytes>, Body) {
+pub(crate) fn body_channel() -> (mpsc::Sender<Bytes>, Body) {
     let (tx, rx) = mpsc::channel::<Bytes>(8);
     let body = BodyExt::boxed(StreamBody::new(stream::unfold(rx, |mut rx| async move {
         rx.recv()
@@ -874,6 +874,10 @@ mod tests {
             crate::agent::Agent {
                 allow_delete: false,
                 allow_exec,
+                allow_images: false,
+                allow_download: false,
+                allow_compose: false,
+                allow_upload: false,
                 socket,
                 audit: |_| {},
                 security: None,

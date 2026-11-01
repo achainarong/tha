@@ -361,6 +361,22 @@ pub fn shell_command(remote: &Remote, control: &Path) -> Result<std::process::Co
     Ok(command)
 }
 
+/// One read-only file request on the shared connection, through the same restricted key.
+pub fn files_command(
+    remote: &Remote,
+    control: &Path,
+    request: &str,
+) -> Result<std::process::Command> {
+    remote.validate()?;
+    let key = checked_key(remote)?;
+    let mut command = std::process::Command::new("ssh");
+    command.args(channel_args(remote, &key, control, request));
+    if let Some(socket) = private_agent_socket() {
+        command.env(AGENT_SOCKET_VARIABLE, socket);
+    }
+    Ok(command)
+}
+
 /// The first-contact test. Not in batch mode, so OpenSSH itself shows the host key fingerprint
 /// and records the answer; `tha` never scans or accepts a host key.
 pub fn test_command(remote: &Remote) -> Result<std::process::Command> {
@@ -668,6 +684,7 @@ pub enum Update {
     Connected {
         engines: Vec<String>,
         allow_delete: bool,
+        capabilities: Option<crate::agent::Capabilities>,
     },
     /// Trying again after `retry` when set; otherwise the user has to act.
     Failed {
@@ -1126,6 +1143,7 @@ pub async fn supervise(remote: Remote, generation: u64, events: mpsc::Sender<Eve
                 if !send(Update::Connected {
                     engines: listing.engines,
                     allow_delete: listing.allow_delete,
+                    capabilities: listing.capabilities,
                 })
                 .await
                 {

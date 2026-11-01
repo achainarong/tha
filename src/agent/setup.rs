@@ -33,6 +33,15 @@ pub struct Options {
     pub key: Option<String>,
     pub allow_delete: bool,
     pub allow_exec: bool,
+    pub allow_images: bool,
+    pub allow_download: bool,
+    pub allow_server_download: bool,
+    pub allow_compose: bool,
+    pub allow_compose_edit: bool,
+    pub allow_upload: bool,
+    /// Where the agent posts alerts. Kept in a root-only file, not the policy.
+    pub alert_webhook: Option<String>,
+    pub no_alert_webhook: bool,
     /// `NAME=/path/to/socket`, to expose only these. When empty, every known socket is exposed.
     pub engines: Vec<String>,
     pub scanner_digest: Option<String>,
@@ -206,6 +215,12 @@ pub fn merge_config(
     AgentConfig {
         allow_delete: allow_delete || existing.allow_delete,
         allow_exec: existing.allow_exec,
+        allow_images: existing.allow_images,
+        allow_download: existing.allow_download,
+        allow_server_download: existing.allow_server_download,
+        allow_compose: existing.allow_compose,
+        allow_compose_edit: existing.allow_compose_edit,
+        allow_upload: existing.allow_upload,
         engines: if engines.is_empty() {
             existing.engines
         } else {
@@ -392,9 +407,23 @@ fn find_engines() -> Vec<AgentEngine> {
 fn finish_root_setup(policy: &Path, config: &AgentConfig) -> Result<()> {
     write_policy(policy, config)?;
     println!(
-        "Agent policy written. tha's traffic goes through the allowlist (delete {}, exec {}).",
+        "Agent policy written. tha's traffic goes through the allowlist (delete {}, exec {}, images {}, downloads {}, server downloads {}, compose {}, compose edit {}, uploads {}).",
         if config.allow_delete { "on" } else { "off" },
-        if config.allow_exec { "on" } else { "off" }
+        if config.allow_exec { "on" } else { "off" },
+        if config.allow_images { "on" } else { "off" },
+        if config.allow_download { "on" } else { "off" },
+        if config.allow_server_download {
+            "on"
+        } else {
+            "off"
+        },
+        if config.allow_compose { "on" } else { "off" },
+        if config.allow_compose_edit {
+            "on"
+        } else {
+            "off"
+        },
+        if config.allow_upload { "on" } else { "off" },
     );
     println!(
         "Root's SSH keys are not restricted: anyone holding one still has full root access. Use a dedicated user to limit the key itself."
@@ -410,6 +439,30 @@ fn write_policy(policy: &Path, config: &AgentConfig) -> Result<()> {
     atomic_write(policy, &toml::to_string(config)?, 0o644, Some((0, 0)))
 }
 
+/// A rerun without either option leaves an existing webhook alone, like the other opt-ins.
+fn apply_webhook(
+    path: &Path,
+    url: Option<&str>,
+    remove: bool,
+    owner: Option<(u32, u32)>,
+) -> Result<()> {
+    if remove {
+        match std::fs::remove_file(path) {
+            Ok(()) => println!("Alert webhook removed."),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    } else if let Some(url) = url {
+        super::alerts::validate_webhook(url)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        atomic_write(path, &format!("{url}\n"), 0o600, owner)?;
+        println!("Alert webhook saved. This server now sends alerts to it over HTTPS.");
+    }
+    Ok(())
+}
+
 pub fn run_setup(options: &Options) -> Result<()> {
     ensure!(
         cfg!(target_os = "linux"),
@@ -420,6 +473,12 @@ pub fn run_setup(options: &Options) -> Result<()> {
         unsafe { libc::geteuid() } == 0,
         "tha-agent setup must run as root"
     );
+    apply_webhook(
+        Path::new(super::alerts::WEBHOOK_PATH),
+        options.alert_webhook.as_deref(),
+        options.no_alert_webhook,
+        Some((0, 0)),
+    )?;
     let root = options.user == "root";
     ensure!(
         root || valid_user(&options.user),
@@ -470,6 +529,12 @@ pub fn run_setup(options: &Options) -> Result<()> {
     };
     let mut config = merge_config(existing, engines, options.allow_delete);
     config.allow_exec |= options.allow_exec;
+    config.allow_images |= options.allow_images;
+    config.allow_download |= options.allow_download;
+    config.allow_server_download |= options.allow_server_download;
+    config.allow_compose |= options.allow_compose;
+    config.allow_compose_edit |= options.allow_compose_edit;
+    config.allow_upload |= options.allow_upload;
     configure_security(&mut config.security, options);
     config.validate()?;
     ensure!(
@@ -568,7 +633,7 @@ fn finish_dedicated_setup(
     }
 
     println!(
-        "Agent ready for user {}: {} (delete {}, exec {})",
+        "Agent ready for user {}: {} (delete {}, exec {}, images {}, downloads {}, server downloads {}, compose {}, compose edit {}, uploads {})",
         options.user,
         config
             .engines
@@ -577,7 +642,21 @@ fn finish_dedicated_setup(
             .collect::<Vec<_>>()
             .join(", "),
         if config.allow_delete { "on" } else { "off" },
-        if config.allow_exec { "on" } else { "off" }
+        if config.allow_exec { "on" } else { "off" },
+        if config.allow_images { "on" } else { "off" },
+        if config.allow_download { "on" } else { "off" },
+        if config.allow_server_download {
+            "on"
+        } else {
+            "off"
+        },
+        if config.allow_compose { "on" } else { "off" },
+        if config.allow_compose_edit {
+            "on"
+        } else {
+            "off"
+        },
+        if config.allow_upload { "on" } else { "off" },
     );
     println!(
         "If sshd uses AllowUsers or AllowGroups, also allow {}.",
@@ -602,6 +681,14 @@ mod tests {
             key: None,
             allow_delete: false,
             allow_exec: false,
+            allow_images: false,
+            allow_download: false,
+            allow_server_download: false,
+            allow_compose: false,
+            allow_compose_edit: false,
+            allow_upload: false,
+            alert_webhook: None,
+            no_alert_webhook: false,
             engines: vec![],
             scanner_digest: None,
             security_interval: 86400,
@@ -718,6 +805,14 @@ mod tests {
             key: Some(ED25519.into()),
             allow_delete: false,
             allow_exec: false,
+            allow_images: false,
+            allow_download: false,
+            allow_server_download: false,
+            allow_compose: false,
+            allow_compose_edit: false,
+            allow_upload: false,
+            alert_webhook: None,
+            no_alert_webhook: false,
             engines: vec!["docker=/missing-security-test.sock".into()],
             scanner_digest: None,
             security_interval: 86400,
@@ -784,6 +879,12 @@ mod tests {
         let existing = AgentConfig {
             allow_delete: true,
             allow_exec: true,
+            allow_images: false,
+            allow_download: false,
+            allow_server_download: false,
+            allow_compose: false,
+            allow_compose_edit: false,
+            allow_upload: false,
             engines: vec![AgentEngine {
                 name: "docker".into(),
                 socket: "/a".into(),
@@ -845,5 +946,24 @@ mod tests {
         for hostile in ["docker", "list=/s", "docker=relative", "a b=/s"] {
             assert!(parse_engine(hostile).is_err(), "{hostile}");
         }
+    }
+
+    #[test]
+    fn the_webhook_is_saved_privately_kept_on_reruns_and_removed_on_request() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("alert-webhook");
+        assert!(apply_webhook(&path, Some("http://insecure"), false, None).is_err());
+        assert!(!path.exists());
+        apply_webhook(&path, Some("https://hooks.example/a"), false, None).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        apply_webhook(&path, None, false, None).unwrap();
+        assert!(path.exists(), "A rerun without the option keeps it");
+        apply_webhook(&path, None, true, None).unwrap();
+        assert!(!path.exists());
+        apply_webhook(&path, None, true, None).unwrap();
     }
 }

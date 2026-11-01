@@ -39,8 +39,10 @@ const APPLICATION_ID: i64 = 1_414_021_429;
 const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 const PRUNE_EVERY: Duration = Duration::from_secs(600);
+pub const REMOTE_ROUTE: &str = "/tha/events";
+const MAX_REMOTE_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tone {
     Failure,
     Warning,
@@ -48,7 +50,7 @@ pub enum Tone {
     Neutral,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Event {
     pub at_ms: i64,
     pub key: String,
@@ -179,7 +181,7 @@ pub async fn watch(connection: Connection, tx: mpsc::Sender<Update>) {
     if connection.kind != BackendKind::Docker {
         return;
     }
-    let mut since = (crate::history::now_ms() - crate::history::RETENTION_MS) / 1000;
+    let mut since = (crate::history::now_ms() - crate::history::retention_ms()) / 1000;
     let mut delay = RETRY_MIN;
     loop {
         // A failed connection is retried like an ended stream; the timeline just pauses.
@@ -353,7 +355,7 @@ impl Store {
     pub fn prune(&self, now_ms: i64) -> Result<()> {
         self.db.execute(
             "DELETE FROM events WHERE at < ?1",
-            [now_ms - crate::history::RETENTION_MS],
+            [now_ms - crate::history::retention_ms()],
         )?;
         self.db.execute(
             "DELETE FROM events WHERE at IN (SELECT at FROM events ORDER BY at DESC LIMIT -1 OFFSET ?1)",
@@ -363,8 +365,69 @@ impl Store {
     }
 }
 
+/// An agent keeps one database per engine, so every row is that engine's.
+pub fn read_all(path: &Path, since_ms: i64, limit: usize) -> Result<Vec<Event>> {
+    read_where(path, None, since_ms, limit)
+}
+
 /// Newest events for a runtime. A missing database simply means no service has run.
 pub fn read(path: &Path, runtime: &str, since_ms: i64, limit: usize) -> Result<Vec<Event>> {
+    read_where(path, Some(runtime), since_ms, limit)
+}
+
+/// What a server's agent saved, for the relay socket of that engine. An older agent refuses
+/// the route, which reads as nothing saved rather than as an error.
+pub async fn read_remote(socket: &Path, since_ms: i64) -> Result<Vec<Event>> {
+    use http_body_util::{BodyExt, Empty, Limited};
+    let stream = tokio::net::UnixStream::connect(socket).await?;
+    let (mut sender, driver) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await?;
+    let driver = tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let result = async {
+        let response = sender
+            .send_request(
+                hyper::Request::builder()
+                    .uri(format!("{REMOTE_ROUTE}?since={since_ms}"))
+                    .header("Host", "agent")
+                    .body(Empty::<hyper::body::Bytes>::new())?,
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Ok(Vec::new());
+        }
+        let body = Limited::new(response.into_body(), MAX_REMOTE_BYTES)
+            .collect()
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .to_bytes();
+        let events: Vec<Event> = serde_json::from_slice(&body)?;
+        // The server's text reaches a terminal here, whatever its database holds.
+        Ok(events
+            .into_iter()
+            .map(|event| Event {
+                key: safe_text(&event.key),
+                name: safe_text(&event.name),
+                project: event.project.map(|name| safe_text(&name)),
+                service: event.service.map(|name| safe_text(&name)),
+                action: safe_text(&event.action),
+                detail: safe_text(&event.detail),
+                at_ms: event.at_ms,
+            })
+            .collect())
+    }
+    .await;
+    driver.abort();
+    result
+}
+
+fn read_where(
+    path: &Path,
+    runtime: Option<&str>,
+    since_ms: i64,
+    limit: usize,
+) -> Result<Vec<Event>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -379,7 +442,7 @@ pub fn read(path: &Path, runtime: &str, since_ms: i64, limit: usize) -> Result<V
     db.busy_timeout(Duration::from_millis(150))?;
     validate(&db)?;
     let mut statement = db.prepare(
-        "SELECT key,at,action,name,project,service,detail FROM events WHERE runtime=?1 AND at>=?2 ORDER BY at DESC LIMIT ?3",
+        "SELECT key,at,action,name,project,service,detail FROM events WHERE (?1 IS NULL OR runtime=?1) AND at>=?2 ORDER BY at DESC LIMIT ?3",
     )?;
     let events = statement
         .query_map(params![runtime, since_ms, limit as i64], |row| {
@@ -568,6 +631,19 @@ mod tests {
         );
         drop(store);
         Store::open(&path).expect("An existing database reopens");
+    }
+
+    #[test]
+    fn an_engines_own_database_reads_without_naming_a_runtime_and_events_survive_json() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events-docker.sqlite3");
+        let mut store = Store::open(&path).unwrap();
+        let now = crate::history::now_ms();
+        store.insert("anything", &[event(now, "oom")]).unwrap();
+        let events = read_all(&path, 0, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        let json = serde_json::to_vec(&events).unwrap();
+        assert_eq!(serde_json::from_slice::<Vec<Event>>(&json).unwrap(), events);
     }
 
     #[test]

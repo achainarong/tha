@@ -7,7 +7,7 @@ use tha::{
     app::{App, Tab},
     config::{BackendKind, Connection},
     logs::{LogBuffer, view::LogView},
-    model::{Container, Snapshot},
+    model::{Container, Resource, Snapshot},
 };
 
 fn measure(name: &str, iterations: usize, mut action: impl FnMut()) {
@@ -193,7 +193,14 @@ fn tree() {
                 },
             );
             app.tree_query = "service-".into();
-            app.refresh_tree();
+            measure(
+                &format!("tree/{count}/{projects}_projects/search_all"),
+                3,
+                || {
+                    app.refresh_tree();
+                    black_box(&app.rows);
+                },
+            );
             assert_eq!(
                 app.rows
                     .iter()
@@ -201,7 +208,76 @@ fn tree() {
                     .count(),
                 count
             );
+            app.tree_query = "no-such-name".into();
+            measure(
+                &format!("tree/{count}/{projects}_projects/search_none"),
+                3,
+                || {
+                    app.refresh_tree();
+                    black_box(&app.rows);
+                },
+            );
+            assert!(app.rows.is_empty());
         }
+        // Resource grouping only costs something when each project owns resources.
+        let projects = count / 5;
+        let mut app = App::new(
+            vec![Connection {
+                name: "fixture".into(),
+                kind: BackendKind::Docker,
+                endpoint: "demo://fixture".into(),
+            }],
+            5000,
+            false,
+            true,
+        );
+        let containers = (0..count)
+            .map(|i| Container {
+                id: format!("id-{i}"),
+                name: format!("container-{i}"),
+                state: "running".into(),
+                project: Some(format!("project-{}", i % projects)),
+                service: Some(format!("service-{i}")),
+                networks: vec![format!("network-{}", i % projects), "shared".into()],
+                volumes: vec![format!("volume-{}", i % projects)],
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let resources = |prefix: &str| {
+            (0..projects)
+                .map(|project| Resource {
+                    name: format!("{prefix}-{project}"),
+                    project: Some(format!("project-{project}")),
+                    containers: (0..count)
+                        .filter(|i| i % projects == project)
+                        .map(|i| format!("container-{i}"))
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut networks = resources("network");
+        networks.push(Resource {
+            name: "shared".into(),
+            external: true,
+            containers: containers.iter().map(|c| c.name.clone()).collect(),
+            ..Default::default()
+        });
+        let volumes = resources("volume");
+        app.update_engine(
+            0,
+            Ok(Snapshot {
+                containers,
+                networks,
+                volumes,
+                volumes_available: true,
+                ..Default::default()
+            }),
+        );
+        measure(&format!("tree/{count}/resources/refresh"), 3, || {
+            app.refresh_tree();
+            black_box(&app.rows);
+        });
     }
 }
 

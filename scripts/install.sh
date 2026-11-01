@@ -16,6 +16,15 @@
 #                         Without these it only installs or updates; existing setup is kept.
 #                         --allow-delete lets that server delete containers, images and volumes.
 #                         --allow-exec opts in to container exec and host shells as the SSH user.
+#                         --allow-images opts in to anonymous image pulls and update checks.
+#                         --allow-download opts in to reading files in containers.
+#                         --allow-server-download opts in to reading server files as the SSH user.
+#                         --allow-compose opts in to Compose actions on files already on the server.
+#                         --allow-compose-edit opts in to rewriting Compose and .env files.
+#                         --allow-upload opts in to writing files into containers.
+#                         --allow-all turns on every --allow option; see the list in the README.
+#                         --alert-webhook URL posts alerts to an https:// URL while Tha is closed.
+#                         --no-alert-webhook removes it.
 #                         Setup enables automatically verified Grype scans; --no-security opts out.
 #
 #   THA_MODE=service      same as passing `service`
@@ -51,6 +60,15 @@ if [ "$MODE" = agent ]; then
     agent_user=
     agent_delete=
     agent_exec=
+    agent_images=
+    agent_download=
+    agent_server_download=
+    agent_compose=
+    agent_compose_edit=
+    agent_upload=
+    agent_all=
+    agent_webhook=
+    agent_no_webhook=
     agent_scanner_digest=
     agent_security_interval=
     agent_no_security=
@@ -60,10 +78,21 @@ if [ "$MODE" = agent ]; then
             --user) [ $# -ge 2 ] || die "--user needs a name"; agent_user=$2; shift 2 ;;
             --allow-delete) agent_delete=1; shift ;;
             --allow-exec) agent_exec=1; shift ;;
+            --allow-images) agent_images=1; shift ;;
+            --allow-download) agent_download=1; shift ;;
+            --allow-server-download) agent_server_download=1; shift ;;
+            --allow-compose) agent_compose=1; shift ;;
+            --allow-compose-edit) agent_compose_edit=1; shift ;;
+            --allow-upload) agent_upload=1; shift ;;
+            --allow-all) agent_all=1; shift ;;
+            --alert-webhook)
+                [ "$#" -ge 2 ] || die "--alert-webhook needs an https:// URL"
+                agent_webhook=$2; shift 2 ;;
+            --no-alert-webhook) agent_no_webhook=1; shift ;;
             --scanner-digest) [ $# -ge 2 ] || die "--scanner-digest needs sha256:DIGEST"; agent_scanner_digest=$2; shift 2 ;;
             --security-interval) [ $# -ge 2 ] || die "--security-interval needs seconds"; agent_security_interval=$2; shift 2 ;;
             --no-security) agent_no_security=1; shift ;;
-            *) die "unknown agent option '$1'; expected --key, --user, --allow-delete, --allow-exec, --no-security or --security-interval" ;;
+            *) die "unknown agent option '$1'; expected --key, --user, --allow-delete, --allow-images, --allow-download, --allow-server-download, --allow-compose, --allow-compose-edit, --allow-upload, --allow-all, --allow-exec, --no-security or --security-interval" ;;
         esac
     done
     if [ "$agent_user" = root ]; then
@@ -75,6 +104,18 @@ if [ "$MODE" = agent ]; then
     fi
     if [ -n "$agent_exec" ] && [ -z "$agent_key$agent_user" ]; then
         die "--allow-exec needs --key or --user root"
+    fi
+    if [ -n "$agent_images" ] && [ -z "$agent_key$agent_user" ]; then
+        die "--allow-images needs --key or --user root"
+    fi
+    if [ -n "$agent_download$agent_server_download$agent_compose$agent_compose_edit$agent_upload" ] && [ -z "$agent_key$agent_user" ]; then
+        die "--allow-download, --allow-server-download, --allow-compose, --allow-compose-edit and --allow-upload need --key or --user root"
+    fi
+    if [ -n "$agent_all" ] && [ -z "$agent_key$agent_user" ]; then
+        die "--allow-all needs --key or --user root"
+    fi
+    if [ -n "$agent_webhook$agent_no_webhook" ] && [ -z "$agent_key$agent_user" ]; then
+        die "--alert-webhook and --no-alert-webhook need --key or --user root"
     fi
     if [ -n "$agent_scanner_digest$agent_security_interval$agent_no_security" ] && [ -z "$agent_key$agent_user" ]; then
         die "security options need --key or --user root"
@@ -254,6 +295,15 @@ if [ "$MODE" = agent ]; then
     [ -z "$agent_key" ] || set -- "$@" --key "$agent_key"
     [ -z "$agent_delete" ] || set -- "$@" --allow-delete
     [ -z "$agent_exec" ] || set -- "$@" --allow-exec
+    [ -z "$agent_images" ] || set -- "$@" --allow-images
+    [ -z "$agent_download" ] || set -- "$@" --allow-download
+    [ -z "$agent_server_download" ] || set -- "$@" --allow-server-download
+    [ -z "$agent_compose" ] || set -- "$@" --allow-compose
+    [ -z "$agent_compose_edit" ] || set -- "$@" --allow-compose-edit
+    [ -z "$agent_upload" ] || set -- "$@" --allow-upload
+    [ -z "$agent_all" ] || set -- "$@" --allow-all
+    [ -z "$agent_webhook" ] || set -- "$@" --alert-webhook "$agent_webhook"
+    [ -z "$agent_no_webhook" ] || set -- "$@" --no-alert-webhook
     [ -z "$agent_scanner_digest" ] || set -- "$@" --scanner-digest "$agent_scanner_digest"
     [ -z "$agent_security_interval" ] || set -- "$@" --security-interval "$agent_security_interval"
     [ -z "$agent_no_security" ] || set -- "$@" --no-security

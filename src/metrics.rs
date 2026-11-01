@@ -119,6 +119,22 @@ pub struct TimedUsage {
 }
 
 impl Store {
+    /// One container's kept readings, oldest first, as CPU percent and percent of its memory
+    /// limit. A reading that was not reported stays missing rather than becoming zero.
+    pub fn session_points(&self, key: &str) -> Vec<(i64, Option<f64>, Option<u64>)> {
+        self.history
+            .iter()
+            .filter_map(|frame| {
+                let usage = frame.values.get(key)?;
+                let memory = usage
+                    .memory_bytes
+                    .zip(usage.memory_limit_bytes.filter(|limit| *limit > 0))
+                    .map(|(bytes, limit)| bytes.saturating_mul(100) / limit);
+                Some((frame.wall_ms, usage.cpu_percent, memory))
+            })
+            .collect()
+    }
+
     pub fn local_samples(&self, key: &str, start: i64, end: i64) -> Vec<crate::history::Sample> {
         self.history
             .iter()

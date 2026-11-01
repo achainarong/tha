@@ -1,7 +1,7 @@
 # Keybindings
 
 Edit `$XDG_CONFIG_HOME/tha/config.toml` (default `~/.config/tha/config.toml`),
-or the file selected with `tha --config PATH`. Restart Tha to apply changes.
+or the file selected with `tha --config PATH`. Changes apply within a few seconds.
 The checked-in `tha.example.toml` includes a ready-to-edit `[bindings]` section.
 
 ```toml
@@ -96,6 +96,14 @@ configured keys take precedence.
 | --- | --- |
 | `performance`, `performance-close`, `performance-scope` | Toggle Performance; close focused Performance; switch runtime/container scope |
 | `sort-contexts` | Open runtime sorting picker |
+| `download-manager`, `download` | Open the download manager, or prompt for a path to download |
+| `timeline` | Show incidents for the selected workload |
+| `alerts` | Show alerts |
+| `fleet` | Show what needs attention across all connections |
+| `copy-id`, `copy-name`, `copy-image`, `copy-log-line` | Copy to the clipboard, if the terminal allows it |
+| `upload`, `network-test` | Prompt for an upload or a connection test |
+| `capabilities` | Show what the selected connection can do, and why not |
+| `saved-views`, `save-view`, `open-view`, `delete-view` | Open the saved views picker, or prompt for a view name to save, open or delete |
 | `previous-range`, `next-range` | Shorter/longer metrics time range |
 | `metrics-left`, `metrics-right` | Pan/inspect earlier or later metrics |
 | `metrics-cursor`, `metrics-live` | Toggle metrics cursor; return to live metrics |
@@ -104,6 +112,7 @@ configured keys take precedence.
 
 | Action names | Behavior |
 | --- | --- |
+| `next-issue`, `previous-issue` | Move between possible issues in the logs |
 | `wrap`, `follow`, `json` | Toggle log wrapping, following, or pretty-printed JSON |
 | `diagnose`, `network-diagnose` | Open read-only health evidence or network troubleshooting for the selected container |
 | `filter-logs`, `filter-logs-advanced`, `clear-log-filter` | Edit the text filter, edit the advanced JSON filter, or clear both |
@@ -118,8 +127,9 @@ configured keys take precedence.
 | Action names | Behavior |
 | --- | --- |
 | `actions`, `action-results` | Open contextual actions or background lifecycle results |
-| `start`, `stop`, `restart`, `delete-container` | Request a confirmed workload operation (Explorer/Performance only) |
+| `start`, `stop`, `restart`, `delete-container`, `pause`, `unpause`, `kill` | Request a confirmed workload operation (Explorer/Performance only) |
 | `compose-update`, `compose-pull`, `compose-up`, `compose-recreate`, `compose-down` | Request a confirmed Compose operation on the selected project or service |
+| `compose-edit` | Open the selected project's Compose file in your editor |
 | `compose-output` | Show the last Compose operation's output |
 | `previous-runtime`, `next-runtime` | Select an inventory runtime |
 | `mark`, `mark-unused`, `clear-marks` | Manage inventory cleanup marks |

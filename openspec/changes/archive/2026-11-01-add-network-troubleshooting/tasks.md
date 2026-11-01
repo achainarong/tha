@@ -3,7 +3,7 @@
 ## 1. Typed passive network evidence
 
 - [x] 1.1 Add optional typed endpoint/network diagnostic metadata and capability states; verify fixtures for bridge, host, none, container-sharing mode, IPv4/IPv6, aliases, missing IDs, and unsupported backends, and document unknown semantics.
-- [ ] 1.2 Add bounded on-demand read-only inspection tied to runtime/endpoint/container generations; verify deadline, cancellation/stale response, removed target, partial data, sanitization, and response-cap tests without global inspect polling.
+- [x] 1.2 Add bounded on-demand read-only inspection tied to runtime/endpoint/container generations; verify deadline, cancellation/stale response, removed target, partial data, sanitization, and response-cap tests without global inspect polling.
 - [x] 1.3 Add pure relationship and port-publication explanations; verify tests for shared exact network IDs, same names with different IDs, no shared networks, exposed-only ports, loopback/wildcard/specific bindings, protocol differences, stopped containers, and uncertain dual-stack overlaps.
 
 ## 2. Scoped troubleshooting workflow
@@ -32,3 +32,7 @@
 
 - Review the passive first-release scope before implementation and treat active testing as a separate future change.
 - Archive only after implementation, checks, and user review.
+
+## Response cap (2026-11-01)
+
+- 1.2 is now closed. `diagnostics::inspect` reads the response through `backend::docker::get_json_capped`, which stops at `MAX_RESPONSE_BYTES` (8 MiB) before parsing and works over local sockets and the remote relay. Container IDs are validated before they enter the request path. Tests cover a normal response, an oversized response, and IDs that could change the path. The image comparison on the Overview tab still uses Bollard's `inspect_image`.

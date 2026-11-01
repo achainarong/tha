@@ -44,6 +44,42 @@ pub struct Entry {
     pub metadata: filter::Metadata,
     /// Indented JSON, present only while pretty-printing is on.
     pub pretty: Option<String>,
+    /// Looks like the start of a problem. A guess from keywords, never proof of a failure.
+    pub issue: bool,
+}
+
+const ISSUE_WORDS: [&str; 6] = [
+    "error",
+    "fatal",
+    "panic",
+    "exception",
+    "traceback",
+    "timeout",
+];
+const ISSUE_PHRASES: [&str; 3] = ["stack trace", "connection refused", "out of memory"];
+
+fn has_word(text: &str, word: &str) -> bool {
+    text.match_indices(word).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + word.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
+/// Case-insensitive keywords as whole words, so `terror` and `errors_total` do not count.
+pub fn looks_like_issue(message: &str) -> bool {
+    let message = message.to_lowercase();
+    ISSUE_WORDS.iter().any(|word| has_word(&message, word))
+        || ISSUE_PHRASES.iter().any(|phrase| message.contains(phrase))
+}
+
+/// The lines under a stack trace's first line, which belong to that one issue.
+fn continues_trace(text: &str) -> bool {
+    let indented = text.starts_with(' ') || text.starts_with('\t');
+    let trimmed = text.trim_start();
+    (indented && (trimmed.starts_with("at ") || trimmed.starts_with("File \"")))
+        || trimmed.starts_with("Caused by:")
+        || (indented && trimmed.starts_with("..."))
 }
 
 impl Entry {
@@ -54,6 +90,8 @@ impl Entry {
 }
 
 pub struct LogBuffer {
+    /// The source of the stack trace being read, so its lines count as one issue.
+    trace_source: Option<String>,
     pub entries: VecDeque<Entry>,
     pub follow: bool,
     pub evicted: u64,
@@ -69,6 +107,7 @@ impl LogBuffer {
 
     pub fn new(capacity: usize) -> Self {
         Self {
+            trace_source: None,
             entries: VecDeque::new(),
             follow: true,
             evicted: 0,
@@ -104,13 +143,24 @@ impl LogBuffer {
             .pretty_json
             .then(|| filter::pretty_json(&text, &metadata))
             .flatten();
+        let source = safe_text(source);
+        let message = filter::message(&text);
+        let continuing =
+            continues_trace(message) && self.trace_source.as_deref() == Some(source.as_str());
+        let issue = !continuing && looks_like_issue(message);
+        if issue {
+            self.trace_source = Some(source.clone());
+        } else if !continuing && self.trace_source.as_deref() == Some(source.as_str()) {
+            self.trace_source = None;
+        }
         self.entries.push_back(Entry {
             sequence: self.next_sequence,
-            source: safe_text(source),
+            source,
             text,
             error,
             metadata,
             pretty,
+            issue,
         });
         self.next_sequence += 1;
     }
@@ -543,6 +593,91 @@ fn container_gone(error: &anyhow::Error) -> bool {
     )
 }
 
+/// Most lines kept by a one-off diagnostic load.
+pub const WINDOW_MAX_LINES: usize = 300;
+const WINDOW_MAX_BYTES: usize = 1024 * 1024;
+
+/// One bounded read of a container's logs, with no follow and nothing saved. `since` and `until`
+/// are Unix seconds. Reading stops at the byte limit, and the result says if it did.
+pub async fn load_window(
+    connection: &Connection,
+    container: &Container,
+    since: Option<i64>,
+    until: Option<i64>,
+) -> anyhow::Result<LogBuffer> {
+    let mut buffer = LogBuffer::new(WINDOW_MAX_LINES);
+    let source = safe_text(&container.name);
+    let mut bytes = 0;
+    let mut push = |text: &str, error: bool, buffer: &mut LogBuffer| {
+        bytes += text.len();
+        if bytes > WINDOW_MAX_BYTES {
+            return false;
+        }
+        buffer.push(&source, text, error);
+        true
+    };
+    match connection.kind {
+        BackendKind::Docker => {
+            let docker = backend::docker::connect(connection)?
+                .negotiate_version()
+                .await?;
+            let mut options = LogsOptionsBuilder::default()
+                .stdout(true)
+                .stderr(true)
+                .follow(false)
+                .timestamps(true)
+                .tail("300");
+            if let Some(since) = since {
+                options = options.since(i32::try_from(since).unwrap_or(i32::MAX));
+            }
+            if let Some(until) = until {
+                options = options.until(i32::try_from(until).unwrap_or(i32::MAX));
+            }
+            let mut logs = docker.logs(&container.id, Some(options.build()));
+            'read: while let Some(message) = logs.next().await {
+                let message = message?.into_bytes();
+                for chunk in message.chunks(MAX_LINE_BYTES) {
+                    for line in String::from_utf8_lossy(chunk).lines() {
+                        if !push(line, false, &mut buffer) {
+                            break 'read;
+                        }
+                    }
+                }
+            }
+        }
+        BackendKind::Containerd => {
+            let mut command =
+                backend::containerd::command(connection, container.namespace.as_deref());
+            command.args(["logs", "--timestamps", "--tail", "300"]);
+            if let Some(since) = since {
+                let since = OffsetDateTime::from_unix_timestamp(since)?.format(&Rfc3339)?;
+                command.args(["--since", &since]);
+            }
+            if let Some(until) = until {
+                let until = OffsetDateTime::from_unix_timestamp(until)?.format(&Rfc3339)?;
+                command.args(["--until", &until]);
+            }
+            command.arg(&container.id).kill_on_drop(true);
+            let output = command.output().await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "nerdctl exited with {}; check its logging configuration",
+                output.status
+            );
+            'read: for (stream, error) in [(&output.stdout, false), (&output.stderr, true)] {
+                for chunk in stream.chunks(MAX_LINE_BYTES) {
+                    for line in String::from_utf8_lossy(chunk).lines() {
+                        if !push(line, error, &mut buffer) {
+                            break 'read;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(buffer)
+}
+
 async fn fetch(
     connection: &Connection,
     container: &Container,
@@ -647,6 +782,71 @@ async fn containerd_logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keywords_match_whole_words_in_any_case_and_a_stack_trace_is_one_issue() {
+        for text in [
+            "ERROR something",
+            "error: x",
+            "Traceback (most recent call last):",
+            "read: connection refused",
+            "request timeout after 5s",
+            "Out Of Memory",
+            "level=fatal msg=x",
+        ] {
+            assert!(looks_like_issue(text), "{text}");
+        }
+        for text in [
+            "terror",
+            "errors_total 4",
+            "all good",
+            "timeouts=0",
+            "panicky",
+        ] {
+            assert!(!looks_like_issue(text), "{text}");
+        }
+        let mut logs = LogBuffer::new(20);
+        for line in [
+            "fine",
+            "java.lang.Exception: broke",
+            "    at com.acme.Main(Main.java:1)",
+            "    at error.handler.Run(Run.java:2)",
+            "Caused by: java.io.IOException: error",
+            "fine again",
+            "    at not.part.of.anything.error",
+        ] {
+            logs.push("api", line, false);
+        }
+        let flagged: Vec<_> = logs.entries.iter().map(|entry| entry.issue).collect();
+        assert_eq!(flagged, [false, true, false, false, false, false, true]);
+    }
+
+    #[test]
+    fn issue_navigation_moves_between_shown_entries_and_counts_hidden_ones() {
+        let mut logs = LogBuffer::new(20);
+        logs.push("api", "error one", false);
+        logs.push("api", "fine", false);
+        logs.push("api", "error two payments", false);
+        logs.push("api", "error three", false);
+        let mut view = view::LogView::new(true);
+        view.sync(&logs, 80, 2);
+        assert!(view.next_issue(&mut logs, false));
+        assert_eq!(view.issue_counts(&logs), (Some(1), 3, 0));
+        assert!(!logs.follow, "Reading stops following");
+        view.next_issue(&mut logs, false);
+        assert_eq!(view.issue_counts(&logs).0, Some(2));
+        view.next_issue(&mut logs, true);
+        assert_eq!(view.issue_counts(&logs).0, Some(1));
+        view.next_issue(&mut logs, true);
+        assert_eq!(view.issue_counts(&logs).0, Some(3), "Wraps around");
+
+        view.filter.set_text("-payments");
+        assert_eq!(view.issue_counts(&logs).1, 2);
+        assert_eq!(view.issue_counts(&logs).2, 1);
+        view.filter.set_text("nothing-matches-this");
+        view.sync(&logs, 80, 2);
+        assert!(!view.next_issue(&mut logs, false));
+    }
 
     #[test]
     fn bounded_history_reports_eviction_and_keeps_paused_position() {

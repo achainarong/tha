@@ -1060,6 +1060,10 @@ mod agent {
                 let agent = Agent {
                     allow_delete,
                     allow_exec: false,
+                    allow_images: false,
+                    allow_download: false,
+                    allow_compose: false,
+                    allow_upload: false,
                     socket: socket.clone(),
                     audit: |_| {},
                     security: None,
@@ -1213,7 +1217,7 @@ mod agent {
             ),
             (
                 "POST /v1.53/images/create?fromImage=x HTTP/1.1\r\nHost: x\r\n\r\n",
-                "allowlist",
+                "--allow-images",
             ),
             (
                 "DELETE /containers/a?force=true HTTP/1.1\r\nHost: x\r\n\r\n",
@@ -1302,6 +1306,10 @@ mod agent {
                 Agent {
                     allow_delete,
                     allow_exec: false,
+                    allow_images: false,
+                    allow_download: false,
+                    allow_compose: false,
+                    allow_upload: false,
                     socket,
                     audit: |_| {},
                     security: None,
@@ -1398,6 +1406,10 @@ mod agent {
                 Agent {
                     allow_delete: false,
                     allow_exec: false,
+                    allow_images: false,
+                    allow_download: false,
+                    allow_compose: false,
+                    allow_upload: false,
                     socket,
                     audit: |_| {},
                     security: None,
@@ -1458,6 +1470,10 @@ mod agent {
                 Agent {
                     allow_delete: false,
                     allow_exec: false,
+                    allow_images: false,
+                    allow_download: false,
+                    allow_compose: false,
+                    allow_upload: false,
                     socket,
                     audit: |_| {},
                     security: None,

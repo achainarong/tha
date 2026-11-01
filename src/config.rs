@@ -29,6 +29,8 @@ pub struct Config {
     pub history_database: Option<PathBuf>,
     /// Total database/WAL budget; sampling pauses with a visible warning if full.
     pub history_disk_mb: u64,
+    /// How long the local service keeps metrics and events. Servers keep 24 hours.
+    pub history_retention_hours: u64,
     pub refresh_seconds: u64,
     pub metrics_refresh_seconds: u64,
     pub log_capacity: usize,
@@ -50,6 +52,11 @@ pub struct Config {
     pub remote_connect: crate::remote::ConnectMode,
     /// Exact displayed connection names, in preferred order. Unknown names are ignored.
     pub context_order: Vec<String>,
+    pub alerts: crate::alerts::Rules,
+    /// Opens Compose files. One of: vim, neovim, nano, vscode.
+    pub editor: crate::editor::Editor,
+    /// Asks GitHub once at startup whether a newer release exists. Off unless set.
+    pub check_updates: bool,
 }
 
 impl Default for Config {
@@ -58,6 +65,7 @@ impl Default for Config {
             discover_connections: true,
             history_database: None,
             history_disk_mb: 1024,
+            history_retention_hours: 24,
             refresh_seconds: 5,
             metrics_refresh_seconds: 1,
             log_capacity: 5000,
@@ -75,6 +83,9 @@ impl Default for Config {
             remotes: Vec::new(),
             remote_connect: Default::default(),
             context_order: Vec::new(),
+            alerts: Default::default(),
+            editor: Default::default(),
+            check_updates: false,
         }
     }
 }
@@ -95,8 +106,12 @@ impl Config {
             }
             _ => Self::default(),
         };
+        config.alerts.validate()?;
         if !(1..=300).contains(&config.refresh_seconds) {
             bail!("refresh_seconds must be between 1 and 300");
+        }
+        if !(1..=crate::history::MAX_RETENTION_HOURS).contains(&config.history_retention_hours) {
+            bail!("history_retention_hours must be between 1 and 720");
         }
         if !(16..=65_536).contains(&config.history_disk_mb) {
             bail!("history_disk_mb must be between 16 and 65536");

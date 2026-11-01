@@ -3,7 +3,8 @@
 use super::*;
 use crate::diagnostics::{
     self, EVIDENCE_PREVIEW, Freshness, HealthCheck, Incomplete, Inspection, Kind, LogCoverage,
-    MAX_ATTACHMENTS, NetworkMode, OverlapKind, ProbeSource, Relationship, Side, Status, View,
+    LogLoad, MAX_ATTACHMENTS, NetworkMode, OverlapKind, ProbeSource, Relationship, Side, Status,
+    View,
 };
 use time::OffsetDateTime;
 
@@ -283,7 +284,7 @@ fn health_lines(app: &App, view: &View) -> Vec<Line<'static>> {
     lines.extend(health_check_section(app, side));
     lines.extend(exit_section(app, side));
     lines.extend(explanations_section(inspection, &events));
-    lines.extend(events_section(app, &events));
+    lines.extend(events_section(app, side.target.engine, &events));
     lines.extend(logs_section(app, side, inspection));
     lines.push(Line::styled(
         crate::i18n::t("Evidence stays on this machine and is not saved or exported by this view."),
@@ -499,7 +500,11 @@ fn explanations_section(
     lines
 }
 
-fn events_section(app: &App, events: &[&crate::events::Event]) -> Vec<Line<'static>> {
+fn events_section(
+    app: &App,
+    engine: usize,
+    events: &[&crate::events::Event],
+) -> Vec<Line<'static>> {
     let mut lines = vec![heading(
         crate::tf!(
             "Related events ({shown} of {total} · e opens Events)",
@@ -509,8 +514,8 @@ fn events_section(app: &App, events: &[&crate::events::Event]) -> Vec<Line<'stat
         .as_str(),
     )];
     lines.push(Line::styled(
-        if app.metrics_database.is_some() {
-            crate::i18n::t("  Coverage: last 24 hours, saved by the service")
+        if app.events_saved(engine) {
+            crate::i18n::t("  Coverage: last 24 hours, saved")
         } else {
             crate::i18n::t("  Coverage: only what the engine retained and Tha saw while open")
         },
@@ -532,16 +537,44 @@ fn events_section(app: &App, events: &[&crate::events::Event]) -> Vec<Line<'stat
 }
 
 fn logs_section(app: &App, side: &Side, inspection: Option<&Inspection>) -> Vec<Line<'static>> {
+    let loaded = app
+        .diagnostics
+        .as_ref()
+        .and_then(|view| view.loaded_logs.as_ref())
+        .filter(|loaded| loaded.target == side.target);
+    let (buffer, covers) = match loaded.map(|loaded| &loaded.status) {
+        Some(LogLoad::Ready(buffer)) => (buffer, true),
+        _ => (&app.logs, app.logs_cover(&side.target)),
+    };
     let (coverage, entries) = diagnostics::related_logs(
-        &app.logs,
-        app.logs_cover(&side.target),
+        buffer,
+        covers,
         inspection.and_then(diagnostics::failure_time),
     );
-    let mut lines = vec![heading(crate::i18n::t("Related logs (l opens Logs)"))];
+    let mut lines = vec![heading(crate::i18n::t(
+        "Related logs (L loads them here · l opens Logs)",
+    ))];
+    match loaded.map(|loaded| &loaded.status) {
+        Some(LogLoad::Loading) => {
+            lines.push(Line::styled(crate::i18n::t("  Loading logs…"), muted()))
+        }
+        Some(LogLoad::Failed(error)) => lines.push(Line::styled(
+            crate::tf!("  Could not load logs: {error}", error = safe_text(error)),
+            accent(app, Color::Yellow),
+        )),
+        Some(LogLoad::Ready(_)) => lines.push(Line::styled(
+            crate::tf!(
+                "  Loaded for this view only, up to {limit} lines. Nothing is saved.",
+                limit = crate::logs::WINDOW_MAX_LINES
+            ),
+            muted(),
+        )),
+        None => {}
+    }
     lines.push(Line::styled(
         match coverage {
             LogCoverage::NotRetained => crate::i18n::t(
-                "  No logs are retained for exactly this container yet. Opening this view does not load them; l does.",
+                "  No logs are retained for exactly this container yet. Press L to load them here, or l to open Logs.",
             )
             .to_owned(),
             LogCoverage::Recent => crate::i18n::t(
@@ -961,7 +994,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .title_bottom(match kind {
             Kind::Health => crate::i18n::t(
-                " j/k Scroll · r Refresh · l Logs · e Events · m Metrics · Esc Close ",
+                " j/k Scroll · r Refresh · L Load logs · l Logs · e Events · m Metrics · x Export · Esc Close ",
             ),
             Kind::Network => {
                 crate::i18n::t(" j/k Scroll · r Refresh · p Peer · n Networks · Esc Close ")
@@ -1364,6 +1397,43 @@ mod tests {
         let output = text(&app, Kind::Health);
         assert!(!output.contains("from another container"), "{output}");
         assert!(output.contains("No logs are retained for exactly this container"));
+    }
+
+    #[test]
+    fn logs_load_only_on_request_and_stay_in_the_view_without_touching_the_logs_tab() {
+        let mut app = demo();
+        let before = open(&mut app, "/api-2", Kind::Health);
+        assert!(before.contains("Press L to load them here"), "{before}");
+        assert!(!before.contains("connection refused"), "{before}");
+        assert!(app.diagnostics_log_request.is_none());
+        let retained = app.logs.entries.len();
+
+        app.load_diagnostic_logs();
+        let after = text(&app, Kind::Health);
+        assert!(after.contains("connection refused"), "{after}");
+        assert!(after.contains("Nothing is saved"), "{after}");
+        assert_eq!(app.logs.entries.len(), retained);
+
+        app.diagnostics_close();
+        let reopened = open(&mut app, "/api-2", Kind::Health);
+        assert!(!reopened.contains("connection refused"), "{reopened}");
+    }
+
+    #[test]
+    fn loading_logs_requests_a_bounded_window_and_closing_cancels_it() {
+        let mut app = demo();
+        open(&mut app, "/api-2", Kind::Health);
+        app.demo = false;
+        app.load_diagnostic_logs();
+        let output = text(&app, Kind::Health);
+        assert!(output.contains("Loading logs"), "{output}");
+        let request = app.diagnostics_log_request.as_ref().unwrap();
+        assert_eq!(request.target.id, request.container.id);
+        // The demo container has a failed check, so the read stays around it.
+        let (since, until) = (request.since.unwrap(), request.until.unwrap());
+        assert_eq!(until - since, 71);
+        app.diagnostics_close();
+        assert!(app.diagnostics_log_request.is_none());
     }
 
     #[test]

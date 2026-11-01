@@ -15,7 +15,7 @@ fn draw_confirmation(frame: &mut Frame, app: &App, area: Rect) {
     };
     let request = &confirmation.request;
     let target = &request.target;
-    let dialog = centered(area, 96, area.height.saturating_sub(2).min(20));
+    let dialog = centered(area, 96, area.height.saturating_sub(2).min(28));
     frame.render_widget(Clear, dialog);
     let path = |path: &std::path::Path| safe_text(&path.to_string_lossy());
     let mut lines = vec![
@@ -45,6 +45,29 @@ fn draw_confirmation(frame: &mut Frame, app: &App, area: Rect) {
             .iter()
             .map(|file| Line::from(crate::tf!("Env file: {a0}", a0 = path(file)))),
     );
+    if request.action.changes_images() {
+        for service in request.before.iter().take(6) {
+            let id = service.image_id.as_deref().map_or_else(String::new, |id| {
+                id.strip_prefix("sha256:")
+                    .unwrap_or(id)
+                    .chars()
+                    .take(12)
+                    .collect()
+            });
+            lines.push(Line::from(crate::tf!(
+                "Now: {service} runs {image} {id}",
+                service = safe_text(&service.service),
+                image = safe_text(&service.image),
+                id = id
+            )));
+        }
+        if request.before.len() > 6 {
+            lines.push(Line::from(crate::tf!(
+                "…and {count} more",
+                count = request.before.len() - 6
+            )));
+        }
+    }
     lines.push(Line::styled(
         crate::i18n::t("These paths come from container labels and Compose runs what they contain. Check them."),
         accent(app, Color::Yellow),
@@ -108,16 +131,23 @@ fn draw_output(frame: &mut Frame, app: &mut App, area: Rect) {
     let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
     frame.render_widget(Paragraph::new(Line::styled(status, style)), parts[0]);
     let height = parts[1].height as usize;
-    let total = job.lines.len();
+    let review = (!job.review.is_empty()).then(|| crate::i18n::t("How it looks now:"));
+    let all: Vec<&str> = job
+        .lines
+        .iter()
+        .map(String::as_str)
+        .chain(review)
+        .chain(job.review.iter().map(String::as_str))
+        .collect();
+    let total = all.len();
     // scroll counts lines back from the newest, so output follows until scrolled away.
     let back = job.scroll.min(total.saturating_sub(height));
     let first = total.saturating_sub(height + back);
-    let visible: Vec<Line> = job
-        .lines
+    let visible: Vec<Line> = all
         .iter()
         .skip(first)
         .take(height)
-        .map(|line| Line::from(line.as_str()))
+        .map(|line| Line::from(*line))
         .collect();
     frame.render_widget(Paragraph::new(visible), parts[1]);
 }
@@ -147,6 +177,7 @@ mod tests {
         crate::demo::populate(&mut app);
         app.compose_confirmation = Some(Confirmation {
             request: Request {
+                before: Vec::new(),
                 connection: app.engines[0].connection.clone(),
                 action,
                 target: Target {

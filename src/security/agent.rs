@@ -361,6 +361,26 @@ impl Engine {
         headroom(&self.policy, load, memory, cpus)
     }
 
+    /// `(image, scanned, critical findings)` for each saved report, for the alert rules.
+    pub async fn critical_counts(&self) -> Result<Vec<(String, u64, usize)>> {
+        let connection = self.connection.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut counts = Vec::new();
+            for (target, scanned) in store::list(&connection)? {
+                if let Some(report) = store::load(&target)? {
+                    let critical = report
+                        .findings
+                        .iter()
+                        .filter(|finding| finding.severity.eq_ignore_ascii_case("critical"))
+                        .count();
+                    counts.push((target.image, scanned, critical));
+                }
+            }
+            Ok(counts)
+        })
+        .await?
+    }
+
     pub async fn handle(&self, route: Route<'_>) -> Result<serde_json::Value> {
         match route {
             Route::Images => {

@@ -1,4 +1,5 @@
-//! Versioned UI state only: never logs, filters, shell bytes, or credentials.
+//! Versioned UI state only: never logs, filters, shell bytes, or credentials. Filters the user
+//! saves on purpose live in `saved_views` instead.
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -9,7 +10,7 @@ use std::{
 };
 
 const LIMIT: u64 = 256 * 1024;
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Row {
     pub connection: String,
@@ -54,7 +55,8 @@ pub fn default_path() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .map(|root| root.join("tha/preferences.toml"))
 }
-pub fn load(path: &Path) -> Result<Option<Preferences>> {
+/// Reads a bounded regular file. Missing is `None`; symlinks and devices are refused.
+pub(crate) fn read_private(path: &Path) -> Result<Option<String>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.is_file() => {
             bail!("Preferences must be a regular file, not a symlink or device")
@@ -76,6 +78,13 @@ pub fn load(path: &Path) -> Result<Option<Preferences>> {
     if text.len() as u64 > LIMIT {
         bail!("Preferences exceed 256 KiB");
     }
+    Ok(Some(text))
+}
+
+pub fn load(path: &Path) -> Result<Option<Preferences>> {
+    let Some(text) = read_private(path)? else {
+        return Ok(None);
+    };
     let preferences: Preferences = toml::from_str(&text).context("Invalid preferences")?;
     if preferences.version != 1 || preferences.expanded.len() > 1024 {
         bail!("Unsupported preferences version or too many expanded branches");
@@ -96,7 +105,11 @@ pub fn load(path: &Path) -> Result<Option<Preferences>> {
 }
 
 pub fn save(path: &Path, preferences: &Preferences) -> Result<()> {
-    let text = toml::to_string(preferences)?;
+    write_private(path, &toml::to_string(preferences)?)
+}
+
+/// Replaces a file atomically, readable only by its owner.
+pub(crate) fn write_private(path: &Path, text: &str) -> Result<()> {
     if text.len() as u64 > LIMIT {
         bail!("Preferences exceed 256 KiB; existing state left intact");
     }

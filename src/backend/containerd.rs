@@ -199,6 +199,66 @@ async fn layers_at(
     })
 }
 
+/// One JSON object per line, as `nerdctl ... --format '{{json .}}'` prints. Only the fields named
+/// here are read, and lines that do not parse are skipped.
+fn parse_resources(output: &str, kind: &str) -> Vec<crate::model::Resource> {
+    let text = |value: &Value, key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(crate::model::safe_text)
+            .unwrap_or_default()
+    };
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|value| {
+            let name = text(&value, "Name");
+            if name.is_empty() {
+                return None;
+            }
+            Some(crate::model::Resource {
+                name,
+                // Nothing here says who owns it, so it is listed as shared rather than guessed.
+                external: true,
+                details: format!("{kind}: {}", text(&value, "Driver")),
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+/// Read-only. A failure is a warning, because containers are still worth showing without these.
+async fn list_resources(connection: &Connection, result: &mut Snapshot) {
+    let namespaces = result.namespaces.clone();
+    let list = |namespace: Option<String>, what: &'static str| {
+        let mut command = command(connection, namespace.as_deref());
+        command.args([what, "ls", "--format", "{{json .}}"]);
+        output(command)
+    };
+    match list(None, "network").await {
+        Ok(text) => result.networks = parse_resources(&text, "driver"),
+        Err(error) => result
+            .warnings
+            .push(format!("Networks unavailable: {error}")),
+    }
+    let mut complete = true;
+    for namespace in namespaces {
+        match list(Some(namespace.clone()), "volume").await {
+            Ok(text) => result.volumes.extend(parse_resources(&text, "driver")),
+            Err(error) => {
+                complete = false;
+                result
+                    .warnings
+                    .push(format!("Volumes unavailable in {namespace}: {error}"));
+            }
+        }
+    }
+    result.volumes.sort_by(|a, b| a.name.cmp(&b.name));
+    result.volumes.dedup_by(|a, b| a.name == b.name);
+    result.volumes_available = complete;
+}
+
 pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
     let mut namespaces_command = command(connection, None);
     namespaces_command.args(["namespace", "ls", "--quiet"]);
@@ -209,8 +269,9 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
         .map(str::to_owned)
         .collect();
     let mut result = Snapshot {
-        version: "containerd via nerdctl".into(), namespaces: namespaces.clone(),
-        warnings: vec!["Native containerd adapter: network/volume inventory is not available in this MVP; logs require nerdctl-managed logging.".into()],
+        version: "containerd via nerdctl".into(),
+        namespaces: namespaces.clone(),
+        warnings: vec!["Native containerd adapter: logs require nerdctl-managed logging.".into()],
         ..Default::default()
     };
     for namespace in namespaces {
@@ -250,6 +311,7 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
             }
         }
     }
+    list_resources(connection, &mut result).await;
     result.containers.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(result)
 }
@@ -394,6 +456,19 @@ fn parse_bytes(text: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resources_parse_one_object_per_line_and_skip_what_they_cannot_read() {
+        let found = parse_resources(
+            "{\"Name\":\"bridge\",\"Driver\":\"bridge\",\"Secret\":\"x\"}\nnot json\n{\"Driver\":\"x\"}\n{\"Name\":\"bad\\u001b[2J\"}\n",
+            "driver",
+        );
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].name, "bridge");
+        assert_eq!(found[0].details, "driver: bridge");
+        assert!(found[0].external);
+        assert!(!found[1].name.contains('\u{1b}'));
+    }
+
     #[test]
     fn stats_io_pairs_are_cumulative_bytes_and_missing_is_not_zero() {
         let usage = parse_usage(

@@ -262,7 +262,7 @@ If both install locations are on `PATH`, `command -v tha` shows which takes prec
 Tha never starts an engine, VM, or workload container automatically. Enabled service
 modules may run their documented helper containers after explicit setup/scan requests.
 
-## First MVP
+## Core features
 
 - Concurrent runtime discovery and refresh; a failed engine does not block others.
 - Runtime-first explorer with label-based Compose grouping and standalone containers.
@@ -279,7 +279,7 @@ modules may run their documented helper containers after explicit setup/scan req
 
 ### Runtime coverage
 
-| Runtime | MVP connection | Notes |
+| Runtime | Connection | Notes |
 | --- | --- | --- |
 | Docker Engine | Docker API over Unix socket | Local and rootless endpoints |
 | Docker Desktop | Docker API over Unix socket | Contexts and macOS socket discovery |
@@ -288,11 +288,11 @@ modules may run their documented helper containers after explicit setup/scan req
 | Podman | Docker-compatible API socket | Native machine discovery plus rootless/rootful local sockets; machine/API service must already be running |
 | Native containerd / nerdctl | `nerdctl` subprocess adapter | Requires `nerdctl` on PATH and an accessible containerd socket |
 
-Containerd namespaces are shown separately. Its network/volume inventory is
-**not implemented**; logs depend on nerdctl's logging configuration. Kubernetes
+Containerd namespaces are shown separately. Networks and volumes are listed through `nerdctl`,
+read-only and without which containers use them; logs depend on nerdctl's logging configuration. Kubernetes
 workloads may not expose Docker-shaped inspect data and remain inspection-only.
 On macOS, a VM's containerd guest socket is not automatically reachable from the
-host. Guest/VM transports are not implemented in this MVP.
+host. Guest/VM transports are not implemented.
 
 SSH, TLS, and TCP Docker contexts remain visible but are marked unsupported.
 Tha does not silently turn secure connections into plaintext connections. To
@@ -445,16 +445,32 @@ to use one, even if the server allows it. That is a client setting: to turn pass
 login off for everyone, set `PasswordAuthentication no` on the server.
 
 **What the agent allows:** listing and inspecting containers, images, networks and
-volumes, image history, logs, stats, events, and start, stop and restart. Everything
-else is refused, including general create, exec, pull, build, file copy, prune and image
-export. Security endpoints can request only agent-constructed, verified scanner jobs
+volumes, image history, logs, stats, events, and start, stop, restart, pause, unpause and kill. Everything
+else is refused, including general create, build, and image export. Security endpoints can request only agent-constructed, verified scanner jobs
 (enabled by setup unless `--no-security` is specified).
 Deleting containers, images and volumes is off unless setup ran with
-`--allow-delete`, and force is always refused. Writes and refusals go to the server's
-system log.
+`--allow-delete`, and force is always refused. Container exec and server shells are
+off unless setup ran with `--allow-exec`; see [Interactive exec](#interactive-exec).
+Writes and refusals go to the server's system log.
 
-**Not available on servers:** exec, image pull, image update checks, Compose actions,
-background metrics history, and starting or stopping the engine itself.
+**Image pull and update checks** are off unless setup ran with `--allow-images`. Pulls are
+anonymous, because the agent passes no registry credentials, so private images are not
+available this way. The option makes the server contact registries and use disk, and it lets
+every holder of the key pull any public image. Updating `/etc/tha/agent.toml` with
+`allow_images = true` and restarting `tha-agent` does the same. Pruning needs `--allow-delete`,
+because Tha removes each unreferenced resource individually.
+
+**File downloads** need their own options; see [Downloading files](#downloading-files).
+
+**Compose actions** are off unless setup ran with `--allow-compose`. The agent finds the project from
+its own engine's labels, runs the Compose CLI on the server (Docker's Compose plugin must be installed
+there), and refuses files that are links or that anyone can change. **Anyone holding the key can then
+restart and recreate those projects, and anyone who can also edit a Compose file effectively has root**,
+because a Compose file can mount the host. With this option the agent service can read home folders,
+read-only, so projects kept there work. Registry credentials are not used.
+
+**Not available on servers:** starting or stopping the engine itself. The agent records
+[background metrics history](remote-history.md) and container events on its own.
 
 **What it does not protect:** reading is still sensitive, because container inspect
 includes environment variables and logs can contain secrets. A stolen key can also
@@ -1088,8 +1104,10 @@ while the tab is open. A group selection shows only the health status of each co
 
 Keys: **`j`/`k`** scroll, **`r`** refreshes, **`l`**, **`e`** and **`m`** open Logs, Events and
 Metrics for the same container, and **Esc** closes. Logs keep your filter, and the view warns
-when it hides related entries. This view does not load logs itself, so its preview is empty
-until Logs has been opened for exactly this container. Event coverage is the last 24 hours
+when it hides related entries. Opening this view does not load logs by itself. Press **`L`** to
+read up to 300 lines for exactly this container: 60 seconds before to 10 seconds after a known
+failure, otherwise the latest lines. They stay in this view until it closes, are not saved, and
+leave the Logs tab unchanged. Event coverage is the last 24 hours
 with the service, and otherwise only what the engine retained and Tha saw while open.
 
 Each load has a 5-second deadline, and detailed inspection runs only when you open or refresh.
@@ -1099,6 +1117,11 @@ that adapter has no detailed inspection. Nothing is uploaded or saved. Remember 
 health-check output on screen can itself contain secrets.
 
 ## Network troubleshooting
+
+Everything below is passive. To actually test a connection, run **`:network-test host:port`** with a container
+selected. It runs inside that container with what the image has (`getent`, then `nc` or `bash`), and shows where
+it ran, what it contacted and the result, or says that it could not test. It installs nothing and is never
+automatic. On a server it needs `--allow-exec`, and it waits up to 10 seconds.
 
 With one container selected, run **`:network-diagnose`** or choose it from the **`a`** menu.
 **This view is passive.** It reads what the runtime reports and sends no DNS lookups, pings,
@@ -1126,9 +1149,219 @@ Keys: **`j`/`k`** scroll, **`r`** refreshes, **`p`** chooses a peer, **`n`** ope
 peers, and appear only as counts of hidden attachments and overlaps. Native containerd keeps
 its existing limits: no detailed inspection and no peer comparison.
 
+## Uploading files
+
+Run **`:upload LOCAL-PATH /folder/in/the/container`** with a container selected. A dialog shows both ends
+before anything is written, because anything there with the same name is replaced and the running workload
+can see it. Progress appears in the download manager, whose Downloads pane lists uploads too. On a server
+this needs `--allow-upload`, which lets every holder of the key change files inside containers.
+
+## Editing Compose files
+
+Run **`:compose-edit`** on a Compose project or service. It opens the file in your editor; a project
+with several files asks which one. Choose the editor in Settings (`,`), or set `editor` in `config.toml`
+to `vim` (the default), `neovim`, `nano` or `vscode`. Tha does not read `VISUAL` or `EDITOR`, and it says
+so if the editor is not installed rather than opening a different one. With VS Code, Tha waits until you
+close the file's tab. Saving never applies anything; a Compose action does that.
+
+**On a server,** this needs `--allow-compose-edit`. Nothing is mounted: Tha copies the file to a private
+temporary folder here and sends it back when the editor closes. If it changed on the server meanwhile,
+Tha refuses to overwrite it and keeps your copy, naming where. The old version is kept beside it as
+`<file>.tha-backup`. The write happens as the SSH login user, so normal permissions decide, and a file
+you cannot write opens read-only. Only `.yml`, `.yaml` and `.env` files up to 1 MiB qualify.
+`root` can edit them all; the dedicated `tha` user only those it has been given access to.
+
+## Downloading files
+
+Run **`:download-manager`** on a container or server row. **Browse** shows a tree that builds in
+the background, so the panel never waits for it. Opening a folder reads it first. **`Enter`** opens
+a folder or starts downloading a file, **`d`** downloads the selected file or folder, and **`Tab`**
+switches to **Downloads**, where you can follow progress and speed and press **`x`** to cancel.
+**`Esc`** closes the panel and downloads keep running, with a `↓` indicator in the status line.
+
+Run **`:download PATH`** when you know the path. Leave a shell with `Ctrl-]` first. The path must be
+absolute, because Tha cannot see a shell's current directory. For example:
+
+```
+:download /tmp/mydb.dump
+```
+
+Both open the same dialog, which shows the size before anything transfers. A folder also shows its
+file count, as a running total while it is counted, and you can start without waiting. Counting a
+container's folder reads all of its contents on the host, so it can be slow on a big folder; it
+stops when the dialog closes. Edit **Save to**, then press **`Enter`**. A folder is saved as one
+`.tar` file and is not unpacked. Files are readable only by you, and an existing file is never
+replaced. A failed or cancelled download removes its partial file and has to start again. Tha never
+creates backups: you run your own commands, and it copies what you name.
+
+**What runs and what is kept.** Browsing a container runs `ls` in it, one folder at a time, starting
+when you open it in the manager. Selecting a container elsewhere starts nothing. If the image has no
+`ls`, browsing says so and `:download PATH` still works. The walk goes 6 levels deep, up to 2,000
+folders and 100,000 entries, skips `/proc`, `/sys` and `/dev`, and pauses while the panel is closed.
+The tree stays in memory only and is released after 10 minutes without use. Native containerd and
+Kubernetes-managed containers are not covered.
+
+**On servers,** each part is off until it is enabled in the server's setup:
+
+| Option | Allows |
+| --- | --- |
+| `--allow-download` | Downloading any file or folder in a container |
+| `--allow-exec` | Browsing a container, which also allows shells |
+| `--allow-server-download` | Browsing and downloading the server's own files as the SSH login user |
+
+Every holder of the key gains that access. A root login with `--allow-server-download` exposes
+files such as `/etc/shadow` and private keys. Normal permissions decide everything else: the
+dedicated `tha` user can read only what it has been given. The key stays restricted, so plain `scp`
+and `sftp` still do not work.
+
+## Keeping history longer
+
+The local service keeps metrics and events for 24 hours. Set `history_retention_hours` in `config.toml`, up to
+720, to keep more, and pan back in the Metrics tab to see it. `history_disk_mb` still limits the size, and
+when it is reached new readings stop being saved rather than old ones being lost. Readings are kept at
+full detail, so a long retention needs a larger budget. Agents on servers always keep 24 hours.
+
+## Scripting
+
+`tha ps`, `tha images` and `tha volumes` print what local engines report, with `--json` for scripts:
+
+```sh
+tha ps --json | jq -r '.connections[].containers[] | select(.health == "unhealthy") | .name'
+```
+
+The JSON has a `version`, which changes only if a field does. A connection that cannot answer has an
+`error` and empty lists, and the command then exits non-zero, so a stopped engine is not mistaken for an
+empty one. Servers are not included, because connecting can need a passphrase a script cannot enter.
+
+## Updating
+
+`tha update` installs the latest release into the folder Tha is in, using the same installer as the README,
+and `tha update --check` only reports. Set `check_updates = true` in `config.toml` to be told at startup;
+that contacts GitHub, so it is off by default. Agents update separately: `:capabilities` shows when a
+server's agent is older than Tha, and rerunning the setup command on the server updates it. Removing a server
+from Tha reminds you that its key stays valid until removed from `authorized_keys` on the server.
+
+## Alerts
+
+A red **`⚠ 2`** at the top means something needs attention; **`:alerts`** lists it. Tha raises an alert
+for a crash loop (5 failed exits in 10 minutes), an out-of-memory kill, a failing health check, memory
+above 90% of its limit for 5 whole minutes, and an unreachable server. Each incident is one alert with a
+rising count, and it clears when the problem stops. **`Enter`** goes to the workload. A connection that
+goes down neither confirms nor clears its alerts, and the list says so. Missing readings never count.
+
+Alerts are checked while Tha is open. With a current agent or the local service, events are saved, so
+crash loops and out-of-memory kills from while Tha was closed appear as finished incidents. To be told
+while Tha is closed, see [Alert webhooks](#alert-webhooks).
+
+Change the limits, or turn alerts off, in `config.toml`:
+
+```toml
+[alerts]
+enabled = true
+restart_count = 5
+restart_minutes = 10
+memory_percent = 90
+memory_minutes = 5
+oom_minutes = 10
+```
+
+## Alert webhooks
+
+To be told about a problem while Tha is closed, have a server's agent post to a URL of your choice:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent --key 'ssh-ed25519 AAAA...' --alert-webhook 'https://hooks.example/your-token'
+```
+
+Each server is set up once and off by default. The agent checks every 30 seconds and posts one JSON
+message per incident for a crash loop, an out-of-memory kill, a failing health check, a disk with under
+5% free, and a new scan with more critical vulnerabilities than the last one:
+
+```json
+{"host":"prod-1","engine":"docker","rule":"crash_loop","subject":"shop-api-1","detail":"Exited 5 times in 10 minutes","at_ms":1793536742000}
+```
+
+No logs, environment variables or file contents are sent. The URL must be `https://`, redirects are not
+followed, and a failed post is noted in the journal once and not retried. This is the one thing that makes
+the agent start outbound connections on its own. The URL is kept in `/etc/tha/alert-webhook`, readable
+only by root, and a token in it can appear in your shell history and the process list while setup runs, so
+you can also write that file yourself and restart `tha-agent`. Remove it with `--no-alert-webhook`.
+
+The agent uses the default limits. High memory is not covered here, and anything that happens while the
+agent itself is stopped goes unnoticed.
+
+## Incidents
+
+Run **`:timeline`** on a container, service or project. It groups exits, out-of-memory kills, health
+failures and CPU or memory spikes into incidents, with a new incident after 10 quiet minutes.
+Stopping something on purpose is not an incident. **`Enter`** opens that container's logs from 60
+seconds before the moment; `:logs-since off` shows all of them again. Things are grouped because
+they were close in time, which does not prove a cause.
+
+**What it covers:** with the local service, or on a server with a current agent, events are saved for
+24 hours, including while Tha is closed. Otherwise only what the engine retained and Tha saw while
+open. Spikes come from readings taken while Tha is open. A spike is CPU at 90% or memory at 90% of its
+limit, and missing readings are never counted.
+
+## Fleet health
+
+Run **`:fleet`** to see what needs attention across every connection: failed, unhealthy and
+restarting containers, unreachable servers, and offline runtimes. With the Security module, it also
+lists running containers whose last saved scan has critical vulnerabilities. Failures come first.
+**`Enter`** jumps to the workload, and `Backspace` returns. A server that is not connected reads as
+*not checked*, never as healthy, and the top line says how many connections were actually checked.
+The list uses what Tha already knows and sends no extra requests. It updates while it is open.
+
+## What a connection can do
+
+Run **`:capabilities`** on a runtime or server row. It lists logs, events, diagnostics, shells,
+Compose, image pull and updates, deleting, security scans, and metrics history, each as
+**available**, **turned off**, **missing dependency**, **not supported**, **unreachable** or
+**unknown**, with what to do about it. Servers report their own opt-ins. An older agent reads as
+unknown rather than off, and a disconnected server reads as unreachable. The view sends no
+requests, and "available" means Tha has what the feature needs, not that a run will succeed.
+
+## Exporting diagnostics
+
+Press **`x`** in the health view to save that view's state, events and up to 300 log lines as one JSON file,
+readable only by you. It never holds environment variables or commands, and nothing is uploaded. Redaction
+is on by default and hides common secrets, but it cannot find everything, so review the file before sharing it.
+
+## Saved views
+
+Save what you are looking at under a name, then return to it later:
+
+| Command | Effect |
+| --- | --- |
+| `:save-view NAME` | Save the current view. An existing name is replaced. |
+| `:saved-views` | Choose a saved view from a list. |
+| `:open-view NAME` | Open a saved view by name. |
+| `:delete-view NAME` | Delete a saved view. |
+
+A view keeps the focused server and project, the selected row, the top-level overview, the
+tab, Explorer search, log filters, and the image or volume search, filter and sort. **Filter
+text is written to disk**, unlike other state, so leave secrets out of filters you save. Views
+are stored in `$XDG_STATE_HOME/tha/views.toml` (default `~/.local/state/tha/views.toml`),
+readable only by you. With `save_preferences = false` or in demo mode they last for the session.
+
+Opening a view only changes what is shown. It never connects a server or opens a shell, and
+`Backspace` returns to where you were. If a server, runtime or project no longer exists, Tha opens
+the rest and names what is unavailable.
+
 ## Log filters and export
 
+### Possible issues
+
+Log lines containing `error`, `fatal`, `panic`, `exception`, `traceback`, `timeout`, `stack trace`,
+`connection refused` or `out of memory` are shown in red and marked on the scrollbar. **`i`** and **`I`** move
+between them, separately from search, and the status line says where you are. A stack trace counts as
+one. This only covers logs that are loaded, and it is a keyword guess: it can flag harmless lines and miss
+real failures. Rebind the keys with `next-issue` and `previous-issue`.
+
 ### Text filter
+
+A word starting with `-` hides messages containing it, so `500 -healthcheck` shows 500s that are not
+health checks. Use `\-v` to search for a literal `-v`.
 
 Press **F3 in Logs** or run `:filter-logs` and type some words. Only entries whose
 message contains **every** word stay visible, so `backend1 500` keeps
@@ -1221,6 +1454,15 @@ opens their bounded, sanitized details with a warning. Tha never executes instru
 extracts layers, or exports history automatically.
 
 ## Container and Compose lifecycle actions
+
+Besides the keys below, **`:pause`**, **`:unpause`** and **`:kill`** ask for the same confirmation. Kill
+stops a process at once, with no chance to shut down cleanly. On servers these work with the agent's
+normal lifecycle permissions, and the agent accepts no other signal than the default.
+
+**`:copy-id`**, **`:copy-name`**, **`:copy-image`** and **`:copy-log-line`** copy to your clipboard through the
+terminal, if it allows that (OSC 52). The log view has no line cursor, so `:copy-log-line` copies the
+newest line showing. Tha reloads `config.toml` within a few seconds of it changing. Connections and
+servers still need a restart, and a file with a mistake is ignored with a message.
 
 With **Explorer focused**, select a container, Compose service/project, **Services**
 group, or **Standalone** group. Runtime rows have separate runtime-wide behavior
@@ -1536,6 +1778,19 @@ containerd image inventory was added by this change.
 - `platform.rs`: resolved image platform lookup and bounded metadata cache.
 - `ui/`: Ratatui rendering using the terminal's palette.
 - `main.rs`: async event loop, refresh workers, and terminal cleanup.
+- `main_input.rs`: keyboard, mouse, and command handling.
+- `saved_views.rs`: named views saved on request, in their own private file.
+- `capabilities.rs`: what each connection can do and why not.
+- `fleet.rs`: what needs attention across all connections.
+- `compose_edit.rs`: editing Compose files, locally and on servers.
+- `editor.rs`: the supported editors.
+- `query.rs`: the `ps`, `images` and `volumes` commands.
+- `update.rs`: `tha update` and the new-version notice.
+- `alerts.rs`: alert rules, incidents, and when they clear.
+- `agent/alerts.rs`: the agent's own rules and its opt-in webhook.
+- `timeline.rs`: groups events and metric spikes into incidents.
+- `files.rs`: file transport over tar streams, for containers and servers.
+- `downloads.rs`: download manager state: the background tree, its cache, and jobs.
 
 The UI never awaits engine requests. Each engine refreshes independently;
 failures retain visibly stale last-known inventory. Log tasks are cancelled when
@@ -1550,6 +1805,5 @@ starts commands in the selected workload—only exec into containers you trust.
 Logs can themselves contain
 secrets—Tha cannot infer or redact every application-specific secret.
 
-This is an early MVP, not a claim of tested parity across every runtime. Next:
-broader Podman/containerd compatibility testing, native containerd transport,
-secure remote transports, explicitly associated Compose orchestration, and release-contract automation.
+Runtimes are not all tested to the same depth, so this is not a claim of parity
+across them. Planned work is listed in [improvement ideas](improvement-ideas.md).

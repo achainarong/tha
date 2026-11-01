@@ -137,6 +137,11 @@ impl Target {
             Action::Stop => "stop",
             Action::Restart => "restart",
             Action::Delete => bail!(crate::i18n::t("Runtime deletion is disabled")),
+            Action::Pause | Action::Unpause | Action::Kill => {
+                bail!(crate::i18n::t(
+                    "This action works on workloads, not runtimes"
+                ))
+            }
         };
         Ok(match self {
             Self::Colima { profile } => vec![(

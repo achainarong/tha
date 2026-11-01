@@ -38,7 +38,8 @@ pub async fn relay(engine: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn unit(executable: &Path) -> Result<String> {
+/// `read_home` lets Compose read projects kept in home folders, read-only. Only that opt-in needs it.
+pub fn unit(executable: &Path, read_home: bool) -> Result<String> {
     let path = executable
         .to_str()
         .context("Invalid agent executable path")?;
@@ -73,21 +74,32 @@ IOWeight=10
 IOSchedulingClass=idle
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome={protect_home}
 PrivateTmp=yes
 ReadWritePaths=/run/tha-agent /var/lib/tha-agent
 TimeoutStopSec=45
 
 [Install]
 WantedBy=multi-user.target
-"
+",
+        protect_home = if read_home { "read-only" } else { "yes" }
     ))
 }
 
 pub fn install(executable: &Path) -> Result<()> {
     validate_executable(executable)?;
     let path = Path::new("/etc/systemd/system/tha-agent.service");
-    super::setup::atomic_write(path, &unit(executable)?, 0o644, Some((0, 0)))?;
+    super::setup::atomic_write(
+        path,
+        &unit(
+            executable,
+            // A policy that cannot be read here keeps the stricter sandbox.
+            super::load_config(Path::new(super::CONFIG_PATH))
+                .is_ok_and(|config| config.allow_compose),
+        )?,
+        0o644,
+        Some((0, 0)),
+    )?;
     for args in [
         &["daemon-reload"][..],
         &["enable", "tha-agent.service"],
@@ -148,6 +160,13 @@ pub async fn run() -> Result<()> {
     let mut listeners = JoinSet::new();
     let mut workers = Vec::new();
     let mut history_workers = Vec::new();
+    // A bad file stops alerts, not the agent, and the journal says why.
+    let webhook = super::alerts::load_webhook(Path::new(super::alerts::WEBHOOK_PATH), 0)
+        .unwrap_or_else(|error| {
+            eprintln!("tha-agent: alert webhook ignored: {error:#}");
+            None
+        });
+    let mut alert_tasks = Vec::new();
     for engine in &config.engines {
         let path = socket(&engine.name);
         if let Ok(metadata) = std::fs::symlink_metadata(&path) {
@@ -191,9 +210,21 @@ pub async fn run() -> Result<()> {
                 None
             }
         };
+        if let (Some(url), Some(history)) = (&webhook, &history) {
+            alert_tasks.push(super::alerts::spawn(
+                url.clone(),
+                engine.name.clone(),
+                history.clone(),
+                security.clone(),
+            )?);
+        }
         let agent = Arc::new(Agent {
             allow_delete: config.allow_delete,
             allow_exec: config.allow_exec,
+            allow_images: config.allow_images,
+            allow_download: config.allow_download,
+            allow_compose: config.allow_compose,
+            allow_upload: config.allow_upload,
             socket: engine.socket.clone(),
             audit: super::syslog,
             security,
@@ -227,6 +258,9 @@ pub async fn run() -> Result<()> {
         result = listeners.join_next() => { anyhow::bail!("Agent listener stopped: {result:?}"); }
     }
     listeners.abort_all();
+    for task in alert_tasks {
+        task.abort();
+    }
     for worker in history_workers {
         if let Err(error) = worker.shutdown().await {
             eprintln!("tha-agent: history shutdown failed: {error:#}");
@@ -248,7 +282,14 @@ mod tests {
     use super::*;
     #[test]
     fn unit_has_no_network_listener_and_uses_private_state() {
-        let unit = unit(Path::new("/usr/local/bin/tha-agent")).unwrap();
+        let unit = unit(Path::new("/usr/local/bin/tha-agent"), false).unwrap();
+        assert!(unit.contains("ProtectHome=yes"));
+        let reading = super::unit(Path::new("/usr/local/bin/tha-agent"), true).unwrap();
+        assert!(reading.contains("ProtectHome=read-only"));
+        assert!(
+            reading.contains("ProtectSystem=strict"),
+            "Everything else stays read-only"
+        );
         assert!(unit.contains("ExecStart=/usr/local/bin/tha-agent daemon"));
         assert!(unit.contains("StateDirectoryMode=0700"));
         assert!(!unit.contains("ListenStream"));
@@ -261,7 +302,7 @@ mod tests {
             "/tmp/a\nExecStart=/bin/sh",
             "relative",
         ] {
-            assert!(unit(Path::new(path)).is_err());
+            assert!(unit(Path::new(path), false).is_err());
         }
     }
 }

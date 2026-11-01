@@ -15,11 +15,21 @@ use futures_util::StreamExt;
 
 pub fn connect(connection: &Connection) -> Result<Docker> {
     // The one place a remote server becomes a socket. Everything above it stays transport-blind.
-    if let Some(socket) = crate::remote::local_socket(&connection.endpoint) {
+    if crate::remote::local_socket(&connection.endpoint).is_some() {
+        let socket = socket_path(connection)?;
         let socket = socket
             .to_str()
             .context("Remote socket path is not valid text")?;
         return Ok(Docker::connect_with_unix(socket, 30, API_DEFAULT_VERSION)?);
+    }
+    let path = socket_path(connection)?;
+    let path = path.to_str().context("Socket path is not valid text")?;
+    Ok(Docker::connect_with_unix(path, 10, API_DEFAULT_VERSION)?)
+}
+
+fn socket_path(connection: &Connection) -> Result<std::path::PathBuf> {
+    if let Some(socket) = crate::remote::local_socket(&connection.endpoint) {
+        return Ok(socket);
     }
     let path = connection
         .endpoint
@@ -27,11 +37,56 @@ pub fn connect(connection: &Connection) -> Result<Docker> {
         .unwrap_or(&connection.endpoint);
     if !path.starts_with('/') {
         bail!(
-            "This MVP supports Unix sockets only. Configure a local socket; SSH/TLS/TCP transport is not implemented ({}).",
+            "Tha connects to Unix sockets only. Configure a local socket; SSH/TLS/TCP transport is not implemented ({}).",
             connection.endpoint
         );
     }
-    Ok(Docker::connect_with_unix(path, 10, API_DEFAULT_VERSION)?)
+    Ok(path.into())
+}
+
+/// GET one JSON document without trusting the engine's response size: Bollard reads a whole
+/// body before parsing it, so calls that must stay bounded read it here and stop at `limit`.
+pub async fn get_json_capped<T: serde::de::DeserializeOwned>(
+    connection: &Connection,
+    docker: &Docker,
+    path_and_query: &str,
+    limit: usize,
+) -> Result<T> {
+    use http_body_util::{BodyExt, Empty};
+    use hyper::body::Bytes;
+    let stream = tokio::net::UnixStream::connect(socket_path(connection)?).await?;
+    let (mut sender, driver) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await?;
+    let driver = tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let result = async {
+        let mut response = sender
+            .send_request(
+                hyper::Request::builder()
+                    .uri(format!("/v{}{path_and_query}", docker.client_version()))
+                    .header("Host", "docker")
+                    .body(Empty::<Bytes>::new())?,
+            )
+            .await?;
+        let status = response.status();
+        let mut bytes = Vec::new();
+        while let Some(frame) = response.body_mut().frame().await {
+            if let Ok(data) = frame?.into_data() {
+                anyhow::ensure!(
+                    bytes.len() + data.len() <= limit,
+                    "{}",
+                    crate::i18n::t("The engine's response is too large to read")
+                );
+                bytes.extend_from_slice(&data);
+            }
+        }
+        anyhow::ensure!(status.is_success(), "Docker API returned {status}");
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+    .await;
+    driver.abort();
+    result
 }
 
 /// Podman's Docker-compatible /info.ID is generated anew on each request.
@@ -241,6 +296,16 @@ pub async fn apply_action(
                     )
                     .await
             }
+            Action::Pause => docker.pause_container(&container.id).await,
+            Action::Unpause => docker.unpause_container(&container.id).await,
+            Action::Kill => {
+                docker
+                    .kill_container(
+                        &container.id,
+                        None::<bollard::query_parameters::KillContainerOptions>,
+                    )
+                    .await
+            }
             Action::Delete => {
                 docker
                     .remove_container(
@@ -269,6 +334,40 @@ pub async fn apply_action(
         Ok(Err(error)) => Status::Unknown(format!("{error}")),
         Err(_) => Status::Unknown("Request timed out; the runtime may still complete it".into()),
     }
+}
+
+/// Who uses one network or volume, in container order.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Attached<'a> {
+    containers: Vec<String>,
+    projects: std::collections::BTreeSet<&'a str>,
+}
+
+impl Attached<'_> {
+    fn shared(&self) -> bool {
+        self.projects.len() > 1
+    }
+}
+
+/// One pass over the containers, instead of scanning them all again for every resource.
+fn attachments<'a>(
+    containers: &'a [Container],
+    names: impl Fn(&'a Container) -> &'a [String],
+) -> std::collections::HashMap<&'a str, Attached<'a>> {
+    let mut index = std::collections::HashMap::<&str, Attached>::new();
+    for container in containers {
+        // A duplicate name on one container must not list that container twice.
+        let mut seen = std::collections::HashSet::new();
+        for name in names(container) {
+            if !seen.insert(name.as_str()) {
+                continue;
+            }
+            let attached = index.entry(name).or_default();
+            attached.containers.push(container.name.clone());
+            attached.projects.extend(container.project.as_deref());
+        }
+    }
+    index
 }
 
 pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
@@ -406,14 +505,19 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
             namespace: None,
         });
     }
-    // Resource failures are partial failures, not a reason to hide containers.
-    let images = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        docker.list_images(Some(ListImagesOptionsBuilder::default().all(true).build())),
-    )
-    .await
-    .context("Image inventory timed out after 2s")
-    .and_then(|result| result.map_err(Into::into));
+    // Resource failures are partial failures, not a reason to hide containers. These requests
+    // do not depend on each other, so a slow one does not delay starting the others.
+    let (images, networks, volumes) = tokio::join!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            docker.list_images(Some(ListImagesOptionsBuilder::default().all(true).build())),
+        ),
+        docker.list_networks(None::<ListNetworksOptions>),
+        docker.list_volumes(None::<ListVolumesOptions>),
+    );
+    let images = images
+        .context("Image inventory timed out after 2s")
+        .and_then(|result| result.map_err(Into::into));
     match images {
         Ok(images) => {
             let mut images: Vec<_> = images
@@ -438,26 +542,17 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
         }
         Err(error) => result.warnings.push(format!("Images unavailable: {error}")),
     }
-    match docker.list_networks(None::<ListNetworksOptions>).await {
+    match networks {
         Ok(networks) => {
+            let attachments = attachments(&result.containers, |container| &container.networks);
             for network in networks {
                 let labels = network.labels.unwrap_or_default().into_iter().collect();
                 let name = network.name.unwrap_or_default();
                 let project = model::project(&labels);
-                let owners: std::collections::BTreeSet<_> = result
-                    .containers
-                    .iter()
-                    .filter(|c| c.networks.contains(&name))
-                    .filter_map(|c| c.project.clone())
-                    .collect();
+                let attached = attachments.get(name.as_str());
                 result.networks.push(Resource {
-                    containers: result
-                        .containers
-                        .iter()
-                        .filter(|c| c.networks.contains(&name))
-                        .map(|c| c.name.clone())
-                        .collect(),
-                    external: project.is_none() || owners.len() > 1,
+                    containers: attached.map_or_else(Vec::new, |a| a.containers.clone()),
+                    external: project.is_none() || attached.is_some_and(Attached::shared),
                     name,
                     project,
                     details: format!(
@@ -472,27 +567,18 @@ pub async fn snapshot(connection: &Connection) -> Result<Snapshot> {
             .warnings
             .push(format!("Networks unavailable: {error}")),
     }
-    match docker.list_volumes(None::<ListVolumesOptions>).await {
+    match volumes {
         Ok(volumes) => {
             result.volumes_available = true;
             result.warnings.extend(volumes.warnings.unwrap_or_default());
+            let attachments = attachments(&result.containers, |container| &container.volumes);
             for volume in volumes.volumes.unwrap_or_default() {
                 let labels = volume.labels.into_iter().collect();
                 let project = model::project(&labels);
-                let owners: std::collections::BTreeSet<_> = result
-                    .containers
-                    .iter()
-                    .filter(|c| c.volumes.contains(&volume.name))
-                    .filter_map(|c| c.project.clone())
-                    .collect();
+                let attached = attachments.get(volume.name.as_str());
                 result.volumes.push(Resource {
-                    containers: result
-                        .containers
-                        .iter()
-                        .filter(|c| c.volumes.contains(&volume.name))
-                        .map(|c| c.name.clone())
-                        .collect(),
-                    external: project.is_none() || owners.len() > 1,
+                    containers: attached.map_or_else(Vec::new, |a| a.containers.clone()),
+                    external: project.is_none() || attached.is_some_and(Attached::shared),
                     name: volume.name,
                     project,
                     details: format!("driver: {} · mount: {}", volume.driver, volume.mountpoint),
@@ -625,6 +711,103 @@ pub fn parse_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A fake engine: `/images`, `/networks` and `/volumes` each take `delay`, and networks fail.
+    async fn slow_engine(name: &str, delay: std::time::Duration) -> Connection {
+        let directory =
+            std::env::temp_dir().join(format!("tha-snapshot-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("engine.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = vec![0; 4096];
+                    let read = stream.read(&mut request).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&request[..read]).to_string();
+                    let line = head.lines().next().unwrap_or_default();
+                    let slow = ["/images/", "/networks", "/volumes"]
+                        .iter()
+                        .any(|path| line.contains(path));
+                    if slow {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let (status, body) = if line.contains("/version") {
+                        ("200 OK", r#"{"ApiVersion":"1.45"}"#)
+                    } else if line.contains("/networks") {
+                        ("500 Internal Server Error", r#"{"message":"broken"}"#)
+                    } else if line.contains("/volumes") {
+                        ("200 OK", r#"{"Volumes":[],"Warnings":[]}"#)
+                    } else if line.contains("/info") {
+                        ("200 OK", "{}")
+                    } else if line.contains("/containers/json") {
+                        (
+                            "200 OK",
+                            r#"[{"Id":"abc","Names":["/web"],"State":"running"}]"#,
+                        )
+                    } else {
+                        ("200 OK", "[]")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        Connection {
+            name: name.into(),
+            kind: crate::config::BackendKind::Docker,
+            endpoint: format!("unix://{}", socket.display()),
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_inventory_requests_overlap_and_one_failure_keeps_the_rest() {
+        let delay = std::time::Duration::from_millis(600);
+        let connection = slow_engine("overlap", delay).await;
+        let started = std::time::Instant::now();
+        let snapshot = snapshot(&connection).await.unwrap();
+        // Three requests one after another would need at least three delays.
+        assert!(started.elapsed() < delay * 2, "{:?}", started.elapsed());
+        assert_eq!(snapshot.containers.len(), 1);
+        assert_eq!(snapshot.images.as_ref().map(Vec::len), Some(0));
+        assert!(snapshot.volumes_available);
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("Networks unavailable")),
+            "{:?}",
+            snapshot.warnings
+        );
+    }
+
+    #[test]
+    fn attachments_index_lists_each_container_once_and_detects_sharing() {
+        let container = |name: &str, project: Option<&str>, networks: &[&str]| Container {
+            name: name.into(),
+            project: project.map(Into::into),
+            networks: networks.iter().map(|n| (*n).into()).collect(),
+            ..Default::default()
+        };
+        let containers = vec![
+            container("a", Some("shop"), &["front", "front"]),
+            container("b", Some("blog"), &["front"]),
+            container("c", Some("shop"), &["back"]),
+            container("d", None, &["back"]),
+        ];
+        let index = attachments(&containers, |c| &c.networks);
+        assert_eq!(index["front"].containers, ["a", "b"]);
+        assert!(index["front"].shared());
+        assert_eq!(index["back"].containers, ["c", "d"]);
+        // A container without a project does not make a resource shared between projects.
+        assert!(!index["back"].shared());
+        assert!(!index.contains_key("unused"));
+    }
+
     #[test]
     fn io_counters_sum_interfaces_and_devices_without_guessing_missing_values() {
         let response=serde_json::from_value(serde_json::json!({"networks":{"eth0":{"rx_bytes":10,"tx_bytes":20},"eth1":{"rx_bytes":30,"tx_bytes":40}},"blkio_stats":{"io_service_bytes_recursive":[{"op":"Read","value":100},{"op":"Read","value":200},{"op":"Write","value":50},{"op":"Total","value":350}]}})).unwrap();

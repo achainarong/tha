@@ -304,6 +304,8 @@ catalog! {
     PerformanceSpace, "Close Performance", [], FocusedPerformance, 40, false, ["space"], [];
     HalfPageDown, "Half-page down", [], Containers, 40, false, ["ctrl-d"], [];
     HalfPageUp, "Half-page up", [], Containers, 40, false, ["ctrl-u"], [];
+    NextIssue, "Next possible issue in the logs", ["next-issue"], Logs, 25, false, ["i"], [];
+    PreviousIssue, "Previous possible issue in the logs", ["previous-issue"], Logs, 40, false, ["shift-i"], [];
     NextMatch, "Next match", [], TreeOrLogs, 25, false, ["n"], [];
     PreviousMatch, "Previous match", [], TreeOrLogs, 40, false, ["shift-n"], [];
     WorkspaceBack, "Previous workspace", ["back"], Containers, 40, false, ["backspace"], [];
@@ -319,6 +321,26 @@ catalog! {
     Performance, "Performance", ["performance"], Performance, 10, false, ["p"], [];
     PerformanceScope, "Runtime / container Performance scope", [], Performance, 25, false, ["shift-p"], [];
     SortContexts, "Sort contexts", ["sort-contexts"], Containers, 25, false, ["o"], [];
+    SavedViews, "Open a saved view", ["saved-views"], Containers, 40, false, [], [];
+    Upload, "Copy a local file or folder into a container", ["upload"], Containers, 40, false, [], [];
+    NetworkTest, "Test a connection from inside a container", ["network-test"], Containers, 40, false, [], [];
+    Pause, "Pause (confirmation required)", ["pause"], Workloads, 40, false, [], [];
+    Unpause, "Unpause (confirmation required)", ["unpause"], Workloads, 40, false, [], [];
+    Kill, "Kill immediately (confirmation required)", ["kill"], Workloads, 40, false, [], [];
+    CopyId, "Copy the container ID", ["copy-id"], Containers, 40, false, [], [];
+    CopyName, "Copy the container name", ["copy-name"], Containers, 40, false, [], [];
+    CopyImage, "Copy the image name", ["copy-image"], Containers, 40, false, [], [];
+    CopyLogLine, "Copy the newest visible log line", ["copy-log-line"], Containers, 40, false, [], [];
+    ComposeEdit, "Edit the Compose file in your editor", ["compose-edit"], Containers, 40, false, [], [];
+    Alerts, "Show alerts", ["alerts"], Containers, 15, false, [], [];
+    Timeline, "Incidents for the selected workload", ["timeline"], Containers, 15, false, [], [];
+    Fleet, "What needs attention across all connections", ["fleet"], Containers, 15, false, [], [];
+    DownloadManager, "Browse and download files", ["download-manager"], Containers, 40, false, [], [];
+    Download, "Download a file or folder by path", ["download"], Containers, 40, false, [], [];
+    Capabilities, "Show what this connection can do", ["capabilities"], Containers, 40, false, [], [];
+    SaveView, "Save this view under a name", ["save-view"], Containers, 40, false, [], [];
+    OpenView, "Open a saved view by name", ["open-view"], Containers, 40, false, [], [];
+    DeleteView, "Delete a saved view", ["delete-view"], Containers, 40, false, [], [];
     Zoom, "Expand / restore focused view", [], Zoom, 9, false, ["z"], [];
     Wrap, "Wrap logs", ["wrap"], Logs, 7, false, ["w"], [];
     Follow, "Follow logs", [], Logs, 8, false, ["f"], [];
@@ -387,6 +409,9 @@ impl ActionId {
             Self::Stop => Some(Action::Stop),
             Self::Restart => Some(Action::Restart),
             Self::DeleteContainer => Some(Action::Delete),
+            Self::Pause => Some(Action::Pause),
+            Self::Unpause => Some(Action::Unpause),
+            Self::Kill => Some(Action::Kill),
             _ => None,
         }
     }
@@ -437,6 +462,8 @@ impl ActionId {
             Self::PerformanceSpace => "performance-close",
             Self::HalfPageDown => "half-page-down",
             Self::HalfPageUp => "half-page-up",
+            Self::NextIssue => "next-issue",
+            Self::PreviousIssue => "previous-issue",
             Self::NextMatch => "next-match",
             Self::PreviousMatch => "previous-match",
             Self::WorkspaceBack => "workspace-back",
@@ -450,6 +477,26 @@ impl ActionId {
             Self::Performance => "performance",
             Self::PerformanceScope => "performance-scope",
             Self::SortContexts => "sort-contexts",
+            Self::SavedViews => "saved-views",
+            Self::Upload => "upload",
+            Self::NetworkTest => "network-test",
+            Self::Pause => "pause",
+            Self::Unpause => "unpause",
+            Self::Kill => "kill",
+            Self::CopyId => "copy-id",
+            Self::CopyName => "copy-name",
+            Self::CopyImage => "copy-image",
+            Self::CopyLogLine => "copy-log-line",
+            Self::ComposeEdit => "compose-edit",
+            Self::Alerts => "alerts",
+            Self::Timeline => "timeline",
+            Self::Fleet => "fleet",
+            Self::DownloadManager => "download-manager",
+            Self::Download => "download",
+            Self::Capabilities => "capabilities",
+            Self::SaveView => "save-view",
+            Self::OpenView => "open-view",
+            Self::DeleteView => "delete-view",
             Self::Zoom => "zoom",
             Self::Wrap => "wrap",
             Self::Follow => "follow",

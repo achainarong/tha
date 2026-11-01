@@ -4,6 +4,7 @@
 //! `tha` client, so nothing here may trust it. Everything is refused unless a route below
 //! allows it, and an allowed call is re-created rather than forwarded, so client headers and
 //! bodies never reach the engine.
+pub mod alerts;
 pub mod history;
 pub mod service;
 pub mod setup;
@@ -38,6 +39,19 @@ pub struct AgentConfig {
     pub allow_delete: bool,
     /// Allows container exec and host shells as the SSH login user. Root must opt in.
     pub allow_exec: bool,
+    /// Lets the key pull images and check registries for updates, which makes this server
+    /// contact registries and use disk. Anonymous only: no registry credentials pass.
+    pub allow_images: bool,
+    /// Lets the key read any file or folder in a container.
+    pub allow_download: bool,
+    /// Lets the key read whatever the SSH login user can read on the server itself.
+    pub allow_server_download: bool,
+    /// Lets the key write files into containers.
+    pub allow_upload: bool,
+    /// Lets the key run Compose actions on projects whose files already are on this server.
+    pub allow_compose: bool,
+    /// Lets the key rewrite Compose and .env files the SSH login user can write.
+    pub allow_compose_edit: bool,
     pub engines: Vec<AgentEngine>,
     /// The only non-root local user allowed to reach the service.
     pub service_uid: u32,
@@ -129,6 +143,8 @@ pub enum Access {
     Read,
     Write,
     Delete,
+    /// Pulling and registry lookups, allowed only with `allow_images`.
+    Images,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +165,10 @@ enum Value {
     /// `force=true` and similar must never pass, whatever the app would send.
     False,
     Boolean,
+    /// Only an image name, so nothing else can be smuggled through its encoding.
+    ImageName,
+    /// Sent empty by the client library; a real value must not pass.
+    Empty,
 }
 
 struct Route {
@@ -172,8 +192,8 @@ macro_rules! route {
 }
 
 /// Every call `tha` makes through this agent. Anything missing here is refused.
-fn routes() -> [Route; 20] {
-    use Value::{Any, Boolean, False, Number};
+fn routes() -> [Route; 25] {
+    use Value::{Any, Boolean, Empty, False, ImageName, Number};
     [
         route!(GET, Read, &[Literal("_ping")], &[]),
         route!(HEAD, Read, &[Literal("_ping")], &[]),
@@ -244,6 +264,18 @@ fn routes() -> [Route; 20] {
         ),
         route!(
             POST,
+            Images,
+            &[Literal("images"), Literal("create")],
+            &[("fromImage", ImageName), ("platform", Empty)]
+        ),
+        route!(
+            GET,
+            Images,
+            &[Literal("distribution"), ImageRef, Literal("json")],
+            &[]
+        ),
+        route!(
+            POST,
             Write,
             &[Literal("containers"), Name, Literal("start")],
             &[]
@@ -259,6 +291,25 @@ fn routes() -> [Route; 20] {
             Write,
             &[Literal("containers"), Name, Literal("restart")],
             &[("t", Number)]
+        ),
+        route!(
+            POST,
+            Write,
+            &[Literal("containers"), Name, Literal("pause")],
+            &[]
+        ),
+        route!(
+            POST,
+            Write,
+            &[Literal("containers"), Name, Literal("unpause")],
+            &[]
+        ),
+        // No signal parameter: this stops a stuck process and cannot be used to signal one.
+        route!(
+            POST,
+            Write,
+            &[Literal("containers"), Name, Literal("kill")],
+            &[]
         ),
         route!(
             DELETE,
@@ -326,6 +377,23 @@ fn path_matches(pattern: &[Segment], segments: &[&str]) -> bool {
     }
 }
 
+/// A percent-encoded image reference. Only the encodings of `:` and `/` are understood, so an
+/// encoded `&` or anything else the engine would decode differently is refused.
+fn valid_pull_name(value: &str) -> bool {
+    let decoded = value
+        .replace("%3A", ":")
+        .replace("%3a", ":")
+        .replace("%2F", "/")
+        .replace("%2f", "/");
+    !decoded.is_empty()
+        && decoded.len() <= 512
+        && decoded.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && decoded
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/'))
+        && !decoded.contains("..")
+}
+
 fn query_allowed(allowed: &[(&str, Value)], query: &str) -> std::result::Result<(), String> {
     if query.is_empty() {
         return Ok(());
@@ -351,6 +419,8 @@ fn query_allowed(allowed: &[(&str, Value)], query: &str) -> std::result::Result<
             }
             Value::False => value == "false",
             Value::Boolean => matches!(value, "true" | "false"),
+            Value::ImageName => valid_pull_name(value),
+            Value::Empty => value.is_empty(),
         };
         if !valid {
             return Err(format!("query parameter {key} has a refused value"));
@@ -395,7 +465,24 @@ pub fn check(
         return Err("deleting is turned off on this server".into());
     }
     query_allowed(route.query, query)?;
+    if route.access == Access::Images
+        && *method == Method::POST
+        && !query.split('&').any(|pair| pair.starts_with("fromImage="))
+    {
+        return Err("a pull must name an image".into());
+    }
     Ok(route.access)
+}
+
+/// The route table says what a call is; this is the server's own policy on whether it may run.
+fn images_gate(allow_images: bool, access: Access) -> std::result::Result<Access, String> {
+    if access == Access::Images && !allow_images {
+        return Err(
+            "image pull and update checks are turned off on this server; rerun tha-agent setup with --allow-images"
+                .into(),
+        );
+    }
+    Ok(access)
 }
 
 /// `v1.53`, exactly. `libpod` paths and three-part versions are not the Docker-compatible API.
@@ -410,6 +497,21 @@ fn is_version(segment: &str) -> bool {
 }
 
 /// Refused outright rather than stripped: a client sending these is not `tha`.
+fn screen_upgrades<B>(request: &Request<B>) -> std::result::Result<(), String> {
+    let headers = request.headers();
+    if headers.contains_key(header::UPGRADE) || headers.contains_key(header::EXPECT) {
+        return Err("connection upgrades are refused".into());
+    }
+    if headers.get_all(header::CONNECTION).iter().any(|value| {
+        value
+            .to_str()
+            .map_or(true, |value| value.to_ascii_lowercase().contains("upgrade"))
+    }) {
+        return Err("connection upgrades are refused".into());
+    }
+    Ok(())
+}
+
 fn screen_headers<B>(request: &Request<B>) -> std::result::Result<(), String> {
     // HTTP/2 always carries a scheme and authority. Only the validated path is ever used.
     if request.version() != hyper::Version::HTTP_2
@@ -441,6 +543,10 @@ fn screen_headers<B>(request: &Request<B>) -> std::result::Result<(), String> {
 pub struct Agent {
     pub allow_delete: bool,
     pub allow_exec: bool,
+    pub allow_images: bool,
+    pub allow_download: bool,
+    pub allow_compose: bool,
+    pub allow_upload: bool,
     pub socket: PathBuf,
     /// Where writes and refusals are recorded. Stderr is not used: SSH returns it to the client.
     pub audit: fn(&str),
@@ -472,6 +578,21 @@ pub(crate) fn loggable(target: &str) -> String {
         .collect()
 }
 
+/// The one form the saved-events route accepts: a read with one numeric time.
+fn events_route(method: &Method, target: &str) -> Option<i64> {
+    let since = target
+        .strip_prefix(crate::events::REMOTE_ROUTE)?
+        .strip_prefix("?since=")?;
+    if *method != Method::GET || since.is_empty() || since.len() > 18 {
+        return None;
+    }
+    since
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| since.parse().ok())
+        .flatten()
+}
+
 async fn handle(
     request: Request<Incoming>,
     agent: Arc<Agent>,
@@ -484,6 +605,49 @@ async fn handle(
         .to_owned();
     if target == crate::remote_exec::ROUTE {
         return Ok(crate::remote_exec::serve(request, agent).await);
+    }
+    if target.starts_with(crate::compose::ROUTE_PREFIX) {
+        if let Err(reason) = screen_headers(&request) {
+            return Ok(message_response(
+                StatusCode::FORBIDDEN,
+                &format!("Not allowed by server: {reason}"),
+            ));
+        }
+        return Ok(crate::compose::serve_agent(request, agent).await);
+    }
+    if target.starts_with(crate::files::ROUTE_PREFIX) {
+        let upload = target.starts_with(crate::files::UPLOAD_PREFIX);
+        // An upload is the one request with a body, but it may not switch protocols either.
+        let screened = if upload {
+            screen_upgrades(&request)
+        } else {
+            screen_headers(&request)
+        };
+        if let Err(reason) = screened {
+            return Ok(message_response(
+                StatusCode::FORBIDDEN,
+                &format!("Not allowed by server: {reason}"),
+            ));
+        }
+        return Ok(crate::files::serve_agent(request, agent).await);
+    }
+    if let Some(since) = events_route(&method, &target) {
+        if let Err(reason) = screen_headers(&request) {
+            return Ok(message_response(
+                StatusCode::FORBIDDEN,
+                &format!("Not allowed by server: {reason}"),
+            ));
+        }
+        return Ok(match agent.history.as_ref() {
+            Some(history) => match history.events(since).await {
+                Ok(value) => message_json(value),
+                Err(error) => message_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &crate::layers::text(&format!("{error:#}")),
+                ),
+            },
+            None => message_response(StatusCode::NOT_FOUND, "Agent history is unavailable"),
+        });
     }
     let security_route = crate::security::agent::route(&method, &target);
     let history_route = target.starts_with("/tha/history");
@@ -501,6 +665,7 @@ async fn handle(
             })
         } else {
             check(agent.allow_delete, &method, &target)
+                .and_then(|access| images_gate(agent.allow_images, access))
         }
     });
     // A body has no way through, and HTTP/2 can send one without any length header.
@@ -555,7 +720,7 @@ async fn handle(
     })
 }
 
-fn message_json(value: serde_json::Value) -> Response<Body> {
+pub(crate) fn message_json(value: serde_json::Value) -> Response<Body> {
     let mut response = Response::new(
         Full::new(Bytes::from(value.to_string()))
             .map_err(|never: Infallible| match never {})
@@ -628,6 +793,8 @@ where
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Requested<'a> {
+    Files(crate::files::HostOp, String),
+    Edit(crate::compose_edit::HostEdit),
     List,
     Shell,
     Engine(&'a AgentEngine),
@@ -642,6 +809,21 @@ pub fn parse_command<'a>(config: &'a AgentConfig, command: Option<&str>) -> Resu
     let command = command.strip_prefix("tha-agent serve ").unwrap_or(command);
     if command == "list" || command == "tha-agent list" {
         return Ok(Requested::List);
+    }
+    if let Some(request) = crate::compose_edit::parse_host_command(command) {
+        ensure!(
+            config.allow_compose_edit,
+            "Compose file editing is turned off on this server; rerun tha-agent setup with --allow-compose-edit"
+        );
+        return Ok(Requested::Edit(request?));
+    }
+    if let Some(request) = crate::files::parse_host_command(command) {
+        ensure!(
+            config.allow_server_download,
+            "Server file access is turned off on this server; rerun tha-agent setup with --allow-server-download"
+        );
+        let (op, path) = request?;
+        return Ok(Requested::Files(op, path));
     }
     if command == "tha-agent shell" {
         ensure!(
@@ -666,6 +848,26 @@ pub struct Listing {
     /// Missing from agents that opened one SSH channel per request.
     #[serde(default)]
     pub protocol: u32,
+    /// Missing from agents older than this field, which is not the same as "off".
+    #[serde(default)]
+    pub capabilities: Option<Capabilities>,
+}
+
+/// What this server's root-owned policy allows. It is informational: the agent still decides
+/// each request, so a client that ignores this gains nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Capabilities {
+    pub allow_exec: bool,
+    pub allow_images: bool,
+    pub allow_download: bool,
+    pub allow_server_download: bool,
+    pub allow_compose: bool,
+    pub allow_compose_edit: bool,
+    pub allow_upload: bool,
+    pub security: bool,
+    pub history: bool,
+    pub agent_version: String,
 }
 
 pub fn listing(config: &AgentConfig) -> Listing {
@@ -677,6 +879,18 @@ pub fn listing(config: &AgentConfig) -> Listing {
             .collect(),
         allow_delete: config.allow_delete,
         protocol: PROTOCOL,
+        capabilities: Some(Capabilities {
+            allow_exec: config.allow_exec,
+            allow_images: config.allow_images,
+            allow_download: config.allow_download,
+            allow_server_download: config.allow_server_download,
+            allow_compose: config.allow_compose,
+            allow_compose_edit: config.allow_compose_edit,
+            allow_upload: config.allow_upload,
+            security: config.security.enabled,
+            history: true,
+            agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+        }),
     }
 }
 
@@ -709,6 +923,22 @@ pub async fn run(argument: Option<&str>) -> Result<()> {
             // Tokio's stdin reader blocks a thread that a normal runtime shutdown would wait on.
             std::process::exit(i32::from(result.is_err()));
         }
+        Requested::Files(op, path) => {
+            syslog(&format!(
+                "allowed server file access as SSH login user: {}",
+                loggable(&path)
+            ));
+            crate::files::serve_host(op, &path)
+        }
+        Requested::Edit(request) => {
+            if let crate::compose_edit::HostEdit::Write { path, .. } = &request {
+                syslog(&format!(
+                    "allowed Compose file edit as SSH login user: {}",
+                    loggable(path)
+                ));
+            }
+            crate::compose_edit::serve_host(request)
+        }
         Requested::Shell => {
             syslog("allowed server shell as SSH login user");
             let result = crate::remote_exec::serve_host().await;
@@ -724,6 +954,112 @@ pub async fn run(argument: Option<&str>) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Asks an agent with the given options for one file route.
+    async fn file_route(allow_exec: bool, allow_download: bool, op: &str) -> (StatusCode, String) {
+        let method = if op == "upload" {
+            Method::POST
+        } else {
+            Method::GET
+        };
+        let (client, server) = tokio::io::duplex(8192);
+        let agent = tokio::spawn(serve(
+            server,
+            Agent {
+                allow_delete: false,
+                allow_exec,
+                allow_images: false,
+                allow_download,
+                allow_compose: false,
+                allow_upload: false,
+                socket: "/missing-files-fixture.sock".into(),
+                audit: |_| {},
+                security: None,
+                history: None,
+            },
+        ));
+        let (mut sender, connection) = crate::remote::connect_channel(client).await.unwrap();
+        let connection = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .method(method)
+                    .uri(format!("http://agent/tha/files/{op}?id=abc&path=2f746d70"))
+                    .body(
+                        Empty::<Bytes>::new()
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        connection.abort();
+        agent.abort();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn file_routes_stay_off_until_their_own_option_allows_them() {
+        for op in ["archive", "size"] {
+            let (status, message) = file_route(true, false, op).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(message.contains("--allow-download"), "{message}");
+        }
+        let (status, message) = file_route(false, true, "list").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(message.contains("--allow-exec"), "{message}");
+        let (status, message) = file_route(true, true, "upload").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(message.contains("--allow-upload"), "{message}");
+        let (status, message) = file_route(false, true, "nettest").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(message.contains("--allow-exec"), "{message}");
+        let (status, message) = file_route(true, true, "delete").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(message.contains("unknown"), "{message}");
+        // Allowed, it reaches the engine, which this fixture does not have.
+        let (status, _) = file_route(false, true, "archive").await;
+        assert_ne!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn the_events_route_accepts_only_a_read_with_one_number() {
+        assert_eq!(
+            events_route(&Method::GET, "/tha/events?since=123"),
+            Some(123)
+        );
+        for target in [
+            "/tha/events",
+            "/tha/events?since=",
+            "/tha/events?since=abc",
+            "/tha/events?since=1&x=2",
+            "/tha/events/../containers?since=1",
+            "/tha/events?since=-1",
+        ] {
+            assert_eq!(events_route(&Method::GET, target), None, "{target}");
+        }
+        assert_eq!(events_route(&Method::POST, "/tha/events?since=1"), None);
+    }
+
+    #[test]
+    fn server_files_need_their_own_option_and_exact_commands() {
+        let mut config = AgentConfig::default();
+        let read = "tha-agent files read 2f746d70";
+        let error = parse_command(&config, Some(read)).unwrap_err();
+        assert!(error.to_string().contains("--allow-server-download"));
+        config.allow_server_download = true;
+        assert!(matches!(
+            parse_command(&config, Some(read)).unwrap(),
+            Requested::Files(crate::files::HostOp::Read, path) if path == "/tmp"
+        ));
+        assert!(parse_command(&config, Some("tha-agent files read 2f;id")).is_err());
+        assert!(parse_command(&config, Some("tha-agent files write 2f")).is_err());
+        // It does not open the shell, which keeps its own option.
+        assert!(parse_command(&config, Some("tha-agent shell")).is_err());
+    }
+
     #[tokio::test]
     async fn disabled_security_reports_the_missing_setup_without_contacting_the_engine() {
         let (client, server) = tokio::io::duplex(8192);
@@ -732,6 +1068,10 @@ mod tests {
             Agent {
                 allow_delete: false,
                 allow_exec: false,
+                allow_images: false,
+                allow_download: false,
+                allow_compose: false,
+                allow_upload: false,
                 socket: "/missing-security-fixture.sock".into(),
                 audit: |_| {},
                 security: None,
@@ -807,6 +1147,9 @@ mod tests {
                 (Method::POST, format!("/containers/{ID}/start")),
                 (Method::POST, format!("/containers/{ID}/stop?t=10")),
                 (Method::POST, format!("/containers/{ID}/restart?t=10")),
+                (Method::POST, format!("/containers/{ID}/pause")),
+                (Method::POST, format!("/containers/{ID}/unpause")),
+                (Method::POST, format!("/containers/{ID}/kill")),
                 (
                     Method::DELETE,
                     format!("/containers/{ID}?force=false&v=false&link=false"),
@@ -824,6 +1167,47 @@ mod tests {
     }
 
     #[test]
+    fn image_calls_need_their_own_opt_in_and_accept_only_an_image_name() {
+        let decide = |allow_images, method: Method, target: &str| {
+            check(false, &method, target).and_then(|access| images_gate(allow_images, access))
+        };
+        for (method, target) in [
+            (
+                Method::POST,
+                "/v1.53/images/create?fromImage=ghcr.io%2Facme%2Fapp%3A1.2&platform=",
+            ),
+            (Method::POST, "/images/create?fromImage=nginx:1.27"),
+            (Method::GET, "/distribution/ghcr.io/acme/app:1.2/json"),
+        ] {
+            assert_eq!(
+                decide(true, method.clone(), target),
+                Ok(Access::Images),
+                "{target}"
+            );
+            let refused = decide(false, method, target).unwrap_err();
+            assert!(refused.contains("--allow-images"), "{refused}");
+        }
+        for target in [
+            "/images/create",
+            "/images/create?platform=",
+            "/images/create?fromSrc=http://evil.example/x.tar",
+            "/images/create?fromSrc=-&fromImage=nginx",
+            "/images/create?fromImage=nginx&repo=evil",
+            "/images/create?fromImage=nginx&tag=latest",
+            "/images/create?fromImage=nginx&platform=linux/arm64",
+            "/images/create?fromImage=nginx%26fromSrc%3Dx",
+            "/images/create?fromImage=nginx%20x",
+            "/images/create?fromImage=-nginx",
+            "/images/create?fromImage=../x",
+            "/images/create?fromImage=",
+        ] {
+            assert!(decide(true, Method::POST, target).is_err(), "{target}");
+        }
+        // Reading a tag must not become a way to reach anything else on that path.
+        assert!(decide(true, Method::POST, "/distribution/nginx/json").is_err());
+    }
+
+    #[test]
     fn dangerous_calls_are_refused() {
         for (method, target) in [
             (Method::POST, "/containers/create".to_owned()),
@@ -831,7 +1215,7 @@ mod tests {
             (Method::POST, "/exec/abc/start".to_owned()),
             (Method::POST, format!("/containers/{ID}/attach")),
             (Method::GET, format!("/containers/{ID}/attach/ws")),
-            (Method::POST, format!("/containers/{ID}/kill")),
+            (Method::POST, format!("/containers/{ID}/kill?signal=SIGHUP")),
             (Method::POST, format!("/containers/{ID}/update")),
             (Method::POST, format!("/containers/{ID}/rename?name=x")),
             (Method::GET, format!("/containers/{ID}/archive?path=/etc")),
@@ -839,14 +1223,12 @@ mod tests {
             (Method::GET, format!("/containers/{ID}/export")),
             (Method::GET, format!("/containers/{ID}/top")),
             (Method::POST, "/containers/prune".to_owned()),
-            (Method::POST, "/images/create?fromImage=evil".to_owned()),
             (Method::POST, "/build".to_owned()),
             (Method::POST, "/commit".to_owned()),
             (Method::POST, "/images/prune".to_owned()),
             (Method::GET, format!("/images/{IMAGE}/get")),
             (Method::POST, format!("/images/{IMAGE}/push")),
             (Method::POST, format!("/images/{IMAGE}/tag")),
-            (Method::GET, "/distribution/evil.example/x/json".to_owned()),
             (Method::POST, "/volumes/create".to_owned()),
             (Method::POST, "/volumes/prune".to_owned()),
             (Method::POST, "/networks/create".to_owned()),

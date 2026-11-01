@@ -57,6 +57,26 @@ pub enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// List containers on local engines; add --json for scripts
+    Ps {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List images on local engines; add --json for scripts
+    Images {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List volumes on local engines; add --json for scripts
+    Volumes {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update Tha to the latest release, or only report it with --check
+    Update {
+        #[arg(long)]
+        check: bool,
+    },
     /// Inspect or compact local history without deleting recent readings
     History {
         #[command(subcommand)]

@@ -115,6 +115,10 @@ async fn report_sync_child() {
         Agent {
             allow_delete: false,
             allow_exec: false,
+            allow_images: false,
+            allow_download: false,
+            allow_compose: false,
+            allow_upload: false,
             socket: engine_path,
             audit: |_| {},
             security: Some(security),

@@ -56,7 +56,6 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "Container-Zustand hat sich geändert; aktualisieren und den Vorgang neu bestätigen",
     ),
     ("Succeeded", "Erfolgreich"),
-    ("Failed: {error}", "Fehlgeschlagen: {error}"),
     (
         "Outcome unknown: {error} · inspect state before retrying",
         "Ergebnis unbekannt: {error} · vor erneutem Versuch den Zustand prüfen",
@@ -882,7 +881,7 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "Ereignisse: {total} · neueste zuerst · UTC · {a0}",
     ),
     (
-        "last 24 hours, saved by the service",
+        "last 24 hours, saved",
         "letzte 24 Stunden, vom Dienst gespeichert",
     ),
     (
@@ -1597,8 +1596,8 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "Verbindung nicht verfügbar / veraltet · Details in der Übersicht",
     ),
     (
-        "Native containerd network inventory is not supported by this MVP adapter.",
-        "Natives containerd-Netzwerkinventar wird von diesem MVP-Adapter nicht unterstützt.",
+        "Native containerd lists networks, but not which containers use them.",
+        "Natives containerd listet Netzwerke, aber nicht, welche Container sie nutzen.",
     ),
     (
         "Networks depend on the launcher and its CNI configuration.",
@@ -2522,7 +2521,6 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("healthy", "healthy"),
     ("alias", "Alias"),
     ("connecting", "verbindet"),
-    ("connected", "verbunden"),
     ("German (QWERTZ)", "Deutsch (QWERTZ)"),
     ("Standard keys", "Standardtasten"),
     (
@@ -2539,7 +2537,6 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ("created", "erstellt"),
     ("removed", "entfernt"),
     ("errors", "Fehler"),
-    ("failed", "fehlgeschlagen"),
     ("OOM killed", "OOM-Kill"),
     ("paused", "pausiert"),
     ("restarting", "Neustart"),
@@ -2674,7 +2671,7 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "  Vergleich unvollständig: Es ist nicht bekannt, ob beide Container auf derselben Runtime liegen.",
     ),
     (
-        "  Coverage: last 24 hours, saved by the service",
+        "  Coverage: last 24 hours, saved",
         "  Abdeckung: letzte 24 Stunden, vom Dienst gespeichert",
     ),
     (
@@ -2719,8 +2716,8 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "  Es ist kein Healthcheck konfiguriert, also ist auch keiner bestanden oder fehlgeschlagen.",
     ),
     (
-        "  No logs are retained for exactly this container yet. Opening this view does not load them; l does.",
-        "  Für genau diesen Container sind noch keine Logs gespeichert. Diese Ansicht lädt sie nicht; l schon.",
+        "  No logs are retained for exactly this container yet. Press L to load them here, or l to open Logs.",
+        "  Für genau diesen Container sind noch keine Logs vorhanden. L lädt sie hier, l öffnet die Logs.",
     ),
     (
         "  No network attachments reported.",
@@ -2842,8 +2839,8 @@ pub const ENTRIES: &[(&str, &str)] = &[
     (" Troubleshoot network ", " Netzwerk prüfen "),
     (" Why is this unhealthy? ", " Warum ist das unhealthy? "),
     (
-        " j/k Scroll · r Refresh · l Logs · e Events · m Metrics · Esc Close ",
-        " j/k Scrollen · r Aktualisieren · l Logs · e Ereignisse · m Metriken · Esc Schließen ",
+        " j/k Scroll · r Refresh · L Load logs · l Logs · e Events · m Metrics · x Export · Esc Close ",
+        " j/k Scrollen · r Aktualisieren · L Logs laden · l Logs · e Ereignisse · m Metriken · x Export · Esc Schließen ",
     ),
     (
         " j/k Scroll · r Refresh · p Peer · n Networks · Esc Close ",
@@ -2864,6 +2861,811 @@ pub const ENTRIES: &[(&str, &str)] = &[
     (
         "Container inspection timed out after 5s",
         "Container-Abfrage nach 5 s abgebrochen",
+    ),
+    (
+        "Loading logs timed out after 5s",
+        "Logs laden nach 5 s abgebrochen",
+    ),
+    ("  Loading logs…", "  Logs werden geladen…"),
+    (
+        "  Could not load logs: {error}",
+        "  Logs konnten nicht geladen werden: {error}",
+    ),
+    (
+        "  Loaded for this view only, up to {limit} lines. Nothing is saved.",
+        "  Nur für diese Ansicht geladen, höchstens {limit} Zeilen. Es wird nichts gespeichert.",
+    ),
+    (
+        "Connection unavailable; logs cannot be loaded right now",
+        "Verbindung nicht verfügbar; Logs können gerade nicht geladen werden",
+    ),
+    ("Open a saved view", "Gespeicherte Ansicht öffnen"),
+    (
+        "This action works on workloads, not runtimes",
+        "Diese Aktion gilt für Workloads, nicht für Runtimes",
+    ),
+    (
+        "Next possible issue in the logs",
+        "Nächstes mögliches Problem in den Logs",
+    ),
+    (
+        "Previous possible issue in the logs",
+        "Vorheriges mögliches Problem in den Logs",
+    ),
+    (
+        "Jump to the next possible issue in the logs (i)",
+        "Zum nächsten möglichen Problem in den Logs springen (i)",
+    ),
+    (
+        "Jump to the previous possible issue in the logs (I)",
+        "Zum vorherigen möglichen Problem in den Logs springen (I)",
+    ),
+    (
+        "No possible issues in the logs that are showing",
+        "In den angezeigten Logs gibt es keine möglichen Probleme",
+    ),
+    (
+        "{search} · Possible issues: {at} of {total} (i/I)",
+        "{search} · Mögliche Probleme: {at} von {total} (i/I)",
+    ),
+    (
+        "{search} · Possible issues: {at} of {total} (i/I), {hidden} hidden by the filter",
+        "{search} · Mögliche Probleme: {at} von {total} (i/I), {hidden} vom Filter ausgeblendet",
+    ),
+    (
+        "Tha {version} is available; run tha update",
+        "Tha {version} ist verfügbar; tha update ausführen",
+    ),
+    ("Agent version", "Agent-Version"),
+    (
+        "{version} is older than this Tha; rerun the setup command on the server",
+        "{version} ist älter als dieses Tha; Setup-Befehl auf dem Server erneut ausführen",
+    ),
+    ("Uploading into containers", "In Container hochladen"),
+    (
+        "Use host:port, for example db:5432",
+        "host:port verwenden, zum Beispiel db:5432",
+    ),
+    (
+        "This host name is not valid",
+        "Dieser Hostname ist ungültig",
+    ),
+    ("This port is not valid", "Dieser Port ist ungültig"),
+    (
+        "Not found on this computer: {path}",
+        "Auf diesem Computer nicht gefunden: {path}",
+    ),
+    (
+        "Demo mode: files are not uploaded",
+        "Demo-Modus: Dateien werden nicht hochgeladen",
+    ),
+    (
+        "Use :upload LOCAL-PATH /folder/in/the/container",
+        ":upload LOKALER-PFAD /ordner/im/container verwenden",
+    ),
+    (
+        "Uploads go into containers; select one",
+        "Uploads gehen in Container; einen auswählen",
+    ),
+    (
+        "Network tests run in a container; select one",
+        "Netzwerktests laufen in einem Container; einen auswählen",
+    ),
+    (
+        "Demo mode: nothing is contacted",
+        "Demo-Modus: Es wird nichts kontaktiert",
+    ),
+    (
+        "Copy a local file or folder into a container",
+        "Lokale Datei oder Ordner in einen Container kopieren",
+    ),
+    (
+        "Test a connection from inside a container",
+        "Verbindung aus einem Container heraus testen",
+    ),
+    (
+        "Copy a file or folder into the container: upload LOCAL /folder",
+        "Datei oder Ordner in den Container kopieren: upload LOKAL /ordner",
+    ),
+    (
+        "Test a connection from the container: network-test host:port",
+        "Verbindung aus dem Container testen: network-test host:port",
+    ),
+    ("could not be tested", "konnte nicht getestet werden"),
+    (
+        "Runs in: {label}, using exec",
+        "Läuft in: {label}, per Exec",
+    ),
+    (
+        "Contacts: {host} port {port}, waiting up to 10 seconds",
+        "Kontaktiert: {host} Port {port}, wartet bis zu 10 Sekunden",
+    ),
+    ("Testing…", "Wird getestet…"),
+    ("resolved", "aufgelöst"),
+    ("did not resolve", "nicht aufgelöst"),
+    ("connected", "verbunden"),
+    ("failed", "fehlgeschlagen"),
+    ("Name lookup: {result}", "Namensauflösung: {result}"),
+    ("Connection: {result}", "Verbindung: {result}"),
+    (" Network test ", " Netzwerktest "),
+    (" Esc Close ", " Esc Schließen "),
+    ("a folder", "ein Ordner"),
+    (
+        "From this computer: {path} ({size})",
+        "Von diesem Computer: {path} ({size})",
+    ),
+    (
+        "Into: {label}, folder {folder}",
+        "Nach: {label}, Ordner {folder}",
+    ),
+    (
+        "Anything there with the same name is replaced, and the running workload can see it.",
+        "Was dort gleich heißt, wird ersetzt, und der laufende Workload kann es sehen.",
+    ),
+    (" Upload ", " Upload "),
+    (
+        " Enter Upload · Esc Cancel ",
+        " Enter Hochladen · Esc Abbrechen ",
+    ),
+    (
+        "Writes this view's state, events and up to 300 log lines to one file. Nothing is uploaded.",
+        "Schreibt Zustand, Ereignisse und bis zu 300 Logzeilen dieser Ansicht in eine Datei. Es wird nichts hochgeladen.",
+    ),
+    (
+        "Logs can contain secrets. Redaction hides common ones but cannot find them all, so review it before sharing.",
+        "Logs können Geheimnisse enthalten. Die Schwärzung findet nicht alle, daher vor dem Weitergeben prüfen.",
+    ),
+    ("Redaction: {state} (Tab)", "Schwärzung: {state} (Tab)"),
+    (" Export diagnostics ", " Diagnose exportieren "),
+    (
+        " Enter Export · Tab Redaction · Esc Cancel ",
+        " Enter Exportieren · Tab Schwärzung · Esc Abbrechen ",
+    ),
+    (
+        "Diagnostics saved to {path}",
+        "Diagnose gespeichert unter {path}",
+    ),
+    (
+        "Diagnostics not saved: {error}",
+        "Diagnose nicht gespeichert: {error}",
+    ),
+    ("Pause", "Anhalten"),
+    ("Unpause", "Fortsetzen"),
+    ("Kill", "Beenden erzwingen"),
+    ("Pausing", "Wird angehalten"),
+    ("Unpausing", "Wird fortgesetzt"),
+    ("Killing", "Wird zwangsweise beendet"),
+    (
+        "Pause (confirmation required)",
+        "Anhalten (Bestätigung nötig)",
+    ),
+    (
+        "Unpause (confirmation required)",
+        "Fortsetzen (Bestätigung nötig)",
+    ),
+    (
+        "Kill immediately (confirmation required)",
+        "Sofort beenden (Bestätigung nötig)",
+    ),
+    (
+        "Pause the selected workload (confirmation required)",
+        "Ausgewählten Workload anhalten (Bestätigung nötig)",
+    ),
+    (
+        "Unpause the selected workload (confirmation required)",
+        "Ausgewählten Workload fortsetzen (Bestätigung nötig)",
+    ),
+    (
+        "Kill the selected workload now, without a grace period",
+        "Ausgewählten Workload sofort beenden, ohne Karenzzeit",
+    ),
+    (
+        "The process gets no chance to shut down cleanly and can lose data.",
+        "Der Prozess kann nicht sauber herunterfahren und Daten verlieren.",
+    ),
+    ("Copy the container ID", "Container-ID kopieren"),
+    ("Copy the container name", "Containernamen kopieren"),
+    ("Copy the image name", "Image-Namen kopieren"),
+    (
+        "Copy the newest visible log line",
+        "Neueste sichtbare Logzeile kopieren",
+    ),
+    (
+        "Copy the selected container's ID",
+        "ID des ausgewählten Containers kopieren",
+    ),
+    (
+        "Copy the selected container's name",
+        "Namen des ausgewählten Containers kopieren",
+    ),
+    (
+        "Copy the selected container's image name",
+        "Image-Namen des ausgewählten Containers kopieren",
+    ),
+    (
+        "This is too long to copy through the terminal",
+        "Das ist zu lang, um es über das Terminal zu kopieren",
+    ),
+    (
+        "Select a single container",
+        "Einen einzelnen Container auswählen",
+    ),
+    ("No log line is showing", "Es wird keine Logzeile angezeigt"),
+    (
+        "Configuration reloaded. Connections apply after a restart.",
+        "Konfiguration neu geladen. Verbindungen gelten nach einem Neustart.",
+    ),
+    (
+        "Configuration not reloaded, keeping the current one: {error}",
+        "Konfiguration nicht neu geladen, die aktuelle bleibt: {error}",
+    ),
+    ("Editor", "Editor"),
+    (
+        "Opens Compose files with :compose-edit. It must be installed on this computer.",
+        "Öffnet Compose-Dateien mit :compose-edit. Er muss auf diesem Computer installiert sein.",
+    ),
+    ("How it looks now:", "So sieht es jetzt aus:"),
+    ("Editing Compose files", "Compose-Dateien bearbeiten"),
+    (
+        "Edit the Compose file in your editor",
+        "Compose-Datei im eigenen Editor bearbeiten",
+    ),
+    (
+        "Edit the selected project's Compose file in your editor; nothing is applied",
+        "Compose-Datei des Projekts im eigenen Editor bearbeiten; es wird nichts angewendet",
+    ),
+    ("Which Compose file?", "Welche Compose-Datei?"),
+    (
+        "Demo mode: files are not edited",
+        "Demo-Modus: Dateien werden nicht bearbeitet",
+    ),
+    (
+        "{editor} is not installed; choose another editor in Settings (,)",
+        "{editor} ist nicht installiert; in den Einstellungen (,) einen anderen Editor wählen",
+    ),
+    (
+        "Compose file editing is turned off on this server; rerun setup with --allow-compose-edit",
+        "Compose-Dateien bearbeiten ist auf diesem Server ausgeschaltet; Setup mit --allow-compose-edit erneut ausführen",
+    ),
+    (
+        "This server's agent does not support Compose file editing; update tha-agent",
+        "Der Agent dieses Servers unterstützt das Bearbeiten von Compose-Dateien nicht; tha-agent aktualisieren",
+    ),
+    (
+        "Compose actions are turned off on this server; rerun setup with --allow-compose",
+        "Compose-Aktionen sind auf diesem Server ausgeschaltet; Setup mit --allow-compose erneut ausführen",
+    ),
+    (
+        "This server's agent does not support Compose actions; update tha-agent",
+        "Der Agent dieses Servers unterstützt keine Compose-Aktionen; tha-agent aktualisieren",
+    ),
+    (
+        "The connection ended before Compose reported a result; check the server",
+        "Die Verbindung endete, bevor Compose ein Ergebnis meldete; Server prüfen",
+    ),
+    ("{name}: no container now", "{name}: jetzt kein Container"),
+    (
+        "image changed from {old} to {new}",
+        "Image geändert von {old} zu {new}",
+    ),
+    ("image unchanged", "Image unverändert"),
+    ("image identity unknown", "Image-Identität unbekannt"),
+    (
+        "Now: {service} runs {image} {id}",
+        "Aktuell: {service} nutzt {image} {id}",
+    ),
+    ("…and {count} more", "…und {count} weitere"),
+    (
+        "You cannot write this file on the server, so it opened read-only",
+        "Diese Datei ist auf dem Server nicht beschreibbar, daher nur lesend geöffnet",
+    ),
+    (
+        "Sending the file back to the server…",
+        "Datei wird zurück zum Server gesendet…",
+    ),
+    (
+        "Saved on the server. Nothing was applied; run a Compose action to use it.",
+        "Auf dem Server gespeichert. Es wurde nichts angewendet; dafür eine Compose-Aktion ausführen.",
+    ),
+    (
+        "No changes, so nothing was sent.",
+        "Keine Änderungen, daher nichts gesendet.",
+    ),
+    (
+        "Not saved on the server: {error}. Your copy is kept in {folder}",
+        "Nicht auf dem Server gespeichert: {error}. Die lokale Kopie liegt in {folder}",
+    ),
+    (
+        "Saved. Nothing was applied; run a Compose action to use it.",
+        "Gespeichert. Es wurde nichts angewendet; dafür eine Compose-Aktion ausführen.",
+    ),
+    ("No changes.", "Keine Änderungen."),
+    (
+        "Getting {file} from the server…",
+        "{file} wird vom Server geholt…",
+    ),
+    (
+        "Could not open the file: {error}",
+        "Datei konnte nicht geöffnet werden: {error}",
+    ),
+    (
+        "Waiting for VS Code. Close the file's tab to return to Tha.",
+        "Warte auf VS Code. Den Tab der Datei schließen, um zu Tha zurückzukehren.",
+    ),
+    (
+        "{editor} exited with an error",
+        "{editor} wurde mit einem Fehler beendet",
+    ),
+    ("Show alerts", "Warnungen anzeigen"),
+    (
+        "Show alerts raised while Tha is open, and earlier ones from saved events",
+        "Warnungen seit dem Start von Tha und frühere aus gespeicherten Ereignissen zeigen",
+    ),
+    (
+        "Exited {count} times in {minutes} minutes",
+        "{count}-mal beendet in {minutes} Minuten",
+    ),
+    (
+        "Killed for running out of memory",
+        "Wegen Speichermangels beendet",
+    ),
+    (
+        "Its health check is failing",
+        "Der Healthcheck schlägt fehl",
+    ),
+    (
+        "Memory at {percent}% of its limit for {minutes} minutes",
+        "Speicher seit {minutes} Minuten bei {percent} % des Limits",
+    ),
+    (
+        "This alert has no workload to open; press . to manage servers",
+        "Diese Warnung hat keinen Workload zum Öffnen; . verwaltet Server",
+    ),
+    (" Alerts · {active} active ", " Warnungen · {active} aktiv "),
+    (
+        "Checked while Tha is open. Earlier incidents appear only where events were saved.",
+        "Geprüft, solange Tha offen ist. Frühere Vorfälle erscheinen nur, wo Ereignisse gespeichert wurden.",
+    ),
+    (
+        "No alerts. This covers only the connections Tha can reach.",
+        "Keine Warnungen. Das gilt nur für die Verbindungen, die Tha erreicht.",
+    ),
+    (
+        "Alerts are turned off in the configuration.",
+        "Warnungen sind in der Konfiguration ausgeschaltet.",
+    ),
+    (
+        "active, but its connection is down",
+        "aktiv, aber die Verbindung ist getrennt",
+    ),
+    ("active since {at}", "aktiv seit {at}"),
+    (
+        "over, at {at}, while Tha was closed",
+        "beendet um {at}, während Tha geschlossen war",
+    ),
+    ("over, at {at}", "beendet um {at}"),
+    (
+        "Incidents for the selected workload",
+        "Vorfälle für den ausgewählten Workload",
+    ),
+    (
+        "Show incidents for the selected workload: exits, OOM, health and spikes",
+        "Vorfälle für den ausgewählten Workload zeigen: Exits, OOM, Health und Spitzen",
+    ),
+    ("CPU reached {percent}%", "CPU erreichte {percent} %"),
+    (
+        "Memory reached {percent}% of its limit",
+        "Speicher erreichte {percent} % des Limits",
+    ),
+    ("Select a workload first", "Zuerst einen Workload auswählen"),
+    (
+        "Select a runtime or workload inside this server",
+        "Eine Runtime oder einen Workload auf diesem Server auswählen",
+    ),
+    (
+        "Logs from 60 s before {name}'s entry · :logs-since off shows all · Backspace returns",
+        "Logs ab 60 s vor dem Eintrag von {name} · :logs-since off zeigt alle · Rücktaste geht zurück",
+    ),
+    (" Incidents · {name} ", " Vorfälle · {name} "),
+    (
+        " j/k Move · Enter Logs from this moment · Esc Close ",
+        " j/k Bewegen · Enter Logs ab diesem Moment · Esc Schließen ",
+    ),
+    (
+        "Events: last 24 hours, saved. Spikes: only while Tha was open.",
+        "Ereignisse: letzte 24 Stunden, gespeichert. Spitzen: nur solange Tha offen war.",
+    ),
+    (
+        "Events: what the engine retained and Tha saw while open. Spikes: only while Tha was open.",
+        "Ereignisse: was die Engine behalten hat und Tha gesehen hat. Spitzen: nur solange Tha offen war.",
+    ),
+    (
+        "Shown together because they were close in time, which does not prove a cause.",
+        "Zusammen gezeigt, weil sie zeitlich nah lagen; das beweist keine Ursache.",
+    ),
+    (
+        "No failures in the available evidence for this selection.",
+        "Für diese Auswahl gibt es in den verfügbaren Daten keine Fehler.",
+    ),
+    ("{start} to {end} · {state}", "{start} bis {end} · {state}"),
+    ("started again afterwards", "danach wieder gestartet"),
+    ("no restart seen afterwards", "danach kein Neustart gesehen"),
+    (
+        "What needs attention across all connections",
+        "Was über alle Verbindungen Aufmerksamkeit braucht",
+    ),
+    (
+        "Show what needs attention across all connections",
+        "Zeigen, was über alle Verbindungen Aufmerksamkeit braucht",
+    ),
+    ("Unreachable: {reason}", "Nicht erreichbar: {reason}"),
+    (
+        "Not connected, so not checked",
+        "Nicht verbunden, daher nicht geprüft",
+    ),
+    (
+        "Connecting, so not checked yet",
+        "Verbindung wird aufgebaut, noch nicht geprüft",
+    ),
+    (
+        "Offline, showing old data: {error}",
+        "Offline, zeigt alte Daten: {error}",
+    ),
+    ("Offline: {error}", "Offline: {error}"),
+    (
+        "{count} critical vulnerabilities in the last saved scan",
+        "{count} kritische Schwachstellen im letzten gespeicherten Scan",
+    ),
+    (
+        "This row is a server or runtime; press . to manage servers",
+        "Diese Zeile ist ein Server oder eine Runtime; . verwaltet Server",
+    ),
+    (" Fleet health ", " Zustand der Flotte "),
+    (
+        " j/k Move · Enter Go to workload · Esc Close ",
+        " j/k Bewegen · Enter Zum Workload · Esc Schließen ",
+    ),
+    (
+        "{attention} need attention · {checked} connections checked",
+        "{attention} brauchen Aufmerksamkeit · {checked} Verbindungen geprüft",
+    ),
+    (
+        "Nothing reported needing attention on the connections checked.",
+        "Auf den geprüften Verbindungen wurde nichts gemeldet, das Aufmerksamkeit braucht.",
+    ),
+    ("this computer", "dieser Computer"),
+    (
+        "Remote server is disconnected",
+        "Der Remote-Server ist getrennt",
+    ),
+    (
+        "Browse and download files",
+        "Dateien durchsuchen und herunterladen",
+    ),
+    (
+        "Download a file or folder by path",
+        "Datei oder Ordner per Pfad herunterladen",
+    ),
+    (
+        "Browse and download files from the selected container or server",
+        "Dateien des ausgewählten Containers oder Servers durchsuchen und herunterladen",
+    ),
+    (
+        "Download a file or folder: download PATH",
+        "Datei oder Ordner herunterladen: download PFAD",
+    ),
+    (
+        "File browsing and download",
+        "Dateien durchsuchen und herunterladen",
+    ),
+    ("Files on this server", "Dateien auf diesem Server"),
+    (
+        "Browsing needs a running container with ls; downloading does not",
+        "Durchsuchen braucht einen laufenden Container mit ls; Herunterladen nicht",
+    ),
+    (
+        "Select a container or server first",
+        "Zuerst einen Container oder Server auswählen",
+    ),
+    (
+        "Connect to this server first",
+        "Zuerst mit diesem Server verbinden",
+    ),
+    (
+        "Server file access is turned off; rerun setup with --allow-server-download",
+        "Dateizugriff auf dem Server ist ausgeschaltet; Setup mit --allow-server-download erneut ausführen",
+    ),
+    (
+        "Select a single container or a server",
+        "Einen einzelnen Container oder einen Server auswählen",
+    ),
+    (
+        "Native containerd has no file access",
+        "Natives containerd bietet keinen Dateizugriff",
+    ),
+    (
+        "Kubernetes-managed containers are excluded",
+        "Von Kubernetes verwaltete Container sind ausgenommen",
+    ),
+    (
+        "Choose a folder below /, not the whole filesystem",
+        "Einen Ordner unterhalb von / wählen, nicht das ganze Dateisystem",
+    ),
+    ("Timed out", "Zeitüberschreitung"),
+    (
+        "Demo mode: files are not downloaded",
+        "Demo-Modus: Dateien werden nicht heruntergeladen",
+    ),
+    (
+        "Wait until the file has been checked",
+        "Warten, bis die Datei geprüft wurde",
+    ),
+    (
+        "Four downloads are already running; wait for one",
+        "Es laufen bereits vier Downloads; auf einen warten",
+    ),
+    (
+        "The destination folder does not exist",
+        "Der Zielordner existiert nicht",
+    ),
+    (
+        " Download manager · {label} ",
+        " Download-Manager · {label} ",
+    ),
+    (
+        " j/k Move · Enter Open or download · d Download · Tab Downloads · Esc Close ",
+        " j/k Bewegen · Enter Öffnen oder laden · d Laden · Tab Downloads · Esc Schließen ",
+    ),
+    (
+        " j/k Move · x Cancel · Tab Browse · Esc Close; downloads keep running ",
+        " j/k Bewegen · x Abbrechen · Tab Durchsuchen · Esc Schließen; Downloads laufen weiter ",
+    ),
+    (
+        "Browsing is unavailable: {reason} · :download PATH still works",
+        "Durchsuchen nicht verfügbar: {reason} · :download PFAD funktioniert weiterhin",
+    ),
+    (
+        "Building the tree in the background: {folders} folders read…",
+        "Baum wird im Hintergrund aufgebaut: {folders} Ordner gelesen…",
+    ),
+    (
+        "The tree is incomplete: it reached its limit. Opening a folder reads it.",
+        "Der Baum ist unvollständig, das Limit wurde erreicht. Ein geöffneter Ordner wird gelesen.",
+    ),
+    (
+        "Complete as of when each folder was read.",
+        "Vollständig, Stand beim Lesen des jeweiligen Ordners.",
+    ),
+    ("Nothing here yet.", "Hier ist noch nichts."),
+    ("reading…", "wird gelesen…"),
+    (
+        "No downloads in this session yet.",
+        "In dieser Sitzung gab es noch keine Downloads.",
+    ),
+    (
+        "{percent}% · {done} of about {total} · {rate}/s",
+        "{percent} % · {done} von etwa {total} · {rate}/s",
+    ),
+    ("{done} · {rate}/s", "{done} · {rate}/s"),
+    ("Finished · {size}", "Fertig · {size}"),
+    ("Failed: {error}", "Fehlgeschlagen: {error}"),
+    (
+        "Cancelled; the partial file was removed",
+        "Abgebrochen; die unvollständige Datei wurde entfernt",
+    ),
+    ("From: {label}", "Von: {label}"),
+    ("Path: {path}", "Pfad: {path}"),
+    ("Size: checking…", "Größe: wird geprüft…"),
+    (
+        "Size: could not be counted",
+        "Größe: konnte nicht gezählt werden",
+    ),
+    (
+        "Size: {size}, {files} files",
+        "Größe: {size}, {files} Dateien",
+    ),
+    (
+        "Size: at least {size}, {files} files…",
+        "Größe: mindestens {size}, {files} Dateien…",
+    ),
+    ("Size: {size}", "Größe: {size}"),
+    ("Modified: {time}", "Geändert: {time}"),
+    ("Save to: {path}▏", "Speichern unter: {path}▏"),
+    (
+        "This disk has only {free} free.",
+        "Auf diesem Datenträger sind nur {free} frei.",
+    ),
+    (
+        "This may contain sensitive data. A folder is saved as one .tar file.",
+        "Das kann vertrauliche Daten enthalten. Ein Ordner wird als eine .tar-Datei gespeichert.",
+    ),
+    (" Download ", " Download "),
+    (
+        " Enter Download · Esc Cancel · Ctrl-u Clear ",
+        " Enter Laden · Esc Abbrechen · Strg-u Leeren ",
+    ),
+    (
+        "Use a full path, starting with /",
+        "Vollständigen Pfad angeben, beginnend mit /",
+    ),
+    ("This path is not valid", "Dieser Pfad ist ungültig"),
+    (
+        "This image has no ls, so it cannot be browsed",
+        "Dieses Image hat kein ls und lässt sich daher nicht durchsuchen",
+    ),
+    (
+        "The transfer ended early",
+        "Die Übertragung wurde vorzeitig beendet",
+    ),
+    (
+        "The size count ended early",
+        "Die Größenzählung wurde vorzeitig beendet",
+    ),
+    (
+        "This server's agent does not support file access; update tha-agent",
+        "Der Agent dieses Servers unterstützt keinen Dateizugriff; tha-agent aktualisieren",
+    ),
+    ("No such file or folder", "Datei oder Ordner nicht gefunden"),
+    (
+        "A file with this name already exists",
+        "Eine Datei mit diesem Namen existiert bereits",
+    ),
+    (
+        "This path is a link or special file; use its target's path",
+        "Dieser Pfad ist ein Link oder eine Spezialdatei; den Pfad des Ziels verwenden",
+    ),
+    (
+        "Image pull and update checks are turned off on this server; rerun setup with --allow-images",
+        "Image-Pull und Update-Prüfung sind auf diesem Server ausgeschaltet; Setup mit --allow-images erneut ausführen",
+    ),
+    (
+        "This server's agent does not support image pull and update checks; update tha-agent",
+        "Der Agent dieses Servers unterstützt Image-Pull und Update-Prüfung nicht; tha-agent aktualisieren",
+    ),
+    (
+        "Show what this connection can do",
+        "Zeigen, was diese Verbindung kann",
+    ),
+    (
+        "Show what this connection can do, and why not",
+        "Zeigen, was diese Verbindung kann und was nicht",
+    ),
+    (" What {name} can do ", " Was {name} kann "),
+    (" j/k Scroll · Esc Close ", " j/k Scrollen · Esc Schließen "),
+    ("available", "verfügbar"),
+    ("turned off", "ausgeschaltet"),
+    ("missing dependency", "Abhängigkeit fehlt"),
+    ("not supported", "nicht unterstützt"),
+    ("unreachable", "nicht erreichbar"),
+    ("Events", "Ereignisse"),
+    ("Diagnostics", "Diagnose"),
+    ("Shell", "Shell"),
+    ("Compose actions", "Compose-Aktionen"),
+    ("Image pull and updates", "Image-Pull und Updates"),
+    ("Deleting resources", "Ressourcen löschen"),
+    ("Security scans", "Sicherheitsscans"),
+    ("Metrics history", "Metrikverlauf"),
+    (
+        "Install the docker or podman CLI",
+        "Docker- oder Podman-CLI installieren",
+    ),
+    (
+        "Needs the Compose plugin or docker-compose; checked when it runs",
+        "Braucht das Compose-Plugin oder docker-compose; wird beim Ausführen geprüft",
+    ),
+    ("Install Docker Compose", "Docker Compose installieren"),
+    (
+        "Run: tha module install security",
+        "Ausführen: tha module install security",
+    ),
+    (
+        "Saved by the background service",
+        "Vom Hintergrunddienst gespeichert",
+    ),
+    (
+        "Only this session; install service mode to keep it",
+        "Nur diese Sitzung; zum Behalten den Dienstmodus installieren",
+    ),
+    ("Install nerdctl", "nerdctl installieren"),
+    (
+        "Not available on native containerd",
+        "Auf nativem containerd nicht verfügbar",
+    ),
+    (
+        "Rerun setup on the server with {flag}",
+        "Setup auf dem Server mit {flag} erneut ausführen",
+    ),
+    (
+        "This agent does not report it; update tha-agent",
+        "Dieser Agent meldet das nicht; tha-agent aktualisieren",
+    ),
+    (
+        "Rerun setup on the server without --no-security",
+        "Setup auf dem Server ohne --no-security erneut ausführen",
+    ),
+    (
+        "Saved by the agent for 24 hours",
+        "Vom Agenten 24 Stunden gespeichert",
+    ),
+    (
+        "Connect to this server to check",
+        "Zum Prüfen mit diesem Server verbinden",
+    ),
+    (
+        "Select a connection to check",
+        "Zum Prüfen eine Verbindung auswählen",
+    ),
+    ("This connection is offline", "Diese Verbindung ist offline"),
+    (
+        "Save this view under a name",
+        "Diese Ansicht unter einem Namen speichern",
+    ),
+    (
+        "Open a saved view by name",
+        "Gespeicherte Ansicht nach Namen öffnen",
+    ),
+    ("Delete a saved view", "Gespeicherte Ansicht löschen"),
+    (
+        "Save this view and its filters under a name: save-view NAME",
+        "Diese Ansicht samt Filtern unter einem Namen speichern: save-view NAME",
+    ),
+    (
+        "Open a saved view by name: open-view NAME",
+        "Gespeicherte Ansicht nach Namen öffnen: open-view NAME",
+    ),
+    (
+        "Delete a saved view: delete-view NAME",
+        "Gespeicherte Ansicht löschen: delete-view NAME",
+    ),
+    ("Saved views", "Gespeicherte Ansichten"),
+    (
+        "A saved view needs a name",
+        "Eine gespeicherte Ansicht braucht einen Namen",
+    ),
+    (
+        "View names can use up to 64 bytes of plain text",
+        "Ansichtsnamen dürfen aus höchstens 64 Byte einfachem Text bestehen",
+    ),
+    (
+        "Could not write saved views: {error}",
+        "Gespeicherte Ansichten konnten nicht geschrieben werden: {error}",
+    ),
+    (
+        "Saved view limit reached; delete one with :delete-view",
+        "Limit für gespeicherte Ansichten erreicht; mit :delete-view eine löschen",
+    ),
+    (
+        "Replaced saved view {name}",
+        "Gespeicherte Ansicht {name} ersetzt",
+    ),
+    (
+        "Saved view {name}, including its filter text · :saved-views opens it",
+        "Ansicht {name} samt Filtertext gespeichert · :saved-views öffnet sie",
+    ),
+    (
+        "No saved view is named {name}",
+        "Keine gespeicherte Ansicht heißt {name}",
+    ),
+    (
+        "Deleted saved view {name}",
+        "Gespeicherte Ansicht {name} gelöscht",
+    ),
+    (
+        "No saved views yet; :save-view NAME saves the current one",
+        "Noch keine gespeicherten Ansichten; :save-view NAME speichert die aktuelle",
+    ),
+    ("advanced log filter", "erweiterter Logfilter"),
+    (
+        "Opened saved view {name} · Backspace returns",
+        "Gespeicherte Ansicht {name} geöffnet · Rücktaste geht zurück",
+    ),
+    (
+        "Opened saved view {name}, but these are unavailable: {missing}",
+        "Gespeicherte Ansicht {name} geöffnet, aber nicht verfügbar: {missing}",
+    ),
+    (
+        "The engine's response is too large to read",
+        "Die Antwort der Engine ist zu groß zum Lesen",
     ),
     ("Current state", "Aktueller Zustand"),
     (
@@ -2929,8 +3731,8 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "Zugehörige Ereignisse ({shown} von {total} · e öffnet Ereignisse)",
     ),
     (
-        "Related logs (l opens Logs)",
-        "Zugehörige Logs (l öffnet Logs)",
+        "Related logs (L loads them here · l opens Logs)",
+        "Zugehörige Logs (L lädt sie hier · l öffnet Logs)",
     ),
     (
         "Runtime answered for a different container; result discarded",
@@ -3075,7 +3877,7 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ),
     (
         "Compose is not available on servers: its files are on the server, not here",
-        "Compose ist auf Servern nicht verfügbar: Die Dateien liegen dort, nicht hier",
+        "Compose ist auf Servern so nicht verfügbar: Die Dateien liegen auf dem Server, nicht hier",
     ),
     ("Connect", "Verbinden"),
     (
@@ -3204,10 +4006,6 @@ pub const ENTRIES: &[(&str, &str)] = &[
     (
         "Port must be between 1 and 65535",
         "Port muss zwischen 1 und 65535 liegen",
-    ),
-    (
-        "Pulling images is not available on servers: the agent does not allow it",
-        "Images pullen ist auf Servern nicht verfügbar: Der Agent erlaubt es nicht",
     ),
     (
         "Remove {name} from this list and disconnect it?",

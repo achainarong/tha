@@ -693,6 +693,9 @@ fn image_runtime(app: &App) -> Result<(&crate::app::Engine, &Snapshot), String> 
     if engine.connection.kind != crate::config::BackendKind::Docker {
         return Err(crate::i18n::t("Registry updates require a Docker-compatible runtime").into());
     }
+    if let Some(reason) = app.remote_images_blocked(&engine.connection) {
+        return Err(reason.into());
+    }
     let snapshot = engine
         .snapshot
         .as_ref()

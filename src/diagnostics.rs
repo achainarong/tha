@@ -19,6 +19,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 pub const DEADLINE: Duration = Duration::from_secs(5);
 /// How often Overview re-reads the one selected container, so the last check stays current.
 pub const OVERVIEW_REFRESH: Duration = Duration::from_secs(10);
+/// Far above a real inspect document, and read before parsing so a bad engine cannot exhaust memory.
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ATTEMPTS: usize = 10;
 pub const MAX_OUTPUT_BYTES: usize = 4096;
 pub const MAX_ENDPOINTS: usize = 32;
@@ -474,12 +476,20 @@ pub async fn inspect(connection: &Connection, id: &str, with_image: bool) -> Res
         let docker = crate::backend::docker::connect(connection)?
             .negotiate_version()
             .await?;
-        let response = docker
-            .inspect_container(
-                id,
-                None::<bollard::query_parameters::InspectContainerOptions>,
-            )
-            .await?;
+        anyhow::ensure!(
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')),
+            "Invalid container ID"
+        );
+        let response: ContainerInspectResponse = crate::backend::docker::get_json_capped(
+            connection,
+            &docker,
+            &format!("/containers/{id}/json?size=false"),
+            MAX_RESPONSE_BYTES,
+        )
+        .await?;
         let image = response.image.clone();
         let mut inspection = parse(response);
         // Only overrides depend on this, so a missing image must not lose the rest.
@@ -536,6 +546,65 @@ pub struct View {
     pub scroll: usize,
     /// Visible explanation of why the last key did nothing.
     pub message: Option<String>,
+    /// Logs the user asked for from this view. They are gone when it closes.
+    pub loaded_logs: Option<LoadedLogs>,
+}
+
+pub struct LoadedLogs {
+    pub target: Target,
+    pub generation: u64,
+    pub status: LogLoad,
+}
+
+pub enum LogLoad {
+    Loading,
+    Ready(LogBuffer),
+    Failed(String),
+}
+
+pub struct LogRequest {
+    pub generation: u64,
+    pub target: Target,
+    pub connection: Connection,
+    pub container: Container,
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+}
+
+pub struct LogLoadEvent {
+    pub generation: u64,
+    pub target: Target,
+    pub result: Result<LogBuffer, String>,
+}
+
+/// Hides values after names that usually hold secrets. It cannot recognize everything, so a
+/// bundle says redaction was a best effort.
+pub fn redact(text: &str) -> String {
+    use std::sync::OnceLock;
+    static PATTERNS: OnceLock<[regex::Regex; 2]> = OnceLock::new();
+    let [named, bearer] = PATTERNS.get_or_init(|| {
+        [
+            regex::Regex::new(
+                r#"(?i)([a-z0-9_.-]*(?:password|passwd|pwd|secret|token|api[_-]?key|authorization|credential)[a-z0-9_.-]*"?\s*[=:]\s*"?)[^\s"',;&]+"#,
+            )
+            .expect("valid pattern"),
+            regex::Regex::new(r"(?i)\b(bearer|basic)\s+[a-z0-9._~+/=-]+").expect("valid pattern"),
+        ]
+    });
+    // In this order, or `Authorization: Bearer x` would lose only the word "Bearer".
+    let text = bearer.replace_all(text, "$1 [redacted]");
+    named.replace_all(&text, "${1}[redacted]").into_owned()
+}
+
+/// The bounded time range to read: around a known failure, otherwise only the latest lines.
+pub fn log_window(failure: Option<OffsetDateTime>) -> (Option<i64>, Option<i64>) {
+    failure.map_or((None, None), |failure| {
+        (
+            Some((failure - LOGS_BEFORE_FAILURE).unix_timestamp()),
+            // The engine's `until` is whole seconds, so round up to keep the last moments.
+            Some((failure + LOGS_AFTER_FAILURE).unix_timestamp() + 1),
+        )
+    })
 }
 
 impl Side {
@@ -561,6 +630,20 @@ impl Side {
 }
 
 impl View {
+    /// Late and replaced results are dropped, so logs never attach to another container.
+    pub fn complete_logs(&mut self, event: LogLoadEvent) {
+        let Some(loaded) = &mut self.loaded_logs else {
+            return;
+        };
+        if loaded.generation != event.generation || loaded.target != event.target {
+            return;
+        }
+        loaded.status = match event.result {
+            Ok(buffer) => LogLoad::Ready(buffer),
+            Err(error) => LogLoad::Failed(error),
+        };
+    }
+
     pub fn side_mut(&mut self, role: Role) -> Option<&mut Side> {
         match role {
             Role::Main => Some(&mut self.main),
@@ -923,6 +1006,70 @@ mod tests {
         })))
     }
 
+    /// Serves one raw HTTP response on a throwaway socket and returns a matching connection.
+    async fn engine(name: &str, response: Vec<u8>) -> Connection {
+        let directory =
+            std::env::temp_dir().join(format!("tha-inspect-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("engine.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Version negotiation and the inspect each get their own connection.
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = vec![0; 4096];
+                let read = stream.read(&mut request).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..read]).to_string();
+                let body = if head.contains("/version") {
+                    br#"{"ApiVersion":"1.45"}"#.to_vec()
+                } else {
+                    assert!(head.contains("/containers/abc/json?size=false"), "{head}");
+                    response.clone()
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            }
+        });
+        Connection {
+            name: name.into(),
+            kind: BackendKind::Docker,
+            endpoint: format!("unix://{}", socket.display()),
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_reads_a_normal_response_and_refuses_an_oversized_one_before_parsing() {
+        let normal = engine(
+            "normal",
+            serde_json::to_vec(&serde_json::json!({"Id": "abc", "RestartCount": 3})).unwrap(),
+        )
+        .await;
+        let inspection = inspect(&normal, "abc", false).await.unwrap();
+        assert_eq!(inspection.id, "abc");
+        assert_eq!(inspection.restart_count, Some(3));
+
+        let oversized = engine("oversized", vec![b' '; MAX_RESPONSE_BYTES + 1]).await;
+        let error = inspect(&oversized, "abc", false).await.unwrap_err();
+        assert!(error.to_string().contains("too large"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn inspect_rejects_an_id_that_could_change_the_request_path() {
+        let connection = engine("path", Vec::new()).await;
+        for id in ["", "../images/x", "abc?size=true", "a b"] {
+            let error = inspect(&connection, id, false).await.unwrap_err();
+            assert!(
+                error.to_string().contains("Invalid container ID"),
+                "{error:#}"
+            );
+        }
+    }
+
     fn target(id: &str) -> Target {
         Target {
             engine: 0,
@@ -951,7 +1098,78 @@ mod tests {
             peer: None,
             scroll: 0,
             message: None,
+            loaded_logs: None,
         }
+    }
+
+    #[test]
+    fn redaction_hides_common_secret_values_and_leaves_other_text() {
+        for (text, expected) in [
+            ("password=hunter2 next", "password=[redacted] next"),
+            ("DB_PASSWORD: hunter2", "DB_PASSWORD: [redacted]"),
+            (
+                r#"{"api_key":"abc123","x":1}"#,
+                r#"{"api_key":"[redacted]","x":1}"#,
+            ),
+            (
+                "Authorization: Bearer abc.def",
+                "Authorization: [redacted] [redacted]",
+            ),
+            ("curl -H bearer xyz", "curl -H bearer [redacted]"),
+            ("GET /health 200", "GET /health 200"),
+        ] {
+            assert_eq!(redact(text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn log_window_surrounds_a_failure_and_is_unbounded_only_without_one() {
+        assert_eq!(log_window(None), (None, None));
+        let failure = time::OffsetDateTime::from_unix_timestamp(1000).unwrap();
+        assert_eq!(log_window(Some(failure)), (Some(940), Some(1011)));
+    }
+
+    #[test]
+    fn loaded_logs_ignore_late_results_and_other_containers() {
+        let mut view = view();
+        let target = view.main.target.clone();
+        view.loaded_logs = Some(LoadedLogs {
+            target: target.clone(),
+            generation: 5,
+            status: LogLoad::Loading,
+        });
+        let result = |text: &str| {
+            let mut buffer = LogBuffer::new(10);
+            buffer.push("web", text, false);
+            Ok(buffer)
+        };
+        view.complete_logs(LogLoadEvent {
+            generation: 4,
+            target: target.clone(),
+            result: result("late"),
+        });
+        assert!(matches!(
+            view.loaded_logs.as_ref().unwrap().status,
+            LogLoad::Loading
+        ));
+        view.complete_logs(LogLoadEvent {
+            generation: 5,
+            target: side("other").target,
+            result: result("recreated"),
+        });
+        assert!(matches!(
+            view.loaded_logs.as_ref().unwrap().status,
+            LogLoad::Loading
+        ));
+        view.complete_logs(LogLoadEvent {
+            generation: 5,
+            target,
+            result: result("current"),
+        });
+        assert!(matches!(
+            view.loaded_logs.as_ref().unwrap().status,
+            LogLoad::Ready(_)
+        ));
     }
 
     fn event(target: Target, generation: u64, id: &str) -> Event {

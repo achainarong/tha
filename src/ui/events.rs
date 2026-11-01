@@ -33,7 +33,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let native = app.current().is_some_and(|row| {
         app.engines[row.engine].connection.kind == crate::config::BackendKind::Containerd
     });
-    let persisted = app.metrics_database.is_some();
+    let persisted = app
+        .current()
+        .is_some_and(|row| app.events_saved(row.engine));
     let lines: Vec<Line> = app
         .visible_events()
         .into_iter()
@@ -55,7 +57,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             "{total} events · newest first · UTC · {a0}",
             total = total,
             a0 = if persisted {
-                crate::i18n::t("last 24 hours, saved by the service")
+                crate::i18n::t("last 24 hours, saved")
             } else {
                 crate::i18n::t("from the engine while Tha is open")
             }

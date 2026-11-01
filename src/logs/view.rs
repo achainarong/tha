@@ -54,6 +54,7 @@ pub struct LogView {
     pub height: usize,
     width: usize,
     anchor: Option<Position>,
+    issue_sequence: Option<u64>,
     query: String,
     query_is_regex: bool,
     /// Search syntax for the next query; literal by default.
@@ -88,6 +89,7 @@ impl LogView {
             height: 1,
             width: 1,
             anchor: None,
+            issue_sequence: None,
             query: String::new(),
             query_is_regex: false,
             regex_search: false,
@@ -131,6 +133,7 @@ impl LogView {
         self.layout_scanned = None;
         self.reset_search_counts();
         self.anchor = None;
+        self.issue_sequence = None;
         self.active = None;
         self.match_count = 0;
         self.match_index = None;
@@ -450,6 +453,54 @@ impl LogView {
         self.match_index = None;
         self.reset_search_counts();
         self.sync(buffer, self.width, self.height);
+    }
+
+    /// Moves between flagged entries, separately from search. Only entries the filter shows
+    /// count, because a jump to something hidden would land nowhere.
+    pub fn next_issue(&mut self, buffer: &mut LogBuffer, backwards: bool) -> bool {
+        let current = self.issue_sequence;
+        let shown = |entry: &&Entry| entry.issue && self.filter.matches(entry);
+        let found = if backwards {
+            buffer
+                .entries
+                .iter()
+                .rev()
+                .filter(shown)
+                .find(|entry| current.is_none_or(|at| entry.sequence < at))
+                .or_else(|| buffer.entries.iter().rev().find(shown))
+        } else {
+            buffer
+                .entries
+                .iter()
+                .filter(shown)
+                .find(|entry| current.is_none_or(|at| entry.sequence > at))
+                .or_else(|| buffer.entries.iter().find(shown))
+        };
+        let Some(sequence) = found.map(|entry| entry.sequence) else {
+            return false;
+        };
+        self.issue_sequence = Some(sequence);
+        self.anchor = Some(Position { sequence, byte: 0 });
+        self.horizontal = 0;
+        buffer.follow = false;
+        self.sync(buffer, self.width, self.height);
+        true
+    }
+
+    /// `(position of the current one, flagged and shown, flagged but hidden by the filter)`.
+    pub fn issue_counts(&self, buffer: &LogBuffer) -> (Option<usize>, usize, usize) {
+        let (mut position, mut shown, mut hidden) = (None, 0, 0);
+        for entry in buffer.entries.iter().filter(|entry| entry.issue) {
+            if self.filter.matches(entry) {
+                shown += 1;
+                if self.issue_sequence == Some(entry.sequence) {
+                    position = Some(shown);
+                }
+            } else {
+                hidden += 1;
+            }
+        }
+        (position, shown, hidden)
     }
 
     pub fn next_match(&mut self, buffer: &mut LogBuffer, backwards: bool) {

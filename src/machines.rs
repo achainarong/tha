@@ -30,6 +30,8 @@ pub struct Machine {
     pub managed: bool,
     pub state: MachineState,
     pub allow_delete: bool,
+    /// `None` until connected, and from agents too old to report it.
+    pub capabilities: Option<crate::agent::Capabilities>,
     /// What the server last reported. It may stop exposing an engine between connections.
     pub engines: Vec<String>,
     pub anchor: usize,
@@ -249,7 +251,7 @@ impl App {
         self.machines.iter().find(|m| m.remote.name == name)
     }
 
-    fn machine_mut(&mut self, name: &str) -> Option<&mut Machine> {
+    pub(crate) fn machine_mut(&mut self, name: &str) -> Option<&mut Machine> {
         self.machines.iter_mut().find(|m| m.remote.name == name)
     }
 
@@ -368,6 +370,7 @@ impl App {
             managed,
             state: MachineState::NotConnected,
             allow_delete: false,
+            capabilities: None,
             engines: Vec::new(),
             anchor,
             generation: 0,
@@ -491,11 +494,13 @@ impl App {
             remote::Update::Connected {
                 engines,
                 allow_delete,
+                capabilities,
             } => {
                 if let Some(machine) = self.machine_mut(&event.server) {
                     machine.state = MachineState::Connected;
                     machine.prompt_unlock = false;
                     machine.allow_delete = allow_delete;
+                    machine.capabilities = capabilities;
                     machine.engines = engines.clone();
                 }
                 self.attach_engines(&event.server, &engines);
@@ -613,6 +618,20 @@ impl App {
     }
 
     /// `Enter` on a machine row. A server that is not connected connects as it opens.
+    /// Why a server would refuse image pull and update checks, known before asking it.
+    pub fn remote_images_blocked(&self, connection: &Connection) -> Option<&'static str> {
+        let (server, _) = remote::parse_endpoint(&connection.endpoint)?;
+        match self.machine(server)?.capabilities.as_ref() {
+            Some(reported) if reported.allow_images => None,
+            Some(_) => Some(crate::i18n::t(
+                "Image pull and update checks are turned off on this server; rerun setup with --allow-images",
+            )),
+            None => Some(crate::i18n::t(
+                "This server's agent does not support image pull and update checks; update tha-agent",
+            )),
+        }
+    }
+
     pub fn open_machine(&mut self, name: &str) {
         if self.machine(name).is_some_and(|machine| {
             matches!(
@@ -1266,6 +1285,7 @@ mod tests {
             update: Update::Connected {
                 engines: vec!["docker".into()],
                 allow_delete: false,
+                capabilities: None,
             },
         });
     }
@@ -1376,6 +1396,7 @@ mod tests {
             update: Update::Connected {
                 engines: vec!["docker".into()],
                 allow_delete: true,
+                capabilities: None,
             },
         });
         assert_eq!(
@@ -1904,6 +1925,7 @@ mod tests {
             update: Update::Connected {
                 engines: vec!["podman".into()],
                 allow_delete: false,
+                capabilities: None,
             },
         });
         let engines = app.machine_engines("prod");
@@ -2121,6 +2143,21 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_view_can_focus_a_server_without_connecting_to_it() {
+        let mut app = with_servers(&["prod"]);
+        app.machine = Some("prod".into());
+        let view = app.capture_view("Production");
+        app.machine = None;
+        app.saved_views.push(view);
+        app.apply_saved_view("Production");
+        assert_eq!(app.machine.as_deref(), Some("prod"));
+        assert!(matches!(
+            app.machine("prod").unwrap().state,
+            MachineState::NotConnected
+        ));
+    }
+
+    #[test]
     fn the_machine_row_never_acts_on_an_engine() {
         use crate::actions::Action;
         let mut app = with_servers(&["prod"]);
@@ -2222,13 +2259,22 @@ mod tests {
                 |row| matches!(&row.scope, Scope::Project { project, .. } if project == "shop"),
             )
             .expect("the project row");
+        // An agent too old to report it, then one with it off, then one with it on.
         app.request_compose(crate::compose::Action::Up);
         assert!(app.compose_confirmation.is_none());
-        assert!(
-            app.notice.contains("not available on servers"),
-            "{}",
-            app.notice
-        );
+        assert!(app.notice.contains("update tha-agent"), "{}", app.notice);
+
+        app.machine_mut("prod").unwrap().capabilities = Some(crate::agent::Capabilities::default());
+        app.request_compose(crate::compose::Action::Up);
+        assert!(app.compose_confirmation.is_none());
+        assert!(app.notice.contains("--allow-compose"), "{}", app.notice);
+
+        app.machine_mut("prod").unwrap().capabilities = Some(crate::agent::Capabilities {
+            allow_compose: true,
+            ..Default::default()
+        });
+        app.request_compose(crate::compose::Action::Up);
+        assert!(app.compose_confirmation.is_some(), "{}", app.notice);
     }
 
     #[test]

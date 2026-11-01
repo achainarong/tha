@@ -14,6 +14,9 @@ pub enum Action {
     Stop,
     Restart,
     Delete,
+    Pause,
+    Unpause,
+    Kill,
 }
 
 impl Action {
@@ -23,6 +26,9 @@ impl Action {
             Self::Stop => crate::i18n::t("Stop"),
             Self::Restart => crate::i18n::t("Restart"),
             Self::Delete => crate::i18n::t("Delete"),
+            Self::Pause => crate::i18n::t("Pause"),
+            Self::Unpause => crate::i18n::t("Unpause"),
+            Self::Kill => crate::i18n::t("Kill"),
         }
     }
     pub fn eligible(self, container: &Container) -> bool {
@@ -30,6 +36,12 @@ impl Action {
             Self::Start => matches!(container.state.as_str(), "created" | "exited"),
             Self::Stop | Self::Restart => container.running(),
             Self::Delete => matches!(container.state.as_str(), "created" | "exited" | "dead"),
+            Self::Pause => container.state == "running",
+            Self::Unpause => container.state == "paused",
+            Self::Kill => matches!(
+                container.state.as_str(),
+                "running" | "paused" | "restarting"
+            ),
         }
     }
 }

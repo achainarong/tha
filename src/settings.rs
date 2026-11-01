@@ -12,6 +12,7 @@ pub struct SavedSettings {
     pub mouse: Option<bool>,
     pub language: Option<Language>,
     pub remote_connect: Option<crate::remote::ConnectMode>,
+    pub editor: Option<crate::editor::Editor>,
 }
 
 /// What the settings fall back to: config.toml, or the built-in defaults.
@@ -23,6 +24,7 @@ pub struct BaseSettings {
     pub log_wrap: bool,
     pub language: Language,
     pub remote_connect: crate::remote::ConnectMode,
+    pub editor: crate::editor::Editor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +32,7 @@ pub enum SettingRow {
     Theme,
     Language,
     Keyboard,
+    Editor,
     Mouse,
     WrapLogs,
     RemoteConnect,
@@ -42,6 +45,7 @@ impl SettingRow {
         Self::Theme,
         Self::Language,
         Self::Keyboard,
+        Self::Editor,
         Self::Mouse,
         Self::WrapLogs,
         Self::RemoteConnect,
@@ -116,6 +120,7 @@ impl App {
         self.set_theme(base.theme);
         self.set_keyboard(base.keyboard);
         self.remote_connect = base.remote_connect;
+        self.editor = base.editor;
     }
 
     pub fn apply_saved_settings(&mut self, saved: SavedSettings) {
@@ -126,6 +131,7 @@ impl App {
         self.set_theme(saved.theme.unwrap_or(base.theme));
         self.set_keyboard(saved.keyboard.unwrap_or(base.keyboard));
         self.remote_connect = saved.remote_connect.unwrap_or(base.remote_connect);
+        self.editor = saved.editor.unwrap_or(base.editor);
     }
 
     pub fn move_setting(&mut self, amount: isize) {
@@ -155,6 +161,11 @@ impl App {
                 let preset = cycled(KeyboardPreset::ALL, self.keyboard, forward);
                 self.saved_settings.keyboard = Some(preset);
                 self.set_keyboard(preset);
+            }
+            SettingRow::Editor => {
+                let editor = cycled(crate::editor::Editor::ALL, self.editor, forward);
+                self.editor = editor;
+                self.saved_settings.editor = Some(editor);
             }
             SettingRow::Mouse => {
                 self.mouse_enabled = !self.mouse_enabled;
@@ -287,6 +298,7 @@ mod tests {
             log_wrap: true,
             language: Language::English,
             remote_connect: crate::remote::ConnectMode::Startup,
+            editor: Default::default(),
         });
         assert_eq!(app.theme, Theme::Nord);
         assert_eq!(app.keyboard, KeyboardPreset::German);

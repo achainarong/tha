@@ -46,6 +46,11 @@ fn split_timestamp(text: &str) -> (Option<OffsetDateTime>, &str) {
     (None, text)
 }
 
+/// A log line without the timestamp the engine added in front of it.
+pub fn message(text: &str) -> &str {
+    split_timestamp(text).1
+}
+
 pub fn line_timestamp(text: &str) -> Option<OffsetDateTime> {
     split_timestamp(text).0
 }
@@ -219,6 +224,28 @@ mod tests {
     }
 
     #[test]
+    fn a_leading_dash_excludes_a_word_and_a_backslash_makes_it_literal() {
+        let keep = |query: &str, text: &str| {
+            let mut logs = LogBuffer::new(10);
+            logs.push("api", text, false);
+            text_filter(query).matches(logs.entries.back().unwrap())
+        };
+        assert!(!keep("-healthcheck", "GET /healthcheck 200"));
+        assert!(keep("-healthcheck", "GET /checkout 200"));
+        assert!(keep("500 -healthcheck", "GET /checkout 500"));
+        assert!(!keep("500 -healthcheck", "GET /healthcheck 500"));
+        assert!(!keep("500 -healthcheck", "GET /checkout 200"));
+        assert!(
+            !keep("-HEALTHCHECK", "get /healthcheck"),
+            "Case does not matter"
+        );
+        assert!(keep("\\-v", "tool -v printed"));
+        assert!(!keep("\\-v", "tool printed"));
+        assert!(keep("-", "a - b"), "A lone dash is just a dash");
+        assert!(text_filter("-x").text_active());
+    }
+
+    #[test]
     fn text_terms_are_literal_and_whitespace_only_text_is_no_constraint() {
         let mut logs = LogBuffer::new(10);
         logs.push("api", "backend1 [500] done", false);
@@ -355,6 +382,7 @@ pub struct Filter {
     until: Option<OffsetDateTime>,
     /// Lowercased literal terms; an entry must contain all of them in its message.
     terms: Vec<String>,
+    excluded: Vec<String>,
 }
 impl Filter {
     /// Parses the advanced JSON document. Text terms are set separately with `set_text`,
@@ -397,22 +425,41 @@ impl Filter {
             since,
             until,
             terms: Vec::new(),
+            excluded: Vec::new(),
         })
     }
     pub fn active(&self) -> bool {
         self != &Self::default()
     }
     /// Replaces the text terms and leaves the advanced predicates alone.
+    ///
+    /// `-word` hides messages containing it, and `\\-word` searches for a literal `-word`.
     pub fn set_text(&mut self, text: &str) {
-        self.terms = text.split_whitespace().map(str::to_lowercase).collect();
+        self.terms.clear();
+        self.excluded.clear();
+        for word in text.split_whitespace() {
+            let word = word.to_lowercase();
+            match word.strip_prefix('-') {
+                Some(rest) if !rest.is_empty() => self.excluded.push(rest.to_owned()),
+                _ => self.terms.push(
+                    word.strip_prefix("\\-")
+                        .map_or_else(|| word.clone(), |rest| format!("-{rest}")),
+                ),
+            }
+        }
     }
     /// Replaces the advanced predicates and leaves the text terms alone.
     pub fn set_advanced(&mut self, advanced: Self) {
         let terms = std::mem::take(&mut self.terms);
-        *self = Self { terms, ..advanced };
+        let excluded = std::mem::take(&mut self.excluded);
+        *self = Self {
+            terms,
+            excluded,
+            ..advanced
+        };
     }
     pub fn text_active(&self) -> bool {
-        !self.terms.is_empty()
+        !self.terms.is_empty() || !self.excluded.is_empty()
     }
     pub fn advanced_active(&self) -> bool {
         self.source.is_some()
@@ -425,11 +472,12 @@ impl Filter {
     /// Every term must occur in this one message. The source label, the timestamp the engine
     /// adds and any pretty-printing are not part of it: `500` must not match `10:00:00.500Z`.
     fn matches_text(&self, entry: &super::Entry) -> bool {
-        if self.terms.is_empty() {
+        if !self.text_active() {
             return true;
         }
         let message = split_timestamp(&entry.text).1.to_lowercase();
         self.terms.iter().all(|term| message.contains(term))
+            && !self.excluded.iter().any(|term| message.contains(term))
     }
     pub fn matches(&self, entry: &super::Entry) -> bool {
         self.source

@@ -9,6 +9,17 @@ mod store;
 mod updates;
 pub use service::{cancel_remote, serve, service_status, submit};
 
+/// Critical findings in the last saved report for one image, if there is a report.
+pub fn saved_critical(target: &Target) -> Result<Option<usize>> {
+    Ok(store::load(target)?.map(|report| {
+        report
+            .findings
+            .iter()
+            .filter(|finding| finding.severity.eq_ignore_ascii_case("critical"))
+            .count()
+    }))
+}
+
 use crate::config::Connection;
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;

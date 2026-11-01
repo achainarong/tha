@@ -298,6 +298,59 @@ fn agent_root_setup_passes_no_key() {
 }
 
 #[test]
+fn allow_all_and_every_single_option_reach_setup_and_need_a_key_or_root() {
+    for flag in [
+        "--allow-all",
+        "--allow-delete",
+        "--allow-exec",
+        "--allow-images",
+        "--allow-download",
+        "--allow-server-download",
+        "--allow-compose",
+        "--allow-compose-edit",
+        "--allow-upload",
+    ] {
+        for arguments in [
+            vec!["agent", "--key", "K", flag],
+            vec!["agent", "--user", "root", flag],
+        ] {
+            let (temp, output) = run_agent("0", &arguments, "");
+            assert!(output.status.success(), "{flag}: {output:?}");
+            assert!(agent_calls(&temp).contains(flag), "{flag}");
+        }
+        let (_, output) = run_agent("0", &["agent", flag], "");
+        assert!(!output.status.success(), "{flag} without a key: {output:?}");
+    }
+    let (temp, output) = run_agent(
+        "0",
+        &[
+            "agent",
+            "--key",
+            "K",
+            "--alert-webhook",
+            "https://hooks.example/a",
+        ],
+        "",
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(agent_calls(&temp).contains("--alert-webhook https://hooks.example/a"));
+}
+
+#[test]
+fn server_images_opt_in_reaches_setup_and_needs_a_key_or_root() {
+    for arguments in [
+        vec!["agent", "--key", "K", "--allow-images"],
+        vec!["agent", "--user", "root", "--allow-images"],
+    ] {
+        let (temp, output) = run_agent("0", &arguments, "");
+        assert!(output.status.success(), "{output:?}");
+        assert!(agent_calls(&temp).contains("--allow-images"));
+    }
+    let (_, output) = run_agent("0", &["agent", "--allow-images"], "");
+    assert!(!output.status.success(), "{output:?}");
+}
+
+#[test]
 fn server_exec_opt_in_reaches_setup_for_dedicated_and_root_users() {
     for arguments in [
         vec!["agent", "--key", "K", "--allow-exec"],

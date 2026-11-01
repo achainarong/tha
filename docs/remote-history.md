@@ -33,3 +33,11 @@ interval (5 seconds by default). Tha displays an upgrade/restart notice instead 
 claiming persistent history is available. Server/query failures also show a notice
 and leave session metrics usable. The chart uses the selected source's sampling
 interval, not the local daemon's interval.
+
+## Container events
+
+The agent also saves container events for each engine, in `/var/lib/tha-agent/events-<engine>.sqlite3`,
+for the same 24 hours and with a 16 MiB budget. Tha reads them over the same channel when the Events
+tab or `:timeline` is open. An older agent has no events to give, and Tha falls back to what the engine
+retained.
+

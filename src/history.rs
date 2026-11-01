@@ -15,7 +15,22 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+/// The default, and what agents on servers keep.
 pub const RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+pub const MAX_RETENTION_HOURS: u64 = 24 * 30;
+static RETENTION: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(RETENTION_MS);
+
+/// `history_retention_hours`, set once at startup. The disk budget still has the last word.
+pub fn set_retention_hours(hours: u64) {
+    RETENTION.store(
+        hours as i64 * 3_600_000,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub fn retention_ms() -> i64 {
+    RETENTION.load(std::sync::atomic::Ordering::Relaxed)
+}
 const APPLICATION_ID: i64 = 0x54484131; // THA1
 pub const RANGES: [i64; 10] = [
     60_000,
@@ -417,7 +432,7 @@ impl Store {
         if self.size_bytes() >= self.budget.saturating_sub(1024 * 1024) {
             return Ok(0);
         }
-        let cutoff = now_ms() - RETENTION_MS;
+        let cutoff = now_ms() - retention_ms();
         let mut written = 0;
         let tx = self.db.transaction()?;
         {
@@ -481,7 +496,7 @@ impl Store {
     }
     /// Small transactions allow readers and ingestion to run between expiry batches.
     pub fn prune_batch(&self, now: i64) -> Result<usize> {
-        Ok(self.db.execute("DELETE FROM samples WHERE (container,at) IN (SELECT container,at FROM samples WHERE at < ?1 LIMIT 2000)", [now - RETENTION_MS])?)
+        Ok(self.db.execute("DELETE FROM samples WHERE (container,at) IN (SELECT container,at FROM samples WHERE at < ?1 LIMIT 2000)", [now - retention_ms()])?)
     }
     pub fn maintenance(&self) -> Result<()> {
         self.db.execute("DELETE FROM containers WHERE id IN (SELECT id FROM containers WHERE NOT EXISTS (SELECT 1 FROM samples WHERE container=containers.id) LIMIT 2000)", [])?;
@@ -547,7 +562,7 @@ pub fn latest(path: &Path, runtime: &str, keys: &[String]) -> Result<crate::metr
     let mut batch = crate::metrics::Batch::new();
     for key in keys {
         let sample = statement
-            .query_row(params![runtime, key, now_ms() - RETENTION_MS], |row| {
+            .query_row(params![runtime, key, now_ms() - retention_ms()], |row| {
                 Ok((row.get::<_, i64>(0)?, usage_row(row, 1)?))
             })
             .optional()?;
@@ -610,7 +625,7 @@ pub fn query_excluding(
         bail!("Too many live samples in a history query");
     }
     let db = reader(path)?;
-    let start = start.max(now_ms() - RETENTION_MS);
+    let start = start.max(now_ms() - retention_ms());
     let width = ((end - start).max(1) / buckets.clamp(1, 1200) as i64).max(1);
     let fields = [
         "cpu",
@@ -882,13 +897,13 @@ impl View {
         self.cursor = None;
         if let Some(end) = self.end_ms {
             let now = now_ms();
-            self.end_ms = Some(end.clamp(now - RETENTION_MS + RANGES[self.range], now));
+            self.end_ms = Some(end.clamp(now - retention_ms() + RANGES[self.range], now));
         }
     }
     pub fn pan(&mut self, direction: i64) {
         self.end_ms = Some(
             (self.bounds().1 + direction * RANGES[self.range] / 4)
-                .clamp(now_ms() - RETENTION_MS + RANGES[self.range], now_ms()),
+                .clamp(now_ms() - retention_ms() + RANGES[self.range], now_ms()),
         );
         self.cursor = None;
     }

@@ -113,6 +113,41 @@ privileged exec or unrestricted Docker API access. Kubernetes-managed
 containers remain excluded. Closing a session disconnects its streams; it does
 not guarantee termination of commands or background processes inside the container.
 
+### Server permissions
+
+A new server allows browsing, logs, metrics, events and start, stop, restart, pause, unpause and kill.
+Everything else is off until you turn it on in the setup command on the **server**:
+
+| Option | Allows | Holder of the key can also |
+| --- | --- | --- |
+| `--allow-delete` | Deleting containers, images and volumes, and pruning | Remove data that cannot be recovered |
+| `--allow-exec` | Container and server shells, browsing container files, network tests | Run commands, including a shell as the SSH login user |
+| `--allow-images` | Pulling public images, checking for updates | Make the server contact registries and use disk |
+| `--allow-download` | Downloading files and folders from containers | Read anything inside any container |
+| `--allow-server-download` | Browsing and downloading the server's own files | Read whatever the SSH login user can read |
+| `--allow-upload` | Copying files into containers | Change files inside running workloads |
+| `--allow-compose` | Compose actions on projects whose files are on the server | Recreate projects from those files |
+| `--allow-compose-edit` | Editing Compose and `.env` files | Change them, which together with `--allow-compose` amounts to root |
+| `--allow-all` | All of the above | All of the above |
+
+Options add up, and rerunning setup keeps what is already on. To allow everything:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent --key 'ssh-ed25519 AAAA...' --allow-all
+```
+
+**`--allow-all` gives every holder of that key full control of the server's containers and, in practice,
+root on the server.** With a root login, it also exposes every file on it. Use it only on machines where
+that is what you want, and prefer the dedicated `tha` user. `--no-security` and `--alert-webhook URL` are
+separate. `:capabilities` in Tha shows what each server allows. To turn one off, set it to `false` in
+`/etc/tha/agent.toml` and run `sudo systemctl restart tha-agent`, for example:
+
+```toml
+allow_upload = false
+```
+
+Keep these at the top of the file, before any table headers. See the [user guide](docs/guide.md) for details on each.
+
 ### Background agent features
 
 Agent setup enables resource-limited, load-aware security scans. The agent verifies
