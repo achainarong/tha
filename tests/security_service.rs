@@ -42,6 +42,11 @@ if [ "$1" != "--host" ] || [ "$2" != "unix:///fixture.sock" ]; then
     exit 1
 fi
 shift 2
+for arg in "$@"; do
+    case "$arg" in
+        --blkio-weight*) echo 'error setting cgroup config: io.weight: no such file or directory' >&2; exit 1 ;;
+    esac
+done
 case "$1" in
     info)
         if [ "$THA_FIXTURE_ENGINE_OFFLINE" = 1 ]; then
@@ -338,6 +343,11 @@ docker-credential-fixture
 printf '%s\n' "$*" >> "$FIXTURE_ROOT/calls"
 [ "$1" = --host ] || exit 90
 shift 2
+for arg in "$@"; do
+ case "$arg" in
+  --blkio-weight*) echo 'error setting cgroup config: io.weight: no such file or directory' >&2; exit 1 ;;
+ esac
+done
 case "$1" in
  pull|run|create|rm) exit 0 ;;
  image) if [ "$2" = inspect ]; then printf '%s\n' "$FIXTURE_SCANNER"; fi; exit 0 ;;

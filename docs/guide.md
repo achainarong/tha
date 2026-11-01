@@ -794,6 +794,24 @@ user service. The default `standalone` mode installs only the CLI. No sudo or sy
 service is used. Services run as your user and need the same runtime/socket
 permissions and CLI availability as interactive Tha. Use
 `tha --config /absolute/path/config.toml service install` to pin a configuration.
+
+On macOS, the collector's service PATH includes `/opt/homebrew/bin` and
+`/usr/local/bin`, so background Podman discovery can find Homebrew installations
+without inheriting your interactive shell environment. Service status reports
+whether the launchd job is running, not just loaded; `tha service start` also
+restarts a loaded but stopped job.
+
+To refresh an existing service definition after upgrading, run:
+
+```sh
+tha service uninstall
+tha service install
+tha service start
+```
+
+History and configuration are preserved. If you pinned a custom configuration,
+use the same `--config /absolute/path/config.toml` when reinstalling.
+
 Stop/uninstall the user service before removing or moving its executable.
 On macOS, a user agent starts after login; on Linux, a user manager must be
 available (collection after logout depends on the user's systemd setup).

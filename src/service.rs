@@ -10,6 +10,7 @@ use std::{
 };
 const LABEL: &str = "io.tha.metrics";
 const MARKER: &str = "Managed by Tha";
+const MACOS_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 fn xml(value: &str) -> String {
     value
@@ -50,7 +51,7 @@ pub fn definition(executable: &Path, config: Option<&Path>, macos: bool) -> Resu
     }
     Ok(if macos {
         format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- {MARKER} -->\n<plist version=\"1.0\"><dict><key>Label</key><string>{LABEL}</string><key>ProgramArguments</key><array>{}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer><key>ProcessType</key><string>Background</string></dict></plist>\n",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- {MARKER} -->\n<plist version=\"1.0\"><dict><key>Label</key><string>{LABEL}</string><key>ProgramArguments</key><array>{}</array><key>EnvironmentVariables</key><dict><key>PATH</key><string>{MACOS_PATH}</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer><key>ProcessType</key><string>Background</string></dict></plist>\n",
             arguments
                 .iter()
                 .map(|value| format!("<string>{}</string>", xml(value)))
@@ -106,7 +107,21 @@ async fn manager(arguments: &[String]) -> Result<()> {
     }
     Ok(())
 }
-async fn active(job: &str) -> Result<bool> {
+struct ServiceState {
+    loaded: bool,
+    running: bool,
+}
+
+fn launchd_running(output: &str) -> bool {
+    // The job state precedes nested resource/activation states. Never mistake
+    // those nested states (or the mere existence of a job) for a running job.
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("state = "))
+        .is_some_and(|state| state == "running")
+}
+
+async fn state(job: &str) -> Result<ServiceState> {
     let mut command = tokio::process::Command::new(if cfg!(target_os = "macos") {
         "launchctl"
     } else {
@@ -117,18 +132,26 @@ async fn active(job: &str) -> Result<bool> {
     } else {
         command.args(["--user", "is-active", "--quiet", job]);
     }
-    let status = tokio::time::timeout(
+    let output = tokio::time::timeout(
         Duration::from_secs(15),
         command
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true)
-            .status(),
+            .output(),
     )
     .await
     .context("User service manager timed out")??;
-    Ok(status.success())
+    // Captured launchctl output may contain environment variables. Only expose
+    // the interpreted state, never the raw job description.
+    let loaded = output.status.success();
+    Ok(ServiceState {
+        loaded,
+        running: loaded
+            && (!cfg!(target_os = "macos")
+                || launchd_running(&String::from_utf8_lossy(&output.stdout))),
+    })
 }
 pub async fn run(action: ServiceAction, config: Option<&Path>) -> Result<()> {
     let path = path()?;
@@ -181,12 +204,17 @@ pub async fn run(action: ServiceAction, config: Option<&Path>) -> Result<()> {
                 bail!("Run `tha service install` first");
             }
             if cfg!(target_os = "macos") {
-                if active(&job).await? {
+                let state = state(&job).await?;
+                if state.running {
                     println!("Tha service is already running");
                     return Ok(());
                 }
                 manager(&["enable".into(), job.clone()]).await?;
-                manager(&["bootstrap".into(), domain, path.display().to_string()]).await?;
+                if state.loaded {
+                    manager(&["kickstart".into(), job]).await?;
+                } else {
+                    manager(&["bootstrap".into(), domain, path.display().to_string()]).await?;
+                }
             } else {
                 manager(&["--user".into(), "enable".into(), "--now".into(), unit]).await?;
             }
@@ -194,7 +222,7 @@ pub async fn run(action: ServiceAction, config: Option<&Path>) -> Result<()> {
         ServiceAction::Stop => {
             if cfg!(target_os = "macos") {
                 manager(&["disable".into(), job.clone()]).await?;
-                if active(&job).await? {
+                if state(&job).await?.loaded {
                     manager(&["bootout".into(), job]).await?;
                 }
             } else {
@@ -202,12 +230,13 @@ pub async fn run(action: ServiceAction, config: Option<&Path>) -> Result<()> {
             }
         }
         ServiceAction::Status => {
-            let running = active(if cfg!(target_os = "macos") {
+            let running = state(if cfg!(target_os = "macos") {
                 &job
             } else {
                 &unit
             })
-            .await?;
+            .await?
+            .running;
             println!(
                 "Tha service: {}",
                 if running {
@@ -254,6 +283,23 @@ mod tests {
         let plist = definition(path, Some(config), true).unwrap();
         assert!(plist.contains("&quot;&amp;"));
         assert!(plist.contains("<string>daemon</string>"));
+        assert!(plist.contains(&format!("<key>PATH</key><string>{MACOS_PATH}</string>")));
+        assert!(!unit.contains(MACOS_PATH));
         assert!(definition(Path::new("/bad\npath"), None, true).is_err());
+    }
+
+    #[test]
+    fn launchd_job_state_is_not_confused_with_loaded_or_nested_states() {
+        assert!(launchd_running(
+            "job = {\n\tstate = running\n\tpid = 123\n}"
+        ));
+        for output in [
+            "",
+            "job = {}",
+            "job = {\n\tstate = waiting\n}",
+            "job = {\n\tstate = exited\n\tresource = {\n\t\tstate = running\n\t}\n}",
+        ] {
+            assert!(!launchd_running(output));
+        }
     }
 }

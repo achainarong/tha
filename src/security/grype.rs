@@ -380,6 +380,82 @@ pub async fn update_database(
     update_database_limited(connection, scanner, name, progress, &Limits::default()).await
 }
 
+#[derive(Clone, Copy)]
+enum ScannerOperation {
+    UpdateDatabase,
+    Scan,
+}
+
+/// Keep both scanner entry points on the same portable limits and hardening flags.
+fn scanner_arguments(
+    operation: ScannerOperation,
+    scanner: &str,
+    name: &str,
+    limits: &Limits,
+) -> Result<Vec<String>> {
+    limits.validate()?;
+    let mut args: Vec<String> = match operation {
+        // Grype needs a container TTY for live download byte counters, not caller input.
+        ScannerOperation::UpdateDatabase => {
+            ["run", "--tty", "--rm", "--name", name, "--pull=never"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+        ScannerOperation::Scan => ["create", "--name", name, "--pull=never", "--network=none"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    };
+    args.extend([
+        format!("--cpus={:.3}", f64::from(limits.cpu_millis) / 1000.0),
+        format!("--memory={}m", limits.memory_mb),
+        format!("--memory-swap={}m", limits.memory_mb),
+        "--cpu-shares=128".into(),
+        "--pids-limit=128".into(),
+        "--cap-drop=ALL".into(),
+        "--security-opt=no-new-privileges".into(),
+    ]);
+    // io.weight is absent on some engines (including Docker Desktop cgroup setups).
+    // Do not require an optional block-I/O weight to start the scanner.
+    args.extend(
+        [
+            "-v",
+            CACHE,
+            "-e",
+            "GRYPE_DB_CACHE_DIR=/cache",
+            "-e",
+            "GRYPE_CHECK_FOR_APP_UPDATE=false",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
+    args.extend(
+        match operation {
+            ScannerOperation::UpdateDatabase => vec![
+                "-e",
+                "NO_COLOR=1",
+                "-e",
+                "TERM=xterm",
+                scanner,
+                "db",
+                "update",
+            ],
+            ScannerOperation::Scan => vec![
+                "-e",
+                "GRYPE_DB_AUTO_UPDATE=false",
+                scanner,
+                "docker-archive:/tmp/image.tar",
+                "--output",
+                "json",
+            ],
+        }
+        .into_iter()
+        .map(str::to_owned),
+    );
+    Ok(args)
+}
+
 pub(super) async fn update_database_limited(
     connection: &Connection,
     scanner: &str,
@@ -387,51 +463,13 @@ pub(super) async fn update_database_limited(
     progress: &(impl Fn(&str) + Sync),
     limits: &Limits,
 ) -> Result<()> {
-    limits.validate()?;
-    let cpus = format!("--cpus={:.3}", f64::from(limits.cpu_millis) / 1000.0);
-    let memory = format!("--memory={}m", limits.memory_mb);
-    let swap = format!("--memory-swap={}m", limits.memory_mb);
+    let arguments = scanner_arguments(ScannerOperation::UpdateDatabase, scanner, name, limits)?;
+    let arguments: Vec<_> = arguments.iter().map(String::as_str).collect();
     let _cleanup = Cleanup {
         connection: connection.clone(),
         name: name.into(),
     };
-    let result = command_with_progress(
-        connection,
-        &[
-            "run",
-            // Grype emits byte counters only with its terminal UI enabled. This
-            // allocates a container TTY, not interactive input from the caller.
-            "--tty",
-            "--rm",
-            "--name",
-            name,
-            "--pull=never",
-            "--cap-drop=ALL",
-            &cpus,
-            &memory,
-            &swap,
-            "--cpu-shares=128",
-            "--blkio-weight=100",
-            "--pids-limit=128",
-            "--security-opt=no-new-privileges",
-            "-v",
-            CACHE,
-            "-e",
-            "GRYPE_DB_CACHE_DIR=/cache",
-            "-e",
-            "GRYPE_CHECK_FOR_APP_UPDATE=false",
-            "-e",
-            "NO_COLOR=1",
-            "-e",
-            "TERM=xterm",
-            scanner,
-            "db",
-            "update",
-        ],
-        600,
-        Some(progress),
-    )
-    .await;
+    let result = command_with_progress(connection, &arguments, 600, Some(progress)).await;
     remove(connection, name).await?;
     result?;
     progress("Vulnerability database is ready.");
@@ -454,46 +492,13 @@ pub(super) async fn scan_limited(
     archive: &Path,
     limits: &Limits,
 ) -> Result<Report> {
-    limits.validate()?;
-    let cpus = format!("--cpus={:.3}", f64::from(limits.cpu_millis) / 1000.0);
-    let memory = format!("--memory={}m", limits.memory_mb);
-    let swap = format!("--memory-swap={}m", limits.memory_mb);
+    let arguments = scanner_arguments(ScannerOperation::Scan, scanner, name, limits)?;
+    let arguments: Vec<_> = arguments.iter().map(String::as_str).collect();
     let _cleanup = Cleanup {
         connection: connection.clone(),
         name: name.into(),
     };
-    command(
-        connection,
-        &[
-            "create",
-            "--name",
-            name,
-            "--pull=never",
-            "--network=none",
-            &cpus,
-            &memory,
-            &swap,
-            "--cpu-shares=128",
-            "--blkio-weight=100",
-            "--pids-limit=128",
-            "--cap-drop=ALL",
-            "--security-opt=no-new-privileges",
-            "-v",
-            CACHE,
-            "-e",
-            "GRYPE_DB_CACHE_DIR=/cache",
-            "-e",
-            "GRYPE_DB_AUTO_UPDATE=false",
-            "-e",
-            "GRYPE_CHECK_FOR_APP_UPDATE=false",
-            scanner,
-            "docker-archive:/tmp/image.tar",
-            "--output",
-            "json",
-        ],
-        30,
-    )
-    .await?;
+    command(connection, &arguments, 30).await?;
     let archive = archive.to_str().context("Archive path is not UTF-8")?;
     let destination = format!("{name}:/tmp/image.tar");
     command(connection, &["cp", archive, &destination], 600).await?;
@@ -713,6 +718,92 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn database_updates_and_scans_do_not_require_io_weight_but_keep_other_restrictions() {
+        for operation in [ScannerOperation::UpdateDatabase, ScannerOperation::Scan] {
+            for limits in [
+                Limits::default(),
+                Limits {
+                    cpu_millis: 1250,
+                    memory_mb: 1024,
+                },
+            ] {
+                let args =
+                    scanner_arguments(operation, "sha256:scanner", "scanner-fixture", &limits)
+                        .unwrap();
+                assert!(
+                    !args
+                        .iter()
+                        .any(|arg| arg.starts_with("--blkio") || arg.starts_with("--io-weight"))
+                );
+                for required in [
+                    format!("--cpus={:.3}", f64::from(limits.cpu_millis) / 1000.0),
+                    format!("--memory={}m", limits.memory_mb),
+                    format!("--memory-swap={}m", limits.memory_mb),
+                    "--cpu-shares=128".into(),
+                    "--pids-limit=128".into(),
+                    "--cap-drop=ALL".into(),
+                    "--security-opt=no-new-privileges".into(),
+                    "--pull=never".into(),
+                ] {
+                    assert!(args.contains(&required), "Missing {required}: {args:?}");
+                }
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair == ["--name", "scanner-fixture"])
+                );
+                assert!(args.windows(2).any(|pair| pair == ["-v", CACHE]));
+                assert!(args.contains(&"GRYPE_DB_CACHE_DIR=/cache".into()));
+                assert!(args.contains(&"GRYPE_CHECK_FOR_APP_UPDATE=false".into()));
+                match operation {
+                    ScannerOperation::UpdateDatabase => {
+                        assert_eq!(args[0], "run");
+                        assert!(args.contains(&"--tty".into()));
+                        assert!(args.contains(&"--rm".into()));
+                        assert!(!args.contains(&"--network=none".into()));
+                        assert!(args.ends_with(&[
+                            "sha256:scanner".into(),
+                            "db".into(),
+                            "update".into()
+                        ]));
+                    }
+                    ScannerOperation::Scan => {
+                        assert_eq!(args[0], "create");
+                        assert!(args.contains(&"--network=none".into()));
+                        assert!(args.contains(&"GRYPE_DB_AUTO_UPDATE=false".into()));
+                        assert!(args.ends_with(&[
+                            "sha256:scanner".into(),
+                            "docker-archive:/tmp/image.tar".into(),
+                            "--output".into(),
+                            "json".into()
+                        ]));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_hard_limits_are_rejected_for_either_scanner_operation() {
+        for operation in [ScannerOperation::UpdateDatabase, ScannerOperation::Scan] {
+            for limits in [
+                Limits {
+                    cpu_millis: 0,
+                    memory_mb: 768,
+                },
+                Limits {
+                    cpu_millis: 500,
+                    memory_mb: 0,
+                },
+            ] {
+                assert!(
+                    scanner_arguments(operation, "sha256:scanner", "scanner-fixture", &limits)
+                        .is_err()
+                );
+            }
+        }
+    }
+
     #[test]
     fn findings_are_prioritized_and_missing_scores_are_not_zero() {
         let report = parse(br#"{"matches":[{"artifact":{"name":"low","version":"1"},"vulnerability":{"id":"CVE-low","severity":"Low"}},{"artifact":{"name":"critical","version":"2"},"vulnerability":{"id":"CVE-critical","severity":"Critical","cvss":[{"metrics":{"baseScore":9.8}}]}}],"descriptor":{"version":"fixture","db":{"built":"today"}}}"#).unwrap();

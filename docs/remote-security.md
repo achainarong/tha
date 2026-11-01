@@ -51,8 +51,10 @@ disable scanning without deleting reports or the scanner/database cache.
 - Defer jobs when one-minute load exceeds 70% of available cores or `MemAvailable`
   is below 1536 MiB. Unknown pressure also defers. Check again every 30 seconds.
 - Scanner and database-update containers default to half a CPU, 768 MiB RAM,
-  no extra swap, 128 processes, and low CPU/I/O weights. Engine/cgroup support is
-  required; unsupported hard limits fail the job rather than silently dropping them.
+  no extra swap, 128 processes, and a low CPU weight. An optional container I/O
+  weight is not requested: some engines do not expose the cgroup `io.weight` file.
+  Engine/cgroup support is required for the remaining hard limits; unsupported
+  limits fail the job rather than silently dropping them.
 - The agent service itself runs with low CPU/I/O scheduling priority.
 - Failed scheduled scans retry after an hour. Previous successful reports remain.
 
