@@ -19,7 +19,7 @@ jobs:
       prerelease: ${{ steps.version.outputs.prerelease }}
       commit: ${{ steps.version.outputs.commit }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Require the tag to match Cargo.toml
@@ -71,7 +71,7 @@ jobs:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Verify native runner architecture
@@ -79,7 +79,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: release-${{ matrix.target }}
       - name: Install native musl toolchain
@@ -128,7 +128,7 @@ jobs:
           agent_asset="tha-agent-${ASSET#tha-}"
           tar -czf "dist/$agent_asset" -C "$stage" tha-agent LICENSE
           python3 scripts/release_smoke.py --archive "dist/$agent_asset"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tha-release-${{ matrix.target }}
           path: dist/*.tar.gz
@@ -142,7 +142,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: tha-release-*
           merge-multiple: true

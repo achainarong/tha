@@ -75,7 +75,27 @@ class Contracts(unittest.TestCase):
 
     def run_shell(self, script, *args, **environment):
         return subprocess.run(["/bin/sh", "-eu", "-c", script, "sh", *args], cwd=self.directory,
-                              env={**self.env, **environment}, capture_output=True, text=True, timeout=20)
+                               env={**self.env, **environment}, capture_output=True, text=True, timeout=20)
+
+    def test_workflows_use_verified_node24_action_versions(self):
+        import yaml
+        expected = {
+            "actions/checkout": "v7",
+            "actions/upload-artifact": "v7",
+            "actions/download-artifact": "v8",
+            "astral-sh/setup-uv": "v10",
+            "Swatinem/rust-cache": "v2.9.3",
+        }
+        seen = set()
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+            for job in workflow["jobs"].values():
+                for step in job.get("steps", []):
+                    action, _, version = step.get("uses", "").partition("@")
+                    if action in expected:
+                        self.assertEqual(version, expected[action], f"{path}: {action}")
+                        seen.add(action)
+        self.assertEqual(seen, set(expected))
 
     def test_installer_matrix_and_preserves_previous_install_on_all_verification_failures(self):
         fixtures = self.directory / "fixtures"
