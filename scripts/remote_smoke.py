@@ -355,11 +355,14 @@ def main():
         )
         print("Preparing the disposable server…")
         inside("pacman -Sy --noconfirm --needed openssh shadow >/dev/null 2>&1 && ssh-keygen -A")
-        # The socket's group ID has no sensible name in a fresh image; this only edits the
-        # container's own /etc/group, and setup refuses privileged group names.
+        # The socket's group ID may have an unrelated name in a fresh image, or none at all, as
+        # on CI runners. This only edits the container's own /etc/group, and setup refuses
+        # privileged group names.
         inside(
-            "group=$(stat -c %G /var/run/docker.sock); "
-            '[ "$group" = docker ] || groupmod -n docker "$group"'
+            "gid=$(stat -c %g /var/run/docker.sock); "
+            'name=$(getent group "$gid" | cut -d: -f1); '
+            'if [ -z "$name" ]; then groupadd -g "$gid" docker; '
+            'elif [ "$name" != docker ]; then groupmod -n docker "$name"; fi'
         )
         run("docker", "cp", str(ROOT / "target/debug/tha-agent"), f"{SERVER}:/usr/local/bin/tha-agent")
         inside("chown root:root /usr/local/bin/tha-agent && chmod 755 /usr/local/bin/tha-agent && /usr/sbin/sshd")
