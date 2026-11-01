@@ -363,6 +363,32 @@ password or sudo rule.
 Then use **Test connection**: OpenSSH shows the host key fingerprint for you to
 confirm, and Tha never accepts a host key itself.
 
+**Use a dedicated user instead of root:** you do not create the user yourself; setup does.
+
+1. On your machine, create a key just for this server, or use **Create new key** in the
+   form:
+
+   ```sh
+   ssh-keygen -t ed25519 -f ~/.ssh/tha-agent
+   cat ~/.ssh/tha-agent.pub
+   ```
+
+2. On the server, as an admin, pass that public key to setup:
+
+   ```sh
+   sudo tha-agent setup --user tha --key 'ssh-ed25519 AAAA...'
+   ```
+
+   This creates `tha` with no usable password, gives it access to the engine's socket, and
+   installs the key so that it can only run the agent. If the server is already set up for
+   root, this adds the user and keeps the existing policy.
+
+3. In the Servers form, set **User** to `tha` and **SSH key** to `~/.ssh/tha-agent`.
+
+To check the limit, run `ssh -i ~/.ssh/tha-agent tha@SERVER id`. It should refuse with
+`this key only runs the tha-agent` instead of printing the user. An existing user also
+works if it has no other SSH keys, but setup stops if any are there.
+
 You can also connect as `root` with an existing key. Setup then only writes the policy:
 
 ```sh
