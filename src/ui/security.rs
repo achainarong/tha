@@ -579,6 +579,7 @@ mod tests {
             scanner: "fixture".into(),
             database: String::new(),
             scanned: 123,
+            scanner_digest: None,
         });
         for width in [140, 90, 60, 35] {
             let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
@@ -647,6 +648,7 @@ mod tests {
             scanner: "fixture".into(),
             database: String::new(),
             scanned: 123,
+            scanner_digest: None,
         });
         app.security.start(3);
         app.security.progress = "Image 1/3 · Scanning image packages with Grype…".into();
@@ -811,6 +813,7 @@ mod tests {
             scanner: "fixture".into(),
             database: "fixture-db".into(),
             scanned: 123,
+            scanner_digest: None,
         });
         for (width, height) in [(140, 40), (60, 20), (32, 10), (140, 40)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();

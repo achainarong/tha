@@ -27,7 +27,7 @@ fn open_at(path: &std::path::Path) -> Result<Connection> {
         id == 0x54485343 || (id == 0 && tables == 0),
         "Unrecognized security database; contents preserved"
     );
-    db.execute_batch("PRAGMA application_id=1414026051; PRAGMA max_page_count=32768;")?;
+    db.execute_batch("PRAGMA application_id=1414026051; PRAGMA max_page_count=262144;")?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS reports (endpoint TEXT NOT NULL, runtime TEXT NOT NULL, image TEXT NOT NULL, scanned INTEGER NOT NULL, report TEXT NOT NULL, PRIMARY KEY(endpoint,runtime,image));")?;
     Ok(db)
 }
@@ -38,11 +38,29 @@ pub fn save(target: &Target, report: &Report) -> Result<()> {
 }
 
 fn save_in(db: &Connection, target: &Target, report: &Report) -> Result<()> {
-    db.execute("INSERT INTO reports(endpoint,runtime,image,scanned,report) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(endpoint,runtime,image) DO UPDATE SET scanned=excluded.scanned,report=excluded.report", params![target.connection.endpoint, target.runtime, target.image, report.scanned, serde_json::to_string(report)?])
+    db.execute("INSERT INTO reports(endpoint,runtime,image,scanned,report) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(endpoint,runtime,image) DO UPDATE SET scanned=excluded.scanned,report=excluded.report WHERE excluded.scanned >= reports.scanned", params![target.connection.endpoint, target.runtime, target.image, report.scanned, serde_json::to_string(report)?])
         .context("Cannot persist security report; scan not marked complete")?;
     // Bound retained images, without coupling to metrics pruning.
-    db.execute("DELETE FROM reports WHERE rowid NOT IN (SELECT rowid FROM reports ORDER BY scanned DESC LIMIT 200)", [])?;
+    db.execute("DELETE FROM reports WHERE rowid NOT IN (SELECT rowid FROM reports ORDER BY scanned DESC LIMIT 10000)", [])?;
     Ok(())
+}
+
+pub(super) fn list(connection: &crate::config::Connection) -> Result<Vec<(Target, u64)>> {
+    let db = open()?;
+    let mut statement = db.prepare("SELECT runtime,image,scanned FROM reports WHERE endpoint=?1 ORDER BY scanned DESC LIMIT 10000")?;
+    let rows = statement.query_map([&connection.endpoint], |row| {
+        Ok((
+            Target {
+                connection: connection.clone(),
+                runtime: row.get(0)?,
+                image: row.get(1)?,
+                label: String::new(),
+            },
+            row.get(2)?,
+        ))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 pub fn load(target: &Target) -> Result<Option<Report>> {
@@ -60,6 +78,18 @@ pub fn load(target: &Target) -> Result<Option<Report>> {
         .optional()?;
     json.map(|json| serde_json::from_str(&json).context("Invalid stored security report"))
         .transpose()
+}
+
+pub(super) fn scanned(target: &Target) -> Result<u64> {
+    let db = open()?;
+    Ok(db
+        .query_row(
+            "SELECT scanned FROM reports WHERE endpoint=?1 AND runtime=?2 AND image=?3",
+            params![target.connection.endpoint, target.runtime, target.image],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -84,6 +114,7 @@ mod tests {
             scanner: "fixture".into(),
             database: "fixture-db".into(),
             scanned: 123,
+            scanner_digest: None,
         };
         let db = open_at(&path).unwrap();
         save_in(&db, &target, &report).unwrap();

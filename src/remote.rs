@@ -886,6 +886,21 @@ pub async fn supervise(remote: Remote, generation: u64, events: mpsc::Sender<Eve
         match open_session(&remote).await {
             Ok((mut session, listing)) => {
                 delay = RETRY_MIN;
+                let connections: Vec<_> = listing
+                    .engines
+                    .iter()
+                    .map(|engine| connection(&remote.name, engine))
+                    .collect();
+                let _security = AbortOnDrop(tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(Duration::from_secs(60));
+                    loop {
+                        tick.tick().await;
+                        for connection in &connections {
+                            // Older/opted-out agents refuse the endpoint; normal engine access is unaffected.
+                            let _ = crate::security::remote::sync(connection).await;
+                        }
+                    }
+                }));
                 if !send(Update::Connected {
                     engines: listing.engines,
                     allow_delete: listing.allow_delete,
@@ -921,6 +936,49 @@ pub async fn supervise(remote: Remote, generation: u64, events: mpsc::Sender<Eve
                 .await
                     || !failure.retry
                 {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(RETRY_MAX);
+    }
+}
+
+/// The main service retrieves scheduled reports even with no UI connected. Only servers
+/// explicitly configured for startup connections are contacted in the background.
+pub async fn collect_security(remote: Remote) {
+    let mut delay = RETRY_MIN;
+    loop {
+        if !crate::security::enabled() {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            continue;
+        }
+        match open_session(&remote).await {
+            Ok((mut session, listing)) => {
+                delay = RETRY_MIN;
+                let mut tick = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    tokio::select! {
+                        _ = session.master.wait() => break,
+                        _ = session.lost.recv() => break,
+                        _ = tick.tick() => {
+                            if !crate::security::enabled() { break; }
+                            for engine in &listing.engines {
+                                if let Err(error) = crate::security::remote::sync(&connection(&remote.name, engine)).await {
+                                    eprintln!("tha security sync {} / {engine}: {error:#}", remote.name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(failure) => {
+                eprintln!(
+                    "tha security connection {}: {}",
+                    remote.name, failure.reason
+                );
+                if !failure.retry {
                     return;
                 }
             }

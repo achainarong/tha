@@ -13,6 +13,34 @@ use tokio::{io::AsyncReadExt, process::Command};
 const CACHE: &str = "tha-security-grype-db:/cache";
 const MAX_OUTPUT: u64 = 32 * 1024 * 1024;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Limits {
+    pub cpu_millis: u32,
+    pub memory_mb: u32,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            cpu_millis: 500,
+            memory_mb: 768,
+        }
+    }
+}
+impl Limits {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (100..=2000).contains(&self.cpu_millis),
+            "Scanner CPU limit must be 100..2000 millicores"
+        );
+        ensure!(
+            (256..=4096).contains(&self.memory_mb),
+            "Scanner memory must be 256..4096 MiB"
+        );
+        Ok(())
+    }
+}
+
 pub fn container_name() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     format!(
@@ -349,6 +377,20 @@ pub async fn update_database(
     name: &str,
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<()> {
+    update_database_limited(connection, scanner, name, progress, &Limits::default()).await
+}
+
+pub(super) async fn update_database_limited(
+    connection: &Connection,
+    scanner: &str,
+    name: &str,
+    progress: &(impl Fn(&str) + Sync),
+    limits: &Limits,
+) -> Result<()> {
+    limits.validate()?;
+    let cpus = format!("--cpus={:.3}", f64::from(limits.cpu_millis) / 1000.0);
+    let memory = format!("--memory={}m", limits.memory_mb);
+    let swap = format!("--memory-swap={}m", limits.memory_mb);
     let _cleanup = Cleanup {
         connection: connection.clone(),
         name: name.into(),
@@ -365,6 +407,12 @@ pub async fn update_database(
             name,
             "--pull=never",
             "--cap-drop=ALL",
+            &cpus,
+            &memory,
+            &swap,
+            "--cpu-shares=128",
+            "--blkio-weight=100",
+            "--pids-limit=128",
             "--security-opt=no-new-privileges",
             "-v",
             CACHE,
@@ -396,6 +444,20 @@ pub async fn scan(
     scanner: &str,
     archive: &Path,
 ) -> Result<Report> {
+    scan_limited(connection, name, scanner, archive, &Limits::default()).await
+}
+
+pub(super) async fn scan_limited(
+    connection: &Connection,
+    name: &str,
+    scanner: &str,
+    archive: &Path,
+    limits: &Limits,
+) -> Result<Report> {
+    limits.validate()?;
+    let cpus = format!("--cpus={:.3}", f64::from(limits.cpu_millis) / 1000.0);
+    let memory = format!("--memory={}m", limits.memory_mb);
+    let swap = format!("--memory-swap={}m", limits.memory_mb);
     let _cleanup = Cleanup {
         connection: connection.clone(),
         name: name.into(),
@@ -408,6 +470,12 @@ pub async fn scan(
             name,
             "--pull=never",
             "--network=none",
+            &cpus,
+            &memory,
+            &swap,
+            "--cpu-shares=128",
+            "--blkio-weight=100",
+            "--pids-limit=128",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             "-v",
@@ -554,6 +622,7 @@ fn parse(bytes: &[u8]) -> Result<Report> {
         scanner: text(&document.descriptor.version),
         database,
         scanned: updates::now(),
+        scanner_digest: None,
     })
 }
 

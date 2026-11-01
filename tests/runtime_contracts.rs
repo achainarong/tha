@@ -1061,6 +1061,7 @@ mod agent {
                     allow_delete,
                     socket: socket.clone(),
                     audit: |_| {},
+                    security: None,
                 };
                 tokio::spawn(async move {
                     let _ = serve(stream, agent).await;
@@ -1300,6 +1301,7 @@ mod agent {
                     allow_delete,
                     socket,
                     audit: |_| {},
+                    security: None,
                 },
             )
             .await;
@@ -1393,6 +1395,7 @@ mod agent {
                     allow_delete: false,
                     socket,
                     audit: |_| {},
+                    security: None,
                 },
             )
             .await;
@@ -1450,6 +1453,7 @@ mod agent {
                     allow_delete: false,
                     socket,
                     audit: |_| {},
+                    security: None,
                 },
             )
             .await;

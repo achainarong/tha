@@ -212,6 +212,15 @@ def main():
         )
         run("docker", "cp", str(ROOT / "target/debug/tha-agent"), f"{SERVER}:/usr/local/bin/tha-agent")
         inside("chown root:root /usr/local/bin/tha-agent && chmod 755 /usr/local/bin/tha-agent && /usr/sbin/sshd")
+        # This disposable container has no systemd PID 1. Exercise the actual persistent
+        # daemon/relay here; unit generation is checked separately in Rust tests.
+        inside("mkdir -p /run/tha-agent /var/lib/tha-agent /etc/systemd/system")
+        inside("cat > /usr/local/bin/systemctl <<'SH'\n#!/bin/sh\n"
+               "case $1 in\nrestart)\n"
+               "if [ -f /run/tha-agent-test.pid ]; then kill \"$(cat /run/tha-agent-test.pid)\" 2>/dev/null || true; sleep 3; fi\n"
+               "HOME=/var/lib/tha-agent XDG_DATA_HOME=/var/lib/tha-agent nohup /usr/local/bin/tha-agent daemon >/var/log/tha-agent-test.log 2>&1 &\n"
+               "echo $! >/run/tha-agent-test.pid\nsleep 1\n;;\nesac\nSH\n"
+               "chmod 755 /usr/local/bin/systemctl")
 
         public = (scratch / "key.pub").read_text().strip()
         setup = f"tha-agent setup --user tha --key {shlex.quote(public)}"

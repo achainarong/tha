@@ -4,6 +4,7 @@
 //! `tha` client, so nothing here may trust it. Everything is refused unless a route below
 //! allows it, and an allowed call is re-created rather than forwarded, so client headers and
 //! bodies never reach the engine.
+pub mod service;
 pub mod setup;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -35,6 +36,10 @@ pub struct AgentConfig {
     /// Lets the key remove containers, images and volumes. Force is refused regardless.
     pub allow_delete: bool,
     pub engines: Vec<AgentEngine>,
+    /// The only non-root local user allowed to reach the service.
+    pub service_uid: u32,
+    pub service_gid: u32,
+    pub security: crate::security::agent::Policy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -46,6 +51,7 @@ pub struct AgentEngine {
 
 impl AgentConfig {
     pub fn validate(&self) -> Result<()> {
+        self.security.validate()?;
         for (index, engine) in self.engines.iter().enumerate() {
             ensure!(
                 valid_engine_name(&engine.name),
@@ -434,6 +440,7 @@ pub struct Agent {
     pub socket: PathBuf,
     /// Where writes and refusals are recorded. Stderr is not used: SSH returns it to the client.
     pub audit: fn(&str),
+    pub security: Option<Arc<crate::security::agent::Engine>>,
 }
 
 fn message_response(status: StatusCode, message: &str) -> Response<Body> {
@@ -470,8 +477,18 @@ async fn handle(
         .path_and_query()
         .map_or("", |value| value.as_str())
         .to_owned();
-    let decision =
-        screen_headers(&request).and_then(|()| check(agent.allow_delete, &method, &target));
+    let security_route = crate::security::agent::route(&method, &target);
+    let decision = screen_headers(&request).and_then(|()| {
+        if security_route.is_some() && agent.security.is_some() {
+            Ok(if method == Method::GET {
+                Access::Read
+            } else {
+                Access::Write
+            })
+        } else {
+            check(agent.allow_delete, &method, &target)
+        }
+    });
     // A body has no way through, and HTTP/2 can send one without any length header.
     let decision = decision.and_then(|access| {
         if request.body().is_end_stream() {
@@ -494,6 +511,15 @@ async fn handle(
     if access != Access::Read {
         (agent.audit)(&format!("allowed {method} {}", loggable(&target)));
     }
+    if let (Some(route), Some(security)) = (security_route, agent.security.as_ref()) {
+        return Ok(match security.handle(route).await {
+            Ok(value) => message_json(value),
+            Err(error) => message_response(
+                StatusCode::BAD_REQUEST,
+                &crate::layers::text(&format!("{error:#}")),
+            ),
+        });
+    }
     Ok(match forward(&agent.socket, method, &target).await {
         Ok(response) => response,
         Err(error) => {
@@ -501,6 +527,19 @@ async fn handle(
             message_response(StatusCode::BAD_GATEWAY, "The engine is unavailable")
         }
     })
+}
+
+fn message_json(value: serde_json::Value) -> Response<Body> {
+    let mut response = Response::new(
+        Full::new(Bytes::from(value.to_string()))
+            .map_err(|never: Infallible| match never {})
+            .boxed(),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 /// A new request carrying only the validated line, so nothing else the client sent can pass.
@@ -540,7 +579,13 @@ pub async fn serve<I>(io: I, agent: Agent) -> Result<()>
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let agent = Arc::new(agent);
+    serve_shared(io, Arc::new(agent)).await
+}
+
+async fn serve_shared<I>(io: I, agent: Arc<Agent>) -> Result<()>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
     builder.http1().max_buf_size(MAX_REQUEST_BUFFER);
     builder
@@ -626,15 +671,7 @@ pub async fn run(argument: Option<&str>) -> Result<()> {
             Ok(())
         }
         Requested::Engine(engine) => {
-            let result = serve(
-                tokio::io::join(tokio::io::stdin(), tokio::io::stdout()),
-                Agent {
-                    allow_delete: config.allow_delete,
-                    socket: engine.socket.clone(),
-                    audit: syslog,
-                },
-            )
-            .await;
+            let result = service::relay(&engine.name).await;
             // Tokio's stdin reader blocks a thread that a normal runtime shutdown would wait on.
             std::process::exit(i32::from(result.is_err()));
         }
@@ -843,6 +880,7 @@ mod tests {
                 name: "docker".into(),
                 socket: "/var/run/docker.sock".into(),
             }],
+            ..Default::default()
         }
     }
 

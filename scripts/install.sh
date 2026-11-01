@@ -10,7 +10,7 @@
 #   service               also installs and starts the per-user background collector
 #                         (launchd/systemd, no sudo), so History keeps 24 hours of metrics
 #   agent                 for a server managed by Tha elsewhere: only tha-agent, owned by root
-#                         in /usr/local/bin. Linux only, needs root, starts no service.
+#                         in /usr/local/bin, with a persistent systemd service. Linux only, needs root.
 #                         --key 'PUBLIC_KEY' also sets it up with a dedicated user, tha, or the
 #                         one named by --user. --user root sets it up for an existing root key.
 #                         Without these it only installs or updates; existing setup is kept.
@@ -48,12 +48,16 @@ if [ "$MODE" = agent ]; then
     agent_key=
     agent_user=
     agent_delete=
+    agent_scanner_digest=
+    agent_security_interval=
     while [ $# -gt 0 ]; do
         case $1 in
             --key) [ $# -ge 2 ] || die "--key needs the public key line"; agent_key=$2; shift 2 ;;
             --user) [ $# -ge 2 ] || die "--user needs a name"; agent_user=$2; shift 2 ;;
             --allow-delete) agent_delete=1; shift ;;
-            *) die "unknown agent option '$1'; expected --key, --user or --allow-delete" ;;
+            --scanner-digest) [ $# -ge 2 ] || die "--scanner-digest needs sha256:DIGEST"; agent_scanner_digest=$2; shift 2 ;;
+            --security-interval) [ $# -ge 2 ] || die "--security-interval needs seconds"; agent_security_interval=$2; shift 2 ;;
+            *) die "unknown agent option '$1'; expected --key, --user, --allow-delete, --scanner-digest or --security-interval" ;;
         esac
     done
     if [ "$agent_user" = root ]; then
@@ -62,6 +66,12 @@ if [ "$MODE" = agent ]; then
         die "--user $agent_user needs --key with the public key for that user"
     elif [ -z "$agent_key" ] && [ -n "$agent_delete" ]; then
         die "--allow-delete needs --key or --user root"
+    fi
+    if [ -n "$agent_scanner_digest$agent_security_interval" ] && [ -z "$agent_key$agent_user" ]; then
+        die "security options need --key or --user root"
+    fi
+    if [ -n "$agent_security_interval" ] && [ -z "$agent_scanner_digest" ]; then
+        die "--security-interval needs --scanner-digest"
     fi
 else
     [ $# -eq 0 ] || die "only agent mode takes options, not '$1'"
@@ -213,12 +223,19 @@ run tar -xzf "$tmp/$asset" -C "$tmp" "$command_name" || die "couldn't unpack $as
 bin=$BIN_DIR/$command_name
 if [ "$MODE" = agent ]; then
     step "installing tha-agent to $BIN_DIR"
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet tha-agent.service; then
+        run systemctl stop tha-agent.service
+    fi
     run mkdir -p "$BIN_DIR"
     run install -m 755 "$tmp/tha-agent" "$bin"
     say "installed $(run "$bin" --version) to $bin"
     if [ -z "$agent_key$agent_user" ]; then
         if [ -r /etc/tha/agent.toml ]; then
-            say "existing setup kept; this server is ready"
+            run "$bin" install-service
+            say "existing setup kept; agent service restarted"
+            if ! grep -q '^service_uid' /etc/tha/agent.toml; then
+                say "legacy policy: rerun setup with --key and --user to enable dedicated-user service access"
+            fi
         else
             say "not ready yet: this server still needs setup. Run this again with one of:"
             say "  dedicated user (recommended): --key 'PUBLIC_KEY'"
@@ -230,6 +247,8 @@ if [ "$MODE" = agent ]; then
     set -- setup --user "${agent_user:-tha}"
     [ -z "$agent_key" ] || set -- "$@" --key "$agent_key"
     [ -z "$agent_delete" ] || set -- "$@" --allow-delete
+    [ -z "$agent_scanner_digest" ] || set -- "$@" --scanner-digest "$agent_scanner_digest"
+    [ -z "$agent_security_interval" ] || set -- "$@" --security-interval "$agent_security_interval"
     run "$bin" "$@" < /dev/null ||
         die "tha-agent was installed, but setup failed; fix the problem above and run this again"
     exit 0

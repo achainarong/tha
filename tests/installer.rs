@@ -313,6 +313,28 @@ fn agent_custom_user_and_delete_reach_setup() {
 }
 
 #[test]
+fn scanner_approval_and_schedule_reach_agent_setup() {
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let (temp, output) = run_agent(
+        "0",
+        &[
+            "agent",
+            "--user",
+            "root",
+            "--scanner-digest",
+            &digest,
+            "--security-interval",
+            "43200",
+        ],
+        "",
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(agent_calls(&temp).contains(&format!(
+        "setup --user root --scanner-digest {digest} --security-interval 43200"
+    )));
+}
+
+#[test]
 fn agent_without_options_only_installs() {
     let (temp, output) = run_agent("0", &["agent"], "");
     assert!(output.status.success());
@@ -327,6 +349,8 @@ fn bad_agent_options_stop_before_downloading() {
         vec!["agent", "--user", "ops"],
         vec!["agent", "--user", "root", "--key", "K"],
         vec!["agent", "--allow-delete"],
+        vec!["agent", "--scanner-digest", "sha256:abc"],
+        vec!["agent", "--user", "root", "--security-interval", "43200"],
     ] {
         let (temp, output) = run_agent("0", &arguments, "");
         assert!(!output.status.success(), "{arguments:?}");

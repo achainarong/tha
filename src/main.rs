@@ -101,7 +101,12 @@ async fn start() -> Result<()> {
                     bail!("daemon cannot be combined with --demo or --standalone");
                 }
                 let connections = connections(&cli, &config, false)?;
-                return tha::daemon::run(config, connections).await;
+                return tha::daemon::run(
+                    config,
+                    connections,
+                    tha::remote::managed_path(cli.config.as_deref()),
+                )
+                .await;
             }
             tha::cli::Command::Service { action } => {
                 return tha::service::run(*action, cli.config.as_deref()).await;
@@ -499,11 +504,13 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let frame_started = std::time::Instant::now();
     terminal.draw(|frame| ui::draw(frame, &mut app))?;
     let mut visual_deadline = app.next_visual_deadline(frame_started);
+    let mut security_refresh = tokio::time::interval(Duration::from_secs(5));
     loop {
         let mut redraw_now = false;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = terminate.recv() => break,
+            _ = security_refresh.tick() => { redraw_now = app.security.refresh_saved(); },
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
                     let height = terminal.size()?.height.saturating_sub(5 + ui::footer_height(&app)) as usize;
@@ -895,17 +902,31 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
             update_layers(&mut app, &mut layers_task, &layers_tx);
             if app.security.cancel {
                 app.security.cancel = false;
-                let sender = security_notice_tx.clone();
-                tokio::spawn(async move {
-                    let notice = match tha::security::cancel_remote().await {
-                        Ok(()) => tha::i18n::t("Security queue cancellation requested").into(),
-                        Err(error) => tha::tf!(
-                            "Cannot cancel security queue: {error}",
-                            error = format!("{error:#}")
-                        ),
-                    };
-                    let _ = sender.send(notice).await;
-                });
+                if app
+                    .security
+                    .scan_target
+                    .as_ref()
+                    .or(app.security.target.as_ref())
+                    .is_some_and(|target| tha::remote::is_remote(&target.connection))
+                {
+                    if let Some(cancel) = &security_cancel {
+                        let _ = cancel.send(true);
+                    }
+                    app.notice =
+                        "Stopped following the remote scan; the agent owns its schedule".into();
+                } else {
+                    let sender = security_notice_tx.clone();
+                    tokio::spawn(async move {
+                        let notice = match tha::security::cancel_remote().await {
+                            Ok(()) => tha::i18n::t("Security queue cancellation requested").into(),
+                            Err(error) => tha::tf!(
+                                "Cannot cancel security queue: {error}",
+                                error = format!("{error:#}")
+                            ),
+                        };
+                        let _ = sender.send(notice).await;
+                    });
+                }
             }
             if app.security.request {
                 if security_task

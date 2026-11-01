@@ -1,5 +1,8 @@
 //! Opt-in image security. Scanner/container details stay behind this module.
+pub mod agent;
 mod grype;
+mod registry;
+pub mod remote;
 mod service;
 mod source;
 mod store;
@@ -37,6 +40,8 @@ pub struct Report {
     pub scanner: String,
     pub database: String,
     pub scanned: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanner_digest: Option<String>,
 }
 
 #[derive(Default)]
@@ -72,6 +77,26 @@ pub struct View {
 }
 
 impl View {
+    /// Pick up reports synchronized by another connection without changing the selected image.
+    pub fn refresh_saved(&mut self) -> bool {
+        let Some(target) = self.target.as_ref() else {
+            return false;
+        };
+        if self.busy || !crate::remote::is_remote(&target.connection) {
+            return false;
+        }
+        let Ok(Some(report)) = store::load(target) else {
+            return false;
+        };
+        if matches!(&self.state, State::Ready(old) if old.scanned >= report.scanned) {
+            return false;
+        }
+        self.selected = self.selected.min(report.findings.len().saturating_sub(1));
+        self.offset = self.offset.min(self.selected);
+        self.state = State::Ready(report);
+        true
+    }
+
     pub fn start(&mut self, total: usize) {
         self.batch = crate::tf!(
             "{total} image(s) queued; continues after image errors",
@@ -536,6 +561,7 @@ mod tests {
                     scanner: "fixture".into(),
                     database: "fixture".into(),
                     scanned: 1,
+                    scanner_digest: None,
                 })),
             });
         }
@@ -569,6 +595,7 @@ mod tests {
             scanner: "saved".into(),
             database: "fixture".into(),
             scanned: 1,
+            scanner_digest: None,
         };
         let mut view = View {
             target: Some(target.clone()),
@@ -665,6 +692,7 @@ mod tests {
                 scanner: "fixture".into(),
                 database: String::new(),
                 scanned: 1,
+                scanner_digest: None,
             })),
         });
         assert!(matches!(view.state, State::Idle));

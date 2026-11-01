@@ -1,5 +1,4 @@
-//! One-time, root-run server setup for `tha-agent`. It only touches the dedicated user, that
-//! user's `authorized_keys`, and the agent policy file.
+//! Root-run server setup: dedicated user/key, root-owned policy, and persistent systemd service.
 use super::{AgentConfig, AgentEngine};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
@@ -35,6 +34,8 @@ pub struct Options {
     pub allow_delete: bool,
     /// `NAME=/path/to/socket`, to expose only these. When empty, every known socket is exposed.
     pub engines: Vec<String>,
+    pub scanner_digest: Option<String>,
+    pub security_interval: u64,
 }
 
 /// A public key reduced to its type and data. The comment and any `authorized_keys` options
@@ -187,6 +188,7 @@ pub fn parse_engine(text: &str) -> Result<AgentEngine> {
     AgentConfig {
         allow_delete: false,
         engines: vec![engine.clone()],
+        ..Default::default()
     }
     .validate()?;
     Ok(engine)
@@ -206,6 +208,9 @@ pub fn merge_config(
         } else {
             engines
         },
+        service_uid: existing.service_uid,
+        service_gid: existing.service_gid,
+        security: existing.security,
     }
 }
 
@@ -294,7 +299,12 @@ fn socket_group(account: &Account, engine: &AgentEngine) -> Result<Option<String
     Ok(Some(group))
 }
 
-fn atomic_write(path: &Path, text: &str, mode: u32, owner: Option<(u32, u32)>) -> Result<()> {
+pub(super) fn atomic_write(
+    path: &Path,
+    text: &str,
+    mode: u32,
+    owner: Option<(u32, u32)>,
+) -> Result<()> {
     let directory = path.parent().context("Path has no parent directory")?;
     let temporary = tempfile::Builder::new()
         .prefix(".tha-setup-")
@@ -423,6 +433,7 @@ pub fn run_setup(options: &Options) -> Result<()> {
         .canonicalize()
         .context("Cannot resolve the tha binary")?;
     let metadata = std::fs::metadata(&executable)?;
+    super::service::validate_executable(&executable)?;
     ensure!(
         metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
         "{} must be owned by root and not writable by others, because the forced command runs it",
@@ -453,7 +464,15 @@ pub fn run_setup(options: &Options) -> Result<()> {
             find_engines(),
         )
     };
-    let config = merge_config(existing, engines, options.allow_delete);
+    let mut config = merge_config(existing, engines, options.allow_delete);
+    if let Some(digest) = &options.scanner_digest {
+        config.security = crate::security::agent::Policy {
+            enabled: true,
+            scanner_digest: digest.clone(),
+            interval_seconds: options.security_interval,
+            ..Default::default()
+        };
+    }
     config.validate()?;
     ensure!(
         !config.engines.is_empty(),
@@ -461,7 +480,10 @@ pub fn run_setup(options: &Options) -> Result<()> {
     );
 
     if root {
-        return finish_root_setup(policy, &config);
+        // Root is always accepted; adding a root login must not revoke an existing
+        // dedicated user's access to the service.
+        finish_root_setup(policy, &config)?;
+        return super::service::install(&executable);
     }
     let line = line.context("A dedicated user always has a key line")?;
     let account = match account(&options.user)? {
@@ -488,7 +510,8 @@ pub fn run_setup(options: &Options) -> Result<()> {
         options.user,
         account.shell
     );
-    finish_dedicated_setup(options, &account, &line, policy, config)
+    finish_dedicated_setup(options, &account, &line, policy, config)?;
+    super::service::install(&executable)
 }
 
 fn finish_dedicated_setup(
@@ -527,6 +550,8 @@ fn finish_dedicated_setup(
         return Err(skipped.unwrap_or_else(|| anyhow::anyhow!("No engine could be exposed")));
     }
     config.engines = reachable;
+    config.service_uid = account.uid;
+    config.service_gid = account.gid;
     // Policy precedes key activation; both must succeed before any group mutation.
     // A later group failure can leave only validated, agent-restricted keys in place.
     write_policy(policy, &config)?;
@@ -664,10 +689,13 @@ mod tests {
             key: Some(ED25519.into()),
             allow_delete: false,
             engines: vec!["docker=/missing-security-test.sock".into()],
+            scanner_digest: None,
+            security_interval: 86400,
         };
         let config = AgentConfig {
             allow_delete: false,
             engines: vec![parse_engine(&options.engines[0]).unwrap()],
+            ..Default::default()
         };
         let line = authorized_line(
             Path::new("/usr/local/bin/tha-agent"),
@@ -728,6 +756,7 @@ mod tests {
                 name: "docker".into(),
                 socket: "/a".into(),
             }],
+            ..Default::default()
         };
         let kept = merge_config(Some(existing.clone()), Vec::new(), false);
         assert_eq!(kept, existing);

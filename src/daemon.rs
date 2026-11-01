@@ -125,7 +125,11 @@ impl Pending {
     }
 }
 
-pub async fn run(config: Config, initial: Vec<Connection>) -> Result<()> {
+pub async fn run(
+    config: Config,
+    initial: Vec<Connection>,
+    remotes_path: Option<PathBuf>,
+) -> Result<()> {
     let path = history::path(&config)?;
     let store = history::Store::open(&path, config.history_disk_mb * 1024 * 1024)?;
     let live: crate::live::Shared = Arc::new(Mutex::new(Default::default()));
@@ -191,6 +195,10 @@ pub async fn run(config: Config, initial: Vec<Connection>) -> Result<()> {
     let claims: collector::Claims = Arc::new(Mutex::new(HashMap::new()));
     let budget = Arc::new(Semaphore::new(2));
     let mut tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut security_remotes: HashMap<
+        String,
+        (crate::remote::Remote, tokio::task::JoinHandle<()>),
+    > = HashMap::new();
     let mut interval = tokio::time::interval(Duration::from_secs(config.refresh_seconds));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -203,6 +211,22 @@ pub async fn run(config: Config, initial: Vec<Connection>) -> Result<()> {
             _ = terminate.recv() => break,
             _ = flush_tick.tick() => {let _=sender.try_send(collector::WriteBatch {runtime:String::new(),samples:vec![],flush:true});},
             _ = interval.tick() => {
+                let mut remotes = config.remotes.clone();
+                if let Some(path) = remotes_path.as_deref() {
+                    match crate::remote::load_managed(path) {
+                        Ok(managed) => { for remote in managed { if !remotes.iter().any(|r| r.name == remote.name) { remotes.push(remote); } } }
+                        Err(error) => eprintln!("tha security remotes: {error:#}"),
+                    }
+                }
+                remotes.retain(|remote| crate::security::enabled() && remote.connect.unwrap_or(config.remote_connect) == crate::remote::ConnectMode::Startup);
+                security_remotes.retain(|name, (old, task)| {
+                    let keep = remotes.iter().any(|remote| &remote.name == name && remote.same_transport(old));
+                    if !keep { task.abort(); }
+                    keep
+                });
+                for remote in remotes {
+                    security_remotes.entry(remote.name.clone()).or_insert_with(|| (remote.clone(), tokio::spawn(crate::remote::collect_security(remote))));
+                }
                 let discovered = if config.discover_connections { crate::discovery::podman::discover().await } else { Default::default() };
                 let mut connections = initial.clone();
                 if config.discover_connections { connections.extend(collector::discover_local()); }
@@ -221,6 +245,12 @@ pub async fn run(config: Config, initial: Vec<Connection>) -> Result<()> {
     }
     for task in tasks.values() {
         task.abort();
+    }
+    for (_, task) in security_remotes.values() {
+        task.abort();
+    }
+    for (_, (_, task)) in security_remotes {
+        let _ = task.await;
     }
     let _ = security_stop.send(true);
     let _ = security_worker.await;

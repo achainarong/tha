@@ -142,8 +142,8 @@ async fn the_whole_path_works_through_real_ssh() {
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&agents.stdout).trim(),
-            "1",
-            "one channel means one agent process: {}",
+            "2",
+            "one persistent daemon plus one SSH relay, regardless of request count: {}",
             String::from_utf8_lossy(&agents.stderr)
         );
     }
@@ -181,6 +181,23 @@ async fn the_whole_path_works_through_real_ssh() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(masters(&session_pattern()), 0, "the SSH session must close");
     assert!(backend::snapshot(&connection).await.is_err());
+    if let Ok(server) = std::env::var("THA_SMOKE_SERVER") {
+        let agents = std::process::Command::new("docker")
+            .args([
+                "exec",
+                &server,
+                "sh",
+                "-c",
+                "ps -eo stat,args | grep '[t]ha-agent' | grep -vc '^Z'",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&agents.stdout).trim(),
+            "1",
+            "The persistent service must survive SSH disconnection"
+        );
+    }
     remote::remove_session_directory();
 }
 

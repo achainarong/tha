@@ -16,6 +16,10 @@ struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
+    /// Run the persistent agent (normally started by systemd)
+    Daemon,
+    /// Install/restart the systemd service using an existing agent policy (root only)
+    InstallService,
     /// List the engines this server exposes
     List,
     /// Serve one engine's allowlisted API on stdin and stdout
@@ -23,7 +27,7 @@ enum Command {
     /// Prepare this server as root: a dedicated user, its restricted key, and the agent policy
     Setup {
         /// Dedicated user for the key, with no other keys, password or sudo rules; or root, to
-        /// write only the policy and leave root's keys unrestricted
+        /// leave root's keys unrestricted
         #[arg(long, default_value = "tha")]
         user: String,
         /// Public key line, as found in the .pub file
@@ -35,6 +39,12 @@ enum Command {
         /// Expose only this engine (repeatable); without it, every known socket found is exposed
         #[arg(long, value_name = "NAME=SOCKET")]
         engine: Vec<String>,
+        /// Opt in to scheduled security scans with this approved Docker Hub manifest digest
+        #[arg(long)]
+        scanner_digest: Option<String>,
+        /// Rescan interval in seconds (at least one hour)
+        #[arg(long, default_value_t = 86400)]
+        security_interval: u64,
     },
 }
 
@@ -44,16 +54,40 @@ async fn main() {
         None => agent::run(None).await,
         Some(Command::List) => agent::run(Some("list")).await,
         Some(Command::Serve { engine }) => agent::run(Some(&engine)).await,
+        Some(Command::Daemon) => {
+            if std::env::var_os("SSH_ORIGINAL_COMMAND").is_some() {
+                agent::run(None).await
+            } else {
+                agent::service::run().await
+            }
+        }
+        Some(Command::InstallService) => {
+            if std::env::var_os("SSH_ORIGINAL_COMMAND").is_some() {
+                agent::run(None).await
+            } else {
+                agent::load_config(std::path::Path::new(agent::CONFIG_PATH)).and_then(|_| {
+                    anyhow::ensure!(
+                        unsafe { libc::geteuid() } == 0,
+                        "Service installation requires root"
+                    );
+                    agent::service::install(&std::env::current_exe()?)
+                })
+            }
+        }
         Some(Command::Setup {
             user,
             key,
             allow_delete,
             engine,
+            scanner_digest,
+            security_interval,
         }) => agent::setup::run_setup(&agent::setup::Options {
             user,
             key,
             allow_delete,
             engines: engine,
+            scanner_digest,
+            security_interval,
         }),
     };
     if let Err(error) = result {

@@ -30,7 +30,7 @@ enum Request {
 }
 #[derive(Serialize, Deserialize)]
 enum Response {
-    Event(Event),
+    Event(Box<Event>),
     Error(String),
     Accepted,
     Status { busy: bool },
@@ -134,6 +134,14 @@ pub async fn submit(
     tx: mpsc::Sender<Event>,
     mut cancel: watch::Receiver<bool>,
 ) {
+    if targets
+        .iter()
+        .all(|target| crate::remote::is_remote(&target.connection))
+        && !targets.is_empty()
+    {
+        super::remote::submit(targets, generation, update, tx, cancel).await;
+        return;
+    }
     let Some(target) = targets.first().cloned() else {
         return;
     };
@@ -167,7 +175,7 @@ pub async fn submit(
             match serde_json::from_slice::<Response>(&bytes)? {
                 Response::Event(event) => {
                     let done = matches!(event.result, Outcome::QueueDone);
-                    if tx.send(event).await.is_err() || done {
+                    if tx.send(*event).await.is_err() || done {
                         break;
                     }
                 }
@@ -356,7 +364,7 @@ async fn client(
         tokio::select! {
             event = receiver.recv() => {
                 let Some(event) = event else { break; };
-                if connected && write_frame(&mut stream, &Response::Event(event)).await.is_err() { connected = false; }
+                if connected && write_frame(&mut stream, &Response::Event(Box::new(event))).await.is_err() { connected = false; }
                 // Always drain events after UI disconnect so the daemon finishes the queue.
             }
             _ = stop.changed() => { let _ = cancel.send(true); }
