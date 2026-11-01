@@ -4074,6 +4074,8 @@ impl App {
                 }
                 Request::Start { .. }
                 | Request::Upload { .. }
+                | Request::CreateFile { .. }
+                | Request::DeleteFile { .. }
                 | Request::Cancel { .. }
                 | Request::CloseDialog => {}
             }

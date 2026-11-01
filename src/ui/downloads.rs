@@ -33,7 +33,7 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
         .title(crate::tf!(" File explorer · {label} ", label = label))
         .title_bottom(match manager.pane {
             Pane::Browse => crate::i18n::t(
-                " j/k Move · Enter Folder · / Find in folder · Ctrl-f Find in system · e Edit · d Download · r Refresh · Tab Downloads · Esc Close ",
+                " j/k Move · Enter Folder · / Find in folder · Ctrl-f Find in system · e Edit · d Download · a New · D Delete · r Refresh · Tab Downloads · Esc Close ",
             ),
             Pane::Downloads => {
                 crate::i18n::t(" j/k Move · x Cancel · Tab Files · Esc Close; downloads keep running ")
@@ -77,6 +77,16 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
             root = safe_text(&manager.search_root),
             query = safe_text(input),
         )));
+    } else if let Some(input) = &manager.new_file_input {
+        footer.push(Line::from(crate::tf!(
+            "New file in {folder}: {name}▏ · Enter Create · Esc Cancel",
+            folder = safe_text(&manager.new_file_folder),
+            name = safe_text(input),
+        )));
+        // A name that was refused is still being typed, so the reason goes below it.
+        if let Some(message) = &manager.message {
+            footer.push(Line::styled(safe_text(message), accent(app, Color::Yellow)));
+        }
     } else if let Some(command) = &manager.command {
         footer.push(Line::from(format!(":{}▏", safe_text(command))));
     } else if let Some(message) = &manager.message {
@@ -629,6 +639,57 @@ mod tests {
             output.contains("43%") && output.contains("web · /x"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn the_new_file_prompt_shows_where_it_goes_and_why_a_name_was_refused() {
+        let mut app = demo_on_container();
+        app.open_file_explorer();
+        app.take_download_requests();
+        app.downloads.demo = false;
+        app.downloads.begin_new_file();
+        app.downloads.append_new_file("a/b");
+        app.downloads.confirm_new_file();
+        let output = screen(&mut app);
+        assert!(output.contains("New file in /etc: a/b"), "{output}");
+        assert!(output.contains("without / or control"), "{output}");
+    }
+
+    #[test]
+    fn the_delete_review_shows_what_was_checked_and_a_hostile_name_stays_harmless() {
+        let mut app = demo_on_container();
+        app.open_file_explorer();
+        app.take_download_requests();
+        let source = app.downloads.tree().unwrap().source.clone();
+        app.downloads.delete_review = Some(crate::downloads::DeleteReview {
+            id: 1,
+            source,
+            path: "/tmp/evil\u{1b}[2J.txt".into(),
+            kind: Kind::File,
+            check: Preview::Loading,
+            error: None,
+        });
+        let output = screen(&mut app);
+        assert!(output.contains("Delete file"), "{output}");
+        assert!(output.contains("Checking"), "{output}");
+        assert!(!output.contains('\u{1b}'));
+        let review = app.downloads.delete_review.as_mut().unwrap();
+        review.check = Preview::Ready(crate::files::Header {
+            name: "evil".into(),
+            kind: Kind::File,
+            size: 2048,
+            modified: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        });
+        let output = screen(&mut app);
+        assert!(output.contains("2.0 KB"), "{output}");
+        assert!(output.contains("cannot be undone"), "{output}");
+        let review = app.downloads.delete_review.as_mut().unwrap();
+        review.check = Preview::Failed("No such file or folder".into());
+        let output = screen(&mut app);
+        assert!(output.contains("No such file"), "{output}");
     }
 
     #[test]

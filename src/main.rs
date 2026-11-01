@@ -354,17 +354,19 @@ enum EditEvent {
         location: Box<tha::compose_edit::Location>,
         message: String,
     },
+    OpenFailed {
+        location: Box<tha::compose_edit::Location>,
+        message: String,
+    },
     NetworkTest(Result<tha::files::NetTest, String>),
 }
 
-fn invalidate_edited_preview(
-    manager: &mut tha::downloads::Manager,
-    location: &tha::compose_edit::Location,
-) {
+/// The explorer tree a file being edited belongs to, and its path there.
+fn edited_file(location: &tha::compose_edit::Location) -> Option<(String, &str)> {
     use tha::{compose_edit::Location, files::Source};
     match location {
-        Location::Local(_) => {}
-        Location::Container { source, path } => manager.invalidate_preview(&source.key(), path),
+        Location::Local(_) => None,
+        Location::Container { source, path } => Some((source.key(), path)),
         Location::Server {
             remote,
             control,
@@ -375,7 +377,7 @@ fn invalidate_edited_preview(
                 control: control.clone(),
                 label: remote.name.clone(),
             };
-            manager.invalidate_preview(&source.key(), path);
+            Some((source.key(), path))
         }
     }
 }
@@ -753,6 +755,8 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                         if let Some(session) = app.sessions.active_mut() && let Err(error) = session.paste(&text) { app.notice = tha::tf!("{error}", error = format!("{error:#}")); }
                     } else if app.downloads.open.is_some() && app.downloads.search_input.is_some() {
                         app.downloads.append_search(&text);
+                    } else if app.downloads.open.is_some() && app.downloads.new_file_input.is_some() {
+                        app.downloads.append_new_file(&text);
                     } else if app.input_mode != InputMode::Normal {
                         let text = tha::model::safe_text(&text);
                         for ch in text.chars() { if app.input.len() + ch.len_utf8() > 1024 { break; } app.input.push(ch); }
@@ -930,7 +934,19 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                         }
                     }
                     EditEvent::Saved { location, message } => {
-                        invalidate_edited_preview(&mut app.downloads, &location);
+                        if let Some((key, path)) = edited_file(&location) {
+                            app.downloads.invalidate_preview(&key, path);
+                            app.downloads.action_failed(&key, path, &message);
+                        }
+                        if app.downloads.open.is_some() {
+                            app.downloads.message = Some(message.clone());
+                        }
+                        app.notice = message;
+                    }
+                    EditEvent::OpenFailed { location, message } => {
+                        if let Some((key, path)) = edited_file(&location) {
+                            app.downloads.action_failed(&key, path, &message);
+                        }
                         if app.downloads.open.is_some() {
                             app.downloads.message = Some(message.clone());
                         }
@@ -1138,10 +1154,13 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                                 location: Box::new(location),
                                 fetched,
                             },
-                            Err(error) => EditEvent::Notice(tha::tf!(
-                                "Could not open the file: {error}",
-                                error = tha::model::safe_text(&format!("{error:#}"))
-                            )),
+                            Err(error) => EditEvent::OpenFailed {
+                                location: Box::new(location),
+                                message: tha::tf!(
+                                    "Could not open the file: {error}",
+                                    error = tha::model::safe_text(&format!("{error:#}"))
+                                ),
+                            },
                         };
                         let _ = sender.send(event).await;
                     })));
@@ -1630,6 +1649,50 @@ fn run_download_request(
                     let _ = sender.send(Event::Finished { job, result }).await;
                 })),
             );
+        }
+        // Longer than a read, and in `lists` so that closing the panel does not interrupt it. A
+        // timeout says nothing about whether it happened, so the folder is read afterwards anyway.
+        Request::CreateFile {
+            source,
+            folder,
+            name,
+        } => {
+            lists.retain(|task| !task.0.is_finished());
+            lists.push(AbortTask(tokio::spawn(async move {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    tha::files::create_file(&source, &folder, &name),
+                )
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!(tha::i18n::t("Timed out"))))
+                .map_err(message);
+                let _ = sender
+                    .send(Event::FileCreated {
+                        key: source.key(),
+                        path: tha::files::join(&folder, &name),
+                        result,
+                    })
+                    .await;
+            })));
+        }
+        Request::DeleteFile { source, path } => {
+            lists.retain(|task| !task.0.is_finished());
+            lists.push(AbortTask(tokio::spawn(async move {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    tha::files::delete_file(&source, &path),
+                )
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!(tha::i18n::t("Timed out"))))
+                .map_err(message);
+                let _ = sender
+                    .send(Event::FileDeleted {
+                        key: source.key(),
+                        path,
+                        result,
+                    })
+                    .await;
+            })));
         }
         Request::Cancel { job } => {
             jobs.remove(&job);

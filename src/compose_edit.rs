@@ -53,6 +53,8 @@ pub enum HostEdit {
     Check(String),
     Read(String),
     Write { path: String, expected: String },
+    Create(String),
+    Delete(String),
 }
 
 /// Understands only the exact form this program sends. It never reaches a shell.
@@ -62,6 +64,8 @@ pub fn parse_host_command(command: &str) -> Option<Result<HostEdit>> {
     Some((|| match parts.as_slice() {
         ["check", path] => Ok(HostEdit::Check(decode(path)?)),
         ["read", path] => Ok(HostEdit::Read(decode(path)?)),
+        ["create", path] => Ok(HostEdit::Create(decode(path)?)),
+        ["delete", path] => Ok(HostEdit::Delete(decode(path)?)),
         ["write", path, expected]
             if expected.len() == 64 && expected.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
         {
@@ -186,8 +190,45 @@ fn write_checked_for_config(
     result
 }
 
+/// Never replaces anything: a file, folder or link already at this path makes it fail.
+fn create_new(path: &Path) -> Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(path)
+        .with_context(|| format!("Cannot create {}", path.display()))?;
+    Ok(())
+}
+
+/// Removes a file or the link itself. Refuses the policy that authorizes the next SSH request,
+/// by what it actually is as well as by its spelling, because removing it locks out every client.
+fn delete_checked(path: &Path, config_path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("Cannot delete {}", path.display()))?;
+    ensure!(
+        metadata.is_file() || metadata.is_symlink(),
+        "Only files and links can be deleted"
+    );
+    let is_policy = path == config_path
+        || std::fs::metadata(config_path)
+            .is_ok_and(|policy| policy.dev() == metadata.dev() && policy.ino() == metadata.ino());
+    ensure!(
+        !is_policy,
+        "The agent's policy cannot be deleted through Tha; it authorizes every request"
+    );
+    std::fs::remove_file(path).with_context(|| format!("Cannot delete {}", path.display()))
+}
+
 /// Runs as the SSH login user, so normal file permissions decide.
 pub fn serve_host(request: HostEdit, any: bool) -> Result<()> {
+    if matches!(request, HostEdit::Create(_) | HostEdit::Delete(_)) {
+        // --allow-compose-edit is for changing Compose files, not for removing them.
+        ensure!(
+            any,
+            "Creating and deleting files is turned off on this server; rerun tha-agent setup with --allow-server-edit"
+        );
+    }
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     match request {
@@ -212,6 +253,10 @@ pub fn serve_host(request: HostEdit, any: bool) -> Result<()> {
                 .take(MAX_FILE_BYTES + 1)
                 .read_to_end(&mut contents)?;
             write_checked(Path::new(&path), &expected, &contents, any)?;
+        }
+        HostEdit::Create(path) => create_new(Path::new(&path))?,
+        HostEdit::Delete(path) => {
+            delete_checked(Path::new(&path), Path::new(crate::agent::CONFIG_PATH))?;
         }
     }
     out.flush()?;
@@ -276,6 +321,30 @@ async fn run_ssh(
         );
     }
     Ok(output.stdout)
+}
+
+/// An older agent refuses the words it has not heard of, which would otherwise read as a mystery.
+async fn change_on_server(remote: &Remote, control: &Path, request: &str) -> Result<()> {
+    match run_ssh(remote, control, request, None).await {
+        Ok(_) => Ok(()),
+        Err(error) if format!("{error:#}").contains("Invalid edit request") => bail!(
+            "{}",
+            crate::i18n::t(
+                "This server's agent cannot create or delete files yet; update tha-agent"
+            )
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+pub async fn create_on_server(remote: &Remote, control: &Path, path: &str) -> Result<()> {
+    let request = format!("tha-agent edit create {}", encode(path));
+    change_on_server(remote, control, &request).await
+}
+
+pub async fn delete_on_server(remote: &Remote, control: &Path, path: &str) -> Result<()> {
+    let request = format!("tha-agent edit delete {}", encode(path));
+    change_on_server(remote, control, &request).await
 }
 
 /// Only text can be edited this way; a binary file would be corrupted by most editors.
@@ -475,6 +544,96 @@ mod tests {
     }
 
     #[test]
+    fn creating_on_a_server_never_replaces_anything() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("new.txt");
+        create_new(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        std::fs::write(&path, b"kept").unwrap();
+        assert!(create_new(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"kept");
+        // A dangling link would otherwise create its target somewhere else entirely.
+        let target = folder.path().join("target");
+        let link = folder.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(create_new(&link).is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn deleting_on_a_server_takes_only_files_and_the_link_not_its_target() {
+        let folder = tempfile::tempdir().unwrap();
+        let policy = folder.path().join("policy.toml");
+        let delete = |path: &Path| delete_checked(path, &policy);
+        let path = folder.path().join("a.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let link = folder.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        delete(&link).unwrap();
+        assert!(!link.exists() && path.exists());
+        delete(&path).unwrap();
+        assert!(!path.exists());
+        // Already gone, so the client can correct what it shows.
+        let error = format!("{:#}", delete(&path).unwrap_err());
+        assert!(crate::files::path_gone(&error), "{error}");
+
+        let inner = folder.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::write(inner.join("kept"), b"x").unwrap();
+        assert!(delete(&inner).is_err());
+        assert!(inner.join("kept").exists());
+    }
+
+    #[test]
+    fn deleting_on_a_server_refuses_the_policy_under_any_spelling() {
+        let folder = tempfile::tempdir().unwrap();
+        let policy = folder.path().join("policy.toml");
+        std::fs::write(&policy, b"x").unwrap();
+        assert!(delete_checked(&policy, &policy).is_err());
+        let alias = folder.path().join("alias");
+        std::os::unix::fs::symlink(folder.path(), &alias).unwrap();
+        assert!(delete_checked(&alias.join("policy.toml"), &policy).is_err());
+        let hard = folder.path().join("hard");
+        std::fs::hard_link(&policy, &hard).unwrap();
+        assert!(delete_checked(&hard, &policy).is_err());
+        assert!(policy.exists());
+    }
+
+    #[test]
+    fn creating_and_deleting_need_the_option_that_reaches_every_file() {
+        for request in [
+            HostEdit::Create("/srv/compose.yaml".into()),
+            HostEdit::Delete("/srv/compose.yaml".into()),
+        ] {
+            let error = serve_host(request, false).unwrap_err().to_string();
+            assert!(error.contains("--allow-server-edit"), "{error}");
+        }
+        let hex = encode("/srv/a");
+        assert_eq!(
+            parse_host_command(&format!("tha-agent edit create {hex}"))
+                .unwrap()
+                .unwrap(),
+            HostEdit::Create("/srv/a".into())
+        );
+        assert_eq!(
+            parse_host_command(&format!("tha-agent edit delete {hex}"))
+                .unwrap()
+                .unwrap(),
+            HostEdit::Delete("/srv/a".into())
+        );
+        assert!(
+            parse_host_command("tha-agent edit delete 2f;id")
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            parse_host_command(&format!("tha-agent edit delete {hex} extra"))
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
     fn only_compose_and_env_files_qualify() {
         for good in [
             "/a/compose.yaml",
@@ -510,7 +669,7 @@ mod tests {
         );
         assert!(parse_host_command("tha-agent shell").is_none());
         for bad in [
-            format!("tha-agent edit delete {hex}"),
+            format!("tha-agent edit chmod {hex}"),
             format!("tha-agent edit write {hex} short"),
             format!("tha-agent edit read {hex};id"),
             format!("tha-agent edit read {}", encode("relative.yaml")),

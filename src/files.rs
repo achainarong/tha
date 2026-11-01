@@ -64,6 +64,29 @@ pub fn join(parent: &str, name: &str) -> String {
     }
 }
 
+/// A name for a new file: one path component, so it cannot point anywhere but the chosen folder.
+pub fn check_new_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty()
+            && name != "."
+            && name != ".."
+            && name.len() <= 255
+            && !name.contains('/')
+            && !name.chars().any(char::is_control),
+        "{}",
+        crate::i18n::t("Use a file name without / or control characters")
+    );
+    Ok(())
+}
+
+/// Whether an error says the path is not there any more, so what the tree shows is out of date.
+/// The operating system, `ls` and the agent all word this in English; `stat` translates it.
+pub fn path_gone(error: &str) -> bool {
+    error.contains("Not a directory")
+        || error.contains("No such file")
+        || error.contains(crate::i18n::t("No such file or folder"))
+}
+
 pub fn file_name(path: &str) -> &str {
     path.rsplit('/')
         .find(|part| !part.is_empty())
@@ -836,8 +859,8 @@ pub async fn serve_agent(
         Ok(parsed) => parsed,
         Err(error) => return refused(&agent, &target, StatusCode::FORBIDDEN, &error.to_string()),
     };
-    // Only an upload has a body, and only an upload changes anything.
-    let expected = if parsed.op == "upload" {
+    // Only an upload has a body. An upload and a delete are the only requests that change anything.
+    let expected = if matches!(parsed.op.as_str(), "upload" | "delete") {
         Method::POST
     } else {
         Method::GET
@@ -857,6 +880,11 @@ pub async fn serve_agent(
         "upload" | "upload-check" => Some((
             agent.allow_upload,
             "container uploads are turned off on this server; rerun tha-agent setup with --allow-upload",
+        )),
+        // This runs the image's `rm`, which an upload can replace, so it is exec as well.
+        "delete" => Some((
+            agent.allow_upload && agent.allow_exec,
+            "deleting container files needs both options; rerun tha-agent setup with --allow-upload and --allow-exec",
         )),
         _ => None,
     };
@@ -914,6 +942,13 @@ pub async fn serve_agent(
     ));
     match parsed.op.as_str() {
         "upload-check" => crate::agent::message_json(serde_json::json!({ "ok": true })),
+        "delete" => match delete_in_container(&docker, &parsed.id, &parsed.path).await {
+            Ok(()) => crate::agent::message_json(serde_json::json!({ "ok": true })),
+            Err(error) => crate::agent::message_response(
+                StatusCode::BAD_REQUEST,
+                &crate::layers::text(&format!("{error:#}")),
+            ),
+        },
         "upload" => {
             let body = futures_util::stream::unfold(request.into_body(), |mut body| async move {
                 loop {
@@ -1238,6 +1273,143 @@ pub fn edited_archive(name: &str, header: &Header, old: &[u8], new: &[u8]) -> Ve
     out
 }
 
+/// One new empty file, owned like the folder it goes into so that the workload can use it.
+fn new_file_archive(name: &str, uid: u64, gid: u64) -> Vec<u8> {
+    let mut out = long_name_header(name.as_bytes());
+    out.extend_from_slice(&tar_header_owned(
+        name.as_bytes(),
+        b'0',
+        0,
+        0o644,
+        crate::history::now_ms() / 1000,
+        uid,
+        gid,
+    ));
+    out.extend_from_slice(&[0; BLOCK * 2]);
+    out
+}
+
+/// Creates an empty file and never replaces one. On a server that is atomic. The engine has no
+/// such option, so a container is checked first, which narrows the window rather than closing it.
+pub async fn create_file(source: &Source, folder: &str, name: &str) -> Result<()> {
+    check_new_name(name)?;
+    let path = join(folder, name);
+    match source {
+        Source::Server {
+            remote, control, ..
+        } => crate::compose_edit::create_on_server(remote, control, &path).await,
+        Source::Container { .. } => {
+            // The archive of `/` is the whole filesystem, and it is always a folder.
+            let (uid, gid) = if folder == "/" {
+                (0, 0)
+            } else {
+                let parent = stat(source, folder).await?;
+                ensure!(
+                    parent.kind == Kind::Folder,
+                    "{}",
+                    crate::i18n::t("This path is not a folder any more")
+                );
+                (parent.uid, parent.gid)
+            };
+            match stat(source, &path).await {
+                Ok(_) => bail!("{}", crate::i18n::t("A file with this name already exists")),
+                Err(error) if path_gone(&format!("{error:#}")) => {}
+                Err(error) => return Err(error),
+            }
+            upload_bytes(source, folder, new_file_archive(name, uid, gid)).await
+        }
+    }
+}
+
+/// Removes one file or link. Neither side can remove a folder, or follow a link to its target.
+pub async fn delete_file(source: &Source, path: &str) -> Result<()> {
+    match source {
+        Source::Server {
+            remote, control, ..
+        } => crate::compose_edit::delete_on_server(remote, control, path).await,
+        Source::Container { connection, id, .. } => {
+            if let Some(socket) = crate::remote::local_socket(&connection.endpoint) {
+                let answer = agent_request(&socket, Method::POST, "delete", id, path)
+                    .await
+                    .map_err(|error| {
+                        // An older agent knows no such route, and accepts no POST but an upload.
+                        let text = format!("{error:#}");
+                        if text.contains("invalid method") || text.contains("unknown file request")
+                        {
+                            anyhow::anyhow!(
+                                "{}",
+                                crate::i18n::t(
+                                    "This server's agent cannot delete files yet; update tha-agent"
+                                )
+                            )
+                        } else {
+                            error
+                        }
+                    })?;
+                collect(answer, 4096).await?;
+                return Ok(());
+            }
+            delete_in_container(&local_docker(connection).await?, id, path).await
+        }
+    }
+}
+
+/// Runs `rm` in the container with the path as one argument, so no shell ever sees it. Without
+/// `-r` it refuses a folder, and without `-f` it reports a file that is already gone. It runs as
+/// root because uploads and edits, which go through the engine, are not limited by the
+/// workload's user either, and a file created here must be removable here.
+pub async fn delete_in_container(docker: &Docker, id: &str, path: &str) -> Result<()> {
+    let exec = docker
+        .create_exec(
+            id,
+            CreateExecOptions {
+                cmd: Some(vec!["rm", "--", path]),
+                env: Some(vec!["LC_ALL=C"]),
+                user: Some("0"),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                tty: Some(false),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let mut stderr = Vec::new();
+    let run = async {
+        if let StartExecResults::Attached { mut output, .. } =
+            docker.start_exec(&exec.id, None).await?
+        {
+            while let Some(chunk) = output.next().await {
+                if let bollard::container::LogOutput::StdErr { message } = chunk?
+                    && stderr.len() < 4096
+                {
+                    stderr.extend_from_slice(&message);
+                }
+            }
+        }
+        anyhow::Ok(())
+    };
+    // The image supplies this `rm`, so it may never finish.
+    tokio::time::timeout(Duration::from_secs(20), run)
+        .await
+        .map_err(|_| anyhow::anyhow!("{}", crate::i18n::t("Timed out")))??;
+    let code = docker.inspect_exec(&exec.id).await?.exit_code;
+    if matches!(code, Some(126 | 127)) {
+        bail!(
+            "{}",
+            crate::i18n::t("This image has no rm, so the file cannot be deleted")
+        );
+    }
+    if code != Some(0) {
+        let reason = String::from_utf8_lossy(&stderr);
+        let reason = crate::model::safe_text(reason.trim());
+        if reason.is_empty() {
+            bail!("{}", crate::i18n::t("The file could not be deleted"));
+        }
+        bail!("{reason}");
+    }
+    Ok(())
+}
+
 /// Whether this container accepts writes from here. Only a server's policy can say no.
 pub async fn can_upload(source: &Source, folder: &str) -> bool {
     match source {
@@ -1448,6 +1620,16 @@ async fn agent_body(
     id: &str,
     path: &str,
 ) -> Result<BoxStream<'static, Result<Bytes>>> {
+    agent_request(socket, Method::GET, op, id, path).await
+}
+
+async fn agent_request(
+    socket: &Path,
+    method: Method,
+    op: &str,
+    id: &str,
+    path: &str,
+) -> Result<BoxStream<'static, Result<Bytes>>> {
     let stream = tokio::net::UnixStream::connect(socket)
         .await
         .context(crate::i18n::t("Remote server is disconnected"))?;
@@ -1459,6 +1641,7 @@ async fn agent_body(
     let response = sender
         .send_request(
             Request::builder()
+                .method(method)
                 .uri(format!("{ROUTE_PREFIX}{op}?id={id}&path={}", encode(path)))
                 .header("Host", "agent")
                 .body(Empty::<Bytes>::new())?,

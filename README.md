@@ -125,8 +125,8 @@ Everything else is off until you turn it on in the setup command on the **server
 | `--allow-images` | Pulling public images, checking for updates | Make the server contact registries and use disk |
 | `--allow-download` | Downloading files and folders from containers | Read anything inside any container |
 | `--allow-server-download` | Browsing and downloading the server's own files | Read whatever the SSH login user can read |
-| `--allow-upload` | Copying files into containers | Change files inside running workloads |
-| `--allow-server-edit` | Editing any file on the server | Rewrite whatever the SSH login user can write |
+| `--allow-upload` | Copying files into containers; with `--allow-exec`, deleting files in them | Change or delete files inside running workloads |
+| `--allow-server-edit` | Editing, creating and deleting any file on the server | Rewrite or delete whatever the SSH login user can reach |
 | `--allow-compose` | Compose actions on projects whose files are on the server | Recreate projects from those files |
 | `--allow-compose-edit` | Editing Compose and `.env` files | Change them, which together with `--allow-compose` amounts to root |
 | `--allow-all` | All of the above | All of the above |

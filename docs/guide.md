@@ -1181,13 +1181,15 @@ background so the panel never waits for it, and the selected file shows read-onl
 | `Enter` / `Space` | Open or close a folder |
 | `e` or `:edit` | Open the file in your editor |
 | `d` or `:download` | Download the file or folder |
+| `a` or `:new NAME` | Create an empty file in the selected folder, or beside the selected file |
+| `D` or `:delete` | Delete the selected file or link, after a review |
 | `/` or `:find` | Find recursively in the selected folder, or the selected file's parent |
 | `Ctrl-f` or `:find-all` | Find across the container's or server's filesystem, starting at `/` |
 | `n` / `N` | Jump to the next / previous match, wrapping at the ends |
 | `x` while finding | Cancel the search, keeping its partial results |
 | `PageUp`/`PageDown` | Scroll the file on the right |
 | `p` | Show the start of a big file |
-| `r` | Read the selected folder again; the tree shows each folder as it was when read |
+| `r` | Read the selected folder and its parent again; the tree shows each folder as it was when read |
 | `Tab` | Switch to **Downloads**, with progress and speed; `x` cancels |
 | `Esc` or `:q` | Close; downloads keep running, with a `↓` in the status line |
 
@@ -1206,6 +1208,26 @@ links. System searches skip `/proc`, `/sys`, and `/dev`. Each search is limited 
 folders, 100,000 directory entries, and 500 matches; unreadable or truncated folders and any reached
 limit are reported as **Incomplete**, not as proof that no other files exist. Closing the explorer
 cancels the search but leaves downloads running. `r` refreshes the folder and clears the search.
+
+**How current the tree is:** the tree is not watched, so a row can be out of date until something reads its
+folder again. That happens when you press `r`, open a folder, reopen the explorer, create or delete a file, or when
+an action finds that a path is gone or is no longer a folder. Nothing is decided from what the tree shows: every
+action checks the real file first.
+
+### Creating and deleting files
+
+`a` asks for a name and creates an empty file, then selects it. It never replaces anything. On a server that is
+guaranteed; on a container, Tha checks first because the engine cannot create only if absent, so a file appearing at
+that same moment could be replaced. In a container the new file gets the folder's owner, so the workload can use it.
+
+`D` checks the file again and shows what is there now, and only then can you confirm with `Enter` or `y`. If the file
+is gone or has become something else, nothing happens and the tree corrects itself. **Deleting cannot be undone, and
+no backup is kept.** Only files and links can be deleted, never folders, and deleting a link leaves its target alone.
+If the file is swapped for another at the moment you confirm, the new one is deleted. A folder never is.
+
+In a container, deleting runs `rm` inside it as root, so the container must be running and its image must have `rm`.
+Creating needs neither. Changes to a container's own files are lost when it is recreated, unless the file is on a
+volume. On a server, both run as the SSH login user, and Tha refuses to delete `/etc/tha/agent.toml`.
 
 ### Editing a file
 
@@ -1235,10 +1257,13 @@ On a server, what you can do depends on its options:
 | Browse | `--allow-exec` | `--allow-server-download` |
 | Read and download | `--allow-download` | `--allow-server-download` |
 | Edit | `--allow-download` and `--allow-upload` | `--allow-server-edit` |
+| Create | `--allow-download` and `--allow-upload` | `--allow-server-edit` |
+| Delete | `--allow-exec`, `--allow-download` and `--allow-upload` | `--allow-server-edit` and `--allow-server-download` |
 
-A file you cannot write opens read-only. **`--allow-server-edit` lets every holder of the key rewrite any file the
-login user can write. With a root login, that means any file on the server, including its keys and system
-configuration.**
+A file you cannot write opens read-only. **`--allow-server-edit` lets every holder of the key rewrite, create or
+delete any file the login user can reach. With a root login, that means any file on the server, including its keys and
+system configuration. `--allow-upload` together with `--allow-exec` likewise lets them delete files inside
+containers.** `--allow-compose-edit` does not allow creating or deleting anything.
 
 ### Downloading
 

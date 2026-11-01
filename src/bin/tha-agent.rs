@@ -26,7 +26,7 @@ enum Command {
     Shell,
     /// Read server files as the SSH login user (requires allow_server_download)
     Files { op: String, path: String },
-    /// Read or replace a file as the SSH login user (requires allow_server_edit or allow_compose_edit)
+    /// Read, replace, create or delete a file as the SSH login user (requires allow_server_edit; allow_compose_edit covers reading and replacing Compose files)
     Edit {
         op: String,
         path: String,

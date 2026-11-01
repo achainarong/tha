@@ -1435,6 +1435,7 @@ mod tests {
             "/containers/abc/start",
             "/tha/files/list?id=abc&path=2f",
             "/tha/files/upload-check?id=abc&path=2f",
+            "/tha/files/delete?id=abc&path=2f",
         ] {
             assert!(
                 body_through_proxy(&socket, target, b"smuggled".to_vec())

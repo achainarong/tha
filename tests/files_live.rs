@@ -98,6 +98,94 @@ async fn uploading_and_network_tests_work_against_a_real_engine() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[tokio::test]
+#[ignore = "needs a running container; creates and removes files under /tmp in it"]
+async fn creating_and_deleting_work_against_a_real_engine_and_replace_nothing() {
+    let source = source();
+    let path = "/tmp/tha-live-new.txt";
+    let _ = files::delete_file(&source, path).await;
+    files::create_file(&source, "/tmp", "tha-live-new.txt")
+        .await
+        .unwrap();
+    let created = files::stat(&source, path).await.unwrap();
+    assert_eq!((created.kind, created.size), (Kind::File, 0));
+
+    // Something already there is refused and left alone.
+    let start = files::Header {
+        name: "tha-live-new.txt".into(),
+        kind: Kind::File,
+        size: 4,
+        modified: 1_700_000_000,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    let archive = files::edited_archive("tha-live-new.txt", &start, b"", b"kept");
+    files::upload_bytes(&source, "/tmp", archive).await.unwrap();
+    let error = files::create_file(&source, "/tmp", "tha-live-new.txt")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("already exists"), "{error:#}");
+    let kept = files::read_start(&source, path, 4096).await.unwrap();
+    assert_eq!(kept.bytes, b"kept");
+
+    assert!(
+        files::create_file(&source, "/tmp/no-such-folder", "x")
+            .await
+            .is_err()
+    );
+    assert!(
+        files::create_file(&source, "/tmp", "../etc/x")
+            .await
+            .is_err()
+    );
+
+    files::delete_file(&source, path).await.unwrap();
+    let gone = files::stat(&source, path).await.unwrap_err();
+    assert!(files::path_gone(&format!("{gone:#}")), "{gone:#}");
+    // Already gone says so, in the words the explorer looks for.
+    let again = files::delete_file(&source, path).await.unwrap_err();
+    assert!(files::path_gone(&format!("{again:#}")), "{again:#}");
+    // Never a folder.
+    let refused = files::delete_file(&source, "/tmp").await.unwrap_err();
+    assert!(!files::path_gone(&format!("{refused:#}")), "{refused:#}");
+    assert_eq!(
+        files::stat(&source, "/tmp").await.unwrap().kind,
+        Kind::Folder
+    );
+    // A listing of what is no longer a folder is recognized as out of date.
+    let file_as_folder = files::list(&source, "/etc/hostname").await.unwrap_err();
+    assert!(
+        files::path_gone(&format!("{file_as_folder:#}")),
+        "{file_as_folder:#}"
+    );
+}
+
+/// A link is removed, and what it points to stays.
+#[tokio::test]
+#[ignore = "needs a running container; creates and removes files under /tmp in it"]
+async fn deleting_a_link_leaves_its_target() {
+    let source = source();
+    assert_eq!(
+        files::stat(&source, "/tmp/tha-live-link")
+            .await
+            .unwrap()
+            .kind,
+        Kind::Link
+    );
+    files::delete_file(&source, "/tmp/tha-live-link")
+        .await
+        .unwrap();
+    assert!(files::stat(&source, "/tmp/tha-live-link").await.is_err());
+    assert_eq!(
+        files::stat(&source, "/tmp/tha-live-target")
+            .await
+            .unwrap()
+            .kind,
+        Kind::File
+    );
+}
+
 /// The whole client path without SSH: the local socket and the channel in front of the agent.
 #[tokio::test]
 #[ignore = "needs a running container; writes one small file under /tmp in it"]
@@ -242,6 +330,27 @@ async fn the_agent_routes_work_against_a_real_engine_and_refuse_what_is_off() {
             .unwrap_err()
     );
     assert!(refused.contains("--allow-upload"), "{refused}");
+    let refused = format!(
+        "{:#}",
+        files::delete_file(&source, "/tmp/tha-live-agent.txt")
+            .await
+            .unwrap_err()
+    );
+    assert!(refused.contains("--allow-upload"), "{refused}");
+    allowed.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Through the agent, too: the file goes, and a folder does not.
+    files::create_file(&source, "/tmp", "tha-live-agent-new.txt")
+        .await
+        .unwrap();
+    files::delete_file(&source, "/tmp/tha-live-agent-new.txt")
+        .await
+        .unwrap();
+    assert!(
+        files::stat(&source, "/tmp/tha-live-agent-new.txt")
+            .await
+            .is_err()
+    );
+    assert!(files::delete_file(&source, "/tmp").await.is_err());
     std::fs::remove_dir_all(directory).unwrap();
 }
 

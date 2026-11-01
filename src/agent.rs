@@ -942,9 +942,16 @@ pub async fn run(argument: Option<&str>) -> Result<()> {
             crate::files::serve_host(op, &path)
         }
         Requested::Edit(request, any) => {
-            if let crate::compose_edit::HostEdit::Write { path, .. } = &request {
+            use crate::compose_edit::HostEdit;
+            let changed = match &request {
+                HostEdit::Write { path, .. } => Some(("edit", path)),
+                HostEdit::Create(path) if any => Some(("create", path)),
+                HostEdit::Delete(path) if any => Some(("delete", path)),
+                _ => None,
+            };
+            if let Some((word, path)) = changed {
                 syslog(&format!(
-                    "allowed file edit as SSH login user: {}",
+                    "allowed file {word} as SSH login user: {}",
                     loggable(path)
                 ));
             }
@@ -967,7 +974,16 @@ mod tests {
 
     /// Asks an agent with the given options for one file route.
     async fn file_route(allow_exec: bool, allow_download: bool, op: &str) -> (StatusCode, String) {
-        let method = if op == "upload" {
+        file_route_uploading(allow_exec, allow_download, false, op).await
+    }
+
+    async fn file_route_uploading(
+        allow_exec: bool,
+        allow_download: bool,
+        allow_upload: bool,
+        op: &str,
+    ) -> (StatusCode, String) {
+        let method = if matches!(op, "upload" | "delete") {
             Method::POST
         } else {
             Method::GET
@@ -981,7 +997,7 @@ mod tests {
                 allow_images: false,
                 allow_download,
                 allow_compose: false,
-                allow_upload: false,
+                allow_upload,
                 socket: "/missing-files-fixture.sock".into(),
                 audit: |_| {},
                 security: None,
@@ -1027,9 +1043,20 @@ mod tests {
         let (status, message) = file_route(false, true, "nettest").await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(message.contains("--allow-exec"), "{message}");
-        let (status, message) = file_route(true, true, "delete").await;
+        let (status, message) = file_route(true, true, "chmod").await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(message.contains("unknown"), "{message}");
+        // Deleting runs the image's `rm`, which an upload can replace, so it needs both options.
+        for (exec, upload) in [(true, false), (false, true), (false, false)] {
+            let (status, message) = file_route_uploading(exec, true, upload, "delete").await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(
+                message.contains("--allow-upload") && message.contains("--allow-exec"),
+                "{message}"
+            );
+        }
+        let (status, _) = file_route_uploading(true, false, true, "delete").await;
+        assert_ne!(status, StatusCode::FORBIDDEN);
         // Allowed, it reaches the engine, which this fixture does not have.
         let (status, _) = file_route(false, true, "archive").await;
         assert_ne!(status, StatusCode::FORBIDDEN);

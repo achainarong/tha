@@ -115,6 +115,13 @@ pub struct PreviewState {
     generation: u64,
 }
 
+fn parent_of(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some(("", _)) | None => "/",
+        Some((parent, _)) => parent,
+    }
+}
+
 fn depth(path: &str) -> usize {
     path.split('/').filter(|part| !part.is_empty()).count()
 }
@@ -145,18 +152,68 @@ impl Tree {
             return None;
         }
         let path = self.queue.pop_front()?;
-        self.folders.insert(path.clone(), Folder::Loading);
+        // A folder being read again stays on screen until the answer replaces it.
+        if !matches!(self.folders.get(&path), Some(Folder::Loaded(_))) {
+            self.folders.insert(path.clone(), Folder::Loading);
+        }
         self.in_flight = Some(path.clone());
         Some(path)
     }
 
-    fn listed(&mut self, path: &str, result: Result<Listing, String>) {
+    /// Reads a folder again next, even one already read. What it shows now stays until then.
+    fn reread(&mut self, path: &str) {
+        self.queue.retain(|queued| queued != path);
+        self.queue.push_front(path.to_owned());
+        if !matches!(
+            self.folders.get(path),
+            Some(Folder::Loaded(_) | Folder::Loading)
+        ) {
+            self.folders.insert(path.to_owned(), Folder::Queued);
+        }
+    }
+
+    /// Only a parent's listing can say what kind of thing a path is, so the parent goes first.
+    fn reread_with_parent(&mut self, path: &str) {
+        self.reread(path);
+        if path != "/" {
+            self.reread(parent_of(path));
+        }
+    }
+
+    /// Drops everything known at and below a path that is no longer a folder. A read still on its
+    /// way for it would otherwise bring a stale listing or error back.
+    fn forget(&mut self, path: &str) {
+        let prefix = format!("{path}/");
+        let inside = |other: &str| other == path || other.starts_with(&prefix);
+        let removed: usize = self
+            .folders
+            .iter()
+            .filter(|(folder, _)| inside(folder))
+            .map(|(_, folder)| match folder {
+                Folder::Loaded(listing) => listing.entries.len(),
+                _ => 0,
+            })
+            .sum();
+        self.entries = self.entries.saturating_sub(removed);
+        self.folders.retain(|folder, _| !inside(folder));
+        self.expanded.retain(|folder| !inside(folder));
+        self.queue.retain(|folder| !inside(folder));
+        self.previews.retain(|file, _| !inside(file));
+        if self.in_flight.as_deref().is_some_and(inside) {
+            self.superseded_in_flight = true;
+        }
+    }
+
+    /// Takes the answer for one folder and returns the paths in it that are no longer what they
+    /// were, so that nothing shown for them outlives the change.
+    fn listed(&mut self, path: &str, result: Result<Listing, String>) -> Vec<String> {
         if self.in_flight.as_deref() == Some(path) {
             self.in_flight = None;
             if std::mem::take(&mut self.superseded_in_flight) {
-                return;
+                return Vec::new();
             }
         }
+        let mut changed = Vec::new();
         match result {
             Ok(listing) => {
                 let old = match self.folders.get(path) {
@@ -164,6 +221,33 @@ impl Tree {
                     _ => 0,
                 };
                 self.entries = self.entries.saturating_sub(old) + listing.entries.len();
+                if let Some(Folder::Loaded(previous)) = self.folders.get(path) {
+                    let now: HashMap<&str, &Entry> = listing
+                        .entries
+                        .iter()
+                        .map(|entry| (entry.name.as_str(), entry))
+                        .collect();
+                    let mut stale_folders = Vec::new();
+                    for before in &previous.entries {
+                        let current = now.get(before.name.as_str());
+                        // Past the listing limit, a missing name proves nothing.
+                        let gone = current.is_none() && !listing.truncated;
+                        let other_kind = current.is_some_and(|entry| entry.kind != before.kind);
+                        let other_size = current.is_some_and(|entry| entry.size != before.size);
+                        if gone || other_kind || other_size {
+                            changed.push(files::join(path, &before.name));
+                        }
+                        if before.kind == Kind::Folder && (gone || other_kind) {
+                            stale_folders.push(files::join(path, &before.name));
+                        }
+                    }
+                    for folder in stale_folders {
+                        self.forget(&folder);
+                    }
+                    for file in &changed {
+                        self.previews.remove(file);
+                    }
+                }
                 for entry in &listing.entries {
                     if entry.kind != Kind::Folder {
                         continue;
@@ -187,13 +271,21 @@ impl Tree {
             }
             Err(error) => {
                 // A failure at the very top means browsing does not work here, not one folder.
-                if path == "/" {
+                let top = path == "/";
+                if top {
                     self.stopped = Some(error.clone());
                     self.queue.clear();
+                } else if files::path_gone(&error) {
+                    // The folder was replaced or removed, which its parent's listing will show.
+                    self.reread(parent_of(path));
                 }
-                self.folders.insert(path.to_owned(), Folder::Failed(error));
+                // A failed re-read of the top keeps what was read, with the reason shown above it.
+                if !(top && matches!(self.folders.get(path), Some(Folder::Loaded(_)))) {
+                    self.folders.insert(path.to_owned(), Folder::Failed(error));
+                }
             }
         }
+        changed
     }
 
     /// Whether the background walk is still going.
@@ -369,6 +461,17 @@ pub struct UploadDialog {
     pub error: Option<String>,
 }
 
+/// Review before deleting. The tree may be out of date, so the file is checked again first, and
+/// confirming stays impossible until that check has said it is still what the row showed.
+pub struct DeleteReview {
+    pub id: u64,
+    pub source: Source,
+    pub path: String,
+    pub kind: Kind,
+    pub check: Preview,
+    pub error: Option<String>,
+}
+
 pub struct Job {
     pub id: u64,
     pub label: String,
@@ -433,6 +536,15 @@ pub enum Request {
         local: PathBuf,
         folder: String,
     },
+    CreateFile {
+        source: Source,
+        folder: String,
+        name: String,
+    },
+    DeleteFile {
+        source: Source,
+        path: String,
+    },
     /// Replaces any preview still loading.
     Preview {
         generation: u64,
@@ -487,6 +599,16 @@ pub enum Event {
         job: u64,
         result: Result<u64, String>,
     },
+    FileCreated {
+        key: String,
+        path: String,
+        result: Result<(), String>,
+    },
+    FileDeleted {
+        key: String,
+        path: String,
+        result: Result<(), String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,10 +637,19 @@ pub struct Manager {
     pub trees: HashMap<String, Tree>,
     pub dialog: Option<Dialog>,
     pub upload: Option<UploadDialog>,
+    pub delete_review: Option<DeleteReview>,
     pub preview: Option<PreviewState>,
     /// Text typed after `:` in the explorer, as in vim.
     pub command: Option<String>,
     pub search_input: Option<String>,
+    pub new_file_input: Option<String>,
+    pub new_file_folder: String,
+    /// A create or delete is on its way. One at a time, so results cannot be mixed up.
+    pub changing: bool,
+    /// Selected once the listing that contains it arrives.
+    pub select_after: Option<String>,
+    /// The result just shown should survive the selection moving because of it.
+    pub keep_message: bool,
     pub search_root: String,
     pub search: Option<FileSearch>,
     /// Why the last key did nothing.
@@ -539,9 +670,15 @@ impl Default for Manager {
             trees: HashMap::new(),
             dialog: None,
             upload: None,
+            delete_review: None,
             preview: None,
             command: None,
             search_input: None,
+            new_file_input: None,
+            new_file_folder: "/".into(),
+            changing: false,
+            select_after: None,
+            keep_message: false,
             search_root: "/".into(),
             search: None,
             message: None,
@@ -591,16 +728,30 @@ impl Manager {
     /// Opens the panel and starts the background walk, reusing a tree that is still cached.
     pub fn open_source(&mut self, source: Source, now: Instant) {
         let key = source.key();
-        self.trees
+        let tree = self
+            .trees
             .entry(key.clone())
-            .or_insert_with(|| Tree::new(source, now))
-            .last_used = now;
+            .or_insert_with(|| Tree::new(source, now));
+        tree.last_used = now;
         if self.open.as_deref() != Some(&key) {
+            // A kept tree is as old as its reads, and what is on screen should not stay that way.
+            // Outermost first, so that a folder replaced by a file is noticed before it is read.
+            let open: Vec<String> = tree
+                .expanded
+                .iter()
+                .rev()
+                .filter(|folder| matches!(tree.folders.get(*folder), Some(Folder::Loaded(_))))
+                .cloned()
+                .collect();
+            for folder in open {
+                tree.reread(&folder);
+            }
             self.cancel_search();
             self.selected = 0;
             self.preview = None;
             self.command = None;
             self.search_input = None;
+            self.new_file_input = None;
             self.search = None;
             self.message = None;
         }
@@ -609,27 +760,26 @@ impl Manager {
         self.pump();
     }
 
+    /// The selected folder, or the folder holding the selected file.
+    fn selected_folder(&self) -> String {
+        self.current_row().map_or_else(
+            || "/".to_owned(),
+            |row| {
+                if row.entry.kind == Kind::Folder {
+                    row.path
+                } else {
+                    parent_of(&row.path).to_owned()
+                }
+            },
+        )
+    }
+
     pub fn begin_search(&mut self, system: bool) {
         self.touch();
         self.search_root = if system {
             "/".to_owned()
         } else {
-            self.current_row().map_or_else(
-                || "/".to_owned(),
-                |row| {
-                    if row.entry.kind == Kind::Folder {
-                        row.path
-                    } else {
-                        row.path
-                            .rsplit_once('/')
-                            .map_or(
-                                "/",
-                                |(parent, _)| if parent.is_empty() { "/" } else { parent },
-                            )
-                            .to_owned()
-                    }
-                },
-            )
+            self.selected_folder()
         };
         self.search_input = Some(
             self.search
@@ -796,7 +946,9 @@ impl Manager {
                 since: now,
                 generation: 0,
             });
-            self.message = None;
+            if !std::mem::take(&mut self.keep_message) {
+                self.message = None;
+            }
         }
         let waiting = self
             .preview
@@ -850,22 +1002,11 @@ impl Manager {
     }
 
     /// Reads the selected folder again, or the folder holding the selected file. The tree shows
-    /// each folder as it was when read, so this is how new files appear.
+    /// each folder as it was when read, so this is how new files appear. A selected folder's
+    /// parent is read too, because that is what shows it has become something else.
     pub fn refresh_selected(&mut self) {
         self.touch();
-        let folder = self.current_row().map_or_else(
-            || "/".to_owned(),
-            |row| {
-                if row.entry.kind == Kind::Folder {
-                    row.path
-                } else {
-                    match row.path.rsplit_once('/') {
-                        Some(("", _)) | None => "/".to_owned(),
-                        Some((parent, _)) => parent.to_owned(),
-                    }
-                }
-            },
-        );
+        let folder = self.selected_folder();
         let Some(tree) = self.tree_mut() else {
             return;
         };
@@ -876,8 +1017,7 @@ impl Manager {
             format!("{folder}/")
         };
         tree.previews.retain(|path, _| !path.starts_with(&prefix));
-        tree.folders.remove(&folder);
-        tree.prioritize(&folder);
+        tree.reread_with_parent(&folder);
         self.preview = None;
         self.cancel_search();
         self.search = None;
@@ -929,6 +1069,7 @@ impl Manager {
         self.preview = None;
         self.command = None;
         self.search_input = None;
+        self.new_file_input = None;
         self.search = None;
         self.message = None;
     }
@@ -1001,7 +1142,234 @@ impl Manager {
         };
         if !tree.expanded.remove(&row.path) {
             tree.expanded.insert(row.path.clone());
-            tree.prioritize(&row.path);
+            // Opening is when what was read earlier starts to matter, so look again.
+            if matches!(
+                tree.folders.get(&row.path),
+                Some(Folder::Loaded(_) | Folder::Failed(_))
+            ) {
+                tree.reread_with_parent(&row.path);
+            } else {
+                tree.prioritize(&row.path);
+            }
+        }
+        self.pump();
+    }
+
+    /// Why nothing may change right now, if anything.
+    fn change_refused(&mut self, demo_reason: &'static str) -> bool {
+        let reason = if self.demo {
+            demo_reason
+        } else if self.changing {
+            crate::i18n::t("Wait for the last file change to finish")
+        } else {
+            return false;
+        };
+        self.message = Some(reason.to_owned());
+        true
+    }
+
+    /// `a`: asks for a name. The new file goes in the selected folder, or beside the selected file.
+    pub fn begin_new_file(&mut self) {
+        self.touch();
+        if self.change_refused(crate::i18n::t("Demo mode: files are not created")) {
+            return;
+        }
+        self.new_file_folder = self.selected_folder();
+        self.new_file_input = Some(String::new());
+        self.message = None;
+    }
+
+    /// Shared by typed and pasted input. The name is checked when it is confirmed.
+    pub fn append_new_file(&mut self, text: &str) {
+        if let Some(input) = &mut self.new_file_input {
+            for character in crate::model::safe_text(text).chars() {
+                if input.len() + character.len_utf8() > 255 {
+                    break;
+                }
+                input.push(character);
+            }
+            self.message = None;
+        }
+    }
+
+    /// A bad name keeps the prompt open, so it can be corrected rather than typed again.
+    pub fn confirm_new_file(&mut self) {
+        let Some(input) = self.new_file_input.take() else {
+            return;
+        };
+        let name = input.trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        if let Err(error) = files::check_new_name(&name) {
+            self.message = Some(error.to_string());
+            self.new_file_input = Some(input);
+            return;
+        }
+        let Some(source) = self.tree().map(|tree| tree.source.clone()) else {
+            return;
+        };
+        self.changing = true;
+        self.message = Some(crate::tf!(
+            "Creating {path}…",
+            path = files::join(&self.new_file_folder, &name)
+        ));
+        self.requests.push(Request::CreateFile {
+            source,
+            folder: self.new_file_folder.clone(),
+            name,
+        });
+    }
+
+    /// `D`: only opens the review. Nothing is removed until that has checked the file and the
+    /// operator has confirmed.
+    pub fn begin_delete(&mut self) {
+        self.touch();
+        let Some(row) = self.current_row() else {
+            return;
+        };
+        if self.change_refused(crate::i18n::t("Demo mode: files are not deleted")) {
+            return;
+        }
+        if !matches!(row.entry.kind, Kind::File | Kind::Link) {
+            self.message = Some(crate::i18n::t("Only files and links can be deleted").to_owned());
+            return;
+        }
+        let Some(source) = self.tree().map(|tree| tree.source.clone()) else {
+            return;
+        };
+        let id = self.id();
+        self.requests.push(Request::CloseDialog);
+        self.requests.push(Request::Inspect {
+            dialog: id,
+            source: source.clone(),
+            path: row.path.clone(),
+        });
+        self.message = None;
+        self.delete_review = Some(DeleteReview {
+            id,
+            source,
+            path: row.path,
+            kind: row.entry.kind,
+            check: Preview::Loading,
+            error: None,
+        });
+    }
+
+    pub fn close_delete_review(&mut self) {
+        self.delete_review = None;
+        self.requests.push(Request::CloseDialog);
+    }
+
+    pub fn confirm_delete(&mut self) {
+        let Some(review) = &mut self.delete_review else {
+            return;
+        };
+        match &review.check {
+            Preview::Ready(_) => {}
+            Preview::Loading => {
+                review.error = Some(crate::i18n::t("Wait until the file has been checked").into());
+                return;
+            }
+            // The reason is on screen already, and it is why this cannot go ahead.
+            Preview::Failed(_) => return,
+        }
+        let (source, path) = (review.source.clone(), review.path.clone());
+        self.close_delete_review();
+        self.changing = true;
+        self.message = Some(crate::tf!("Deleting {path}…", path = path));
+        self.requests.push(Request::DeleteFile { source, path });
+    }
+
+    /// Something said this path is not there. Whatever was asked, the tree is out of date.
+    fn notice_gone(&mut self, path: &str, error: &str) {
+        if files::path_gone(error)
+            && let Some(tree) = self.tree_mut()
+        {
+            tree.reread(parent_of(path));
+            self.pump();
+        }
+    }
+
+    /// An action outside this panel failed on a path. `key` says which tree it belongs to.
+    pub fn action_failed(&mut self, key: &str, path: &str, error: &str) {
+        if self.open.as_deref() == Some(key) {
+            self.notice_gone(path, error);
+        }
+    }
+
+    fn file_created(&mut self, key: &str, path: String, result: Result<(), String>) {
+        self.changing = false;
+        let folder = parent_of(&path).to_owned();
+        let created = result.is_ok();
+        if let Some(tree) = self.trees.get_mut(key) {
+            // Also after a failure or a timeout, since the file may be there all the same.
+            tree.reread(&folder);
+            if created {
+                tree.expanded.insert(folder);
+            }
+        }
+        if self.open.as_deref() != Some(key) {
+            return;
+        }
+        self.message = Some(match result {
+            Ok(()) => {
+                self.keep_message = true;
+                let message = crate::tf!("Created {path}", path = path);
+                self.select_after = Some(path);
+                message
+            }
+            Err(error) => crate::tf!(
+                "Could not create {path}: {error}",
+                path = path,
+                error = error
+            ),
+        });
+        self.pump();
+    }
+
+    fn file_deleted(&mut self, key: &str, path: String, result: Result<(), String>) {
+        self.changing = false;
+        let folder = parent_of(&path).to_owned();
+        let name = files::file_name(&path).to_owned();
+        let gone = result
+            .as_ref()
+            .err()
+            .is_some_and(|error| files::path_gone(error));
+        if let Some(tree) = self.trees.get_mut(key) {
+            tree.previews.remove(&path);
+            // Off the screen at once, so nothing more can be asked of it; the read confirms this.
+            if (result.is_ok() || gone)
+                && let Some(Folder::Loaded(listing)) = tree.folders.get_mut(&folder)
+            {
+                let before = listing.entries.len();
+                listing.entries.retain(|entry| entry.name != name);
+                tree.entries = tree.entries.saturating_sub(before - listing.entries.len());
+            }
+            tree.reread(&folder);
+        }
+        if self.open.as_deref() != Some(key) {
+            return;
+        }
+        self.invalidate_preview(key, &path);
+        let count = self.tree().map_or(0, Tree::row_count);
+        self.selected = self.selected.min(count.saturating_sub(1));
+        self.message = Some(match &result {
+            Ok(()) => crate::tf!("Deleted {path}", path = path),
+            Err(_) if gone => crate::tf!("{path} was already gone", path = path),
+            Err(error) => crate::tf!(
+                "Could not delete {path}: {error}",
+                path = path,
+                error = error
+            ),
+        });
+        if result.is_ok() || gone {
+            self.keep_message = true;
+            // A running search would hold up the read; what it found so far stays.
+            self.stop_search();
+            if let Some(search) = &mut self.search {
+                search.matches.retain(|found| *found != path);
+            }
         }
         self.pump();
     }
@@ -1288,6 +1656,7 @@ impl Manager {
                 else {
                     return;
                 };
+                let gone = result.as_ref().err().cloned();
                 let status = match result {
                     Err(error) => FilePreview::Failed(error),
                     Ok(start) if files::looks_binary(&start.bytes, start.truncated) => {
@@ -1305,27 +1674,71 @@ impl Manager {
                     if tree.previews.len() >= MAX_CACHED_PREVIEWS {
                         tree.previews.clear();
                     }
-                    tree.previews.insert(path, status);
+                    tree.previews.insert(path.clone(), status);
+                }
+                if let Some(error) = gone {
+                    self.notice_gone(&path, &error);
                 }
             }
             Event::Listed { key, path, result } => {
-                let selected = self
-                    .search
-                    .as_ref()
-                    .and_then(|_| self.current_row())
-                    .map(|row| row.path);
-                if let Some(tree) = self.trees.get_mut(&key) {
-                    tree.listed(&path, result);
+                // Rows above the cursor can come and go, so the cursor stays on its path.
+                let open = self.open.as_deref() == Some(&key);
+                let selected = if open {
+                    self.current_row().map(|row| row.path)
+                } else {
+                    None
+                };
+                let changed = self
+                    .trees
+                    .get_mut(&key)
+                    .map_or_else(Vec::new, |tree| tree.listed(&path, result));
+                for file in &changed {
+                    self.invalidate_preview(&key, file);
                 }
-                if self.open.as_deref() == Some(&key)
-                    && let Some(path) = selected
-                    && let Some(index) = self
-                        .tree()
-                        .and_then(|tree| tree.rows().iter().position(|row| row.path == path))
-                {
-                    self.selected = index;
+                if open && let Some(tree) = self.tree() {
+                    let rows = tree.rows();
+                    let find = |wanted: &str| rows.iter().position(|row| row.path == wanted);
+                    let created = self.select_after.as_deref().and_then(find);
+                    let index = created.or_else(|| selected.as_deref().and_then(find));
+                    if created.is_some() {
+                        self.select_after = None;
+                    }
+                    self.selected =
+                        index.unwrap_or(self.selected.min(rows.len().saturating_sub(1)));
                 }
                 self.pump();
+            }
+            Event::FileCreated { key, path, result } => self.file_created(&key, path, result),
+            Event::FileDeleted { key, path, result } => self.file_deleted(&key, path, result),
+            Event::Inspected { dialog, result }
+                if self
+                    .delete_review
+                    .as_ref()
+                    .is_some_and(|review| review.id == dialog) =>
+            {
+                let Some(review) = self.delete_review.as_mut() else {
+                    return;
+                };
+                let path = review.path.clone();
+                match result {
+                    Ok(header) if header.kind == review.kind => {
+                        review.check = Preview::Ready(header);
+                    }
+                    Ok(_) => {
+                        review.check = Preview::Failed(
+                            crate::i18n::t("This changed since it was read, so it was not deleted")
+                                .to_owned(),
+                        );
+                        if let Some(tree) = self.tree_mut() {
+                            tree.reread_with_parent(parent_of(&path));
+                        }
+                        self.pump();
+                    }
+                    Err(error) => {
+                        review.check = Preview::Failed(error.clone());
+                        self.notice_gone(&path, &error);
+                    }
+                }
             }
             Event::Inspected { dialog, result } => {
                 let Some(open) = self.dialog.as_mut().filter(|open| open.id == dialog) else {
@@ -1348,7 +1761,11 @@ impl Manager {
                             open.preview = Preview::Ready(header);
                         }
                     }
-                    Err(error) => open.preview = Preview::Failed(error),
+                    Err(error) => {
+                        open.preview = Preview::Failed(error.clone());
+                        let path = open.path.clone();
+                        self.notice_gone(&path, &error);
+                    }
                 }
             }
             Event::Counted { dialog, result } => {
@@ -1976,6 +2393,446 @@ mod tests {
         assert!(rows.iter().any(|row| row.path == "/new.txt"));
     }
 
+    /// `/data` is a folder with one file in it, read by the background walk, and selected.
+    fn explorer_with_data_folder() -> (Manager, String) {
+        let (mut manager, _) = explorer_with(vec![folder("data"), file("z.txt", 1)]);
+        let key = source("a").key();
+        answer(&mut manager, &key, "/data", listing(vec![file("old", 1)]));
+        manager.requests.clear();
+        manager.selected = 0;
+        (manager, key)
+    }
+
+    #[test]
+    fn refreshing_a_folder_that_became_a_file_notices_the_change() {
+        let (mut manager, key) = explorer_with_data_folder();
+        manager.refresh_selected();
+        // Only the parent's listing can say what kind of thing the path is now.
+        assert_eq!(lists(&mut manager), ["/"]);
+        answer(
+            &mut manager,
+            &key,
+            "/",
+            listing(vec![file("data", 5), file("z.txt", 1)]),
+        );
+        // The queued read of the old folder is dropped, so it cannot bring a stale error back.
+        assert!(lists(&mut manager).is_empty());
+        let row = manager.current_row().unwrap();
+        assert_eq!((row.path.as_str(), row.entry.kind), ("/data", Kind::File));
+        assert_eq!(row.state, RowState::Idle);
+        let tree = manager.tree().unwrap();
+        assert!(!tree.folders.contains_key("/data"));
+        assert!(!tree.building());
+    }
+
+    #[test]
+    fn a_stale_folder_listing_cannot_return_after_the_path_became_a_file() {
+        let (mut manager, key) = explorer_with_data_folder();
+        manager.toggle_selected();
+        assert_eq!(lists(&mut manager), ["/"]);
+        answer(&mut manager, &key, "/", listing(vec![folder("data")]));
+        // The folder is read next, and is replaced while that read is on its way.
+        assert_eq!(lists(&mut manager), ["/data"]);
+        manager.tree_mut().unwrap().reread("/");
+        answer(&mut manager, &key, "/data", listing(vec![file("old", 1)]));
+        assert_eq!(lists(&mut manager), ["/"]);
+        answer(&mut manager, &key, "/", listing(vec![file("data", 5)]));
+        manager.tree_mut().unwrap().reread("/");
+        manager.pump();
+        assert_eq!(lists(&mut manager), ["/"]);
+        // Now back to a folder, with nothing left from its previous life.
+        answer(&mut manager, &key, "/", listing(vec![folder("data")]));
+        let tree = manager.tree().unwrap();
+        assert!(!tree.expanded.contains("/data"));
+        assert!(!matches!(
+            tree.folders.get("/data"),
+            Some(Folder::Loaded(_))
+        ));
+        assert_eq!(lists(&mut manager), ["/data"]);
+    }
+
+    #[test]
+    fn a_read_on_its_way_for_a_forgotten_folder_is_discarded() {
+        let (mut manager, _) = explorer_with(vec![folder("data")]);
+        let key = source("a").key();
+        // The walk has `/data` in flight when the parent says it is a file now.
+        manager.tree_mut().unwrap().in_flight = Some("/data".into());
+        let tree = manager.tree_mut().unwrap();
+        tree.folders.insert(
+            "/".into(),
+            Folder::Loaded(listing(vec![folder("data")]).unwrap()),
+        );
+        tree.listed("/", listing(vec![file("data", 1)]));
+        answer(&mut manager, &key, "/data", Err("Not a directory".into()));
+        let tree = manager.tree().unwrap();
+        assert!(!tree.folders.contains_key("/data"));
+        assert_eq!(tree.row_at(0).unwrap().state, RowState::Idle);
+    }
+
+    #[test]
+    fn a_read_that_finds_no_folder_makes_the_parent_look_again_once() {
+        let (mut manager, _) = explorer_with(vec![folder("data")]);
+        let key = source("a").key();
+        answer(
+            &mut manager,
+            &key,
+            "/data",
+            Err("ls: /data/: Not a directory".into()),
+        );
+        assert_eq!(lists(&mut manager), ["/"]);
+        answer(&mut manager, &key, "/", listing(vec![folder("data")]));
+        // It still says folder, so nothing goes round in circles.
+        assert!(lists(&mut manager).is_empty());
+        answer(&mut manager, &key, "/", listing(vec![file("data", 3)]));
+        assert_eq!(manager.current_row().unwrap().entry.kind, Kind::File);
+    }
+
+    #[test]
+    fn opening_a_folder_or_the_explorer_again_looks_at_it_again() {
+        let (mut manager, key) = explorer_with_data_folder();
+        manager.toggle_selected();
+        assert_eq!(lists(&mut manager), ["/"]);
+        answer(&mut manager, &key, "/", listing(vec![folder("data")]));
+        assert_eq!(lists(&mut manager), ["/data"]);
+        answer(&mut manager, &key, "/data", listing(vec![file("new", 1)]));
+        // Closing asks for nothing, and neither does a second tree being left alone.
+        manager.toggle_selected();
+        assert!(lists(&mut manager).is_empty());
+        manager.toggle_selected();
+        assert_eq!(lists(&mut manager), ["/"]);
+        answer(&mut manager, &key, "/", listing(vec![folder("data")]));
+        lists(&mut manager);
+        answer(&mut manager, &key, "/data", listing(vec![file("new", 1)]));
+
+        manager.close();
+        manager.open_source(source("a"), Instant::now());
+        assert_eq!(lists(&mut manager), ["/"]);
+        answer(&mut manager, &key, "/", listing(vec![file("data", 1)]));
+        assert!(lists(&mut manager).is_empty(), "the old folder is not read");
+        assert_eq!(manager.tree().unwrap().row_count(), 1);
+    }
+
+    #[test]
+    fn a_failed_reread_of_the_top_keeps_the_rows_and_says_why() {
+        let (mut manager, _) = explorer_with(vec![file("a.txt", 1)]);
+        let key = source("a").key();
+        manager.refresh_selected();
+        lists(&mut manager);
+        answer(
+            &mut manager,
+            &key,
+            "/",
+            Err("The connection was lost".into()),
+        );
+        let tree = manager.tree().unwrap();
+        assert_eq!(tree.stopped.as_deref(), Some("The connection was lost"));
+        assert_eq!(tree.row_count(), 1);
+    }
+
+    #[test]
+    fn the_cursor_stays_on_its_file_when_rows_above_it_change() {
+        let (mut manager, _) = explorer_with(vec![file("b", 1), file("c", 1)]);
+        let key = source("a").key();
+        manager.selected = 1;
+        manager.refresh_selected();
+        lists(&mut manager);
+        answer(
+            &mut manager,
+            &key,
+            "/",
+            listing(vec![file("a", 1), file("b", 1), file("c", 1)]),
+        );
+        assert_eq!(manager.current_row().unwrap().path, "/c");
+        manager.refresh_selected();
+        lists(&mut manager);
+        answer(&mut manager, &key, "/", listing(vec![file("a", 1)]));
+        assert_eq!(manager.current_row().unwrap().path, "/a");
+    }
+
+    #[test]
+    fn a_preview_of_something_that_changed_is_not_kept() {
+        let (mut manager, start) = explorer_with(vec![file("a.txt", 5)]);
+        let key = source("a").key();
+        manager.update_preview(start);
+        manager.update_preview(start + Duration::from_secs(1));
+        answer_preview(&mut manager, b"hello", false);
+        assert!(manager.tree().unwrap().previews.contains_key("/a.txt"));
+        manager.tree_mut().unwrap().reread("/");
+        manager.pump();
+        answer(&mut manager, &key, "/", listing(vec![folder("a.txt")]));
+        assert!(manager.preview.is_none());
+        assert!(manager.tree().unwrap().previews.is_empty());
+    }
+
+    #[test]
+    fn a_preview_that_finds_nothing_corrects_the_tree() {
+        let (mut manager, start) = explorer_with(vec![file("a.txt", 5)]);
+        let key = source("a").key();
+        manager.update_preview(start);
+        manager.update_preview(start + Duration::from_secs(1));
+        let preview = manager.preview.as_ref().unwrap();
+        manager.apply(
+            Event::Previewed {
+                key: key.clone(),
+                generation: preview.generation,
+                path: "/a.txt".into(),
+                result: Err("No such file or folder".into()),
+            },
+            start,
+        );
+        assert_eq!(lists(&mut manager), ["/"]);
+        answer(&mut manager, &key, "/", listing(vec![]));
+        assert!(manager.current_row().is_none());
+    }
+
+    fn inspected(manager: &mut Manager, kind: Kind) {
+        let dialog = manager.delete_review.as_ref().unwrap().id;
+        manager.apply(
+            Event::Inspected {
+                dialog,
+                result: Ok(Header {
+                    name: "a.txt".into(),
+                    kind,
+                    size: 5,
+                    modified: 0,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                }),
+            },
+            Instant::now(),
+        );
+    }
+
+    fn deletes(manager: &mut Manager) -> Vec<String> {
+        manager
+            .requests
+            .iter()
+            .filter_map(|request| match request {
+                Request::DeleteFile { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nothing_is_deleted_before_the_check_and_the_confirmation() {
+        let (mut manager, _) = explorer_with(vec![file("a.txt", 5), file("b.txt", 5)]);
+        let key = source("a").key();
+        manager.begin_delete();
+        assert!(deletes(&mut manager).is_empty());
+        manager.confirm_delete();
+        assert!(
+            deletes(&mut manager).is_empty(),
+            "the check has not answered"
+        );
+        assert!(manager.delete_review.as_ref().unwrap().error.is_some());
+
+        inspected(&mut manager, Kind::File);
+        assert!(deletes(&mut manager).is_empty(), "not confirmed yet");
+        manager.confirm_delete();
+        assert_eq!(deletes(&mut manager), ["/a.txt"]);
+        assert!(manager.delete_review.is_none());
+
+        // One change at a time.
+        manager.requests.clear();
+        manager.begin_new_file();
+        assert!(manager.new_file_input.is_none());
+        manager.begin_delete();
+        assert!(manager.delete_review.is_none());
+
+        manager.apply(
+            Event::FileDeleted {
+                key: key.clone(),
+                path: "/a.txt".into(),
+                result: Ok(()),
+            },
+            Instant::now(),
+        );
+        // It leaves the screen at once, and the folder is read to confirm.
+        assert_eq!(manager.current_row().unwrap().path, "/b.txt");
+        assert!(
+            manager
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("Deleted /a.txt")
+        );
+        assert_eq!(lists(&mut manager), ["/"]);
+        manager.update_preview(Instant::now());
+        assert!(
+            manager.message.is_some(),
+            "the result stays when the cursor moves"
+        );
+        manager.begin_new_file();
+        assert!(manager.new_file_input.is_some());
+    }
+
+    #[test]
+    fn a_file_that_changed_since_it_was_read_cannot_be_deleted() {
+        let (mut manager, _) = explorer_with(vec![file("a.txt", 5)]);
+        let key = source("a").key();
+        manager.begin_delete();
+        manager.requests.clear();
+        inspected(&mut manager, Kind::Folder);
+        assert!(matches!(
+            manager.delete_review.as_ref().unwrap().check,
+            Preview::Failed(_)
+        ));
+        manager.confirm_delete();
+        assert!(deletes(&mut manager).is_empty());
+        assert_eq!(lists(&mut manager), ["/"]);
+        manager.close_delete_review();
+
+        // Gone by the time of the check: same, and the tree corrects itself.
+        answer(&mut manager, &key, "/", listing(vec![file("b.txt", 5)]));
+        manager.begin_delete();
+        manager.requests.clear();
+        let dialog = manager.delete_review.as_ref().unwrap().id;
+        manager.apply(
+            Event::Inspected {
+                dialog,
+                result: Err("No such file or folder".into()),
+            },
+            Instant::now(),
+        );
+        manager.confirm_delete();
+        assert!(deletes(&mut manager).is_empty());
+        assert_eq!(lists(&mut manager), ["/"]);
+    }
+
+    #[test]
+    fn a_delete_that_finds_nothing_says_so_and_removes_the_row() {
+        let (mut manager, _) = explorer_with(vec![file("a.txt", 5)]);
+        let key = source("a").key();
+        manager.apply(
+            Event::FileDeleted {
+                key,
+                path: "/a.txt".into(),
+                result: Err("rm: cannot remove '/a.txt': No such file or directory".into()),
+            },
+            Instant::now(),
+        );
+        assert!(manager.current_row().is_none());
+        assert!(manager.message.as_deref().unwrap().contains("already gone"));
+    }
+
+    #[test]
+    fn a_refused_delete_keeps_the_row_and_says_why() {
+        let (mut manager, _) = explorer_with(vec![file("a.txt", 5)]);
+        let key = source("a").key();
+        manager.apply(
+            Event::FileDeleted {
+                key,
+                path: "/a.txt".into(),
+                result: Err("Not allowed by server: --allow-upload".into()),
+            },
+            Instant::now(),
+        );
+        assert_eq!(manager.current_row().unwrap().path, "/a.txt");
+        assert!(
+            manager
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("--allow-upload")
+        );
+    }
+
+    #[test]
+    fn folders_cannot_be_deleted_and_demo_mode_changes_nothing() {
+        let (mut manager, _) = explorer_with(vec![folder("data")]);
+        manager.begin_delete();
+        assert!(manager.delete_review.is_none());
+        assert!(manager.message.is_some());
+
+        let (mut manager, _) = explorer_with(vec![file("a.txt", 5)]);
+        manager.demo = true;
+        manager.begin_delete();
+        assert!(manager.delete_review.is_none());
+        manager.begin_new_file();
+        assert!(manager.new_file_input.is_none());
+        assert!(manager.requests.is_empty());
+    }
+
+    #[test]
+    fn a_new_file_goes_beside_the_selection_and_is_selected_once_it_appears() {
+        let (mut manager, _) = explorer_with_data_folder();
+        let key = source("a").key();
+        // On a folder, it goes inside, and the folder opens to show it.
+        manager.begin_new_file();
+        assert_eq!(manager.new_file_folder, "/data");
+        manager.append_new_file("new.txt");
+        manager.confirm_new_file();
+        assert!(matches!(
+            &manager.requests[..],
+            [Request::CreateFile { folder, name, .. }] if folder == "/data" && name == "new.txt"
+        ));
+        manager.requests.clear();
+        manager.apply(
+            Event::FileCreated {
+                key: key.clone(),
+                path: "/data/new.txt".into(),
+                result: Ok(()),
+            },
+            Instant::now(),
+        );
+        assert_eq!(lists(&mut manager), ["/data"]);
+        answer(
+            &mut manager,
+            &key,
+            "/data",
+            listing(vec![file("new.txt", 0), file("old", 1)]),
+        );
+        assert_eq!(manager.current_row().unwrap().path, "/data/new.txt");
+        manager.update_preview(Instant::now());
+        assert!(manager.message.as_deref().unwrap().contains("Created"));
+
+        // On a file, it goes beside it.
+        manager.begin_new_file();
+        assert_eq!(manager.new_file_folder, "/data");
+    }
+
+    #[test]
+    fn a_bad_name_keeps_the_prompt_and_a_failed_create_is_reported() {
+        let (mut manager, _) = explorer_with(vec![file("a.txt", 5)]);
+        let key = source("a").key();
+        for bad in ["a/b", "..", "."] {
+            manager.begin_new_file();
+            manager.append_new_file(bad);
+            manager.confirm_new_file();
+            assert_eq!(manager.new_file_input.as_deref(), Some(bad));
+            assert!(manager.message.is_some());
+            assert!(manager.requests.is_empty());
+            manager.new_file_input = None;
+        }
+        manager.begin_new_file();
+        manager.confirm_new_file();
+        assert!(manager.requests.is_empty(), "an empty name is a cancel");
+
+        manager.begin_new_file();
+        manager.append_new_file("a.txt");
+        manager.confirm_new_file();
+        manager.requests.clear();
+        manager.apply(
+            Event::FileCreated {
+                key,
+                path: "/a.txt".into(),
+                result: Err("A file with this name already exists".into()),
+            },
+            Instant::now(),
+        );
+        assert!(
+            manager
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("already exists")
+        );
+        assert!(manager.select_after.is_none());
+        assert_eq!(lists(&mut manager), ["/"]);
+    }
+
     #[test]
     fn refresh_retries_a_failed_root_listing_after_the_server_is_repaired() {
         let mut manager = Manager::default();
@@ -2083,11 +2940,14 @@ mod tests {
         lists(&mut manager);
         answer(&mut manager, &key, "/", listing(vec![file("x", 1)]));
 
-        // Reopening within the window keeps what was already read.
+        // Reopening within the window keeps what was already read, and looks again only at what
+        // is on screen, so it is not a new walk. The rows stay while it does.
         manager.close();
         manager.open_source(source("a"), start + Duration::from_secs(60));
-        assert!(lists(&mut manager).is_empty());
+        assert_eq!(lists(&mut manager), ["/"]);
         assert_eq!(manager.tree().unwrap().rows().len(), 1);
+        answer(&mut manager, &key, "/", listing(vec![file("x", 1)]));
+        assert!(lists(&mut manager).is_empty());
 
         // The open tree is in use however long it stays open.
         let opened = start + Duration::from_secs(60);

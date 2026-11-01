@@ -91,6 +91,11 @@ controlled even when it comes from the operator's own engine.
   owner, mode, and link checks that refuse foreign or unsafe files.
 - Edits are atomic and refuse a file that changed meanwhile. Agent config edits are validated
   before saving.
+- Deleting never recurses and never follows a link (`rm --` in a container, `delete_checked` on a
+  server), and refuses the agent policy under any path or hard link. Creating on a server never
+  replaces anything (`create_new`). Both need `allow_server_edit`, not `allow_compose_edit`.
+- Deleting in a container runs the image's `rm`, which an upload can replace, so the `delete` route
+  needs `allow_exec` as well as `allow_upload`. It must never be reachable with `allow_upload` alone.
 - `src/compose_edit.rs` and `src/files.rs` act on server paths chosen by the key holder. Only the
   SSH login user's rights may apply, so check any path work running as root for symlink races.
 

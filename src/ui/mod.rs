@@ -216,7 +216,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("copy-log-line", "Copy the newest visible log line"),
     (
         "file-explorer",
-        "Browse, read, edit and download the selected container or server's files",
+        "Browse, edit, create, delete and download the selected container or server's files",
     ),
     ("download", "Download a file or folder: download PATH"),
     (
@@ -3433,6 +3433,59 @@ fn draw_review_dialogs(frame: &mut Frame, app: &App, area: Rect) {
         (
             crate::i18n::t(" Upload "),
             crate::i18n::t(" Enter Upload · Esc Cancel "),
+            lines,
+        )
+    } else if let Some(review) = &app.downloads.delete_review {
+        use crate::downloads::Preview;
+        let mut lines = vec![
+            Line::from(crate::tf!(
+                "On: {label}",
+                label = safe_text(review.source.label())
+            )),
+            Line::from(crate::tf!("Path: {path}", path = safe_text(&review.path))),
+        ];
+        match &review.check {
+            Preview::Loading => lines.push(Line::from(crate::i18n::t(
+                "Checking that it is still there…",
+            ))),
+            Preview::Failed(error) => {
+                lines.push(Line::styled(safe_text(error), accent(app, Color::Red)))
+            }
+            Preview::Ready(header) => {
+                if review.kind == crate::files::Kind::Link {
+                    lines.push(Line::from(crate::i18n::t(
+                        "A link: only the link is removed, not what it points to.",
+                    )));
+                } else {
+                    lines.push(Line::from(crate::tf!(
+                        "Size: {size}",
+                        size = crate::downloads::human_size(header.size)
+                    )));
+                }
+                if let Ok(modified) = time::OffsetDateTime::from_unix_timestamp(header.modified)
+                    && header.modified > 0
+                    && let Ok(text) =
+                        modified.format(&time::format_description::well_known::Rfc3339)
+                {
+                    lines.push(Line::from(crate::tf!("Modified: {time}", time = text)));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::styled(
+                    crate::i18n::t("This cannot be undone, and no backup is kept."),
+                    accent(app, Color::Yellow),
+                ));
+            }
+        }
+        if let Some(error) = &review.error {
+            lines.push(Line::styled(safe_text(error), accent(app, Color::Red)));
+        }
+        (
+            crate::i18n::t(" Delete file "),
+            if matches!(review.check, Preview::Ready(_)) {
+                crate::i18n::t(" Enter Delete · Esc Cancel ")
+            } else {
+                crate::i18n::t(" Esc Close ")
+            },
             lines,
         )
     } else if let Some(export) = &app.diagnostic_export {

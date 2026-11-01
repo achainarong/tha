@@ -373,6 +373,22 @@ pub(super) fn handle_key(
         }
         return false;
     }
+    if app.downloads.delete_review.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') => app.downloads.close_delete_review(),
+            // A held key or a stray chord must not remove a file.
+            KeyCode::Enter | KeyCode::Char('y')
+                if key.kind == KeyEventKind::Press
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                app.downloads.confirm_delete();
+            }
+            _ => {}
+        }
+        return false;
+    }
     if app.diagnostic_export.is_some() {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -454,6 +470,30 @@ pub(super) fn handle_key(
             }
             return false;
         }
+        if app.downloads.new_file_input.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    app.downloads.new_file_input = None;
+                    app.downloads.message = None;
+                }
+                KeyCode::Enter => app.downloads.confirm_new_file(),
+                KeyCode::Char('u') if control => {
+                    if let Some(input) = &mut app.downloads.new_file_input {
+                        input.clear();
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(input) = &mut app.downloads.new_file_input {
+                        input.pop();
+                    }
+                }
+                KeyCode::Char(character) if !control => {
+                    app.downloads.append_new_file(&character.to_string())
+                }
+                _ => {}
+            }
+            return false;
+        }
         if let Some(command) = app.downloads.command.clone() {
             match key.code {
                 KeyCode::Esc => app.downloads.command = None,
@@ -489,11 +529,19 @@ pub(super) fn handle_key(
                                 app.downloads.confirm_search();
                             }
                         }
+                        ("new", name) => {
+                            app.downloads.begin_new_file();
+                            if !name.is_empty() && app.downloads.new_file_input.is_some() {
+                                app.downloads.append_new_file(name);
+                                app.downloads.confirm_new_file();
+                            }
+                        }
+                        ("delete", "") => app.downloads.begin_delete(),
                         ("q" | "quit", "") => app.downloads.close(),
                         ("", "") => {}
                         _ => {
                             app.downloads.message = Some(tha::tf!(
-                                "Unknown command: {command}. Try :edit, :download, :find, :find-all or :q",
+                                "Unknown command: {command}. Try :edit, :download, :new, :delete, :find, :find-all or :q",
                                 command = tha::model::safe_text(command)
                             ));
                         }
@@ -530,6 +578,8 @@ pub(super) fn handle_key(
             }
             KeyCode::Char('e') if pane == Pane::Browse => app.edit_selected_file(),
             KeyCode::Char('d') if pane == Pane::Browse => app.downloads.dialog_selected(),
+            KeyCode::Char('a') if pane == Pane::Browse => app.downloads.begin_new_file(),
+            KeyCode::Char('D') if pane == Pane::Browse => app.downloads.begin_delete(),
             KeyCode::Char('p') if pane == Pane::Browse => app.downloads.show_big_file(),
             KeyCode::Char('r') if pane == Pane::Browse => app.downloads.refresh_selected(),
             KeyCode::Char(' ') | KeyCode::Enter if pane == Pane::Browse => {

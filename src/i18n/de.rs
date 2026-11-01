@@ -3135,8 +3135,8 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "Dateien auf diesem Server bearbeiten",
     ),
     (
-        "Unknown command: {command}. Try :edit, :download, :find, :find-all or :q",
-        "Unbekannter Befehl: {command}. Versuche :edit, :download, :find, :find-all oder :q",
+        "Unknown command: {command}. Try :edit, :download, :new, :delete, :find, :find-all or :q",
+        "Unbekannter Befehl: {command}. Versuche :edit, :download, :new, :delete, :find, :find-all oder :q",
     ),
     (
         "Select a file to see it here.",
@@ -3387,16 +3387,16 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "Der Remote-Server ist getrennt",
     ),
     (
-        "Browse, read, edit and download files",
-        "Dateien durchsuchen, lesen, bearbeiten und herunterladen",
+        "Browse, edit, create, delete and download files",
+        "Dateien durchsuchen, bearbeiten, anlegen, löschen und herunterladen",
     ),
     (
         "Download a file or folder by path",
         "Datei oder Ordner per Pfad herunterladen",
     ),
     (
-        "Browse, read, edit and download the selected container or server's files",
-        "Dateien des ausgewählten Containers oder Servers durchsuchen, lesen, bearbeiten und herunterladen",
+        "Browse, edit, create, delete and download the selected container or server's files",
+        "Dateien des ausgewählten Containers oder Servers durchsuchen, bearbeiten, anlegen, löschen und herunterladen",
     ),
     (
         "Download a file or folder: download PATH",
@@ -3458,8 +3458,8 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ),
     (" File explorer · {label} ", " Datei-Explorer · {label} "),
     (
-        " j/k Move · Enter Folder · / Find in folder · Ctrl-f Find in system · e Edit · d Download · r Refresh · Tab Downloads · Esc Close ",
-        " j/k Bewegen · Enter Ordner · / Im Ordner suchen · Strg-f Im System suchen · e Bearbeiten · d Laden · r Neu laden · Tab Downloads · Esc Schließen ",
+        " j/k Move · Enter Folder · / Find in folder · Ctrl-f Find in system · e Edit · d Download · a New · D Delete · r Refresh · Tab Downloads · Esc Close ",
+        " j/k Bewegen · Enter Ordner · / Im Ordner suchen · Strg-f Im System suchen · e Bearbeiten · d Laden · a Neu · D Löschen · r Neu laden · Tab Downloads · Esc Schließen ",
     ),
     (
         "Searching · n/N Matches · x Cancel",
@@ -4242,5 +4242,84 @@ pub const ENTRIES: &[(&str, &str)] = &[
     (
         "This server runs an older tha-agent. Update it by running the setup command on it.",
         "Auf diesem Server läuft ein älterer tha-agent. Zum Aktualisieren den Setup-Befehl dort ausführen.",
+    ),
+    (
+        "Use a file name without / or control characters",
+        "Einen Dateinamen ohne / und Steuerzeichen verwenden",
+    ),
+    (
+        "This path is not a folder any more",
+        "Dieser Pfad ist kein Ordner mehr",
+    ),
+    (
+        "This server's agent cannot delete files yet; update tha-agent",
+        "Der Agent dieses Servers kann noch keine Dateien löschen; tha-agent aktualisieren",
+    ),
+    (
+        "This server's agent cannot create or delete files yet; update tha-agent",
+        "Der Agent dieses Servers kann noch keine Dateien anlegen oder löschen; tha-agent aktualisieren",
+    ),
+    (
+        "This image has no rm, so the file cannot be deleted",
+        "Dieses Image enthält kein rm, daher kann die Datei nicht gelöscht werden",
+    ),
+    (
+        "The file could not be deleted",
+        "Die Datei konnte nicht gelöscht werden",
+    ),
+    (
+        "Wait for the last file change to finish",
+        "Warten, bis die letzte Dateiänderung abgeschlossen ist",
+    ),
+    (
+        "Demo mode: files are not created",
+        "Demo-Modus: Dateien werden nicht angelegt",
+    ),
+    (
+        "Demo mode: files are not deleted",
+        "Demo-Modus: Dateien werden nicht gelöscht",
+    ),
+    (
+        "Only files and links can be deleted",
+        "Nur Dateien und Links können gelöscht werden",
+    ),
+    ("Creating {path}…", "{path} wird angelegt…"),
+    ("Deleting {path}…", "{path} wird gelöscht…"),
+    ("Created {path}", "{path} angelegt"),
+    ("Deleted {path}", "{path} gelöscht"),
+    ("{path} was already gone", "{path} war bereits weg"),
+    (
+        "Could not create {path}: {error}",
+        "{path} konnte nicht angelegt werden: {error}",
+    ),
+    (
+        "Could not delete {path}: {error}",
+        "{path} konnte nicht gelöscht werden: {error}",
+    ),
+    (
+        "This changed since it was read, so it was not deleted",
+        "Das hat sich seit dem Einlesen geändert und wurde deshalb nicht gelöscht",
+    ),
+    (
+        "New file in {folder}: {name}▏ · Enter Create · Esc Cancel",
+        "Neue Datei in {folder}: {name}▏ · Enter Anlegen · Esc Abbrechen",
+    ),
+    ("On: {label}", "Auf: {label}"),
+    (
+        "Checking that it is still there…",
+        "Es wird geprüft, ob sie noch vorhanden ist…",
+    ),
+    (
+        "A link: only the link is removed, not what it points to.",
+        "Ein Link: Nur der Link wird entfernt, nicht sein Ziel.",
+    ),
+    (
+        "This cannot be undone, and no backup is kept.",
+        "Das lässt sich nicht rückgängig machen, und es bleibt keine Sicherung.",
+    ),
+    (" Delete file ", " Datei löschen "),
+    (
+        " Enter Delete · Esc Cancel ",
+        " Enter Löschen · Esc Abbrechen ",
     ),
 ];
