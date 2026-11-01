@@ -837,19 +837,22 @@ Default history paths:
 - Linux: `$XDG_STATE_HOME/tha/metrics.sqlite` (default `~/.local/state/tha/metrics.sqlite`)
 
 ```toml
-history_disk_mb = 1024          # Approximate DB/WAL guard, 16–65536 MiB
+history_disk_mb = 1024          # Approximate DB/WAL budget; oldest readings evicted, 16–65536 MiB
 # history_database = "/private/user-owned/directory/metrics.sqlite"
 # discover_connections = false # Use only explicit [[connections]], also in daemon
 ```
 
 Expired readings are deleted in small transactions at startup and during
 minute-based maintenance; cleanup continues between ingestions until caught up.
-Queries always exclude readings older than 24 hours. SQLite reuses freed pages;
+Queries always exclude readings older than the configured retention (24 hours by default). SQLite reuses freed pages;
 the database file may retain its high-water size. Periodic WAL checkpoints limit
 normal write-file growth; offline compaction reclaims free pages and needs spare
-disk space. The disk guard pauses sample storage with an explicit warning/dropped
-sample count rather than deleting recent history. It is not an OS filesystem
-quota: in-flight transactions/checkpoints need headroom. Increase the budget for
+disk space. Near the disk budget, the oldest readings are deleted in small batches
+to keep saving new ones, even if they are within the retention period. Normal
+eviction is not a warning or a dropped sample; failed writes still report both.
+`tha history status` includes the age of the oldest retained reading. The budget
+is not an OS filesystem quota: in-flight transactions/checkpoints need headroom.
+A reader holding a checkpoint open can temporarily prevent new writes. Increase the budget for
 larger fleets. Slow runtimes have gaps rather than an unbounded request backlog.
 At most two runtime stats batches (eight container requests each) run concurrently;
 the writer queue is bounded to eight batches and excess data is reported dropped.
@@ -1334,9 +1337,10 @@ and `sftp` still do not work.
 
 The local service keeps metrics and events for 24 hours. Set `history_retention_hours` in `config.toml`, up to
 720, to keep more, and pan back in the Metrics tab to see it. `history_disk_mb` still limits the size, and
-when it is reached new readings stop being saved rather than old ones being lost. Saving resumes as old
-readings expire, and a file left larger than a lowered budget shrinks once they have. Readings are kept at
-full detail, so a long retention needs a larger budget. Agents on servers always keep 24 hours.
+near that budget the oldest readings are deleted so new readings can keep being saved. The effective
+history may therefore be shorter than the configured retention. A file left larger than a lowered budget
+shrinks once bounded eviction passes have made room. Readings are kept at full detail, so a long retention
+needs a larger budget. Agents on servers retain up to 24 hours, subject to their own disk budget.
 
 ## Scripting
 

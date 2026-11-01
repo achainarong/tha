@@ -480,9 +480,44 @@ impl Store {
         if count == 0 {
             return Ok(0);
         }
-        if self.size_bytes() >= self.budget.saturating_sub(1024 * 1024) {
+        self.evict(false)?;
+        self.reclaim()?;
+        // A reader can pin the WAL despite checkpoints. Do not let that grow without bound.
+        if self.size_bytes() >= self.budget {
             return Ok(0);
         }
+        // A much lower budget can take several bounded maintenance passes to reach.
+        let (used, capacity) = self.used_pages()?;
+        let pages: u64 = self
+            .db
+            .pragma_query_value(None, "page_count", |row| row.get(0))?;
+        if pages > capacity && used >= capacity {
+            return Ok(0);
+        }
+        let result = match self.write_batches(&batches) {
+            Err(error)
+                if error
+                    .downcast_ref::<rusqlite::Error>()
+                    .is_some_and(|error| {
+                        error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull)
+                    }) =>
+            {
+                // write_batches has dropped its transaction, including any partial inserts.
+                // A flush can contain 20,000 readings: leave more room than routine maintenance.
+                self.evict(true)?;
+                self.reclaim()?;
+                self.write_batches(&batches)
+            }
+            result => result,
+        };
+        if self.size_bytes() >= self.budget.saturating_sub(1024 * 1024) {
+            // A large flush (or its rolled-back first attempt) can leave a large WAL.
+            // Readers may delay truncation; the budget remains an approximate disk guard.
+            self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        }
+        result
+    }
+    fn write_batches(&mut self, batches: &[(&str, &[Sample])]) -> Result<usize> {
         let cutoff = now_ms() - retention_ms();
         let mut written = 0;
         let tx = self.db.transaction()?;
@@ -550,24 +585,68 @@ impl Store {
         Ok(self.db.execute("DELETE FROM samples WHERE (container,at) IN (SELECT container,at FROM samples WHERE at < ?1 LIMIT 2000)", [now - retention_ms()])?)
     }
     pub fn maintenance(&self) -> Result<()> {
-        self.db.execute("DELETE FROM containers WHERE id IN (SELECT id FROM containers WHERE NOT EXISTS (SELECT 1 FROM samples WHERE container=containers.id) LIMIT 2000)", [])?;
+        self.remove_empty_containers()?;
+        self.evict(false)?;
         self.db.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
         self.reclaim()
     }
-    /// Deleting rows does not shrink a SQLite file, so once a file is over budget, say after the
-    /// budget was lowered, writing would stay paused for good even with every row expired. Only
-    /// empty space is given back: readings within retention are never removed to make room.
+    fn remove_empty_containers(&self) -> Result<()> {
+        self.db.execute("DELETE FROM containers WHERE id IN (SELECT id FROM containers WHERE NOT EXISTS (SELECT 1 FROM samples WHERE container=containers.id) LIMIT 2000)", [])?;
+        Ok(())
+    }
+    /// Free pages are reusable even when the database file does not shrink.
+    fn used_pages(&self) -> Result<(u64, u64)> {
+        let pragma = |name: &str| -> Result<u64> {
+            Ok(self.db.pragma_query_value(None, name, |row| row.get(0))?)
+        };
+        Ok((
+            pragma("page_count")?.saturating_sub(pragma("freelist_count")?),
+            capacity_pages(self.budget, pragma("page_size")?),
+        ))
+    }
+    /// Hysteresis avoids evicting on every write. Routine calls do at most 32 small batches;
+    /// a full-write retry allows 128 to replace dense readings with a large new fleet.
+    /// Cleanup keeps container churn from consuming all of the reclaimed sample space.
+    fn evict(&self, full: bool) -> Result<()> {
+        let (used, capacity) = self.used_pages()?;
+        if !full && used < capacity * 9 / 10 {
+            return Ok(());
+        }
+        let target = if full {
+            capacity / 2
+        } else {
+            capacity * 8 / 10
+        };
+        for _ in 0..if full { 128 } else { 32 } {
+            if self.used_pages()?.0 <= target {
+                break;
+            }
+            let removed = self.db.execute("DELETE FROM samples WHERE (container,at) IN (SELECT container,at FROM samples ORDER BY at LIMIT 2000)", [])?;
+            self.remove_empty_containers()?;
+            if removed == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+    /// Deleting rows does not shrink a SQLite file. After a budget reduction, give the
+    /// empty space back once eviction has made the live data small enough to fit.
     fn reclaim(&self) -> Result<()> {
         if self.size_bytes() < self.budget.saturating_sub(1024 * 1024) {
             return Ok(());
         }
+        self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         let pragma = |name: &str| -> Result<u64> {
             Ok(self.db.pragma_query_value(None, name, |row| row.get(0))?)
         };
         let page_size = pragma("page_size")?;
         let free = pragma("freelist_count")?;
-        let used = pragma("page_count")?.saturating_sub(free) * page_size;
-        if free == 0 || used >= capacity_pages(self.budget, page_size) * page_size {
+        let pages = pragma("page_count")?;
+        let capacity = capacity_pages(self.budget, page_size);
+        let used = pages.saturating_sub(free);
+        // Normal high-water files reuse free pages. VACUUM is only needed after a reduction;
+        // vacuuming a pinned WAL would make the disk pressure worse, not better.
+        if pages <= capacity || free == 0 || used >= capacity {
             return Ok(());
         }
         self.compact()?;
@@ -594,8 +673,13 @@ pub fn status(path: &Path) -> Result<String> {
         [],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
+    let oldest: Option<i64> = db.query_row(
+        "SELECT MIN(at) FROM samples WHERE at>=?1",
+        [now_ms() - retention_ms()],
+        |row| row.get(0),
+    )?;
     Ok(format!(
-        "{}{} · heartbeat {}s ago · {} dropped samples",
+        "{}{} · heartbeat {}s ago · {} dropped samples{}",
         if warning.is_empty() {
             String::new()
         } else {
@@ -608,6 +692,9 @@ pub fn status(path: &Path) -> Result<String> {
         },
         (now_ms() - at).max(0) / 1000,
         dropped,
+        oldest
+            .map(|at| format!(" · oldest reading {}s ago", (now_ms() - at).max(0) / 1000))
+            .unwrap_or_default(),
     ))
 }
 
@@ -1061,7 +1148,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn lowering_the_budget_resumes_once_old_readings_have_expired() {
+    fn lowering_the_budget_evicts_recent_readings_and_shrinks_the_file() {
         let fixture = Fixture::new();
         let path = fixture.database();
         let now = now_ms();
@@ -1079,29 +1166,159 @@ pub(crate) mod tests {
         let budget = 16 * 1024 * 1024;
         let mut store = Store::open(&path, budget).unwrap();
         let samples = rows(now, 10, usize::MAX);
-        assert_eq!(
-            store
-                .append_many([("runtime", samples.as_slice())])
-                .unwrap(),
-            0,
-            "Over budget: writing pauses"
-        );
-        // Readings within retention are kept: only expiry frees room.
-        store.maintenance().unwrap();
-        assert!(store.size_bytes() > budget);
-
-        while store.prune_batch(now + retention_ms() + 60_000).unwrap() > 0 {}
-        // Each pass also removes a bounded number of containers with no readings left.
+        // No readings have expired. Bounded passes evict the oldest until the data fits.
         for _ in 0..round {
             store.maintenance().unwrap();
         }
         assert!(store.size_bytes() < budget);
+        let remaining: usize = store
+            .db
+            .query_row("SELECT COUNT(*) FROM samples", [], |row| row.get(0))
+            .unwrap();
+        assert!(remaining > 0 && remaining < round * 2000);
         assert_eq!(
             store
                 .append_many([("runtime", samples.as_slice())])
                 .unwrap(),
             10
         );
+    }
+
+    #[test]
+    fn full_database_retries_a_large_flush_and_keeps_the_newest_readings() {
+        for dense in [false, true] {
+            let fixture = Fixture::new();
+            let path = fixture.database();
+            let budget = 16 * 1024 * 1024;
+            let now = now_ms();
+            let mut store = Store::open(&path, budget).unwrap();
+            let oldest = sample(now - 7_200_000, 1.0);
+            store.append("runtime", &[oldest]).unwrap();
+            let mut round = 0;
+            loop {
+                let samples = if dense {
+                    (0..2000)
+                        .map(|index| sample(now - 3_600_000 + (round * 2000 + index) as i64, 1.0))
+                        .collect()
+                } else {
+                    rows(now - 30_000, 2000, round)
+                };
+                store.write_batches(&[("runtime", &samples)]).unwrap();
+                round += 1;
+                let (used, capacity) = store.used_pages().unwrap();
+                if used >= capacity * 8 / 10 {
+                    assert!(
+                        used < capacity * 9 / 10,
+                        "Exercise the full-write fallback, not preflight eviction"
+                    );
+                    break;
+                }
+            }
+            let mut samples = rows(now, 20_000, usize::MAX);
+            samples.push(sample(now, 99.0));
+            // Demonstrate that this transaction really does hit SQLITE_FULL and rolls back.
+            let error = store.write_batches(&[("runtime", &samples)]).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<rusqlite::Error>()
+                    .unwrap()
+                    .sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DiskFull)
+            );
+            assert_eq!(
+                store
+                    .append_many([("runtime", samples.as_slice())])
+                    .unwrap(),
+                samples.len()
+            );
+            let oldest_left: bool = store
+                .db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM samples WHERE at=?1)",
+                    [now - 7_200_000],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!oldest_left);
+            let data = query(&path, "runtime", "/container-id", now - 1000, now, 60).unwrap();
+            assert_eq!(data.points.len(), 1);
+            assert_eq!(data.points[0].values[0], Some(99.0));
+            assert!(status(&path).unwrap().contains("0 dropped"));
+            assert!(store.size_bytes() < budget);
+        }
+    }
+
+    #[test]
+    fn a_reader_pinning_the_wal_cannot_cause_unbounded_writes() {
+        let fixture = Fixture::new();
+        let path = fixture.database();
+        let budget = 16 * 1024 * 1024;
+        let now = now_ms();
+        let mut store = Store::open(&path, budget).unwrap();
+        store.append("runtime", &[sample(now - 1000, 1.0)]).unwrap();
+        store
+            .db
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        let reader = reader(&path).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT * FROM health;")
+            .unwrap();
+        let samples = rows(now - 500, 2000, 0);
+        while store.size_bytes() < budget {
+            store.write_batches(&[("runtime", &samples)]).unwrap();
+        }
+        let size = store.size_bytes();
+        let newest = [sample(now, 99.0)];
+        assert_eq!(
+            store.append_many([("runtime", newest.as_slice())]).unwrap(),
+            0
+        );
+        assert_eq!(
+            store.size_bytes(),
+            size,
+            "Do not VACUUM or append into a pinned WAL"
+        );
+        reader.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            store.append_many([("runtime", newest.as_slice())]).unwrap(),
+            1
+        );
+        assert!(store.size_bytes() < budget);
+    }
+
+    #[test]
+    fn repeated_eviction_reuses_space_and_cleans_up_container_churn() {
+        let fixture = Fixture::new();
+        let path = fixture.database();
+        let budget = 16 * 1024 * 1024;
+        let now = now_ms();
+        let mut store = Store::open(&path, budget).unwrap();
+        for round in 0..100 {
+            let samples = rows(now - 1000 + round as i64, 2000, round);
+            assert_eq!(
+                store
+                    .append_many([("runtime", samples.as_slice())])
+                    .unwrap(),
+                samples.len()
+            );
+            store.maintenance().unwrap();
+            assert!(
+                store.size_bytes() < budget,
+                "round {round}: {} bytes",
+                store.size_bytes()
+            );
+        }
+        let (containers, samples): (usize, usize) = store
+            .db
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM containers),(SELECT COUNT(*) FROM samples)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(containers, samples, "Evicted containers do not accumulate");
+        assert!(samples < 200_000);
     }
 
     #[test]
@@ -1270,7 +1487,7 @@ pub(crate) mod tests {
         store.maintenance().unwrap();
     }
     #[test]
-    fn budget_refuses_new_samples_without_deleting_recent_history_and_rejects_symlinks() {
+    fn file_size_near_budget_does_not_block_reusing_pages_and_rejects_symlinks() {
         let fixture = Fixture::new();
         let path = fixture.database();
         let now = now_ms();
@@ -1278,14 +1495,14 @@ pub(crate) mod tests {
         store.append("runtime", &[sample(now - 1000, 1.0)]).unwrap();
         store.budget = store.size_bytes() + 512 * 1024;
         store.append("runtime", &[sample(now, 99.0)]).unwrap();
-        assert!(status(&path).unwrap().contains("1 dropped"));
-        assert!(status(&path).unwrap().contains("Disk budget reached"));
+        assert!(status(&path).unwrap().contains("0 dropped"));
+        assert!(!status(&path).unwrap().contains("Disk budget reached"));
         assert_eq!(
             query(&path, "runtime", "/container-id", now - 10_000, now, 10)
                 .unwrap()
                 .points
                 .len(),
-            1
+            2
         );
         drop(store);
         let link = fixture.0.join("link.sqlite");

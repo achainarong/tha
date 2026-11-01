@@ -10,8 +10,9 @@ No extra network port, Docker CLI, or Security module is required for collection
   can lose the pending samples.
 - **Storage:** `/var/lib/tha-agent/history-<engine>.sqlite`, private to the agent.
   Each engine has its own database and a 256 MiB database/WAL budget.
-- **Retention:** 24 hours with incremental pruning. A full disk budget pauses new
-  persistence rather than removing recent history, and the chart reports a warning.
+- **Retention:** Up to 24 hours with incremental pruning. Near the disk budget,
+  the oldest readings are evicted to keep saving new ones, so effective retention
+  can be shorter. Normal eviction does not produce a warning; failed writes still do.
 - **Failures:** a damaged database is moved aside as `*.damaged-<time>`, keeping only the newest
   copy, and a new one starts. If collection stops for any other reason the agent starts it again,
   waiting up to 5 minutes between tries, and keeps serving the engine meanwhile.
@@ -43,4 +44,3 @@ The agent also saves container events for each engine, in `/var/lib/tha-agent/ev
 for the same 24 hours and with a 16 MiB budget. Tha reads them over the same channel when the Events
 tab or `:timeline` is open. An older agent has no events to give, and Tha falls back to what the engine
 retained.
-
