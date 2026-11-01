@@ -334,6 +334,60 @@ impl Drop for HostChild {
     }
 }
 
+fn login_shell() -> Option<std::path::PathBuf> {
+    use std::{ffi::CStr, mem::MaybeUninit, os::unix::ffi::OsStrExt};
+
+    let mut buffer = vec![0u8; 4096];
+    loop {
+        let mut entry = MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        // SAFETY: entry and result are writable, and buffer is valid for its stated length.
+        // The reentrant lookup keeps all returned strings in our own buffer.
+        let status = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                entry.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE && buffer.len() < 1024 * 1024 {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if status != 0 || result.is_null() {
+            return None;
+        }
+        // SAFETY: a successful lookup with non-null result initialized entry.
+        let entry = unsafe { entry.assume_init() };
+        if entry.pw_shell.is_null() {
+            return None;
+        }
+        // SAFETY: pw_shell is a NUL-terminated string in buffer, which is still alive.
+        let shell = unsafe { CStr::from_ptr(entry.pw_shell) };
+        return Some(Path::new(std::ffi::OsStr::from_bytes(shell.to_bytes())).to_owned());
+    }
+}
+
+fn host_shell_command(shell: Option<&Path>) -> portable_pty::CommandBuilder {
+    use std::os::unix::fs::PermissionsExt;
+
+    let shell = shell
+        .filter(|path| {
+            path.is_absolute()
+                && path.metadata().is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+        })
+        .unwrap_or_else(|| Path::new("/bin/sh"));
+    let mut command = portable_pty::CommandBuilder::new(shell);
+    command.args(["-i", "-l"]);
+    command.env("SHELL", shell);
+    command.env("TERM", "xterm-256color");
+    command
+}
+
 async fn host_session(mut reader: Reader, tx: &mpsc::Sender<Bytes>) -> Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd};
     let Input::Open(open) =
@@ -354,9 +408,8 @@ async fn host_session(mut reader: Reader, tx: &mpsc::Sender<Bytes>) -> Result<()
         pixel_height: 0,
     };
     let pair = portable_pty::native_pty_system().openpty(size(open.rows, open.cols))?;
-    let mut command = portable_pty::CommandBuilder::new("/bin/sh");
-    command.arg("-l");
-    command.env("TERM", "xterm-256color");
+    // Resolve the SSH identity's shell on the server, never from client input or $SHELL.
+    let command = host_shell_command(login_shell().as_deref());
     let mut child = HostChild(Some(pair.slave.spawn_command(command)?));
     drop(pair.slave);
     let fd = pair
@@ -605,6 +658,102 @@ async fn resize_exec(docker: &Docker, id: &str, rows: u16, cols: u16) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_shell_uses_the_configured_login_shell() {
+        let shell = std::env::current_exe().unwrap();
+        let command = host_shell_command(Some(&shell));
+        assert_eq!(command.get_argv()[0], shell.as_os_str());
+        assert_eq!(&command.get_argv()[1..], &["-i", "-l"]);
+    }
+
+    #[test]
+    fn server_shell_falls_back_when_the_login_shell_is_unavailable() {
+        for shell in [
+            None,
+            Some(Path::new("")),
+            Some(Path::new("relative/sh")),
+            Some(Path::new("/missing-tha-shell")),
+            Some(Path::new("/")),
+        ] {
+            let command = host_shell_command(shell);
+            assert_eq!(command.get_argv()[0], "/bin/sh");
+        }
+    }
+
+    #[test]
+    fn server_shell_falls_back_when_the_login_shell_is_not_executable() {
+        let directory = tempfile::tempdir().unwrap();
+        let shell = directory.path().join("shell");
+        std::fs::write(&shell, "not executable").unwrap();
+        let command = host_shell_command(Some(&shell));
+        assert_eq!(command.get_argv()[0], "/bin/sh");
+    }
+
+    #[test]
+    fn server_shell_completes_directory_names_with_tab_in_bash() {
+        use std::io::{Read, Write};
+
+        let bash = Path::new("/bin/bash");
+        if !bash.is_file() {
+            eprintln!("Skipping Bash completion test: /bin/bash is not installed");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let completed = directory.path().join("tha-completion-target");
+        std::fs::create_dir(&completed).unwrap();
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let mut command = host_shell_command(Some(bash));
+        // Keep personal startup files and Readline bindings out of this regression test.
+        command.get_argv_mut().splice(
+            1..1,
+            [
+                std::ffi::OsString::from("--noprofile"),
+                std::ffi::OsString::from("--norc"),
+            ],
+        );
+        command.env("INPUTRC", "/dev/null");
+        command.env("THA_COMPLETION_DIR", directory.path());
+        let _child = HostChild(Some(pair.slave.spawn_command(command).unwrap()));
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let mut writer = pair.master.take_writer().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            while let Ok(count) = reader.read(&mut buffer) {
+                if count == 0 || tx.send(buffer[..count].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        writer.write_all(b"stty -echo; cd \"$THA_COMPLETION_DIR\"; bind 'TAB: complete'; printf '\\nREADY_%s\\n' shell\n").unwrap();
+        let mut output = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !String::from_utf8_lossy(&output).contains("READY_shell\r\n") {
+            output.extend(
+                rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap(),
+            );
+        }
+        writer
+            .write_all(b"cd tha-completion-t\t\nprintf '\\nCOMPLETED=%s\\n' \"$PWD\"\n")
+            .unwrap();
+        let expected = format!("COMPLETED={}\r\n", completed.display());
+        while !String::from_utf8_lossy(&output).contains(&expected) {
+            let bytes = rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Tab did not complete the directory: {error}; {}",
+                        String::from_utf8_lossy(&output)
+                    )
+                });
+            output.extend(bytes);
+        }
+    }
 
     #[test]
     fn open_rejects_paths_options_and_invalid_commands() {

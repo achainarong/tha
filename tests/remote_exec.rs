@@ -65,7 +65,7 @@ async fn helper_preserves_terminal_input_resize_output_and_exit_status() {
                                 .unwrap();
                             let mut input = Vec::new();
                             let mut resized = false;
-                            while input.len() < 7 || !resized {
+                            while input.len() < 8 || !resized {
                                 let next = message(&mut body, &mut pending).await;
                                 if let Some(data) = next.get("Data") {
                                     input.extend(
@@ -78,7 +78,7 @@ async fn helper_preserves_terminal_input_resize_output_and_exit_status() {
                                     panic!("Unexpected frame: {next}");
                                 }
                             }
-                            assert_eq!(input, b"\x03hello\r");
+                            assert_eq!(input, b"\x03hello\t\r");
                             tx.send(frame(json!({"Data": b"CLIENT_OK\r\n".to_vec()})))
                                 .await
                                 .unwrap();
@@ -129,7 +129,7 @@ async fn helper_preserves_terminal_input_resize_output_and_exit_status() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         session.resize(39, 110).unwrap();
-        session.send(b"\x03hello\r".to_vec()).unwrap();
+        session.send(b"\x03hello\t\r".to_vec()).unwrap();
         while session.running() {
             session.poll();
             tokio::time::sleep(Duration::from_millis(10)).await;

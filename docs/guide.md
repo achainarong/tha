@@ -916,8 +916,10 @@ by `sudo systemctl restart tha-agent`). It is disabled by default and independen
 of `allow_delete`. Setup reruns preserve an existing opt-in.
 
 The same opt-in also enables **server shells**: select a connected remote server
-row and press `e`. This opens `/bin/sh` as the configured SSH login user, not as
-the root agent daemon. A root SSH login therefore opens a root shell; the
+row and press `e`. This opens the SSH user's configured login shell interactively
+(falling back to `/bin/sh` if unavailable), with that shell's normal completion
+and startup files. It runs as the SSH login user, not as the root agent daemon.
+A root SSH login therefore opens a root shell; the
 dedicated `tha` login opens a shell with that user's permissions. The restricted
 key's forced-command and forwarding restrictions are not relaxed by Tha. Full
 shell access can modify account-owned files and keys; disabling `allow_exec`
