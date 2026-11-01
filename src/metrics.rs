@@ -180,6 +180,7 @@ impl Store {
             start_ms: start,
             bucket_ms: 1,
             end_ms: end,
+            sample_interval_ms: None,
         }
     }
     pub fn has_history(&self) -> bool {

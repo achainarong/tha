@@ -836,7 +836,51 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                         let (start, end) = app.history_view.bounds();
                         history_request = Some(request);
                         history_updated = std::time::Instant::now();
-                        if let Some(path) = app.history_database.clone() {
+                        if tha::remote::is_remote(&engine.connection) {
+                            let sender = history_tx.clone();
+                            let connection = engine.connection.clone();
+                            let mut fallback =
+                                engine.metrics.local_history(&container.key(), start, end);
+                            let seconds = tha::remote::server_of(&connection)
+                                .and_then(|server| {
+                                    app.machines.iter().find(|m| m.remote.name == server)
+                                })
+                                .map_or(tha::remote::DEFAULT_METRICS_SECONDS, |m| {
+                                    m.remote.metrics_seconds()
+                                });
+                            fallback.sample_interval_ms = Some(seconds as i64 * 1000);
+                            app.history_view.loading = true;
+                            history_task = Some(AbortTask(tokio::spawn(async move {
+                                let data = match tha::remote_history::query(
+                                    &connection,
+                                    &target.0,
+                                    &target.1,
+                                    (start, end),
+                                    600,
+                                )
+                                .await
+                                {
+                                    Ok(Some(data)) => data,
+                                    Ok(None) => {
+                                        fallback.source = "Warning: Agent history unavailable; upgrade/restart tha-agent for persistent history · session only".into();
+                                        fallback
+                                    }
+                                    Err(error) => {
+                                        fallback.source = format!(
+                                            "Warning: {} · session only",
+                                            tha::layers::text(&format!("{error:#}"))
+                                        );
+                                        fallback
+                                    }
+                                };
+                                let _ = sender
+                                    .send(tha::history::Event {
+                                        generation,
+                                        data: Ok(data),
+                                    })
+                                    .await;
+                            })));
+                        } else if let Some(path) = app.history_database.clone() {
                             let sender = history_tx.clone();
                             let session =
                                 engine.metrics.local_samples(&container.key(), start, end);
@@ -2764,6 +2808,7 @@ fn wheel_over(
         T::Performance | T::PerformanceEngine(_) => focus_performance(app),
         T::Details
         | T::DetailTab(_)
+        | T::MetricsRange(_)
         | T::LogScrollbar
         | T::NetworkRow(_)
         | T::LayerRow(_)
@@ -2871,6 +2916,11 @@ fn click(
                     seek_log_scrollbar(app, mouse.row);
                 }
             }
+        }
+        T::MetricsRange(index) => {
+            focus_details(app);
+            let amount = index as isize - app.history_view.range as isize;
+            app.history_view.range_by(amount);
         }
         T::NetworkRow(index) => {
             if details_focused && app.network_cursor == index {
@@ -5470,6 +5520,57 @@ mod tests {
         assert!(app.settings.is_none());
         execute(&mut app, "settings", &refresh);
         assert!(app.settings.is_some());
+    }
+
+    #[tokio::test]
+    async fn metrics_range_labels_select_on_one_click_and_follow_wrapping() {
+        let mut app = app();
+        let (refresh, _) = watch::channel(0);
+        app.selected = row_named(&app, "shop-api-2");
+        app.tab = Tab::History;
+        app.history_view.expanded = true;
+
+        for width in [240, 60, 32] {
+            for index in 0..tha::history::RANGE_LABELS.len() {
+                app.detail_focus = true;
+                let buffer = draw_at(&mut app, width, 50);
+                let (area, _) = *app
+                    .mouse_regions
+                    .iter()
+                    .find(|(_, target)| *target == MouseTarget::MetricsRange(index))
+                    .expect("every range is clickable, including without readings");
+                let text: String = (area.x..area.right())
+                    .map(|x| buffer[(x, area.y)].symbol())
+                    .collect();
+                let label = tha::history::RANGE_LABELS[index];
+                let expected = if app.history_view.range == index {
+                    format!("[{label}]")
+                } else {
+                    label.to_string()
+                };
+                assert_eq!(text, expected, "range hit area at width {width}");
+                assert_eq!(
+                    app.mouse_target(area.right() - 1, area.y),
+                    Some(MouseTarget::MetricsRange(index))
+                );
+
+                app.detail_focus = false;
+                app.history_view.cursor = Some(0);
+                click_at(&mut app, MouseTarget::MetricsRange(index), &refresh);
+                assert_eq!(app.history_view.range, index);
+                assert!(app.detail_focus);
+                assert_eq!(app.history_view.cursor, None);
+                assert_eq!(app.history_view.end_ms, None, "live stays live");
+
+                draw_at(&mut app, width, 50);
+                click_at(&mut app, MouseTarget::MetricsRange(index), &refresh);
+                assert_eq!(app.history_view.range, index, "repeat clicks stay selected");
+            }
+        }
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('[')), 20, &refresh);
+        assert_eq!(app.history_view.range, tha::history::RANGE_LABELS.len() - 2);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char(']')), 20, &refresh);
+        assert_eq!(app.history_view.range, tha::history::RANGE_LABELS.len() - 1);
     }
 
     #[tokio::test]

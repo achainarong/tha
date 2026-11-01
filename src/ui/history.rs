@@ -164,19 +164,37 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     if inner.width < 12 || inner.height < 5 {
         return;
     }
-    let mut ranges = vec![Span::styled(crate::i18n::t("Range: "), muted())];
+    let mut ranges = Line::from(Span::styled(crate::i18n::t("Range: "), muted()));
+    let mut range_lines = Vec::new();
+    let mut range_regions = Vec::new();
     for (index, label) in RANGE_LABELS.iter().enumerate() {
-        ranges.push(if index == view.range {
+        let span = if index == view.range {
             Span::styled(
                 format!("[{label}]"),
                 accent(app, Color::Cyan).add_modifier(Modifier::BOLD),
             )
         } else {
             Span::styled(*label, muted())
-        });
-        ranges.push(Span::raw(" "));
+        };
+        let width = span.width() as u16;
+        // Wrap labels ourselves so their hit areas follow the text on narrow panes.
+        if ranges.width() + usize::from(width) > usize::from(inner.width) {
+            range_lines.push(ranges);
+            ranges = Line::default();
+        }
+        range_regions.push((
+            Rect::new(
+                inner.x + ranges.width() as u16,
+                inner.y + range_lines.len() as u16,
+                width,
+                1,
+            ),
+            MouseTarget::MetricsRange(index),
+        ));
+        ranges.spans.push(span);
+        ranges.spans.push(Span::raw(" "));
     }
-    ranges.push(Span::styled(
+    ranges.spans.push(Span::styled(
         crate::tf!(
             "· {a0} shorter / {a1} longer",
             a0 = app.key_hint(crate::shortcuts::ActionId::PreviousRange),
@@ -184,7 +202,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         muted(),
     ));
-    let legend = Paragraph::new(Line::from(ranges)).wrap(Wrap { trim: true });
+    range_lines.push(ranges);
+    let legend = Paragraph::new(range_lines).wrap(Wrap { trim: true });
     let legend_height = legend.line_count(inner.width) as u16;
     let notice = history_notice(view);
     let parts = Layout::vertical([
@@ -260,6 +279,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     frame.render_widget(Paragraph::new(header), parts[1]);
     frame.render_widget(legend, parts[0]);
+    app.mouse_regions.extend(
+        range_regions
+            .into_iter()
+            .filter(|(area, _)| parts[0].contains(area.as_position())),
+    );
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
@@ -313,6 +337,27 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         );
     }
 }
+fn sample_interval(app: &App) -> i64 {
+    app.history_view.data.sample_interval_ms.unwrap_or_else(|| {
+        let remote = app
+            .performance_container()
+            .and_then(|(index, _)| crate::remote::server_of(&app.engines[index].connection));
+        let seconds = if let Some(server) = remote {
+            app.machines
+                .iter()
+                .find(|machine| machine.remote.name == server)
+                .map_or(crate::remote::DEFAULT_METRICS_SECONDS, |machine| {
+                    machine.remote.metrics_seconds()
+                })
+        } else if app.history_database.is_some() {
+            1
+        } else {
+            app.metrics_refresh_seconds.max(1)
+        };
+        seconds as i64 * 1000
+    })
+}
+
 fn runs(
     points: &[Point],
     metric: usize,
@@ -445,12 +490,7 @@ fn draw_chart(
         );
     }
     let duration = (end - start).max(1) as f64 / 1000.0;
-    let seconds = if app.history_database.is_some() {
-        1
-    } else {
-        app.metrics_refresh_seconds.max(1)
-    };
-    let interval = (seconds as i64 * 1000)
+    let interval = sample_interval(app)
         .max(app.history_view.data.bucket_ms)
         .max((end - start) / 600);
     let series: Vec<_> = metrics
@@ -575,6 +615,46 @@ mod tests {
         assert_eq!(history_notice(&view), Some("Disk budget reached"));
         view.error = Some("Cannot read history".into());
         assert_eq!(history_notice(&view), Some("Cannot read history"));
+    }
+
+    #[test]
+    fn remote_session_cadence_is_not_overridden_by_local_sqlite() {
+        let mut app = App::new(crate::demo::connections(), 100, true, true);
+        crate::demo::populate(&mut app);
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| matches!(row.scope, Scope::Container(_)))
+            .unwrap();
+        let (index, _) = app.performance_container().unwrap();
+        app.engines[index].connection = crate::remote::connection("fixture", "docker");
+        app.history_database = Some("/unused-local-history.sqlite".into());
+        let points: Vec<_> = [0, 5000, 10_000]
+            .into_iter()
+            .map(|at_ms| Point {
+                at_ms,
+                values: [Some(1.0); 6],
+                peaks: [Some(1.0); 6],
+                count: 1,
+                valid: [1; 6],
+            })
+            .collect();
+        assert_eq!(sample_interval(&app), 5000);
+        assert_eq!(
+            runs(&points, 0, (0, 10_000), sample_interval(&app)).len(),
+            1
+        );
+        app.history_view.data.sample_interval_ms = Some(1000);
+        assert_eq!(
+            sample_interval(&app),
+            1000,
+            "agent history advertises 1s sampling"
+        );
+        assert_eq!(
+            runs(&points, 0, (0, 10_000), sample_interval(&app)).len(),
+            3,
+            "real gaps must remain visible"
+        );
     }
 
     #[test]
@@ -720,6 +800,7 @@ mod tests {
             start_ms: start,
             end_ms: end,
             bucket_ms: 100,
+            sample_interval_ms: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(160, 55)).unwrap();
         terminal

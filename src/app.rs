@@ -77,6 +77,7 @@ pub enum MouseTarget {
     TreeArrow(usize),
     Details,
     DetailTab(Tab),
+    MetricsRange(usize),
     LogScrollbar,
     NetworkRow(usize),
     LayerRow(usize),

@@ -117,6 +117,7 @@ async fn report_sync_child() {
             socket: engine_path,
             audit: |_| {},
             security: Some(security),
+            history: None,
         },
     ));
     let (mut sender, driver) = tha::remote::connect_channel(client).await.unwrap();

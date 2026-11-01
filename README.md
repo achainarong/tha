@@ -68,6 +68,9 @@ Agent setup enables resource-limited, load-aware security scans. The agent verif
 the official Grype image automatically—no manual SHA setup. Only reports are sent
 back and saved centrally. Use `--no-security` to opt out. See [remote security](docs/remote-security.md).
 
+The agent also records [performance history](docs/remote-history.md), even while
+Tha is closed: 1-second samples, SQLite flushes every 15 seconds, and 24-hour retention.
+
 ## Configuration and development
 
 Configuration: `~/.config/tha/config.toml` (or `$XDG_CONFIG_HOME/tha/config.toml`).

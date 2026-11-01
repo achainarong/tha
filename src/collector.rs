@@ -71,7 +71,7 @@ pub async fn run(
     claims: Claims,
     budget: Arc<Semaphore>,
     live: crate::live::Shared,
-    events: mpsc::Sender<(String, Vec<crate::events::Event>)>,
+    events: Option<mpsc::Sender<(String, Vec<crate::events::Event>)>>,
 ) {
     let (inventory_tx, mut inventory_rx) = mpsc::channel(1);
     let (target_tx, target_rx) = watch::channel(None);
@@ -117,7 +117,7 @@ pub async fn run(
                 }
                 // Only the connection that owns a runtime records it, as with metrics.
                 if watcher.as_ref().map(|(key, _)| key) != claim.as_ref().map(|claim| &claim.key) {
-                    watcher = claim.as_ref().map(|claim| (claim.key.clone(), Tasks(watch_events(&connection, &claim.key, &events))));
+                    watcher = claim.as_ref().zip(events.as_ref()).map(|(claim, events)| (claim.key.clone(), Tasks(watch_events(&connection, &claim.key, events))));
                 }
                 if claim.is_some() {
                     let changed=target_tx.borrow().as_ref().is_none_or(|target| !target.same_workload(&next.engine_id,&next.containers));

@@ -125,24 +125,14 @@ impl Pending {
     }
 }
 
-pub async fn run(
-    config: Config,
-    initial: Vec<Connection>,
-    remotes_path: Option<PathBuf>,
-) -> Result<()> {
-    let path = history::path(&config)?;
-    let store = history::Store::open(&path, config.history_disk_mb * 1024 * 1024)?;
-    let live: crate::live::Shared = Arc::new(Mutex::new(Default::default()));
-    let server = crate::live::Server::bind(&path, live.clone())?;
-    store.mark_collector()?;
-    let (security_stop, security_shutdown) = tokio::sync::watch::channel(false);
-    let security_worker = tokio::spawn(crate::security::serve(security_shutdown));
-    let (sender, mut receiver) = mpsc::channel::<collector::WriteBatch>(8);
-    let dropped = Arc::new(AtomicU64::new(0));
-    let writer_dropped = dropped.clone();
-    let writer_live = live.clone();
-    let writer_path = path.clone();
-    let writer = tokio::task::spawn_blocking(move || -> Result<()> {
+pub(crate) fn spawn_writer(
+    writer_path: PathBuf,
+    store: history::Store,
+    writer_live: crate::live::Shared,
+    writer_dropped: Arc<AtomicU64>,
+    mut receiver: mpsc::Receiver<collector::WriteBatch>,
+) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
         let mut store = store;
         // Startup expiry is incremental, even after extended downtime.
         while store.prune_batch(history::now_ms())? > 0 {}
@@ -188,7 +178,24 @@ pub async fn run(
         pending.flush(&mut store, &writer_dropped)?;
         store.maintenance()?;
         Ok(())
-    });
+    })
+}
+
+pub async fn run(
+    config: Config,
+    initial: Vec<Connection>,
+    remotes_path: Option<PathBuf>,
+) -> Result<()> {
+    let path = history::path(&config)?;
+    let store = history::Store::open(&path, config.history_disk_mb * 1024 * 1024)?;
+    let live: crate::live::Shared = Arc::new(Mutex::new(Default::default()));
+    let server = crate::live::Server::bind(&path, live.clone())?;
+    store.mark_collector()?;
+    let (security_stop, security_shutdown) = tokio::sync::watch::channel(false);
+    let security_worker = tokio::spawn(crate::security::serve(security_shutdown));
+    let (sender, receiver) = mpsc::channel::<collector::WriteBatch>(8);
+    let dropped = Arc::new(AtomicU64::new(0));
+    let writer = spawn_writer(path.clone(), store, live.clone(), dropped.clone(), receiver);
     let events = crate::events::spawn_writer(
         crate::events::database_path(&path).context("History path has no directory")?,
     );
@@ -235,7 +242,7 @@ pub async fn run(
                 let keys: std::collections::HashSet<_> = connections.iter().map(Connection::key).collect();
                 tasks.retain(|key,task| { if !keys.contains(key) { task.abort(); false } else { true } });
                 for connection in connections {
-                    tasks.entry(connection.key()).or_insert_with(|| tokio::spawn(collector::run(connection, config.refresh_seconds, sender.clone(), dropped.clone(), claims.clone(), budget.clone(),live.clone(),events.clone())));
+                    tasks.entry(connection.key()).or_insert_with(|| tokio::spawn(collector::run(connection, config.refresh_seconds, sender.clone(), dropped.clone(), claims.clone(), budget.clone(),live.clone(),Some(events.clone()))));
                 }
                 // Wake writer for heartbeat and expiry, even with zero running containers.
                 let _ = sender.try_send(collector::WriteBatch { runtime: String::new(), samples: vec![],flush:false });

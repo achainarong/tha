@@ -569,7 +569,7 @@ pub fn latest(path: &Path, runtime: &str, keys: &[String]) -> Result<crate::metr
     Ok(batch)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Point {
     pub at_ms: i64,
     pub values: [Option<f64>; 6],
@@ -577,13 +577,15 @@ pub struct Point {
     pub count: u64,
     pub valid: [u64; 6],
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Data {
     pub points: Vec<Point>,
     pub source: String,
     pub start_ms: i64,
     pub bucket_ms: i64,
     pub end_ms: i64,
+    #[serde(default)]
+    pub sample_interval_ms: Option<i64>,
 }
 pub fn query(
     path: &Path,
@@ -668,6 +670,7 @@ pub fn query_excluding(
         start_ms: start,
         bucket_ms: width,
         end_ms: end,
+        sample_interval_ms: Some(1000),
     })
 }
 

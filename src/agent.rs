@@ -4,6 +4,7 @@
 //! `tha` client, so nothing here may trust it. Everything is refused unless a route below
 //! allows it, and an allowed call is re-created rather than forwarded, so client headers and
 //! bodies never reach the engine.
+pub mod history;
 pub mod service;
 pub mod setup;
 
@@ -441,6 +442,7 @@ pub struct Agent {
     /// Where writes and refusals are recorded. Stderr is not used: SSH returns it to the client.
     pub audit: fn(&str),
     pub security: Option<Arc<crate::security::agent::Engine>>,
+    pub history: Option<Arc<history::Engine>>,
 }
 
 fn message_response(status: StatusCode, message: &str) -> Response<Body> {
@@ -478,8 +480,12 @@ async fn handle(
         .map_or("", |value| value.as_str())
         .to_owned();
     let security_route = crate::security::agent::route(&method, &target);
+    let history_route = target.starts_with("/tha/history");
+    let history_query = history_route.then(|| history::Query::parse(&method, &target));
     let decision = screen_headers(&request).and_then(|()| {
-        if security_route.is_some() && agent.security.is_none() {
+        if let Some(query) = &history_query {
+            query.as_ref().map(|_| Access::Read).map_err(|error| error.to_string())
+        } else if security_route.is_some() && agent.security.is_none() {
             Err("security scanning is disabled on this server; rerun tha-agent setup without --no-security, then reconnect".into())
         } else if security_route.is_some() {
             Ok(if method == Method::GET {
@@ -512,6 +518,18 @@ async fn handle(
     };
     if access != Access::Read {
         (agent.audit)(&format!("allowed {method} {}", loggable(&target)));
+    }
+    if let Some(Ok(query)) = history_query {
+        return Ok(match agent.history.as_ref() {
+            Some(history) => match history.query(query).await {
+                Ok(value) => message_json(value),
+                Err(error) => message_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &crate::layers::text(&format!("{error:#}")),
+                ),
+            },
+            None => message_response(StatusCode::NOT_FOUND, "Agent history is unavailable"),
+        });
     }
     if let (Some(route), Some(security)) = (security_route, agent.security.as_ref()) {
         return Ok(match security.handle(route).await {
@@ -694,6 +712,7 @@ mod tests {
                 socket: "/missing-security-fixture.sock".into(),
                 audit: |_| {},
                 security: None,
+                history: None,
             },
         ));
         let (mut sender, connection) = crate::remote::connect_channel(client).await.unwrap();

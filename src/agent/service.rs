@@ -147,6 +147,7 @@ pub async fn run() -> Result<()> {
     let scans = Arc::new(Semaphore::new(1));
     let mut listeners = JoinSet::new();
     let mut workers = Vec::new();
+    let mut history_workers = Vec::new();
     for engine in &config.engines {
         let path = socket(&engine.name);
         if let Ok(metadata) = std::fs::symlink_metadata(&path) {
@@ -172,11 +173,30 @@ pub async fn run() -> Result<()> {
         } else {
             None
         };
+        let history = match super::history::Engine::start(
+            engine,
+            Path::new("/var/lib/tha-agent").join(format!("history-{}.sqlite", engine.name)),
+        )
+        .await
+        {
+            Ok((history, worker)) => {
+                history_workers.push(worker);
+                Some(history)
+            }
+            Err(error) => {
+                eprintln!(
+                    "tha-agent: history unavailable for {}: {error:#}",
+                    engine.name
+                );
+                None
+            }
+        };
         let agent = Arc::new(Agent {
             allow_delete: config.allow_delete,
             socket: engine.socket.clone(),
             audit: super::syslog,
             security,
+            history,
         });
         let allowed_uid = config.service_uid;
         let limits = limits.clone();
@@ -206,6 +226,11 @@ pub async fn run() -> Result<()> {
         result = listeners.join_next() => { anyhow::bail!("Agent listener stopped: {result:?}"); }
     }
     listeners.abort_all();
+    for worker in history_workers {
+        if let Err(error) = worker.shutdown().await {
+            eprintln!("tha-agent: history shutdown failed: {error:#}");
+        }
+    }
     for worker in &workers {
         worker.abort();
     }
