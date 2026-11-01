@@ -3028,4 +3028,318 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "  Healthcheck (am Container gesetzt, per Compose oder run)",
     ),
     ("  Healthcheck", "  Healthcheck"),
+    (" Add server ", " Server hinzufügen "),
+    (
+        " All runtimes · Enter a machine or Compose project to focus it",
+        " Alle Runtimes · Enter öffnet einen Rechner oder ein Compose-Projekt",
+    ),
+    (
+        " All runtimes › {name}  · Backspace Back",
+        " Alle Runtimes › {name}  · Backspace Zurück",
+    ),
+    (" Edit server ", " Server bearbeiten "),
+    (" Remove server ", " Server entfernen "),
+    (" Servers ", " Server "),
+    (
+        " Tab/↑/↓ Move · Enter Select · Ctrl+S Save · Esc Back ",
+        " Tab/↑/↓ Wechseln · Enter Auswählen · Strg+S Speichern · Esc Zurück ",
+    ),
+    (" [not connected]", " [nicht verbunden]"),
+    (
+        " a Add · e Edit · d Remove · Enter Connect/Disconnect · Esc Close ",
+        " a Hinzufügen · e Bearbeiten · d Entfernen · Enter Verbinden/Trennen · Esc Schließen ",
+    ),
+    (" y Remove · Esc Cancel ", " y Entfernen · Esc Abbrechen "),
+    (
+        "A file already exists at this path; it was not changed",
+        "Unter diesem Pfad gibt es schon eine Datei; sie wurde nicht geändert",
+    ),
+    (
+        "A server with this name already exists",
+        "Ein Server mit diesem Namen existiert bereits",
+    ),
+    (
+        "Cannot read {path}; create it with ssh-keygen -y -f KEY > KEY.pub",
+        "{path} ist nicht lesbar; erstellen mit ssh-keygen -y -f KEY > KEY.pub",
+    ),
+    (
+        "Cannot run ssh; install OpenSSH and ensure it is on PATH",
+        "ssh lässt sich nicht starten; OpenSSH installieren und zum PATH hinzufügen",
+    ),
+    (
+        "Changes last for this session: saving is turned off.",
+        "Änderungen gelten nur für diese Sitzung: Speichern ist deaktiviert.",
+    ),
+    (
+        "Choose an SSH key to see the command for the server.",
+        "SSH-Schlüssel auswählen, um den Befehl für den Server zu sehen.",
+    ),
+    (
+        "Compose is not available on servers: its files are on the server, not here",
+        "Compose ist auf Servern nicht verfügbar: Die Dateien liegen dort, nicht hier",
+    ),
+    ("Connect", "Verbinden"),
+    (
+        "Connect or disconnect the selected server",
+        "Ausgewählten Server verbinden oder trennen",
+    ),
+    ("Connect to servers", "Mit Servern verbinden"),
+    ("Connected", "Verbunden"),
+    (
+        "Connected · delete {delete}",
+        "Verbunden · Löschen {delete}",
+    ),
+    (
+        "Connecting over SSH…",
+        "Verbindung über SSH wird aufgebaut…",
+    ),
+    ("Connection works.", "Verbindung funktioniert."),
+    (
+        "Connection works. Engines: {engines}",
+        "Verbindung funktioniert. Engines: {engines}",
+    ),
+    (
+        "Copy server setup command",
+        "Setup-Befehl für den Server kopieren",
+    ),
+    (
+        "Could not save servers: {error}",
+        "Server konnten nicht gespeichert werden: {error}",
+    ),
+    ("Create SSH key {path}", "SSH-Schlüssel {path} erstellen"),
+    (
+        "Create new key at this path",
+        "Neuen Schlüssel unter diesem Pfad erstellen",
+    ),
+    (
+        "Deleting is turned off on this server",
+        "Löschen ist auf diesem Server deaktiviert",
+    ),
+    (
+        "Demo mode: servers are not contacted",
+        "Demo-Modus: Server werden nicht kontaktiert",
+    ),
+    (
+        "Discard your changes? y Discard · any other key keeps editing",
+        "Änderungen verwerfen? y Verwerfen · jede andere Taste bearbeitet weiter",
+    ),
+    (
+        "Each server runs tha-agent, which only allows start, stop, restart, logs and inventory.",
+        "Auf jedem Server läuft tha-agent und erlaubt nur Starten, Stoppen, Neustarten, Logs und Inventar.",
+    ),
+    (
+        "Enter adds, edits or removes servers.",
+        "Enter fügt Server hinzu, bearbeitet oder entfernt sie.",
+    ),
+    (
+        "Exec is not available on servers: the agent does not allow running commands",
+        "Exec ist auf Servern nicht verfügbar: Der Agent erlaubt keine Befehle",
+    ),
+    (
+        "HOME is not set, so ~/ cannot be expanded",
+        "HOME ist nicht gesetzt, ~/ lässt sich also nicht auflösen",
+    ),
+    ("Host", "Host"),
+    (
+        "Host key unknown or changed. Use Test connection under Servers.",
+        "Host-Schlüssel unbekannt oder geändert. Unter Server die Verbindung testen.",
+    ),
+    (
+        "Host must not start with - or contain spaces, quotes or slashes",
+        "Host darf nicht mit - beginnen und keine Leerzeichen, Anführungszeichen oder Schrägstriche enthalten",
+    ),
+    (
+        "Key created. Run the setup command on the server.",
+        "Schlüssel erstellt. Jetzt den Setup-Befehl auf dem Server ausführen.",
+    ),
+    (
+        "Key refused. Run the setup command on the server; if the key has a passphrase, load it with ssh-add.",
+        "Schlüssel abgelehnt. Setup-Befehl auf dem Server ausführen; einen Schlüssel mit Passphrase mit ssh-add laden.",
+    ),
+    (
+        "Machines have no actions; select a workload inside one",
+        "Rechner haben keine Aktionen; einen Workload darin auswählen",
+    ),
+    ("Manual", "Manuell"),
+    ("Needs attention", "Handlung nötig"),
+    (
+        "No servers yet. Press a to add one.",
+        "Noch keine Server. Mit a einen hinzufügen.",
+    ),
+    ("Not connected", "Nicht verbunden"),
+    (
+        "Not connected, so no traffic is sent. Enter connects and opens this server.",
+        "Nicht verbunden, es fließt also kein Traffic. Enter verbindet und öffnet diesen Server.",
+    ),
+    ("Offline, retrying", "Offline, neuer Versuch läuft"),
+    ("On startup", "Beim Start"),
+    ("Port", "Port"),
+    (
+        "Port must be between 1 and 65535",
+        "Port muss zwischen 1 und 65535 liegen",
+    ),
+    (
+        "Pulling images is not available on servers: the agent does not allow it",
+        "Images pullen ist auf Servern nicht verfügbar: Der Agent erlaubt es nicht",
+    ),
+    (
+        "Remove {name} from this list and disconnect it?",
+        "{name} aus dieser Liste entfernen und trennen?",
+    ),
+    (
+        "Removed {name}. Its key still works on the server until removed from that user's authorized_keys.",
+        "{name} entfernt. Der Schlüssel funktioniert auf dem Server weiter, bis er aus den authorized_keys des Benutzers entfernt wird.",
+    ),
+    (
+        "SSH cannot use this key. Check the file and that its mode is 600.",
+        "SSH kann diesen Schlüssel nicht verwenden. Datei prüfen und Rechte auf 600 setzen.",
+    ),
+    (
+        "SSH ended without an error message",
+        "SSH wurde ohne Fehlermeldung beendet",
+    ),
+    ("SSH key", "SSH-Schlüssel"),
+    ("SSH key      {key}", "SSH-Schlüssel {key}"),
+    (
+        "SSH key is not a file: {path}",
+        "SSH-Schlüssel ist keine Datei: {path}",
+    ),
+    (
+        "SSH key must be an absolute path or start with ~/ or $HOME/",
+        "SSH-Schlüssel muss ein absoluter Pfad sein oder mit ~/ oder $HOME/ beginnen",
+    ),
+    (
+        "SSH key not found: {path}",
+        "SSH-Schlüssel nicht gefunden: {path}",
+    ),
+    (
+        "SSH key path contains control characters",
+        "Pfad zum SSH-Schlüssel enthält Steuerzeichen",
+    ),
+    ("Save", "Speichern"),
+    (
+        "Saving reconnects this server. Save again to continue.",
+        "Beim Speichern wird dieser Server neu verbunden. Zum Fortfahren erneut speichern.",
+    ),
+    ("Select a server first", "Zuerst einen Server auswählen"),
+    (
+        "Sent to the clipboard, if your terminal allows it.",
+        "In die Zwischenablage gelegt, sofern das Terminal es erlaubt.",
+    ),
+    (
+        "Server agent problem: {detail}",
+        "Problem mit dem Agenten auf dem Server: {detail}",
+    ),
+    (
+        "Server names can use letters, digits, spaces, - _ and .",
+        "Servernamen dürfen Buchstaben, Ziffern, Leerzeichen, - _ und . enthalten",
+    ),
+    ("Servers", "Server"),
+    (
+        "Servers: add, edit or remove remote servers",
+        "Server: Remote-Server hinzufügen, bearbeiten oder entfernen",
+    ),
+    (
+        "Skipped saved server {name}: the name is already in config.toml",
+        "Gespeicherter Server {name} übersprungen: Der Name steht schon in der config.toml",
+    ),
+    (
+        "Step 1: run this on the server to install and set up the agent:",
+        "Schritt 1: Das hier auf dem Server ausführen, um den Agenten zu installieren und einzurichten:",
+    ),
+    (
+        "Step 2: Test connection confirms the host key. Step 3: Save.",
+        "Schritt 2: Verbindung testen bestätigt den Host-Schlüssel. Schritt 3: Speichern.",
+    ),
+    ("Test connection", "Verbindung testen"),
+    ("Test connection to {name}", "Verbindung zu {name} testen"),
+    (
+        "The key file and the server are not changed.",
+        "Die Schlüsseldatei und der Server bleiben unverändert.",
+    ),
+    (
+        "The server did not answer the engine list request",
+        "Der Server hat die Anfrage nach den Engines nicht beantwortet",
+    ),
+    (
+        "The server agent exposes no engines",
+        "Der Agent auf dem Server gibt keine Engines frei",
+    ),
+    (
+        "The server reported an invalid engine name",
+        "Der Server hat einen ungültigen Engine-Namen gemeldet",
+    ),
+    (
+        "The server's engine list is too large",
+        "Die Engine-Liste des Servers ist zu groß",
+    ),
+    ("Local", "Lokal"),
+    (
+        "This server does not run tha-agent. Run the setup command on it.",
+        "Auf diesem Server läuft tha-agent nicht. Den Setup-Befehl dort ausführen.",
+    ),
+    (
+        "This server is in config.toml; edit it there.",
+        "Dieser Server steht in der config.toml; dort bearbeiten.",
+    ),
+    (
+        "This server is in config.toml; remove it there.",
+        "Dieser Server steht in der config.toml; dort entfernen.",
+    ),
+    (
+        "Timed out connecting over SSH",
+        "Zeitüberschreitung beim Verbinden über SSH",
+    ),
+    (
+        "Type the path for the new key first, such as ~/.ssh/tha_prod",
+        "Zuerst den Pfad für den neuen Schlüssel eingeben, z. B. ~/.ssh/tha_prod",
+    ),
+    (
+        "Use the Settings value ({mode})",
+        "Wert aus den Einstellungen ({mode})",
+    ),
+    (
+        "Used when tha opens. The background service never connects to servers.",
+        "Gilt beim Öffnen von tha. Der Hintergrunddienst verbindet sich nie mit Servern.",
+    ),
+    ("User", "Benutzer"),
+    (
+        "User must not start with - or contain spaces, quotes, slashes or @",
+        "Benutzer darf nicht mit - beginnen und keine Leerzeichen, Anführungszeichen, Schrägstriche oder @ enthalten",
+    ),
+    (
+        "metrics_refresh_seconds must be between 1 and 60",
+        "metrics_refresh_seconds muss zwischen 1 und 60 liegen",
+    ),
+    (
+        "{count} engines · delete {delete}",
+        "{count} Engines · Löschen {delete}",
+    ),
+    ("{running}/{total} running", "{running}/{total} läuft"),
+    (
+        "{status}. Read the output above, then :servers returns to the form.",
+        "{status}. Ausgabe oben lesen, :servers führt zurück zum Formular.",
+    ),
+    ("not connected", "nicht verbunden"),
+    (
+        "On server {name} ({address})",
+        "Auf Server {name} ({address})",
+    ),
+    (
+        "No engines yet. Press . or type :servers to add a server.",
+        "Noch keine Engines. Mit . oder :servers einen Server hinzufügen.",
+    ),
+    (
+        "Root key: tha's traffic uses the allowlist, but anyone holding this key has full root access.",
+        "Root-Schlüssel: Der Traffic von tha läuft über die Allowlist, aber wer diesen Schlüssel hat, hat vollen Root-Zugriff.",
+    ),
+    (
+        "tha-agent is not installed on this server. Run the setup command on it.",
+        "tha-agent ist auf diesem Server nicht installiert. Den Setup-Befehl dort ausführen.",
+    ),
+    ("<name>", "<Name>"),
+    ("<name|address>", "<Name|Adresse>"),
+    ("<user>", "<Benutzer>"),
+    ("<port>", "<Port>"),
+    ("<path>", "<Pfad>"),
 ];

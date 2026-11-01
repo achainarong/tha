@@ -223,6 +223,11 @@ pub async fn check(targets: Vec<Target>, tx: mpsc::Sender<Event>) {
 }
 
 async fn pull_tag(request: &PullRequest, tag: &str, tx: &mpsc::Sender<Event>) -> Result<()> {
+    anyhow::ensure!(
+        !crate::remote::is_remote(&request.connection),
+        "{}",
+        crate::i18n::t("Pulling images is not available on servers: the agent does not allow it")
+    );
     let (program, path) = crate::exec::runtime_cli(&request.connection).context(crate::i18n::t(
         "Install the Docker or Podman CLI and add it to PATH to pull images",
     ))?;

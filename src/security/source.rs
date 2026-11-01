@@ -8,6 +8,10 @@ use std::{
 
 pub fn validate(target: &Target) -> Result<()> {
     ensure!(
+        !crate::remote::is_remote(&target.connection),
+        "Security scans are not available on servers: the agent does not allow image export"
+    );
+    ensure!(
         target.connection.kind == crate::config::BackendKind::Docker,
         "Security scanning currently supports Docker-compatible Unix endpoints only"
     );

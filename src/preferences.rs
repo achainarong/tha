@@ -26,6 +26,8 @@ pub struct Preferences {
     pub expanded: Vec<Row>,
     pub selected: Option<Row>,
     pub project: Option<Row>,
+    /// A focused machine, by name. Restoring it never connects a server.
+    pub machine: Option<String>,
     pub runtimes: Vec<crate::runtime::Saved>,
     pub settings: crate::settings::SavedSettings,
 }
@@ -40,6 +42,7 @@ impl Default for Preferences {
             expanded: Vec::new(),
             selected: None,
             project: None,
+            machine: None,
             runtimes: Vec::new(),
             settings: Default::default(),
         }

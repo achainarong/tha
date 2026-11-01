@@ -17,6 +17,7 @@ const STORED_VALUES: &[&str] = &[
     "alias",
     "connecting",
     "connected",
+    "not connected",
     "unavailable",
     "out of memory",
     "health",

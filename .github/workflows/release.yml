@@ -107,6 +107,9 @@ jobs:
           file "$binary"
           if [ "$RUNNER_OS" = Linux ]; then
             file "$binary" | grep -Eq 'statically linked|static-pie linked'
+            agent="target/$TARGET/release/tha-agent"
+            test "$("$agent" --version)" = "tha-agent ${GITHUB_REF_NAME#v}"
+            file "$agent" | grep -Eq 'statically linked|static-pie linked'
           fi
       - name: Package executable and license
         run: |
@@ -116,10 +119,19 @@ jobs:
           mkdir -p dist
           COPYFILE_DISABLE=1 tar -czf "dist/$ASSET" -C "$stage" tha LICENSE README.md
           python3 scripts/release_smoke.py --archive "dist/$ASSET"
+      - name: Package server agent and license
+        if: runner.os == 'Linux'
+        run: |
+          stage=$(mktemp -d)
+          install -m 755 "target/$TARGET/release/tha-agent" "$stage/tha-agent"
+          cp LICENSE "$stage/"
+          agent_asset="tha-agent-${ASSET#tha-}"
+          tar -czf "dist/$agent_asset" -C "$stage" tha-agent LICENSE
+          python3 scripts/release_smoke.py --archive "dist/$agent_asset"
       - uses: actions/upload-artifact@v4
         with:
           name: tha-release-${{ matrix.target }}
-          path: dist/${{ matrix.asset }}
+          path: dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -146,6 +158,8 @@ jobs:
               "tha-linux-amd64.tar.gz",
               "tha-linux-arm64.tar.gz",
               "tha-macos-arm64.tar.gz",
+              "tha-agent-linux-amd64.tar.gz",
+              "tha-agent-linux-arm64.tar.gz",
           }
           actual = {path.name for path in directory.iterdir()}
           if actual != expected:

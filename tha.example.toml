@@ -32,9 +32,22 @@ save_preferences = true # Separate XDG state file; never stores logs or shells. 
 # "alt-c" = "metrics-cursor"
 # "alt-s" = "stop" # Still opens a confirmation; never bypasses safety checks.
 
+# Remote servers run `tha-agent`, which only allows an explicit list of Docker API calls.
+# They can also be managed in the app: press . or type :servers. Those are saved in
+# remotes.toml next to this file, and this file is never rewritten.
+# remote_connect = "manual" # Or "startup". Manual sends nothing until you connect.
+# [[remotes]]
+# name = "prod"
+# host = "10.0.0.5"
+# user = "tha"
+# identity_file = "~/.ssh/tha_prod"
+# port = 22
+# connect = "startup" # Overrides remote_connect for this server.
+# metrics_refresh_seconds = 5
+
 # Discovery still runs alongside these explicit connections.
-# Docker API connections currently require a Unix socket. SSH/TLS contexts
-# remain visible but are marked unsupported rather than downgraded to plaintext.
+# Docker API connections require a Unix socket. SSH/TLS Docker contexts remain visible
+# but are marked unsupported rather than downgraded to plaintext; use [[remotes]] for SSH.
 # [[connections]]
 # name = "OrbStack"
 # kind = "docker"

@@ -82,6 +82,8 @@ configured keys take precedence.
 | `containers-view`, `images-view`, `volumes-view`, `security-view` | Open a top-level overview |
 | `overview`, `logs`, `networks`, `exec`, `metrics`, `layers`, `security`, `events` | Select an inner workload tab; `exec` selects navigation, not shell input |
 | `settings` | Open the settings pane |
+| `servers` | Open the Servers modal to add, edit or remove servers |
+| `toggle-connection` | Connect or disconnect the selected server |
 | `zoom` | Expand/restore the focused Explorer, detail tab, Performance, or inventory view |
 | `toggle-branch` | Toggle an Explorer branch |
 | `next-match`, `previous-match` | Navigate tree/log search matches |

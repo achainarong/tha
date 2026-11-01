@@ -1039,3 +1039,294 @@ async fn live_events_report_a_restart_with_its_exit_and_start() {
         "{seen:?}"
     );
 }
+
+mod agent {
+    use super::*;
+    use tha::agent::{Agent, serve};
+
+    /// A local socket with the real agent behind it, standing in for one SSH channel per
+    /// connection. The fixture only replaces OpenSSH, not the HTTP path under test.
+    fn through_agent(engine: &MockEngine, allow_delete: bool) -> (Connection, JoinHandle<()>) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "tha-agent-{}-{}.sock",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        let socket = engine.path.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let agent = Agent {
+                    allow_delete,
+                    socket: socket.clone(),
+                    audit: |_| {},
+                };
+                tokio::spawn(async move {
+                    let _ = serve(stream, agent).await;
+                });
+            }
+        });
+        (
+            Connection {
+                name: "through agent".into(),
+                kind: BackendKind::Docker,
+                endpoint: format!("unix://{}", path.display()),
+            },
+            task,
+        )
+    }
+
+    fn seen(engine: &MockEngine) -> Vec<String> {
+        let mut requests = engine.requests.lock().unwrap().clone();
+        requests.sort();
+        requests
+    }
+
+    /// Sends raw bytes, as a client that is not `tha` would, and returns the raw response.
+    async fn raw(connection: &Connection, request: &str) -> String {
+        let path = connection.endpoint.strip_prefix("unix://").unwrap();
+        let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            stream.read_to_end(&mut response),
+        )
+        .await;
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[tokio::test]
+    async fn the_real_client_sends_the_same_inventory_calls_through_the_gate() {
+        let direct = MockEngine::start(false);
+        let through = MockEngine::start(false);
+        let (connection, task) = through_agent(&through, false);
+        let expected = backend::snapshot(&direct.connection()).await.unwrap();
+        let snapshot = backend::snapshot(&connection).await.unwrap();
+        task.abort();
+        assert_eq!(snapshot.containers.len(), expected.containers.len());
+        assert_eq!(snapshot.warnings, expected.warnings);
+        assert_eq!(seen(&through), seen(&direct));
+    }
+
+    #[tokio::test]
+    async fn logs_flow_through_the_gate() {
+        let engine = MockEngine::start(false);
+        let (connection, agent) = through_agent(&engine, false);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let container = tha::model::Container {
+            id: "api123".into(),
+            name: "shop-api-1".into(),
+            ..Default::default()
+        };
+        let task = tha::logs::subscribe(connection, vec![container], 7, None, 100, tx);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        agent.abort();
+        assert_eq!(event.source, "shop-api-1");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_calls_from_the_real_client_are_allowed() {
+        use bollard::query_parameters::{
+            RestartContainerOptionsBuilder, StopContainerOptionsBuilder,
+        };
+        let engine = MockEngine::start(false);
+        let (connection, task) = through_agent(&engine, false);
+        let docker = backend::docker::connect(&connection).unwrap();
+        let _ = docker.start_container("api123", None).await;
+        let _ = docker
+            .stop_container(
+                "api123",
+                Some(StopContainerOptionsBuilder::default().t(10).build()),
+            )
+            .await;
+        let _ = docker
+            .restart_container(
+                "api123",
+                Some(RestartContainerOptionsBuilder::default().t(10).build()),
+            )
+            .await;
+        task.abort();
+        let requests = seen(&engine);
+        for action in ["start", "stop?t=10", "restart?t=10"] {
+            assert!(
+                requests
+                    .iter()
+                    .any(|line| line.contains(&format!("/containers/api123/{action} "))),
+                "{action} missing from {requests:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn removal_uses_the_real_clients_query_only_when_the_server_allows_it() {
+        use bollard::query_parameters::RemoveContainerOptionsBuilder;
+        let options = || {
+            RemoveContainerOptionsBuilder::default()
+                .force(false)
+                .v(false)
+                .link(false)
+                .build()
+        };
+        let off = MockEngine::start(false);
+        let (connection, off_task) = through_agent(&off, false);
+        let refused = backend::docker::connect(&connection)
+            .unwrap()
+            .remove_container("api123", Some(options()))
+            .await
+            .unwrap_err()
+            .to_string();
+        off_task.abort();
+        assert!(refused.contains("Not allowed by server"), "{refused}");
+        assert!(off.requests.lock().unwrap().is_empty());
+
+        let on = MockEngine::start(false);
+        let (connection, on_task) = through_agent(&on, true);
+        let _ = backend::docker::connect(&connection)
+            .unwrap()
+            .remove_container("api123", Some(options()))
+            .await;
+        on_task.abort();
+        assert!(seen(&on).iter().any(|line| line.starts_with("DELETE ")));
+    }
+
+    #[tokio::test]
+    async fn refused_calls_never_reach_the_engine() {
+        let engine = MockEngine::start(false);
+        let (connection, task) = through_agent(&engine, true);
+        for (request, reason) in [
+            (
+                "POST /containers/create HTTP/1.1\r\nHost: x\r\n\r\n",
+                "allowlist",
+            ),
+            (
+                "POST /containers/a/exec HTTP/1.1\r\nHost: x\r\n\r\n",
+                "allowlist",
+            ),
+            (
+                "POST /v1.53/images/create?fromImage=x HTTP/1.1\r\nHost: x\r\n\r\n",
+                "allowlist",
+            ),
+            (
+                "DELETE /containers/a?force=true HTTP/1.1\r\nHost: x\r\n\r\n",
+                "refused value",
+            ),
+            (
+                "POST /containers/a/%2e%2e/exec HTTP/1.1\r\nHost: x\r\n\r\n",
+                "refused characters",
+            ),
+            ("GET http://x/info HTTP/1.1\r\nHost: x\r\n\r\n", "absolute"),
+            (
+                "POST /containers/a/start HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n",
+                "upgrade",
+            ),
+            (
+                "POST /containers/a/start HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}",
+                "bodies",
+            ),
+            (
+                "POST /containers/a/start HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+                "transfer-encoding",
+            ),
+        ] {
+            let response = raw(&connection, request).await;
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "{request}: {response}"
+            );
+            assert!(response.contains(reason), "{request}: {response}");
+        }
+        task.abort();
+        assert_eq!(seen(&engine), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_refused_call_cannot_follow_an_allowed_one_on_a_connection() {
+        let engine = MockEngine::start(false);
+        let (connection, task) = through_agent(&engine, false);
+        let response = raw(
+            &connection,
+            "GET /_ping HTTP/1.1\r\nHost: x\r\n\r\nPOST /containers/create HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        task.abort();
+        assert!(response.contains("HTTP/1.1 403"), "{response}");
+        assert!(
+            seen(&engine).iter().all(|line| !line.contains("create")),
+            "{:?}",
+            seen(&engine)
+        );
+    }
+
+    #[tokio::test]
+    async fn smuggling_with_conflicting_lengths_does_not_reach_the_engine() {
+        let engine = MockEngine::start(false);
+        let (connection, task) = through_agent(&engine, false);
+        let smuggled = "POST /containers/create HTTP/1.1\r\nHost: x\r\n\r\n";
+        let request = format!(
+            "POST /containers/a/start HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n{smuggled}",
+            smuggled.len() + 5
+        );
+        let _ = raw(&connection, &request).await;
+        task.abort();
+        assert!(
+            seen(&engine)
+                .iter()
+                .all(|line| !line.contains("create") && !line.contains("start")),
+            "{:?}",
+            seen(&engine)
+        );
+    }
+
+    #[tokio::test]
+    async fn client_headers_are_not_forwarded() {
+        let path =
+            std::env::temp_dir().join(format!("tha-agent-headers-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let engine = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0; 4096];
+            let read = stream.read(&mut buffer).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&buffer[..read]).into_owned()
+        });
+        let (client, server) = tokio::io::duplex(8192);
+        let socket = path.clone();
+        let agent = tokio::spawn(async move {
+            let _ = serve(
+                server,
+                Agent {
+                    allow_delete: false,
+                    socket,
+                    audit: |_| {},
+                },
+            )
+            .await;
+        });
+        let mut client = client;
+        client
+            .write_all(
+                b"GET /_ping HTTP/1.1\r\nHost: evil\r\nX-Registry-Auth: secret\r\nCookie: a=b\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let received = engine.await.unwrap();
+        agent.abort();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            received.starts_with("GET /_ping HTTP/1.1\r\n"),
+            "{received}"
+        );
+        assert!(!received.contains("secret"), "{received}");
+        assert!(!received.contains("Cookie"), "{received}");
+        assert!(!received.contains("evil"), "{received}");
+    }
+}

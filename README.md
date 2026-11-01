@@ -36,15 +36,23 @@ setup and scanning. Colima is optional; native Docker Engine works on Linux.
 curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | MODULES=security sh
 ```
 
+**Agent** is for a server you manage from Tha on another machine. It installs only
+`tha-agent`, with no UI, service or modules, as a root-owned binary in `/usr/local/bin`.
+Linux only, and it does need root; see [Remote servers](#remote-servers):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent
+```
+
 The [script](scripts/install.sh) downloads the release archive and `SHA256SUMS`,
 verifies the checksum, and installs `tha` into `~/.local/bin`. It needs `curl` or
 `wget`, `tar`, and `sha256sum` (Linux) or `shasum` (macOS). Optional settings:
 
 | Variable | Effect |
 | --- | --- |
-| `THA_MODE=service` | Same as passing `service` |
+| `THA_MODE=service` | Same as passing `service` (or `agent`) |
 | `THA_VERSION=v0.6.0` | Install that release instead of the latest (pin or roll back) |
-| `THA_BIN_DIR=...` | Install somewhere other than `~/.local/bin` |
+| `THA_BIN_DIR=...` | Install somewhere other than `~/.local/bin` (agent: `/usr/local/bin`) |
 | `THA_INSTALL_LOG_DIR=...` | Override the installer debug log directory (default `$XDG_STATE_HOME/tha/install`, or `~/.local/state/tha/install`) |
 | `MODULES=security` | Install the Security service module; implies service mode; requires Docker CLI and a running Docker-compatible Unix endpoint |
 
@@ -207,6 +215,8 @@ make run        # Discover and browse your actual engines
 make install                # Standalone: install tha into ~/.cargo/bin (or your Cargo root)
 make install MODE=service   # Also install and start the per-user background collector
 make install:full           # Service + security; requires Docker CLI and a running engine
+make install:agent           # Only tha-agent, for a server; uses sudo
+make install:agent           # Only tha-agent, for a server; uses sudo
 tha
 ```
 
@@ -248,7 +258,8 @@ On macOS, a VM's containerd guest socket is not automatically reachable from the
 host. Guest/VM transports are not implemented in this MVP.
 
 SSH, TLS, and TCP Docker contexts remain visible but are marked unsupported.
-Tha does not silently turn secure connections into plaintext connections.
+Tha does not silently turn secure connections into plaintext connections. To
+reach another machine over SSH, see [Remote servers](#remote-servers).
 
 ## Connections
 
@@ -305,6 +316,80 @@ without duplicate workload trees. Native containerd has endpoint-level deduplica
 Configuration lives at `$XDG_CONFIG_HOME/tha/config.toml`, falling back to
 `~/.config/tha/config.toml`. Use `--config PATH` to override. See
 [`tha.example.toml`](tha.example.toml). Explicit connections supplement discovery.
+
+## Remote servers
+
+Manage containers on other machines next to your local ones. Each server gets its
+own SSH key and runs `tha-agent`, an allowlist in front of its Docker socket. The
+allowlist runs on the server, so with a dedicated user it holds even for someone who
+has stolen the key and does not use Tha.
+
+**Add a server:** press `.` or type `:servers`, then `a`. Enter the host, user and
+key path, or create a key from the form. It shows the command to run once on the
+server, as an admin:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent \
+  && sudo tha-agent setup --user tha --key 'ssh-ed25519 AAAA...'
+```
+
+The command installs `tha-agent` too, so that is all the server needs; the full `tha`
+stays on your own machine. The agent is not a service: it opens no port and uses nothing
+while idle. SSH starts it for each connection, and it exits when the connection ends. Setup creates the dedicated user, writes the
+root-owned policy `/etc/tha/agent.toml`, and restricts the key in `authorized_keys`
+to the agent. It stops if that user already has a key that could bypass the agent.
+Then use **Test connection**: OpenSSH shows the host key fingerprint for you to
+confirm, and Tha never accepts a host key itself. Do not give the agent user any
+other key, password or sudo rule.
+
+You can also connect as `root` with an existing key, after running
+`tha-agent setup --user root`, which only writes the policy. `tha`'s own traffic still
+goes through the allowlist, but the key is not restricted: anyone holding it has full
+root access on the server. Use a dedicated user if the limit must hold for a stolen key.
+
+Servers can also be written by hand as `[[remotes]]` in `config.toml`; see
+`tha.example.toml`. Those show as read-only in the modal. Servers added in the modal
+are saved in `remotes.toml` next to it, mode `0600`. Only the path to each key is
+stored; Tha never reads or copies a private key. A key with a passphrase must be
+loaded with `ssh-add`, because Tha cannot prompt for it while running.
+
+**What the agent allows:** listing and inspecting containers, images, networks and
+volumes, image history, logs, stats, events, and start, stop and restart. Everything
+else is refused, including create, exec, pull, build, file copy, prune and image
+export. Deleting containers, images and volumes is off unless setup ran with
+`--allow-delete`, and force is always refused. Writes and refusals go to the server's
+system log.
+
+**Not available on servers:** exec, image pull, image update checks, Compose actions,
+security scans, background history, and starting or stopping the engine itself.
+
+**What it does not protect:** reading is still sensitive, because container inspect
+includes environment variables and logs can contain secrets. A stolen key can also
+stop every container. Removing a server from Tha leaves its key valid until you remove
+it from that user's `authorized_keys`.
+
+**Machines in the Explorer:** once a server exists, engines group under their machine.
+`Enter` on a machine shows only that machine, and connects it if needed. `Backspace`
+returns, and `:all` shows everything. `Shift+C` connects or disconnects the selected
+server. Without servers, the Explorer does not change.
+
+**Traffic:** "Connect to servers" in Settings is **Manual** by default, so nothing is
+sent until you connect; a server's `connect` setting overrides it. Only the open UI
+connects. The background service never does, so there is no permanent SSH connection.
+Quitting closes the session, a disconnected server gets no polling, and stats refresh
+every 5 seconds unless `metrics_refresh_seconds` says otherwise. A refused key or
+changed host key stops and waits for you instead of retrying.
+
+Requires OpenSSH on your machine, and Linux on the server. Only Docker and
+Docker-compatible engines are supported through the agent. A rootless engine's socket
+usually cannot be shared with a separate user, so setup explains the problem and stops.
+
+To try it against a disposable server, with Docker installed:
+
+```sh
+python3 scripts/remote_smoke.py --try  # Keeps a test server running until you press Enter
+python3 scripts/remote_smoke.py        # Runs the automated end-to-end checks
+```
 
 ## Compose workspaces
 
@@ -1112,7 +1197,7 @@ shutdown also stops its Linux machines. Runtime Delete is disabled.
 
 Provider control requires a recognized local socket location or a natively
 discovered Podman machine, not a display-name match. Generic Docker sockets,
-remote contexts, native containerd, and aliases cannot control a daemon. There is
+remote contexts, remote servers, native containerd, and aliases cannot control a daemon. There is
 no fallback to stopping containers, no sudo/system-service management, no machine
 initialization, and no context switching. Colima/Podman commands verify the named
 instance still exists before proceeding. The corresponding CLI must be installed.

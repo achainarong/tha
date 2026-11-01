@@ -3,15 +3,18 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sh
 #   curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sh -s -- service
+#   curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh | sudo sh -s -- agent
 #
-# Two modes:
+# Three modes:
 #   standalone (default)  only the tha binary; metrics are sampled while the UI is open
 #   service               also installs and starts the per-user background collector
 #                         (launchd/systemd, no sudo), so History keeps 24 hours of metrics
+#   agent                  for a server managed by Tha elsewhere: only tha-agent, owned by root
+#                         in /usr/local/bin. Linux only, needs root, starts no service.
 #
 #   THA_MODE=service      same as passing `service`
 #   THA_VERSION=v0.6.0    install that release instead of the latest
-#   THA_BIN_DIR=...       where the tha command goes (default ~/.local/bin)
+#   THA_BIN_DIR=...       where the command goes (default ~/.local/bin, or /usr/local/bin for agent)
 #   MODULES=security      optional comma-separated modules (currently: security)
 #   THA_INSTALL_LOG_DIR=...  debug log directory (default ~/.local/state/tha/install)
 #
@@ -22,13 +25,21 @@ set -eu
 REPO=achainarong/tha
 MODE=${1:-${THA_MODE:-standalone}}
 VERSION=${THA_VERSION:-latest}
-BIN_DIR=${THA_BIN_DIR:-$HOME/.local/bin}
 MODULES=${MODULES:-}
 
 say() { printf 'tha: %s\n' "$*"; }
 die() { printf 'tha: %s\n' "$*" >&2; exit 1; }
 
-log_dir=${THA_INSTALL_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tha/install}
+if [ "$MODE" = agent ]; then
+    # Checked first: the forced SSH command runs this binary, so only root may be able to
+    # replace it, and sudo's HOME must not end up with root-owned files in a user's directory.
+    [ "$(id -u)" = 0 ] || die "agent mode installs a root-owned binary; run it with: | sudo sh -s -- agent"
+    BIN_DIR=${THA_BIN_DIR:-/usr/local/bin}
+    log_dir=${THA_INSTALL_LOG_DIR:-/var/log/tha-agent}
+else
+    BIN_DIR=${THA_BIN_DIR:-$HOME/.local/bin}
+    log_dir=${THA_INSTALL_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tha/install}
+fi
 mkdir -p "$log_dir" || die "couldn't create installer log directory: $log_dir"
 log_file=$(mktemp "$log_dir/install-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX") ||
     die "couldn't create installer log in $log_dir"
@@ -77,7 +88,8 @@ debug "mode=$MODE version=$VERSION bin_dir=$BIN_DIR modules=$MODULES"
 
 case $MODE in
     standalone | service) ;;
-    *) die "mode must be standalone or service, not '$MODE'" ;;
+    agent) [ -z "$MODULES" ] || die "agent mode installs only tha-agent; MODULES do not apply" ;;
+    *) die "mode must be standalone, service or agent, not '$MODE'" ;;
 esac
 
 # Validate before downloading or replacing anything. Repeated names are harmless.
@@ -142,6 +154,15 @@ fetch() {
     fi || die "couldn't download $1"
 }
 
+command_name=tha
+if [ "$MODE" = agent ]; then
+    case $asset in
+        tha-linux-*) asset=tha-agent-${asset#tha-} ;;
+        *) die "agent mode supports Linux servers only" ;;
+    esac
+    command_name=tha-agent
+fi
+
 step "downloading $asset ($VERSION)"
 fetch "$base/$asset" "$tmp/$asset"
 fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS"
@@ -159,9 +180,17 @@ awk -v asset="$asset" '$2 == asset { print }' "$tmp/SHA256SUMS" > "$tmp/CHECKSUM
     fi
 ) || die "checksum mismatch for $asset; nothing installed"
 step "unpacking release"
-run tar -xzf "$tmp/$asset" -C "$tmp" tha || die "couldn't unpack $asset; nothing installed"
+run tar -xzf "$tmp/$asset" -C "$tmp" "$command_name" || die "couldn't unpack $asset; nothing installed"
 
-bin=$BIN_DIR/tha
+bin=$BIN_DIR/$command_name
+if [ "$MODE" = agent ]; then
+    step "installing tha-agent to $BIN_DIR"
+    run mkdir -p "$BIN_DIR"
+    run install -m 755 "$tmp/tha-agent" "$bin"
+    say "installed $(run "$bin" --version) to $bin"
+    say "next: run the setup command shown in Tha under Servers, on this server"
+    exit 0
+fi
 running=0
 # Never replace the executable under a running collector.
 debug "checking existing collector status at $bin"

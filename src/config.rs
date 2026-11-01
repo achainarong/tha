@@ -44,6 +44,10 @@ pub struct Config {
     pub save_preferences: bool,
     pub bindings: std::collections::BTreeMap<String, String>,
     pub connections: Vec<Connection>,
+    /// Servers reached through `tha-agent`. Only the interactive UI ever connects to these.
+    pub remotes: Vec<crate::remote::Remote>,
+    /// Default for servers that do not set `connect` themselves.
+    pub remote_connect: crate::remote::ConnectMode,
     /// Exact displayed connection names, in preferred order. Unknown names are ignored.
     pub context_order: Vec<String>,
 }
@@ -68,6 +72,8 @@ impl Default for Config {
             save_preferences: true,
             bindings: Default::default(),
             connections: Vec::new(),
+            remotes: Vec::new(),
+            remote_connect: Default::default(),
             context_order: Vec::new(),
         }
     }
@@ -110,6 +116,13 @@ impl Config {
         for connection in &config.connections {
             if connection.name.trim().is_empty() || connection.endpoint.trim().is_empty() {
                 bail!("Connection names and endpoints must not be empty");
+            }
+        }
+        let mut remote_names = std::collections::HashSet::new();
+        for remote in &config.remotes {
+            remote.validate()?;
+            if !remote_names.insert(&remote.name) {
+                bail!("Duplicate remote name: {}", remote.name);
             }
         }
         let mut pins = std::collections::HashSet::new();

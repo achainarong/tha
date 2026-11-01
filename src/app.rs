@@ -28,6 +28,8 @@ pub enum ResourceKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
+    /// A whole machine. It has no single engine, so it reads and acts on nothing by itself.
+    Machine(String),
     Engine,
     Namespace(String),
     Project {
@@ -88,6 +90,7 @@ pub enum MouseTarget {
     InventoryRow(usize),
     PickerRow(usize),
     SettingsRow(usize),
+    ServerRow(usize),
     OptionRow(usize),
 }
 
@@ -234,6 +237,7 @@ impl App {
 
 #[derive(Clone)]
 struct NavigationState {
+    machine: Option<String>,
     project: Option<Project>,
     selected: Option<String>,
     tree_offset: usize,
@@ -352,6 +356,18 @@ pub struct App {
     pub auto_history_database: Option<PathBuf>,
     presentations: PresentationCache,
     pub engines: Vec<Engine>,
+    pub machines: Vec<crate::machines::Machine>,
+    /// The focused machine: a server name, or `machines::LOCAL_MACHINE`.
+    pub machine: Option<String>,
+    pub remote_connect: crate::remote::ConnectMode,
+    pub remotes_path: Option<PathBuf>,
+    pub remotes_problem: Option<String>,
+    pub remotes_modal: Option<crate::machines::RemotesModal>,
+    pub remote_commands: Vec<crate::machines::RemoteCommand>,
+    pub remote_availability: Vec<(usize, bool)>,
+    pub clipboard_request: Option<String>,
+    pending_machine: Option<String>,
+    local_machine_expanded: bool,
     pub context_order: Vec<usize>,
     pub context_pins: Vec<String>,
     pub context_sort: crate::context_sort::ContextSort,
@@ -468,6 +484,17 @@ impl App {
     ) -> Self {
         let context_order = (0..connections.len()).collect();
         let mut app = Self {
+            machines: Vec::new(),
+            machine: None,
+            remote_connect: Default::default(),
+            remotes_path: None,
+            remotes_problem: None,
+            remotes_modal: None,
+            remote_commands: Vec::new(),
+            remote_availability: Vec::new(),
+            clipboard_request: None,
+            pending_machine: None,
+            local_machine_expanded: false,
             service_modules: false,
             discover_connections: true,
             history_view: Default::default(),
@@ -887,7 +914,25 @@ impl App {
                 crate::i18n::t("Select a container or Compose workload")
             })
         })?;
+        // Checked first: a machine row only borrows an engine index to satisfy `Row`.
+        if matches!(row.scope, Scope::Machine(_)) {
+            anyhow::bail!(
+                "{}",
+                crate::i18n::t("Machines have no actions; select a workload inside one")
+            );
+        }
         let engine = &self.engines[row.engine];
+        if crate::remote::is_remote(&engine.connection)
+            && action == crate::actions::Action::Delete
+            && !self
+                .machine(self.machine_name(row.engine))
+                .is_some_and(|machine| machine.allow_delete)
+        {
+            anyhow::bail!(
+                "{}",
+                crate::i18n::t("Deleting is turned off on this server")
+            );
+        }
         if row.scope == Scope::Engine {
             if engine.alias.is_some() {
                 anyhow::bail!(
@@ -1317,6 +1362,18 @@ impl App {
             anyhow::bail!(
                 "{}",
                 crate::i18n::t("Demo mode: Compose operations are disabled")
+            );
+        }
+        // Stops here, before the local path check could match a same-named local project.
+        if self
+            .current()
+            .is_some_and(|row| crate::remote::is_remote(&self.engines[row.engine].connection))
+        {
+            anyhow::bail!(
+                "{}",
+                crate::i18n::t(
+                    "Compose is not available on servers: its files are on the server, not here"
+                )
             );
         }
         if self.compose_busy() {
@@ -2064,6 +2121,9 @@ impl App {
     }
 
     fn metrics_for_at(&self, row: &Row, now: std::time::Instant) -> crate::metrics::Summary {
+        if let Scope::Machine(name) = &row.scope {
+            return self.machine_metrics(name);
+        }
         let engine = &self.engines[row.engine];
         let Some(snapshot) = &engine.snapshot else {
             return Default::default();
@@ -2078,7 +2138,7 @@ impl App {
                         .is_none_or(|project| project.contains(c))
             }),
             now,
-            self.metrics_stale_after(),
+            self.engine_stale_after(row.engine),
             available,
         );
         // An observed empty workload has a known zero sum. This is distinct
@@ -2095,6 +2155,42 @@ impl App {
             return std::time::Duration::MAX;
         }
         std::time::Duration::from_secs(self.metrics_refresh_seconds.saturating_mul(3).max(3))
+    }
+
+    /// Servers sample more slowly to save traffic, so they also go stale more slowly.
+    fn engine_stale_after(&self, index: usize) -> std::time::Duration {
+        match self.machine(self.machine_name(index)) {
+            Some(machine) if !self.demo => std::time::Duration::from_secs(
+                machine.remote.metrics_seconds().saturating_mul(3).max(3),
+            ),
+            _ => self.metrics_stale_after(),
+        }
+    }
+
+    /// Totals across the machine's engines. Unmeasured engines add nothing, rather than zero.
+    fn machine_metrics(&self, name: &str) -> crate::metrics::Summary {
+        let mut total = crate::metrics::Summary::default();
+        for index in self.machine_engines(name) {
+            if self.engines[index].alias.is_some() {
+                continue;
+            }
+            let summary = self.engine_metrics(index);
+            total.cpu_percent = match (total.cpu_percent, summary.cpu_percent) {
+                (Some(a), Some(b)) => Some(a + b),
+                (a, b) => a.or(b),
+            };
+            total.memory_bytes = match (total.memory_bytes, summary.memory_bytes) {
+                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                (a, b) => a.or(b),
+            };
+            total.running += summary.running;
+            total.stopped += summary.stopped;
+            total.cpu_samples += summary.cpu_samples;
+            total.memory_samples += summary.memory_samples;
+            total.warming += summary.warming;
+            total.stale += summary.stale;
+        }
+        total
     }
 
     fn invalidate_presentations(&mut self) {
@@ -2238,7 +2334,7 @@ impl App {
         let mut summary = engine.metrics.summary(
             &snapshot.containers,
             std::time::Instant::now(),
-            self.metrics_stale_after(),
+            self.engine_stale_after(index),
             available,
         );
         if available && summary.running == 0 {
@@ -2251,6 +2347,9 @@ impl App {
     pub fn condition_for(&self, row: &Row) -> Option<Condition> {
         if matches!(row.scope, Scope::Resource { .. } | Scope::Resources { .. }) {
             return None;
+        }
+        if let Scope::Machine(name) = &row.scope {
+            return Some(self.machine_condition(name));
         }
         let engine = &self.engines[row.engine];
         if engine.alias.is_some() {
@@ -2357,10 +2456,7 @@ impl App {
         }
         let mut rows = Vec::new();
         let query = self.tree_query.to_lowercase();
-        for &index in &self.context_order {
-            let Some(tree) = self.explorer_tree(index) else {
-                continue;
-            };
+        for tree in self.explorer_nodes() {
             let mut expanded = HashSet::new();
             let mut pending = vec![&tree];
             while let Some(node) = pending.pop() {
@@ -2509,6 +2605,9 @@ impl App {
     }
 
     fn explorer_tree(&self, index: usize) -> Option<Node> {
+        if !self.engine_visible(index) {
+            return None;
+        }
         if self
             .project
             .as_ref()
@@ -2534,8 +2633,120 @@ impl App {
         })
     }
 
+    /// Local engines must not vanish behind a collapsed row when the first server is added.
+    fn expand_machines_once(&mut self) {
+        if self.machines.is_empty() || self.local_machine_expanded {
+            return;
+        }
+        let local = crate::machines::LOCAL_MACHINE;
+        if let Some(first) = self.machine_engines(local).into_iter().min() {
+            self.expanded
+                .insert(format!("{first}/{:?}", Scope::Machine(local.to_owned())));
+            self.local_machine_expanded = true;
+        }
+    }
+
+    fn machine_condition(&self, name: &str) -> Condition {
+        use crate::machines::MachineState;
+        match self.machine(name).map(|machine| &machine.state) {
+            Some(MachineState::NotConnected) => Condition::new(Tone::Neutral, "not connected"),
+            Some(MachineState::Connecting) => Condition::new(Tone::Warning, "connecting"),
+            Some(MachineState::Offline { .. }) => Condition::new(Tone::Warning, "unavailable"),
+            Some(MachineState::Connected) | None => {
+                let engines = self.machine_engines(name);
+                if engines
+                    .iter()
+                    .any(|&index| self.engines[index].error.is_some())
+                {
+                    return Condition::new(Tone::Warning, "unavailable");
+                }
+                if engines
+                    .iter()
+                    .any(|&index| self.engines[index].snapshot.is_none())
+                {
+                    return Condition::new(Tone::Warning, "connecting");
+                }
+                let members: Vec<_> = engines
+                    .iter()
+                    .filter(|&&index| self.engines[index].alias.is_none())
+                    .filter_map(|&index| self.engines[index].snapshot.as_ref())
+                    .flat_map(|snapshot| &snapshot.containers)
+                    .collect();
+                if members.is_empty() {
+                    Condition::new(Tone::Good, "connected")
+                } else {
+                    crate::model::runtime_condition(members)
+                }
+            }
+        }
+    }
+
+    fn machine_node(&self, name: &str, children: Vec<Node>) -> Option<Node> {
+        use crate::machines::{LOCAL_MACHINE, MachineState};
+        if name == LOCAL_MACHINE {
+            let first = self.machine_engines(name).into_iter().min()?;
+            return Some(node(
+                first,
+                Scope::Machine(name.to_owned()),
+                crate::i18n::t("Local").into(),
+                children,
+            ));
+        }
+        let machine = self.machine(name)?;
+        let status = match &machine.state {
+            MachineState::NotConnected => crate::i18n::t(" [not connected]"),
+            MachineState::Connecting => crate::i18n::t(" [connecting]"),
+            MachineState::Connected => "",
+            MachineState::Offline { .. } => crate::i18n::t(" (offline)"),
+        };
+        Some(node(
+            machine.anchor,
+            Scope::Machine(name.to_owned()),
+            format!("{name}{status}"),
+            children,
+        ))
+    }
+
+    fn engine_nodes(&self, machine: &str) -> Vec<Node> {
+        self.machine_engines(machine)
+            .into_iter()
+            .filter_map(|index| self.explorer_tree(index))
+            .collect()
+    }
+
+    /// The Explorer's top level. Without servers, or inside a Compose project, it stays a
+    /// plain list of engines, exactly as before machines existed.
+    fn explorer_nodes(&self) -> Vec<Node> {
+        use crate::machines::LOCAL_MACHINE;
+        if self.machines.is_empty() || self.project.is_some() {
+            return self
+                .context_order
+                .iter()
+                .filter_map(|&index| self.explorer_tree(index))
+                .collect();
+        }
+        if let Some(focus) = &self.machine {
+            let engines = self.engine_nodes(focus);
+            // Keeps a row, and so the state and the way to connect, while nothing is reachable.
+            if engines.is_empty() {
+                return self.machine_node(focus, Vec::new()).into_iter().collect();
+            }
+            return engines;
+        }
+        let mut forest: Vec<_> = self
+            .machine_node(LOCAL_MACHINE, self.engine_nodes(LOCAL_MACHINE))
+            .into_iter()
+            .collect();
+        for machine in &self.machines {
+            let name = &machine.remote.name;
+            forest.extend(self.machine_node(name, self.engine_nodes(name)));
+        }
+        forest
+    }
+
     pub fn refresh_tree(&mut self) {
         let previous = self.current().map(|r| r.key.clone());
+        self.expand_machines_once();
         if matches!(
             self.context_sort,
             crate::context_sort::ContextSort::ConnectedFirst
@@ -2544,10 +2755,7 @@ impl App {
             self.reorder_contexts();
         }
         let mut rows = Vec::new();
-        for &i in &self.context_order {
-            let Some(tree) = self.explorer_tree(i) else {
-                continue;
-            };
+        for tree in self.explorer_nodes() {
             flatten(
                 &tree,
                 0,
@@ -2743,11 +2951,27 @@ impl App {
 
     pub fn configure_startup(&mut self, cwd: PathBuf) {
         self.startup_cwd = Some(cwd);
-        self.startup_pending = (0..self.engines.len()).collect();
+        // Servers are excluded: they may never connect, and their paths are not local paths.
+        self.startup_pending = (0..self.engines.len())
+            .filter(|&index| !crate::remote::is_remote(&self.engines[index].connection))
+            .collect();
         self.notice = crate::i18n::t(
             "Matching the current directory to Compose projects… (--overview skips this)",
         )
         .into();
+    }
+
+    /// Restores a focused machine without connecting it, even for a server set to manual.
+    pub fn finish_preference_restore(&mut self) {
+        if let Some(name) = self.pending_machine.take()
+            && (self.machine(&name).is_some()
+                || (name == crate::machines::LOCAL_MACHINE && !self.machines.is_empty()))
+            && self.project.is_none()
+        {
+            self.machine = Some(name);
+            self.refresh_tree();
+            self.selected = 0;
+        }
     }
 
     pub fn cancel_startup(&mut self) {
@@ -2763,6 +2987,9 @@ impl App {
         restore_navigation: bool,
     ) {
         self.apply_saved_settings(preferences.settings);
+        self.pending_machine = restore_navigation
+            .then(|| preferences.machine.clone())
+            .flatten();
         // Only validated provider/name metadata is retained; no endpoints or commands.
         if let Some(home) = std::env::var_os("HOME") {
             for saved in &preferences.runtimes {
@@ -2865,6 +3092,7 @@ impl App {
             selected: self
                 .current()
                 .map(|current| row(current.engine, format!("{:?}", current.scope))),
+            machine: self.machine.clone(),
             project: self.project.as_ref().map(|project| {
                 row(
                     project.engine,
@@ -2895,6 +3123,15 @@ impl App {
             }
         };
         self.expanded = preferences.expanded.iter().filter_map(resolve).collect();
+        // Saved state may predate a server, so machine rows always start open.
+        self.local_machine_expanded = false;
+        for machine in &self.machines {
+            self.expanded.insert(format!(
+                "{}/{:?}",
+                machine.anchor,
+                Scope::Machine(machine.remote.name.clone())
+            ));
+        }
         self.refresh_tree();
         if let Some(saved) = &preferences.project
             && let Some(key) = resolve_preference_key(self, saved)
@@ -2923,6 +3160,10 @@ impl App {
     }
 
     pub fn open_selected(&mut self) {
+        if let Some(Scope::Machine(name)) = self.current().map(|row| row.scope.clone()) {
+            self.open_machine(&name);
+            return;
+        }
         if let Some(row) = self.current().cloned()
             && let Scope::Project { namespace, project } = row.scope
         {
@@ -2940,8 +3181,9 @@ impl App {
         self.detail_scroll = 0;
     }
 
-    pub fn open_project(&mut self, project: Project) {
+    pub(crate) fn push_navigation(&mut self) {
         self.history.push(NavigationState {
+            machine: self.machine.clone(),
             project: self.project.clone(),
             selected: self.current().map(|row| row.key.clone()),
             tree_offset: self.tree_offset,
@@ -2951,6 +3193,10 @@ impl App {
             tab: self.tab,
             detail_scroll: self.detail_scroll,
         });
+    }
+
+    pub fn open_project(&mut self, project: Project) {
+        self.push_navigation();
         let scope = Scope::Project {
             namespace: project.namespace.clone(),
             project: project.name.clone(),
@@ -2973,6 +3219,10 @@ impl App {
         let Some(previous) = self.history.pop() else {
             return false;
         };
+        // A server removed since this view was saved must not come back as a focus.
+        self.machine = previous
+            .machine
+            .filter(|name| name == crate::machines::LOCAL_MACHINE || self.machine(name).is_some());
         self.project = previous.project;
         self.performance_focus = false;
         self.exec_input = false;
@@ -3193,6 +3443,7 @@ fn find_project<'a>(node: &'a Node, project: &Project) -> Option<&'a Node> {
 
 pub fn matches_container(scope: &Scope, c: &Container) -> bool {
     match scope {
+        Scope::Machine(_) => false,
         Scope::Engine => true,
         Scope::Namespace(ns) => c.namespace.as_ref() == Some(ns),
         Scope::Project { namespace, project } | Scope::Services { namespace, project } => {
@@ -3253,7 +3504,11 @@ fn engine_tree(index: usize, engine: &Engine) -> Node {
     node(
         index,
         Scope::Engine,
-        format!("{}{status}", engine.connection.name),
+        format!(
+            "{}{status}",
+            crate::remote::parse_endpoint(&engine.connection.endpoint)
+                .map_or(engine.connection.name.as_str(), |(_, name)| name)
+        ),
         children,
     )
 }

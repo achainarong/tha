@@ -300,6 +300,12 @@ pub enum Event {
 
 /// How Compose is installed for this connection, tried in the order users expect.
 fn program(connection: &Connection) -> Result<std::process::Command> {
+    // The final guard: this would run local Compose files against the server's engine.
+    if crate::remote::is_remote(connection) {
+        bail!(crate::i18n::t(
+            "Compose is not available on servers: its files are on the server, not here"
+        ));
+    }
     let cli = crate::exec::runtime_cli(connection);
     if let Some((name, path)) = &cli {
         let mut probe = std::process::Command::new(path);

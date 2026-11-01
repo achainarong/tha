@@ -100,7 +100,7 @@ async fn start() -> Result<()> {
                 if cli.demo || cli.standalone {
                     bail!("daemon cannot be combined with --demo or --standalone");
                 }
-                let connections = connections(&cli, &config)?;
+                let connections = connections(&cli, &config, false)?;
                 return tha::daemon::run(config, connections).await;
             }
             tha::cli::Command::Service { action } => {
@@ -135,7 +135,7 @@ async fn start() -> Result<()> {
     let connections = if cli.demo {
         demo::connections()
     } else {
-        connections(&cli, &config)?
+        connections(&cli, &config, !cli.list_connections)?
     };
     if cli.list_connections {
         let discovery = if cli.demo || !config.discover_connections {
@@ -199,6 +199,14 @@ async fn start() -> Result<()> {
         config.metrics_refresh_seconds
     };
     app.context_pins = config.context_order;
+    if !cli.demo {
+        let path = tha::remote::managed_path(cli.config.as_deref());
+        let managed = path
+            .as_deref()
+            .map_or_else(|| Ok(Vec::new()), tha::remote::load_managed);
+        let path = path.filter(|_| config.save_preferences);
+        app.load_machines(std::mem::take(&mut config.remotes), managed, path);
+    }
     app.refresh_tree();
     if !cli.demo {
         app.selected = 0;
@@ -217,12 +225,16 @@ async fn start() -> Result<()> {
         mouse: config.mouse,
         log_wrap: config.log_wrap,
         language: config.language,
+        remote_connect: config.remote_connect,
     });
     if config.save_preferences && !cli.demo {
         app.preferences_path = tha::preferences::default_path();
         if let Some(path) = &app.preferences_path {
             match tha::preferences::load(path) {
-                Ok(Some(preferences)) => app.apply_preferences(preferences, !cli.overview),
+                Ok(Some(preferences)) => {
+                    app.apply_preferences(preferences, !cli.overview);
+                    app.finish_preference_restore();
+                }
                 Ok(None) => {}
                 Err(error) => {
                     eprintln!("tha: preferences ignored (existing file preserved): {error:#}");
@@ -234,7 +246,8 @@ async fn start() -> Result<()> {
     run(app, config.refresh_seconds).await
 }
 
-fn connections(cli: &Cli, config: &Config) -> Result<Vec<Connection>> {
+/// `allow_empty` is for the UI, where servers can be the only engines or be added later.
+fn connections(cli: &Cli, config: &Config, allow_empty: bool) -> Result<Vec<Connection>> {
     let mut connections = config.connections.clone();
     for value in &cli.connection {
         connections.push(parse_connection(value, BackendKind::Docker)?);
@@ -256,6 +269,9 @@ fn connections(cli: &Cli, config: &Config) -> Result<Vec<Connection>> {
     }
     if connections.is_empty() {
         if !config.discover_connections {
+            if allow_empty {
+                return Ok(connections);
+            }
             bail!("No connections configured; add [[connections]] or enable discover_connections");
         }
         connections.push(Connection {
@@ -339,7 +355,19 @@ fn sync_workers(
             continue;
         }
         let connection = engine.connection.clone();
-        if let Some(path) = &app.metrics_database {
+        // The daemon never collects from servers, so their metrics are always sampled here.
+        let server_seconds = tha::remote::server_of(&connection)
+            .and_then(|server| app.machines.iter().find(|m| m.remote.name == server))
+            .map(|machine| machine.remote.metrics_seconds());
+        if let Some(seconds) = server_seconds {
+            slot.tasks.push(AbortTask(tokio::spawn(metrics::worker(
+                index,
+                connection.clone(),
+                targets[index].subscribe(),
+                channels.metrics.clone(),
+                seconds,
+            ))));
+        } else if let Some(path) = &app.metrics_database {
             slot.tasks
                 .push(AbortTask(tokio::spawn(tha::daemon::metrics_worker(
                     index,
@@ -422,8 +450,14 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     };
     let (discovery_tx, mut discovery_rx) = mpsc::channel(1);
     let mut discovery_task = None;
+    let (remote_tx, mut remote_rx) = mpsc::channel::<tha::remote::Event>(16);
+    let mut remote_tasks = std::collections::HashMap::<String, AbortTask>::new();
     if !app.demo {
-        let available: Vec<_> = (0..app.engines.len()).map(|index| (index, true)).collect();
+        if !app.machines.is_empty() {
+            tha::remote::sweep_stale_sessions().await;
+        }
+        app.connect_startup_machines();
+        let available = app.worker_availability();
         sync_workers(
             &mut app,
             &available,
@@ -481,7 +515,9 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 Some(Ok(Event::Paste(text))) => {
                     redraw_now = true;
                     app.cancel_startup();
-                    if let Some(confirmation) = &mut app.action_confirmation {
+                    if app.servers_modal_visible() {
+                        app.servers_paste(&text);
+                    } else if let Some(confirmation) = &mut app.action_confirmation {
                         if confirmation.request.action == tha::actions::Action::Delete {
                             if text.chars().any(char::is_control) || confirmation.typed.len() + text.len() > 1024 {
                                 confirmation.error = Some(tha::i18n::t("Paste contains control characters or exceeds 1024 bytes; nothing pasted").into());
@@ -504,6 +540,10 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 app.update_engine(event.engine, event.result);
                 publish_metric_targets(&mut app, &metric_targets);
                 sync_event_watchers(&app, &mut event_watchers, &event_tx);
+                redraw_now = true;
+            },
+            Some(event) = remote_rx.recv() => {
+                app.apply_remote_event(event);
                 redraw_now = true;
             },
             Some(discovery) = discovery_rx.recv() => {
@@ -624,7 +664,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                                 app.metrics_database=running.then_some(path);
                                 app.metrics_refresh_seconds=if running {1} else {app.local_metrics_refresh_seconds};
                                 for worker in &mut workers { worker.connection=None; }
-                                let available: Vec<_>=(0..app.engines.len()).map(|index|(index,true)).collect();
+                                let available=app.worker_availability();
                                 sync_workers(&mut app,&available,&mut workers,&mut metric_targets,&channels,refresh_seconds);
                                 publish_metric_targets(&mut app,&metric_targets);
                                 app.notice=if running { tha::i18n::t("Connected to daemon metrics; local stats polling stopped") } else { tha::i18n::t("Daemon stopped; local stats sampling resumed") }.into();
@@ -639,6 +679,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 redraw_now |= app.tab == Tab::History && history_updated.elapsed() >= Duration::from_secs(1);
                 for notice in app.sessions.poll() {
                     redraw_now = true;
+                    if app.local_tool_finished(notice.id) { continue; }
                     if Some(notice.id) == app.sessions.active_id() { app.exec_input = false; }
                     app.notice = tha::tf!("Exec #{a0} {a1} · container was not stopped. F6 switches retained sessions.", a0 = notice.id, a1 = notice.status);
                 }
@@ -651,6 +692,46 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                     }
                 }
             }
+        }
+        for command in app.take_remote_commands() {
+            match command {
+                tha::machines::RemoteCommand::Connect { remote, generation } => {
+                    let name = remote.name.clone();
+                    // Replacing the entry drops the old session, which closes its SSH process.
+                    remote_tasks.insert(
+                        name,
+                        AbortTask(tokio::spawn(tha::remote::supervise(
+                            remote,
+                            generation,
+                            remote_tx.clone(),
+                        ))),
+                    );
+                }
+                tha::machines::RemoteCommand::Disconnect(name) => {
+                    remote_tasks.remove(&name);
+                }
+            }
+        }
+        let availability = app.take_remote_availability();
+        if !availability.is_empty() {
+            sync_workers(
+                &mut app,
+                &availability,
+                &mut workers,
+                &mut metric_targets,
+                &channels,
+                refresh_seconds,
+            );
+            publish_metric_targets(&mut app, &metric_targets);
+            sync_event_watchers(&app, &mut event_watchers, &event_tx);
+        }
+        if let Some(text) = app.clipboard_request.take() {
+            // OSC 52: the terminal decides whether to allow it, so the form says "if allowed".
+            let _ = std::io::Write::write_all(
+                &mut std::io::stdout(),
+                tha::remote::osc52(&text).as_bytes(),
+            );
+            let _ = std::io::Write::flush(&mut std::io::stdout());
         }
         if let Some(request) = app.exec_request.take() {
             app.start_exec(request);
@@ -1241,6 +1322,10 @@ fn handle_key(app: &mut App, key: KeyEvent, height: usize, refresh: &watch::Send
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return true;
+    }
+    if app.servers_modal_visible() {
+        app.servers_key(key);
+        return false;
     }
     if let Some(removal) = app.inventory_removal.as_mut()
         && !removal.dismissed
@@ -1904,6 +1989,8 @@ fn dispatch_navigation(
             app.help_scroll = 0;
         }
         A::Settings => app.settings = Some(Default::default()),
+        A::Servers => app.open_servers(),
+        A::ToggleConnection => app.toggle_selected_connection(),
         A::Commands => {
             app.input_mode = InputMode::Command;
             app.input.clear();
@@ -2544,6 +2631,18 @@ fn handle_mouse(
         MouseEventKind::ScrollDown => Some(KeyCode::Down),
         _ => None,
     };
+    if app.servers_modal_visible() {
+        if back {
+            return handle_key(app, KeyEvent::from(KeyCode::Esc), height, refresh);
+        }
+        if let Some(code) = wheel {
+            return handle_key(app, KeyEvent::from(code), height, refresh);
+        }
+        if let Some(MouseTarget::ServerRow(index)) = target {
+            app.select_server_row(index);
+        }
+        return false;
+    }
     if app.help
         || app.settings.is_some()
         || app.picker.is_some()
@@ -2643,6 +2742,7 @@ fn wheel_over(
         | T::InventoryRuntime(_)
         | T::PickerRow(_)
         | T::SettingsRow(_)
+        | T::ServerRow(_)
         | T::OptionRow(_) => {
             return false;
         }
@@ -2794,7 +2894,7 @@ fn click(
                 app.detail_focus = false;
             }
         }
-        T::PickerRow(_) | T::SettingsRow(_) | T::OptionRow(_) => {}
+        T::PickerRow(_) | T::SettingsRow(_) | T::ServerRow(_) | T::OptionRow(_) => {}
     }
     false
 }
@@ -3045,6 +3145,8 @@ fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>) -> bool {
         "all" => while app.back() {},
         "monochrome" => app.monochrome = !app.monochrome,
         "settings" => app.settings = Some(Default::default()),
+        "servers" => app.open_servers(),
+        "toggle-connection" => app.toggle_selected_connection(),
         "help" => {
             app.help = true;
             app.help_scroll = 0;

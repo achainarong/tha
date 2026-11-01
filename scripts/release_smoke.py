@@ -17,19 +17,23 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-ASSETS = ("tha-linux-amd64.tar.gz", "tha-linux-arm64.tar.gz", "tha-macos-arm64.tar.gz")
+BUILD_ASSETS = ("tha-linux-amd64.tar.gz", "tha-linux-arm64.tar.gz", "tha-macos-arm64.tar.gz")
+ASSETS = (*BUILD_ASSETS, "tha-agent-linux-amd64.tar.gz", "tha-agent-linux-arm64.tar.gz")
 
 
 def check_archive(path):
     with tarfile.open(path, "r:gz") as archive:
         members = archive.getmembers()
-        if sorted(member.name for member in members) != ["LICENSE", "README.md", "tha"]:
-            raise ValueError("Archive must contain exactly tha, LICENSE, README.md (no duplicate or hidden files)")
+        agent = Path(path).name.startswith("tha-agent-")
+        name = "tha-agent" if agent else "tha"
+        expected = ["LICENSE", "tha-agent"] if agent else ["LICENSE", "README.md", "tha"]
+        if sorted(member.name for member in members) != expected:
+            raise ValueError(f"Archive must contain exactly {', '.join(expected)} (no duplicate or hidden files)")
         if any(not member.isfile() for member in members):
             raise ValueError("Archive entries must be regular files; links and devices are forbidden")
-        binary = archive.getmember("tha")
+        binary = archive.getmember(name)
         if not binary.mode & 0o111 or binary.size == 0:
-            raise ValueError("Packaged tha must be nonempty and executable")
+            raise ValueError(f"Packaged {name} must be nonempty and executable")
 
 
 def fixture_archive(path, members=None):
@@ -160,7 +164,7 @@ shutil.copyfile(Path(os.environ['FIXTURES']) / args[4].rsplit('/',1)[1], args[ar
                 calls = (home / "calls").read_text().splitlines() if (home / "calls").exists() else []
                 if expected is None:
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("mode must be standalone or service", result.stderr)
+                    self.assertIn("mode must be standalone, service or agent", result.stderr)
                     self.assertEqual(calls, [])
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -225,7 +229,7 @@ if args[0]=='api': print('moved' if mode=='moved' else 'fixture-commit')
 elif args[:2]==['release','view']: raise SystemExit(0 if mode=='exists' else 1)
 elif args[:2]==['release','create']:
     assert '--draft' in args and '--verify-tag' in args
-    assert sorted(arg for arg in args if arg.startswith('dist/')) == sorted('dist/'+name for name in ['tha-linux-amd64.tar.gz','tha-linux-arm64.tar.gz','tha-macos-arm64.tar.gz','SHA256SUMS'])
+    assert sorted(arg for arg in args if arg.startswith('dist/')) == sorted('dist/'+name for name in ['tha-agent-linux-amd64.tar.gz','tha-agent-linux-arm64.tar.gz','tha-linux-amd64.tar.gz','tha-linux-arm64.tar.gz','tha-macos-arm64.tar.gz','SHA256SUMS'])
     if mode=='upload-failure': raise SystemExit(1)
 elif args[:2]==['release','edit']:
     assert args[-1]=='--draft=false'
@@ -260,7 +264,7 @@ else: raise SystemExit('unexpected command')
                 package.addfile(member)
         with self.assertRaises(ValueError): check_archive(archive)
         matrix = self.workflow["jobs"]["build"]["strategy"]["matrix"]["include"]
-        self.assertEqual({entry["asset"] for entry in matrix}, set(ASSETS))
+        self.assertEqual({entry["asset"] for entry in matrix}, set(BUILD_ASSETS))
         self.assertEqual({entry["target"] for entry in matrix}, {"x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin"})
         self.assertEqual(self.workflow["jobs"]["publish"]["needs"], ["validate", "build"])
 

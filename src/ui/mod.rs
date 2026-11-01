@@ -26,6 +26,7 @@ mod diagnostics;
 mod events;
 mod history;
 pub mod inventory;
+mod remotes;
 mod security;
 mod settings;
 
@@ -324,7 +325,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             crate::tf!(
                 "{connected} connected / {a0} configured",
                 connected = connected,
-                a0 = app.engines.len()
+                a0 = app.configured_engine_count()
             ),
             muted(),
         ),
@@ -345,6 +346,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .unwrap_or_default(),
             a2 = safe_text(&project.name)
         )
+    } else if let Some(machine) = &app.machine {
+        let name = if machine == crate::machines::LOCAL_MACHINE {
+            crate::i18n::t("Local").to_owned()
+        } else {
+            safe_text(machine)
+        };
+        crate::tf!(" All runtimes › {name}  · Backspace Back", name = name)
+    } else if !app.machines.is_empty() {
+        crate::i18n::t(" All runtimes · Enter a machine or Compose project to focus it").into()
     } else {
         crate::i18n::t(" All runtimes · Enter a Compose project to focus it").into()
     };
@@ -419,6 +429,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.settings.is_some() {
         settings::draw(frame, app, area);
+    }
+    if app.servers_modal_visible() {
+        remotes::draw(frame, app, area);
     }
     if app.input_mode == InputMode::Command {
         draw_palette(frame, app, area);
@@ -707,6 +720,19 @@ fn draw_action_confirmation(frame: &mut Frame, app: &mut App, area: Rect) {
         a0 = safe_text(&request.connection.name)
     ));
     let mut lines = Vec::new();
+    // On a remote server this is what prevents acting on the wrong machine.
+    if let Some(machine) =
+        crate::remote::server_of(&request.connection).and_then(|server| app.machine(server))
+    {
+        lines.push(Line::styled(
+            crate::tf!(
+                "On server {name} ({address})",
+                name = safe_text(&machine.remote.name),
+                address = safe_text(&machine.remote.address())
+            ),
+            accent(app, Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
     if request.runtime.is_some() {
         lines.push(Line::styled(
             match request.action {
@@ -1174,6 +1200,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
             if let Some(condition) = condition.filter(|condition| {
                 matches!(condition.tone, Tone::Error | Tone::Warning)
                     && !matches!(condition.label, "errors" | "workload issues")
+                    && !matches!(row.scope, Scope::Machine(_))
                     && (!matches!(row.scope, Scope::Engine)
                         || app.engines[row.engine].error.is_none()
                             && app.engines[row.engine].snapshot.is_some())
@@ -2071,12 +2098,86 @@ fn draw_usage(frame: &mut Frame, app: &App, index: usize, area: Rect) {
     );
 }
 
+fn machine_lines(app: &App, name: &str) -> Vec<Line<'static>> {
+    use crate::machines::MachineState;
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let mut lines = Vec::new();
+    if let Some(machine) = app.machine(name) {
+        lines.push(Line::styled(safe_text(name), bold));
+        lines.push(Line::styled(safe_text(&machine.remote.address()), muted()));
+        lines.push(Line::from(""));
+        match &machine.state {
+            MachineState::NotConnected => lines.push(Line::from(crate::i18n::t(
+                "Not connected, so no traffic is sent. Enter connects and opens this server.",
+            ))),
+            MachineState::Connecting => {
+                lines.push(Line::from(crate::i18n::t("Connecting over SSH…")))
+            }
+            MachineState::Offline { reason, retrying } => {
+                lines.push(Line::styled(
+                    if *retrying {
+                        crate::i18n::t("Offline, retrying")
+                    } else {
+                        crate::i18n::t("Needs attention")
+                    },
+                    accent(app, Color::Yellow),
+                ));
+                lines.push(Line::from(safe_text(reason)));
+            }
+            MachineState::Connected => lines.push(Line::from(crate::tf!(
+                "Connected · delete {delete}",
+                delete = if machine.allow_delete {
+                    crate::i18n::t("on")
+                } else {
+                    crate::i18n::t("off")
+                }
+            ))),
+        }
+        lines.push(Line::from(crate::tf!(
+            "SSH key      {key}",
+            key = safe_text(&machine.remote.identity_file)
+        )));
+    } else {
+        lines.push(Line::styled(crate::i18n::t("Local"), bold));
+    }
+    lines.push(Line::from(""));
+    for index in app.machine_engines(name) {
+        let engine = &app.engines[index];
+        let containers = engine.snapshot.as_ref().map(|snapshot| {
+            (
+                snapshot.containers.iter().filter(|c| c.running()).count(),
+                snapshot.containers.len(),
+            )
+        });
+        let summary = match containers {
+            Some((running, total)) => {
+                crate::tf!(
+                    "{running}/{total} running",
+                    running = running,
+                    total = total
+                )
+            }
+            None => crate::i18n::t("connecting").into(),
+        };
+        lines.push(Line::from(format!(
+            "  {} · {summary}",
+            safe_text(&engine.connection.name)
+        )));
+    }
+    lines
+}
+
 fn overview_lines(app: &App) -> Vec<Line<'static>> {
     let Some(row) = app.current() else {
-        return vec![Line::from(crate::i18n::t(
-            "Select a runtime or workload in the explorer.",
-        ))];
+        return vec![Line::from(if app.engines.is_empty() {
+            crate::i18n::t("No engines yet. Press . or type :servers to add a server.")
+        } else {
+            crate::i18n::t("Select a runtime or workload in the explorer.")
+        })];
     };
+    if let Scope::Machine(name) = &row.scope {
+        return machine_lines(app, name);
+    }
     let engine = &app.engines[row.engine];
     let mut lines = vec![
         Line::styled(

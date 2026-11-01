@@ -96,6 +96,26 @@ impl Sessions {
         let session = Session::start(request, command, dimensions.0, dimensions.1)?;
         self.insert(session)
     }
+    /// A command on this machine that needs a terminal, such as `ssh` asking about a host key.
+    pub fn open_local_tool(
+        &mut self,
+        title: &str,
+        kind: &str,
+        command: std::process::Command,
+        dimensions: (u16, u16),
+    ) -> Result<u64> {
+        let _ = self.poll();
+        if self.entries.len() >= self.limit {
+            bail!(crate::tf!(
+                "Exec session limit reached ({open}/{limit} retained). Use F6 to select one and :close-exec to free a slot",
+                open = self.len(),
+                limit = self.limit
+            ));
+        }
+        let request = crate::machines::local_tool_request(title, kind);
+        let session = Session::start(request, command, dimensions.0, dimensions.1)?;
+        self.insert(session)
+    }
     fn insert(&mut self, terminal: Session) -> Result<u64> {
         let id = self.next_id;
         self.next_id = self

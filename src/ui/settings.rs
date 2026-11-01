@@ -11,7 +11,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     let on_off = |value: bool| if value { t("On") } else { t("Off") };
-    let area = centered(area, 72, 15);
+    let area = centered(area, 72, 17);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
         .title(t(" Settings "))
@@ -27,6 +27,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             SettingRow::Keyboard => (t("Keyboard layout"), Some(t(app.keyboard.label()))),
             SettingRow::Mouse => (t("Mouse"), Some(on_off(app.mouse_enabled))),
             SettingRow::WrapLogs => (t("Wrap logs"), Some(on_off(app.log_view.wrap))),
+            SettingRow::RemoteConnect => {
+                (t("Connect to servers"), Some(app.remote_connect.label()))
+            }
+            SettingRow::Servers => (t("Servers"), None),
             SettingRow::Reset => (t("Reset to defaults"), None),
         };
         let text = match (row, value) {
@@ -66,6 +70,14 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         )),
         SettingRow::WrapLogs => lines.push(Line::styled(
             t("The same setting as w in the log pane."),
+            muted(),
+        )),
+        SettingRow::RemoteConnect => lines.push(Line::styled(
+            t("Used when tha opens. The background service never connects to servers."),
+            muted(),
+        )),
+        SettingRow::Servers => lines.push(Line::styled(
+            t("Enter adds, edits or removes servers."),
             muted(),
         )),
         SettingRow::Reset => lines.push(Line::styled(

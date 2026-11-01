@@ -367,6 +367,8 @@ catalog! {
     RemovalResults, "Last cleanup results", ["removal-results"], Global, 40, false, [], [];
     Monochrome, "Toggle terminal colors", ["monochrome"], Global, 40, false, [], [];
     Settings, "Settings: theme, language, keyboard layout, mouse", ["settings"], Global, 25, false, [","], [];
+    Servers, "Servers: add, edit or remove remote servers", ["servers"], Global, 26, false, ["."], [];
+    ToggleConnection, "Connect or disconnect the selected server", ["toggle-connection"], Containers, 41, false, ["shift-c"], [];
     Quit, "Quit Tha", ["quit", "q"], Global, 40, false, ["ctrl-c"], [];
 }
 
@@ -499,6 +501,8 @@ impl ActionId {
             Self::RemovalResults => "removal-results",
             Self::Monochrome => "monochrome",
             Self::Settings => "settings",
+            Self::Servers => "servers",
+            Self::ToggleConnection => "toggle-connection",
             Self::Quit => "quit",
         }
     }

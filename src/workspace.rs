@@ -23,7 +23,11 @@ pub fn directory_matches(engines: &[Engine], cwd: &Path) -> Vec<Project> {
     let mut matches = BTreeSet::new();
     let mut deepest = 0;
     for (engine_index, engine) in engines.iter().enumerate() {
-        if engine.error.is_some() || engine.alias.is_some() {
+        // A server's Compose paths say nothing about this machine's filesystem.
+        if engine.error.is_some()
+            || engine.alias.is_some()
+            || crate::remote::is_remote(&engine.connection)
+        {
             continue;
         }
         let Some(snapshot) = &engine.snapshot else {

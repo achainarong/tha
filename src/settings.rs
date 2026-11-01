@@ -11,6 +11,7 @@ pub struct SavedSettings {
     pub keyboard: Option<KeyboardPreset>,
     pub mouse: Option<bool>,
     pub language: Option<Language>,
+    pub remote_connect: Option<crate::remote::ConnectMode>,
 }
 
 /// What the settings fall back to: config.toml, or the built-in defaults.
@@ -21,6 +22,7 @@ pub struct BaseSettings {
     pub mouse: bool,
     pub log_wrap: bool,
     pub language: Language,
+    pub remote_connect: crate::remote::ConnectMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +32,8 @@ pub enum SettingRow {
     Keyboard,
     Mouse,
     WrapLogs,
+    RemoteConnect,
+    Servers,
     Reset,
 }
 
@@ -40,6 +44,8 @@ impl SettingRow {
         Self::Keyboard,
         Self::Mouse,
         Self::WrapLogs,
+        Self::RemoteConnect,
+        Self::Servers,
         Self::Reset,
     ];
 }
@@ -109,6 +115,7 @@ impl App {
         self.log_view.wrap = base.log_wrap;
         self.set_theme(base.theme);
         self.set_keyboard(base.keyboard);
+        self.remote_connect = base.remote_connect;
     }
 
     pub fn apply_saved_settings(&mut self, saved: SavedSettings) {
@@ -118,6 +125,7 @@ impl App {
         self.mouse_enabled = saved.mouse.unwrap_or(base.mouse);
         self.set_theme(saved.theme.unwrap_or(base.theme));
         self.set_keyboard(saved.keyboard.unwrap_or(base.keyboard));
+        self.remote_connect = saved.remote_connect.unwrap_or(base.remote_connect);
     }
 
     pub fn move_setting(&mut self, amount: isize) {
@@ -153,6 +161,22 @@ impl App {
                 self.saved_settings.mouse = Some(self.mouse_enabled);
             }
             SettingRow::WrapLogs => self.log_view.toggle_wrap(&self.logs),
+            // Only the next start reads this; it never opens or closes a connection now.
+            SettingRow::RemoteConnect => {
+                let mode = cycled(
+                    &crate::remote::ConnectMode::ALL,
+                    self.remote_connect,
+                    forward,
+                );
+                self.remote_connect = mode;
+                self.saved_settings.remote_connect = Some(mode);
+            }
+            SettingRow::Servers if confirm => {
+                self.settings = None;
+                self.open_servers();
+                return;
+            }
+            SettingRow::Servers => return,
             SettingRow::Reset if confirm => {
                 self.apply_saved_settings(SavedSettings::default());
                 if self.log_view.wrap != self.base_settings.log_wrap {
@@ -262,6 +286,7 @@ mod tests {
             mouse: false,
             log_wrap: true,
             language: Language::English,
+            remote_connect: crate::remote::ConnectMode::Startup,
         });
         assert_eq!(app.theme, Theme::Nord);
         assert_eq!(app.keyboard, KeyboardPreset::German);

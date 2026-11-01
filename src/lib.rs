@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod agent;
 pub mod app;
 pub mod backend;
 pub mod cli;
@@ -20,10 +21,12 @@ pub mod keymap;
 pub mod layers;
 pub mod live;
 pub mod logs;
+pub mod machines;
 pub mod metrics;
 pub mod model;
 pub mod platform;
 pub mod preferences;
+pub mod remote;
 pub mod runtime;
 pub mod security;
 pub mod service;

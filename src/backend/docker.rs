@@ -14,6 +14,13 @@ use bollard::{
 use futures_util::StreamExt;
 
 pub fn connect(connection: &Connection) -> Result<Docker> {
+    // The one place a remote server becomes a socket. Everything above it stays transport-blind.
+    if let Some(socket) = crate::remote::local_socket(&connection.endpoint) {
+        let socket = socket
+            .to_str()
+            .context("Remote socket path is not valid text")?;
+        return Ok(Docker::connect_with_unix(socket, 30, API_DEFAULT_VERSION)?);
+    }
     let path = connection
         .endpoint
         .strip_prefix("unix://")
@@ -44,6 +51,15 @@ pub async fn runtime_identity(
     });
     if !podman {
         return Ok(info.id.clone().filter(|id| !id.is_empty()));
+    }
+    // The local socket says nothing about a server, and is recreated on every reconnect. The
+    // engine's reported host still changes if the name is later pointed at another machine.
+    if crate::remote::is_remote(connection) {
+        return Ok(Some(format!(
+            "podman:{}:{}",
+            connection.endpoint,
+            info.name.as_deref().unwrap_or_default()
+        )));
     }
     let path = connection
         .endpoint

@@ -174,3 +174,99 @@ fn security_rejects_explicit_standalone_before_any_download() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("service module"));
 }
+
+/// Agent mode with a fixture release, as root or not according to the mocked `id`.
+fn run_agent(
+    uid: &str,
+    arguments: &[&str],
+    modules: &str,
+) -> (tempfile::TempDir, std::process::Output) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join("mock")).unwrap();
+    fs::create_dir(root.join("assets")).unwrap();
+    script(
+        &root.join("assets/tha-agent"),
+        "#!/bin/sh\n[ \"$1\" = --version ] && echo 'tha-agent fixture'\n",
+    );
+    assert!(
+        Command::new("tar")
+            .args(["-czf"])
+            .arg(root.join("assets/tha-agent-linux-amd64.tar.gz"))
+            .arg("-C")
+            .arg(root.join("assets"))
+            .arg("tha-agent")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let sum = Command::new("sha256sum")
+        .arg("tha-agent-linux-amd64.tar.gz")
+        .current_dir(root.join("assets"))
+        .output()
+        .unwrap();
+    fs::write(root.join("assets/SHA256SUMS"), sum.stdout).unwrap();
+    script(
+        &root.join("mock/curl"),
+        "#!/bin/sh\necho \"$@\" >> \"$INSTALL_LOG\"\nfor arg do case $arg in https://*) url=$arg;; esac; done\nwhile [ $# -gt 0 ]; do if [ \"$1\" = -o ]; then shift; out=$1; fi; shift; done\ncp \"$INSTALL_FIXTURES/${url##*/}\" \"$out\"\n",
+    );
+    script(
+        &root.join("mock/uname"),
+        "#!/bin/sh\ncase $1 in -s) echo \"${MOCK_OS:-Linux}\";; -m) echo x86_64;; esac\n",
+    );
+    script(&root.join("mock/id"), &format!("#!/bin/sh\necho {uid}\n"));
+    let output = Command::new("sh")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/install.sh"))
+        .args(arguments)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("mock").display()),
+        )
+        .env("HOME", root)
+        .env("TMPDIR", root)
+        .env("MODULES", modules)
+        .env_remove("THA_MODE")
+        .env("THA_BIN_DIR", root.join("installed"))
+        .env("INSTALL_FIXTURES", root.join("assets"))
+        .env("INSTALL_LOG", root.join("calls"))
+        .env("THA_INSTALL_LOG_DIR", root.join("logs"))
+        .output()
+        .unwrap();
+    (temp, output)
+}
+
+#[test]
+fn agent_mode_installs_only_the_gate_and_starts_nothing() {
+    let (temp, output) = run_agent("0", &["agent"], "");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(temp.path().join("installed/tha-agent").exists());
+    assert!(!temp.path().join("installed/tha").exists());
+    assert!(stdout.contains("tha-agent fixture"), "{stdout}");
+    let calls = fs::read_to_string(temp.path().join("calls")).unwrap();
+    assert!(calls.contains("tha-agent-linux-amd64.tar.gz"), "{calls}");
+    assert!(!calls.contains("/tha-linux-amd64"), "{calls}");
+    assert!(!calls.contains("service"), "{calls}");
+}
+
+#[test]
+fn agent_mode_refuses_non_root_before_writing_anything() {
+    let (temp, output) = run_agent("1000", &["agent"], "");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("sudo sh -s -- agent"), "{stderr}");
+    assert!(!temp.path().join("calls").exists(), "nothing downloaded");
+    assert!(
+        !temp.path().join("logs").exists(),
+        "no root-owned logs in a user's home"
+    );
+    assert!(!temp.path().join("installed").exists());
+}
+
+#[test]
+fn agent_mode_refuses_modules_before_downloading() {
+    let (temp, output) = run_agent("0", &["agent"], "security");
+    assert!(!output.status.success());
+    assert!(!temp.path().join("calls").exists());
+    assert!(!temp.path().join("installed").exists());
+}

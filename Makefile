@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build release run demo install install\:full uninstall fmt lint test check clean
+.PHONY: help build release run demo install install\:full install\:agent uninstall fmt lint test check clean
 
 # Locally, tests and lint leave the rest of the machine free. Override with: make check CPUS=8
 # CI runners set CI, and there the job can use the whole machine.
@@ -45,7 +45,7 @@ MODE ?= standalone
 
 install: ## Install tha into Cargo's bin directory (MODE=standalone|service, no sudo)
 	@case "$(MODE)" in standalone|service) ;; *) echo "MODE must be standalone or service" >&2; exit 1 ;; esac
-	cargo install --path . --locked
+	cargo install --path . --locked --bin tha
 	@# Replace any existing service (e.g. one from the curl installer) so it runs this build.
 	@if [ "$(MODE)" = "service" ]; then \
 		tha="$${CARGO_HOME:-$$HOME/.cargo}/bin/tha"; \
@@ -56,6 +56,10 @@ install\:full: ## Install tha in service mode with the security module enabled
 	$(MAKE) install MODE=service
 	"$${CARGO_HOME:-$$HOME/.cargo}/bin/tha" module install security
 	"$${CARGO_HOME:-$$HOME/.cargo}/bin/tha" module enable security
+
+install\:agent: ## Install only tha-agent into /usr/local/bin for a server (uses sudo)
+	cargo build --release --locked --bin tha-agent
+	sudo install -m 755 -o root target/release/tha-agent /usr/local/bin/tha-agent
 
 uninstall: ## Uninstall tha using Cargo
 	cargo uninstall tha
