@@ -1334,7 +1334,8 @@ and `sftp` still do not work.
 
 The local service keeps metrics and events for 24 hours. Set `history_retention_hours` in `config.toml`, up to
 720, to keep more, and pan back in the Metrics tab to see it. `history_disk_mb` still limits the size, and
-when it is reached new readings stop being saved rather than old ones being lost. Readings are kept at
+when it is reached new readings stop being saved rather than old ones being lost. Saving resumes as old
+readings expire, and a file left larger than a lowered budget shrinks once they have. Readings are kept at
 full detail, so a long retention needs a larger budget. Agents on servers always keep 24 hours.
 
 ## Scripting
@@ -1351,7 +1352,7 @@ empty one. Servers are not included, because connecting can need a passphrase a 
 
 ## Updating
 
-`tha update` installs the latest release into the folder Tha is in, using the same installer as the README,
+`tha update` installs the latest release into the folder Tha is in, using the installer published with it,
 and `tha update --check` only reports. Set `check_updates = true` in `config.toml` to be told at startup;
 that contacts GitHub, so it is off by default. Agents update separately: `:capabilities` shows when a
 server's agent is older than Tha, and rerunning the setup command on the server updates it. Removing a server

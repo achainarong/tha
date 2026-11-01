@@ -35,7 +35,9 @@
 #   THA_INSTALL_LOG_DIR=...  debug log directory (default ~/.local/state/tha/install)
 #
 # Updating stops a running collector before the binary is replaced and starts it
-# again afterwards, in either mode. Configuration and history are left alone.
+# again afterwards, in either mode. Configuration and history are left alone. The new
+# binary is checked before anything stops, replaces the old one in a single step, and
+# if the update then fails, the old one goes back and is started again.
 set -eu
 
 REPO=achainarong/tha
@@ -133,6 +135,10 @@ log_file=$(mktemp "$log_dir/install-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX") ||
     die "couldn't create installer log in $log_dir"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/tha-install.XXXXXX") || die "couldn't create installer workspace; log: $log_file"
 stage=initialization
+staged=
+previous=
+stopped=
+bin=
 # A FIFO keeps subprocess output live (including module setup), without losing
 # command failures to a pipeline or requiring bash/process substitution.
 mkfifo "$tmp/output" "$tmp/errors" || die "couldn't create installer output pipes; log: $log_file"
@@ -142,9 +148,28 @@ logger_pid=$!
 tee -a "$log_file" < "$tmp/errors" >&2 &
 logger_err_pid=$!
 exec > "$tmp/output" 2> "$tmp/errors"
+# Leave what worked before: runs on any failure, including an interrupted update.
+restore_previous() {
+    [ -z "$staged" ] || rm -f "$staged"
+    if [ -n "$previous" ] && [ -e "$previous" ]; then
+        if mv -f "$previous" "$bin"; then
+            say "put the previous version back" >&2
+        fi
+    fi
+    if [ -n "$stopped" ]; then
+        if [ "$MODE" = agent ]; then
+            systemctl start tha-agent.service || say "couldn't restart tha-agent.service" >&2
+        else
+            "$bin" service start || say "couldn't restart the background collector" >&2
+        fi
+    fi
+}
 finish() {
     status=$?
     trap - EXIT HUP INT TERM
+    if [ "$status" != 0 ]; then
+        restore_previous
+    fi
     if [ "$status" = 0 ]; then
         say "installation complete; debug log: $log_file"
     else
@@ -271,17 +296,42 @@ step "unpacking release"
 run tar -xzf "$tmp/$asset" -C "$tmp" "$command_name" || die "couldn't unpack $asset; nothing installed"
 
 bin=$BIN_DIR/$command_name
+# Beside its final name, so moving it there is one step, and where it is sure to be allowed to
+# run. Nothing has been stopped or replaced yet if it turns out not to work on this system.
+step "checking the new version"
+run mkdir -p "$BIN_DIR"
+staged=$(mktemp "$BIN_DIR/.$command_name.XXXXXX") || die "couldn't write to $BIN_DIR; nothing installed"
+run cp "$tmp/$command_name" "$staged"
+run chmod 755 "$staged"
+installed_version=$(run "$staged" --version) || die "the new $command_name doesn't run on this system; nothing installed"
+
+replace_binary() {
+    if [ -e "$bin" ]; then
+        previous=$bin.previous
+        run ln -f "$bin" "$previous" || run cp -p "$bin" "$previous"
+    fi
+    run mv -f "$staged" "$bin"
+    staged=
+    say "installed $installed_version to $bin"
+}
+# From here on a failure no longer undoes the update.
+keep_update() {
+    [ -z "$previous" ] || rm -f "$previous"
+    previous=
+    stopped=
+}
+
 if [ "$MODE" = agent ]; then
     step "installing tha-agent to $BIN_DIR"
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet tha-agent.service; then
         run systemctl stop tha-agent.service
+        stopped=1
     fi
-    run mkdir -p "$BIN_DIR"
-    run install -m 755 "$tmp/tha-agent" "$bin"
-    say "installed $(run "$bin" --version) to $bin"
+    replace_binary
     if [ -z "$agent_key$agent_user" ]; then
         if [ -r /etc/tha/agent.toml ]; then
             run "$bin" install-service
+            keep_update
             say "existing setup kept; agent service restarted"
             if ! grep -q '^service_uid' /etc/tha/agent.toml; then
                 say "legacy policy: rerun setup with --key and --user to enable dedicated-user service access"
@@ -291,6 +341,7 @@ if [ "$MODE" = agent ]; then
             say "  dedicated user (recommended): --key 'PUBLIC_KEY'"
             say "  existing root key:            --user root"
         fi
+        keep_update
         exit 0
     fi
     step "setting up tha-agent"
@@ -312,7 +363,8 @@ if [ "$MODE" = agent ]; then
     [ -z "$agent_security_interval" ] || set -- "$@" --security-interval "$agent_security_interval"
     [ -z "$agent_no_security" ] || set -- "$@" --no-security
     run "$bin" "$@" < /dev/null ||
-        die "tha-agent was installed, but setup failed; fix the problem above and run this again"
+        die "tha-agent setup failed; fix the problem above and run this again"
+    keep_update
     exit 0
 fi
 running=0
@@ -322,12 +374,10 @@ if [ -x "$bin" ] && "$bin" service status 2>> "$log_file" | grep -q ': running$'
     step "stopping the background collector for the update"
     run "$bin" service stop
     running=1
+    stopped=1
 fi
 step "installing binary to $BIN_DIR"
-run mkdir -p "$BIN_DIR"
-run install -m 755 "$tmp/tha" "$bin"
-installed_version=$(run "$bin" --version)
-say "installed $installed_version to $bin"
+replace_binary
 
 if [ "$MODE" = service ]; then
     step "installing background collector service"
@@ -340,6 +390,7 @@ elif [ "$running" = 1 ]; then
     run "$bin" service start
     say "background collector restarted; remove it with: tha service uninstall"
 fi
+keep_update
 
 case ,$MODULES, in
     *,security,*)
@@ -351,5 +402,13 @@ esac
 
 case :$PATH: in
     *:"$BIN_DIR":*) ;;
-    *) say "$BIN_DIR isn't on your PATH; add it to use the tha command in a shell" ;;
+    *)
+        say "$BIN_DIR isn't on your PATH, so the tha command won't be found yet. To add it, run:"
+        case ${SHELL:-} in
+            */fish) say "  fish_add_path $BIN_DIR" ;;
+            */zsh) say "  echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.zshrc && source ~/.zshrc" ;;
+            */bash) say "  echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.bashrc && source ~/.bashrc" ;;
+            *) say "  export PATH=\"$BIN_DIR:\$PATH\"" ;;
+        esac
+        ;;
 esac

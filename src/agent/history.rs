@@ -73,6 +73,19 @@ pub struct Response {
     pub data: history::Data,
 }
 
+const RESTART_MIN: Duration = Duration::from_secs(5);
+const RESTART_MAX: Duration = Duration::from_secs(300);
+
+/// The agent's own files, in a folder only it uses, so damage can always be moved aside.
+async fn open_store(path: PathBuf) -> Result<history::Store> {
+    tokio::task::spawn_blocking(move || {
+        let store = history::Store::open_recovering(&path, DISK_BYTES)?;
+        store.mark_collector()?;
+        Ok(store)
+    })
+    .await?
+}
+
 pub struct Engine {
     path: PathBuf,
     events_path: PathBuf,
@@ -130,12 +143,7 @@ impl Engine {
     pub async fn start(engine: &super::AgentEngine, path: PathBuf) -> Result<(Arc<Self>, Worker)> {
         let events_path = path.with_file_name(format!("events-{}.sqlite3", engine.name));
         let open_path = path.clone();
-        let store = tokio::task::spawn_blocking(move || {
-            let store = history::Store::open(&open_path, DISK_BYTES)?;
-            store.mark_collector()?;
-            Ok::<_, anyhow::Error>(store)
-        })
-        .await??;
+        let store = open_store(open_path).await?;
         let live: live::Shared = Arc::new(Mutex::new(Default::default()));
         let server = live::Server::bind(&path, live.clone())?;
         let connection = Connection {
@@ -151,44 +159,96 @@ impl Engine {
             claims: claims.clone(),
             queries: Arc::new(Semaphore::new(2)),
         });
-        let (sender, receiver) = mpsc::channel(8);
         let dropped = Arc::new(AtomicU64::new(0));
-        let mut writer =
-            crate::daemon::spawn_writer(path, store, live.clone(), dropped.clone(), receiver);
-        let collector = tokio::spawn(collector::run(
-            connection,
-            5,
-            sender.clone(),
-            dropped,
-            claims,
-            Arc::new(Semaphore::new(2)),
-            live,
-            Some(crate::events::spawn_writer(events_path.clone())),
-        ));
+        let events = crate::events::spawn_writer(events_path.clone(), true);
+        let budget = Arc::new(Semaphore::new(2));
+        let name = engine.name.clone();
         let (stop, mut shutdown) = watch::channel(false);
+        // The agent keeps serving its engine whatever happens here, and nothing else would notice
+        // history stopping, so this runs until shutdown and starts again after any failure.
         let task = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(live::FLUSH_SECONDS));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let writer_result = loop {
-                tokio::select! {
-                    _ = shutdown.changed() => break None,
-                    result = &mut writer => break Some(result),
-                    _ = tick.tick() => {
-                        if collector.is_finished() || server.is_finished() { break None; }
-                        let _ = sender.try_send(collector::WriteBatch { runtime: String::new(), samples: vec![], flush: true });
+            let mut store = Some(store);
+            let mut server = Some(server);
+            let mut delay = RESTART_MIN;
+            loop {
+                let started = std::time::Instant::now();
+                let (sender, receiver) = mpsc::channel(8);
+                let mut writer = crate::daemon::spawn_writer(
+                    path.clone(),
+                    store.take().context("History store unavailable")?,
+                    live.clone(),
+                    dropped.clone(),
+                    receiver,
+                );
+                let collector = tokio::spawn(collector::run(
+                    connection.clone(),
+                    5,
+                    sender.clone(),
+                    dropped.clone(),
+                    claims.clone(),
+                    budget.clone(),
+                    live.clone(),
+                    Some(events.clone()),
+                ));
+                let listener = server.take().context("History listener unavailable")?;
+                let mut tick = tokio::time::interval(Duration::from_secs(live::FLUSH_SECONDS));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut stopping = false;
+                let writer_result = loop {
+                    tokio::select! {
+                        _ = shutdown.changed() => { stopping = true; break None; }
+                        result = &mut writer => break Some(result),
+                        _ = tick.tick() => {
+                            if collector.is_finished() || listener.is_finished() { break None; }
+                            let _ = sender.try_send(collector::WriteBatch { runtime: String::new(), samples: vec![], flush: true });
+                        }
+                    }
+                };
+                collector.abort();
+                let _ = collector.await;
+                drop(sender);
+                // Closing the channel drains pending readings and flushes before releasing the lock.
+                let result = match writer_result {
+                    Some(result) => result,
+                    None => writer.await,
+                };
+                drop(listener);
+                if stopping {
+                    return result?;
+                }
+                match result {
+                    Ok(Ok(())) => eprintln!("tha-agent: history for {name} stopped; restarting"),
+                    Ok(Err(error)) => {
+                        eprintln!("tha-agent: history for {name} failed: {error:#}; restarting");
+                    }
+                    Err(error) => {
+                        eprintln!("tha-agent: history for {name} panicked: {error}; restarting");
                     }
                 }
-            };
-            collector.abort();
-            let _ = collector.await;
-            drop(sender);
-            // Closing the channel drains pending readings and flushes before releasing the lock.
-            match writer_result {
-                Some(result) => result??,
-                None => writer.await??,
+                if started.elapsed() >= RESTART_MAX {
+                    delay = RESTART_MIN;
+                }
+                loop {
+                    tokio::select! {
+                        _ = shutdown.changed() => return Ok(()),
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                    delay = (delay * 2).min(RESTART_MAX);
+                    match open_store(path.clone()).await.and_then(|opened| {
+                        let bound = live::Server::bind(&path, live.clone())?;
+                        Ok((opened, bound))
+                    }) {
+                        Ok((opened, bound)) => {
+                            store = Some(opened);
+                            server = Some(bound);
+                            break;
+                        }
+                        Err(error) => {
+                            eprintln!("tha-agent: history for {name} cannot restart: {error:#}");
+                        }
+                    }
+                }
             }
-            drop(server);
-            Ok(())
         });
         Ok((
             this,

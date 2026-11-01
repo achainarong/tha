@@ -19,7 +19,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, so a new Clippy lint cannot fail a release with no code change. Dependabot
+      # does not bump this; move it forward on purpose.
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.9.3
@@ -33,4 +35,20 @@ jobs:
       - run: uv run --with pyte python scripts/features_smoke.py
       - run: uv run --with pyte python scripts/daemon_smoke.py
       - run: uv run --with pyyaml python scripts/release_smoke.py
+      - run: python3 scripts/monkey_smoke.py
+      - name: Exercise a real SSH server
+        if: runner.os == 'Linux'
+        run: python3 scripts/remote_smoke.py
       - run: make release
+
+  minimum-rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Keep equal to rust-version in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2.9.3
+      - run: cargo check --locked --all-targets

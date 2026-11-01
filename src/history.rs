@@ -266,6 +266,10 @@ pub struct Store {
     path: PathBuf,
     _lock: WriterLock,
     budget: u64,
+    /// Only a path Tha chose itself: a configured path could be someone's other file.
+    recoverable: bool,
+    /// Shown in the status until the collector restarts, so the gap in history is explained.
+    recovered: Option<String>,
 }
 struct WriterLock(File);
 impl Drop for WriterLock {
@@ -296,6 +300,60 @@ impl Sample {
         }
     }
 }
+fn capacity_pages(budget: u64, page_size: u64) -> u64 {
+    (budget.saturating_sub(4 * 1024 * 1024) / page_size).max(32)
+}
+
+/// Opens and prepares the database file. The caller holds the writer lock.
+fn connect(path: &Path, budget: u64) -> Result<Connection> {
+    let file = FsOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let db = Connection::open_with_flags(
+        sqlite_path(path)?,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    harden(&db)?;
+    db.busy_timeout(Duration::from_millis(250))?;
+    let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > 1 {
+        bail!("History database is newer than this Tha; database preserved");
+    }
+    let application: i64 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
+    if (version == 1 && application != APPLICATION_ID) || (version == 0 && application != 0) {
+        bail!("Not a Tha history database; existing database preserved");
+    }
+    if version == 1 {
+        validate_schema(&db)?;
+    }
+    if version == 0 {
+        let tables: i64 = db.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
+            [],
+            |row| row.get(0),
+        )?;
+        if tables > 0 {
+            bail!("Not a Tha history database; existing database preserved");
+        }
+    }
+    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=1048576;
+        CREATE TABLE IF NOT EXISTS containers(id INTEGER PRIMARY KEY, runtime TEXT NOT NULL, key TEXT NOT NULL, name TEXT NOT NULL, UNIQUE(runtime,key));
+        CREATE TABLE IF NOT EXISTS samples(container INTEGER NOT NULL REFERENCES containers(id), at INTEGER NOT NULL, cpu REAL, memory INTEGER, mem_limit INTEGER, rx INTEGER, tx INTEGER, dread INTEGER, dwrite INTEGER, rx_rate REAL, tx_rate REAL, read_rate REAL, write_rate REAL, flags INTEGER NOT NULL, PRIMARY KEY(container,at)) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS samples_expiry ON samples(at);
+        CREATE TABLE IF NOT EXISTS health(id INTEGER PRIMARY KEY CHECK(id=1), heartbeat INTEGER NOT NULL, dropped INTEGER NOT NULL, warning TEXT NOT NULL);
+        INSERT OR IGNORE INTO health VALUES(1,0,0,''); PRAGMA user_version=1; PRAGMA application_id=1414021425;")?;
+    let page_size: u64 = db.pragma_query_value(None, "page_size", |row| row.get(0))?;
+    db.pragma_update(None, "max_page_count", capacity_pages(budget, page_size))?;
+    Ok(db)
+}
+
 impl Store {
     pub fn open(path: &Path, budget: u64) -> Result<Self> {
         let parent = path
@@ -340,58 +398,51 @@ impl Store {
                 "Existing history database must be private (mode 0600); refusing to change its permissions"
             );
         }
-        let file = FsOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        let db = Connection::open_with_flags(
-            sqlite_path(path)?,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        harden(&db)?;
-        db.busy_timeout(Duration::from_millis(250))?;
-        let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 1 {
-            bail!("History database is newer than this Tha; database preserved");
-        }
-        let application: i64 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
-        if (version == 1 && application != APPLICATION_ID) || (version == 0 && application != 0) {
-            bail!("Not a Tha history database; existing database preserved");
-        }
-        if version == 1 {
-            validate_schema(&db)?;
-        }
-        if version == 0 {
-            let tables: i64 = db.query_row(
-                "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
-                [],
-                |row| row.get(0),
-            )?;
-            if tables > 0 {
-                bail!("Not a Tha history database; existing database preserved");
-            }
-        }
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=1048576;
-            CREATE TABLE IF NOT EXISTS containers(id INTEGER PRIMARY KEY, runtime TEXT NOT NULL, key TEXT NOT NULL, name TEXT NOT NULL, UNIQUE(runtime,key));
-            CREATE TABLE IF NOT EXISTS samples(container INTEGER NOT NULL REFERENCES containers(id), at INTEGER NOT NULL, cpu REAL, memory INTEGER, mem_limit INTEGER, rx INTEGER, tx INTEGER, dread INTEGER, dwrite INTEGER, rx_rate REAL, tx_rate REAL, read_rate REAL, write_rate REAL, flags INTEGER NOT NULL, PRIMARY KEY(container,at)) WITHOUT ROWID;
-            CREATE INDEX IF NOT EXISTS samples_expiry ON samples(at);
-            CREATE TABLE IF NOT EXISTS health(id INTEGER PRIMARY KEY CHECK(id=1), heartbeat INTEGER NOT NULL, dropped INTEGER NOT NULL, warning TEXT NOT NULL);
-            INSERT OR IGNORE INTO health VALUES(1,0,0,''); PRAGMA user_version=1; PRAGMA application_id=1414021425;")?;
-        let page_size: u64 = db.pragma_query_value(None, "page_size", |row| row.get(0))?;
-        let pages = budget.saturating_sub(4 * 1024 * 1024) / page_size;
-        db.pragma_update(None, "max_page_count", pages.max(32))?;
         Ok(Self {
-            db,
+            db: connect(path, budget)?,
             path: path.to_owned(),
             _lock: lock,
             budget,
+            recoverable: false,
+            recovered: None,
         })
+    }
+    /// For the default path: a damaged database is set aside and collection starts again.
+    pub fn open_recovering(path: &Path, budget: u64) -> Result<Self> {
+        match Self::open(path, budget) {
+            Err(error) if crate::recovery::damaged(&error) => {
+                eprintln!("tha: history database is damaged: {error:#}");
+                let target = crate::recovery::set_aside(path)?;
+                let mut store = Self::open(path, budget)?;
+                store.recoverable = true;
+                store.note_recovery(&target);
+                Ok(store)
+            }
+            Ok(mut store) => {
+                store.recoverable = true;
+                Ok(store)
+            }
+            error => error,
+        }
+    }
+    pub fn recoverable(&self) -> bool {
+        self.recoverable
+    }
+    /// After SQLite reports damage while running. The writer lock stays held throughout.
+    pub fn recover(&mut self) -> Result<()> {
+        // Closes the damaged file first; its journal must not outlive it under the same name.
+        self.db = Connection::open_in_memory()?;
+        let target = crate::recovery::set_aside(&self.path)?;
+        self.db = connect(&self.path, self.budget)?;
+        self.note_recovery(&target);
+        Ok(())
+    }
+    fn note_recovery(&mut self, target: &Path) {
+        let name = target.file_name().unwrap_or_default().to_string_lossy();
+        let message = format!("History was damaged and started again; old file kept as {name}");
+        eprintln!("tha: {message}");
+        let _ = self.health(0, &message);
+        self.recovered = Some(message);
     }
     pub fn size_bytes(&self) -> u64 {
         [
@@ -470,8 +521,8 @@ impl Store {
             }
         }
         tx.execute(
-            "UPDATE health SET heartbeat=?1,warning='' WHERE id=1",
-            [now_ms()],
+            "UPDATE health SET heartbeat=?1,warning=?2 WHERE id=1",
+            params![now_ms(), self.recovered.as_deref().unwrap_or("")],
         )?;
         tx.commit()?;
         Ok(written)
@@ -501,6 +552,31 @@ impl Store {
     pub fn maintenance(&self) -> Result<()> {
         self.db.execute("DELETE FROM containers WHERE id IN (SELECT id FROM containers WHERE NOT EXISTS (SELECT 1 FROM samples WHERE container=containers.id) LIMIT 2000)", [])?;
         self.db.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+        self.reclaim()
+    }
+    /// Deleting rows does not shrink a SQLite file, so once a file is over budget, say after the
+    /// budget was lowered, writing would stay paused for good even with every row expired. Only
+    /// empty space is given back: readings within retention are never removed to make room.
+    fn reclaim(&self) -> Result<()> {
+        if self.size_bytes() < self.budget.saturating_sub(1024 * 1024) {
+            return Ok(());
+        }
+        let pragma = |name: &str| -> Result<u64> {
+            Ok(self.db.pragma_query_value(None, name, |row| row.get(0))?)
+        };
+        let page_size = pragma("page_size")?;
+        let free = pragma("freelist_count")?;
+        let used = pragma("page_count")?.saturating_sub(free) * page_size;
+        if free == 0 || used >= capacity_pages(self.budget, page_size) * page_size {
+            return Ok(());
+        }
+        self.compact()?;
+        // SQLite cannot lower this below the size of the file, so it may only now take effect.
+        self.db.pragma_update(
+            None,
+            "max_page_count",
+            capacity_pages(self.budget, page_size),
+        )?;
         Ok(())
     }
     pub fn compact(&self) -> Result<()> {
@@ -973,6 +1049,132 @@ pub(crate) mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+    fn rows(at: i64, count: usize, round: usize) -> Vec<Sample> {
+        (0..count)
+            .map(|index| Sample {
+                key: format!("/container-{round}-{index}-{}", "x".repeat(60)),
+                name: "api".into(),
+                at_ms: at,
+                usage: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lowering_the_budget_resumes_once_old_readings_have_expired() {
+        let fixture = Fixture::new();
+        let path = fixture.database();
+        let now = now_ms();
+        let mut store = Store::open(&path, 64 * 1024 * 1024).unwrap();
+        let mut round = 0;
+        while store.size_bytes() < 30 * 1024 * 1024 {
+            let samples = rows(now - 1000 - round as i64, 2000, round);
+            store
+                .append_many([("runtime", samples.as_slice())])
+                .unwrap();
+            round += 1;
+        }
+        drop(store);
+
+        let budget = 16 * 1024 * 1024;
+        let mut store = Store::open(&path, budget).unwrap();
+        let samples = rows(now, 10, usize::MAX);
+        assert_eq!(
+            store
+                .append_many([("runtime", samples.as_slice())])
+                .unwrap(),
+            0,
+            "Over budget: writing pauses"
+        );
+        // Readings within retention are kept: only expiry frees room.
+        store.maintenance().unwrap();
+        assert!(store.size_bytes() > budget);
+
+        while store.prune_batch(now + retention_ms() + 60_000).unwrap() > 0 {}
+        // Each pass also removes a bounded number of containers with no readings left.
+        for _ in 0..round {
+            store.maintenance().unwrap();
+        }
+        assert!(store.size_bytes() < budget);
+        assert_eq!(
+            store
+                .append_many([("runtime", samples.as_slice())])
+                .unwrap(),
+            10
+        );
+    }
+
+    #[test]
+    fn a_damaged_default_database_is_set_aside_and_collection_starts_again() {
+        for bad_pages in [true, false] {
+            let fixture = Fixture::new();
+            let path = fixture.database();
+            let now = now_ms();
+            {
+                let mut store = Store::open(&path, 16 * 1024 * 1024).unwrap();
+                store.append("runtime", &[sample(now, 1.0)]).unwrap();
+            }
+            if bad_pages {
+                let mut bytes = fs::read(&path).unwrap();
+                bytes[4096..].fill(0xA5);
+                fs::write(&path, bytes).unwrap();
+            } else {
+                fs::write(&path, vec![0xA5; 8192]).unwrap();
+            }
+            let damaged = fs::read(&path).unwrap();
+
+            // A configured path could be anything, so it is refused and left as it was.
+            assert!(Store::open(&path, 16 * 1024 * 1024).is_err());
+            assert_eq!(fs::read(&path).unwrap(), damaged);
+
+            let mut store = Store::open_recovering(&path, 16 * 1024 * 1024).unwrap();
+            store.append("runtime", &[sample(now, 2.0)]).unwrap();
+            let status = status(&path).unwrap();
+            assert!(status.contains("damaged"), "{status}");
+            let kept: Vec<_> = fs::read_dir(&fixture.0)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".damaged-"))
+                .collect();
+            assert_eq!(kept.len(), 1);
+            assert_eq!(fs::read(kept[0].path()).unwrap(), damaged);
+        }
+    }
+
+    #[test]
+    fn a_foreign_database_is_never_treated_as_damage() {
+        let fixture = Fixture::new();
+        let path = fixture.database();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE user_work(value TEXT);")
+            .unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(Store::open_recovering(&path, 16 * 1024 * 1024).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn damage_found_while_running_starts_again_under_the_same_lock() {
+        let fixture = Fixture::new();
+        let path = fixture.database();
+        let now = now_ms();
+        let mut store = Store::open_recovering(&path, 16 * 1024 * 1024).unwrap();
+        assert!(store.recoverable());
+        store.append("runtime", &[sample(now, 1.0)]).unwrap();
+        store.recover().unwrap();
+        assert!(status(&path).unwrap().contains("damaged"));
+        assert!(
+            Store::open(&path, 16 * 1024 * 1024).is_err(),
+            "Still locked"
+        );
+        store.append("runtime", &[sample(now, 2.0)]).unwrap();
+        let data = query(&path, "runtime", "/container-id", now - 1000, now, 1).unwrap();
+        assert_eq!(data.points.len(), 1);
+        assert_eq!(data.points[0].values[0], Some(2.0));
+        assert!(status(&path).unwrap().contains("damaged"), "Stays visible");
+    }
+
     fn sample(at: i64, cpu: f64) -> Sample {
         Sample {
             key: "/container-id".into(),

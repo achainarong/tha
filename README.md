@@ -28,7 +28,8 @@ curl -fsSL https://raw.githubusercontent.com/achainarong/tha/main/scripts/instal
 ```
 
 Rerun the installer to update. [Releases](https://github.com/achainarong/tha/releases)
-include checksums; configuration and saved data are preserved.
+include checksums and build attestations (`gh attestation verify FILE --repo achainarong/tha`);
+configuration and saved data are preserved. If an update fails, the previous version is put back.
 
 ## Basics
 

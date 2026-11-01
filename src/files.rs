@@ -1862,17 +1862,15 @@ pub async fn count(
     Ok(())
 }
 
-/// Removes a partial file unless the transfer finished, including when its task is cancelled.
+/// Removes a partial file however the transfer ends, including when its task is cancelled. A
+/// finished file also has its real name by then, so this name is the only one that goes.
 struct PartialFile {
     path: PathBuf,
-    keep: bool,
 }
 
 impl Drop for PartialFile {
     fn drop(&mut self) {
-        if !self.keep {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -1892,18 +1890,73 @@ fn create_private(path: &Path) -> Result<std::fs::File> {
         })
 }
 
+const PARTIAL_PREFIX: &str = ".tha-part-";
+
+/// A power cut or `kill -9` leaves a partial file behind. Removes those whose process has gone.
+fn remove_abandoned_partials(folder: &Path) {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let abandoned = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(PARTIAL_PREFIX))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<i32>().ok())
+            .is_some_and(|pid| !crate::remote::process_alive(pid));
+        if abandoned {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Gives a finished file its real name, all at once, without replacing anything already there.
+fn publish_partial(partial: &Path, destination: &Path) -> Result<()> {
+    let exists = || anyhow::anyhow!("{}", crate::i18n::t("A file with this name already exists"));
+    match std::fs::hard_link(partial, destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Err(exists()),
+        // Some disks, such as exFAT and network shares, have no hard links.
+        Err(_) => {
+            if std::fs::symlink_metadata(destination).is_ok() {
+                return Err(exists());
+            }
+            std::fs::rename(partial, destination)?;
+        }
+    }
+    if let Some(folder) = destination.parent()
+        && let Ok(folder) = std::fs::File::open(folder)
+    {
+        let _ = folder.sync_all();
+    }
+    Ok(())
+}
+
 /// Consumes a stream into `destination`: one file's contents, or the whole archive for a folder.
+/// Its name only appears once it is complete, so a file with that name is never a partial one.
 pub async fn save_stream(
     mut stream: impl Stream<Item = Result<Bytes>> + Unpin + Send,
     destination: &Path,
     folder: bool,
     mut progress: impl FnMut(u64) + Send,
 ) -> Result<u64> {
-    let mut file = tokio::fs::File::from_std(create_private(destination)?);
-    let mut partial = PartialFile {
-        path: destination.to_owned(),
-        keep: false,
-    };
+    static NEXT_PARTIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if std::fs::symlink_metadata(destination).is_ok() {
+        anyhow::bail!("{}", crate::i18n::t("A file with this name already exists"));
+    }
+    let directory = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    remove_abandoned_partials(directory);
+    let partial_path = directory.join(format!(
+        "{PARTIAL_PREFIX}{}-{}",
+        std::process::id(),
+        NEXT_PARTIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut file = tokio::fs::File::from_std(create_private(&partial_path)?);
+    let partial = PartialFile { path: partial_path };
     let mut reader = TarReader::default();
     let mut written = 0u64;
     let mut last = Instant::now();
@@ -1959,7 +2012,8 @@ pub async fn save_stream(
     );
     file.flush().await?;
     file.sync_all().await?;
-    partial.keep = true;
+    drop(file);
+    publish_partial(&partial.path, destination)?;
     progress(written);
     Ok(written)
 }
@@ -1988,6 +2042,57 @@ pub fn free_space(path: &Path) -> Option<u64> {
         stats.assume_init()
     };
     Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+}
+
+#[cfg(test)]
+mod hostile_archives {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn feed_all(bytes: &[u8], chunk: usize) -> std::result::Result<Vec<String>, ()> {
+        let mut reader = TarReader::default();
+        let mut seen = Vec::new();
+        for piece in bytes.chunks(chunk) {
+            for event in reader.feed(piece).map_err(|_| ())? {
+                seen.push(match event {
+                    TarEvent::Entry(header) => format!("entry {} {}", header.name, header.size),
+                    TarEvent::Data(data) => format!("data {}", data.len()),
+                });
+            }
+        }
+        Ok(seen)
+    }
+
+    fn block() -> impl Strategy<Value = Vec<u8>> {
+        // Mostly tar-like: a valid header's shape with some of it overwritten.
+        (
+            proptest::collection::vec(any::<u8>(), 0..2048),
+            any::<u16>(),
+            any::<u8>(),
+        )
+            .prop_map(|(mut bytes, at, value)| {
+                if bytes.len() >= 512 {
+                    bytes[257..262].copy_from_slice(b"ustar");
+                    bytes[(at as usize) % 512] = value;
+                }
+                bytes
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 512,
+            // The same inputs each run, so a release cannot fail on an unrelated random find.
+            rng_seed: proptest::test_runner::RngSeed::Fixed(1),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        // A server chooses these bytes. They may be refused, but must never panic.
+        #[test]
+        fn any_bytes_are_refused_or_read_without_panicking(bytes in block(), chunk in 1usize..700) {
+            let _ = feed_all(&bytes, chunk);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2202,12 +2307,41 @@ mod tests {
             let out = out.clone();
             tokio::spawn(async move { save_stream(forever, &out, true, |_| {}).await })
         };
-        while !out.exists() {
+        let in_folder = || std::fs::read_dir(&root).unwrap().count();
+        while in_folder() == 0 {
             tokio::task::yield_now().await;
         }
+        assert!(!out.exists(), "The real name appears only when complete");
         task.abort();
         let _ = task.await;
+        assert_eq!(in_folder(), 0, "Nothing is left behind");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_killed_download_neither_looks_finished_nor_blocks_a_retry() {
+        let root = temp("killed");
+        std::fs::write(root.join("mydb.dump"), b"backup").unwrap();
+        let mut archive = Vec::new();
+        write_tar(&mut archive, &root.join("mydb.dump")).unwrap();
+        std::fs::remove_file(root.join("mydb.dump")).unwrap();
+        // What `kill -9` leaves: a partial file whose process is gone, and no cleanup.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let gone = child.id();
+        child.wait().unwrap();
+        let abandoned = root.join(format!("{PARTIAL_PREFIX}{gone}-0"));
+        std::fs::write(&abandoned, b"half a ba").unwrap();
+        let ours = root.join(format!("{PARTIAL_PREFIX}{}-999", std::process::id()));
+        std::fs::write(&ours, b"another download still running").unwrap();
+
+        let out = root.join("out.dump");
         assert!(!out.exists());
+        save_stream(chunks(archive, 100), &out, false, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"backup");
+        assert!(!abandoned.exists());
+        assert!(ours.exists(), "A running process keeps its partial file");
         std::fs::remove_dir_all(root).unwrap();
     }
 

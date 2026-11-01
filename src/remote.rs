@@ -40,6 +40,17 @@ const MAX_MESSAGE_CHARS: usize = 300;
 const MASTER_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const RETRY_MIN: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(60);
+/// A connection must last this long to count as working again. One that drops straight away
+/// would otherwise be retried at the shortest delay for as long as the server keeps doing it.
+const STABLE_AFTER: Duration = Duration::from_secs(60);
+
+fn delay_after_session(delay: Duration, connected_for: Duration) -> Duration {
+    if connected_for >= STABLE_AFTER {
+        RETRY_MIN
+    } else {
+        delay
+    }
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -748,6 +759,20 @@ impl Failure {
         }
     }
 
+    /// The login worked moments ago, so a failed channel is worth retrying, unless the tool
+    /// to open it is missing.
+    fn channel(error: anyhow::Error) -> Self {
+        let missing = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        });
+        Self {
+            retry: !missing,
+            ..Self::local(error)
+        }
+    }
+
     fn locked() -> Self {
         Self {
             reason: crate::i18n::t(
@@ -1092,7 +1117,7 @@ async fn open_session(remote: &Remote) -> Result<(Session, crate::agent::Listing
         channels.push(
             open_channel(remote, &key, &control, engine, index, lost_tx.clone())
                 .await
-                .map_err(Failure::local)?,
+                .map_err(Failure::channel)?,
         );
     }
     Ok((
@@ -1125,7 +1150,7 @@ pub async fn supervise(remote: Remote, generation: u64, events: mpsc::Sender<Eve
         }
         match open_session(&remote).await {
             Ok((mut session, listing)) => {
-                delay = RETRY_MIN;
+                let connected = std::time::Instant::now();
                 let connections: Vec<_> = listing
                     .engines
                     .iter()
@@ -1159,6 +1184,7 @@ pub async fn supervise(remote: Remote, generation: u64, events: mpsc::Sender<Eve
                 };
                 let (reason, retry) = classify_failure(&stderr);
                 drop(session);
+                delay = delay_after_session(delay, connected.elapsed());
                 if !send(Update::Failed {
                     reason,
                     retrying: retry,
@@ -1201,7 +1227,7 @@ pub async fn collect_security(remote: Remote) {
         }
         match open_session(&remote).await {
             Ok((mut session, listing)) => {
-                delay = RETRY_MIN;
+                let connected = std::time::Instant::now();
                 let mut tick = tokio::time::interval(Duration::from_secs(60));
                 loop {
                     tokio::select! {
@@ -1217,6 +1243,7 @@ pub async fn collect_security(remote: Remote) {
                         }
                     }
                 }
+                delay = delay_after_session(delay, connected.elapsed());
             }
             Err(failure) => {
                 eprintln!(
@@ -1233,7 +1260,7 @@ pub async fn collect_security(remote: Remote) {
     }
 }
 
-fn process_alive(pid: i32) -> bool {
+pub(crate) fn process_alive(pid: i32) -> bool {
     // SAFETY: signal 0 only checks that the process exists.
     let result = unsafe { libc::kill(pid, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
@@ -1375,6 +1402,20 @@ pub fn save_managed(path: &Path, remotes: &[Remote]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_lasting_connection_resets_the_retry_delay() {
+        let delay = Duration::from_secs(32);
+        assert_eq!(delay_after_session(delay, Duration::from_secs(1)), delay);
+        assert_eq!(delay_after_session(delay, STABLE_AFTER), RETRY_MIN);
+    }
+
+    #[test]
+    fn a_failed_channel_retries_unless_the_tool_is_missing() {
+        assert!(Failure::channel(anyhow::anyhow!("handshake failed")).retry);
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(!Failure::channel(anyhow::Error::from(missing)).retry);
+    }
 
     /// What arrives at the far end of the channel for one request sent to the local socket.
     async fn body_through_proxy(socket: &Path, target: &str, body: Vec<u8>) -> Vec<u8> {

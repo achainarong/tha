@@ -10,6 +10,7 @@ use crate::{
     config::{BackendKind, Connection},
 };
 use anyhow::{Context, Result, ensure};
+use futures_util::FutureExt;
 use hyper::Method;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -358,8 +359,13 @@ impl Engine {
                         ).await;
                         let Some(_permit) = admitted else { break; };
                         worker.set_state(&target, "running", None);
-                        let result = tokio::time::timeout(Duration::from_secs(1800), worker.scan(&target, update_db)).await
-                            .context("Remote scan timed out").and_then(|result| result);
+                        // A panic in one scan must not end this loop: every later scan would
+                        // then sit in the queue, reported as queued, forever.
+                        let scan = std::panic::AssertUnwindSafe(worker.scan(&target, update_db)).catch_unwind();
+                        let result = tokio::time::timeout(Duration::from_secs(1800), scan).await
+                            .context("Remote scan timed out")
+                            .and_then(|result| result.map_err(|_| anyhow::anyhow!("The scan stopped unexpectedly")))
+                            .and_then(|result| result);
                         match result {
                             Ok(()) => worker.set_state(&target, "complete", None),
                             Err(error) => {

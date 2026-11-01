@@ -102,17 +102,21 @@ controlled even when it comes from the operator's own engine.
 ### Updates and release (`src/update.rs`, `scripts/install.sh`, `.github/workflows/`)
 
 - The installer verifies a release checksum and fails closed. `update.rs` accepts only a plain
-  `vX.Y.Z` tag from the redirect.
-- `release.yml` has read-only default permissions, with `contents: write` only on the publishing
-  job.
+  `vX.Y.Z` tag from the redirect, and runs the `install.sh` published with that release, after
+  checking it against the release's `SHA256SUMS`.
+- The installer runs the new binary before stopping or replacing anything, replaces it with a
+  rename, and on any later failure puts the old binary back and restarts it.
+- `release.yml` has read-only default permissions, with `contents: write`, `id-token: write` and
+  `attestations: write` only on the publishing job, which attests the release's assets.
 
 ## Accepted risks
 
 Report these only if a change makes them worse.
 
 - A root SSH key is not restricted to the agent (documented in the README and shown in the form).
-- `curl | sh` installation and `tha update` running `install.sh` from `main`. The checksum comes
-  from the same release as the binary, so this trusts GitHub and HTTPS, and it is not a signature.
+- `curl | sh` installation runs `install.sh` from `main`. The checksums come from the same release
+  as the binaries, so this and `tha update` trust GitHub and HTTPS. Neither checks the build
+  attestation; `gh attestation verify` does that by hand.
 - The scanner trusts the official Docker Hub repository and HTTPS (`docs/remote-security.md`).
 - An authenticated compromised server can lie about its own contents and scan results.
 - `--allow-*` flags grant exactly what they say, including whatever the SSH login user can read

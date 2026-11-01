@@ -165,11 +165,13 @@ shutil.copyfile(Path(os.environ['FIXTURES']) / args[4].rsplit('/',1)[1], args[ar
         old = ('#!/bin/sh\necho "old:$*" >> "$HOME/calls"\n'
                '[ "$*" = "service status" ] && [ "$OLD_RUNNING" = 1 ] && echo "Tha service: running"\nexit 0\n')
         new_service = ["new:--version", "new:service install", "new:service start"]
+        # The new binary is checked first, before anything is stopped or replaced.
         cases = [("standalone", None, ["new:--version"]),
                  ("service", None, new_service),
-                 ("standalone", "0", ["old:service status", "new:--version"]),
-                 ("standalone", "1", ["old:service status", "old:service stop", "new:--version", "new:service start"]),
-                 ("service", "1", ["old:service status", "old:service stop"] + new_service),
+                 ("standalone", "0", ["new:--version", "old:service status"]),
+                 ("standalone", "1", ["new:--version", "old:service status", "old:service stop", "new:service start"]),
+                 ("service", "1", ["new:--version", "old:service status", "old:service stop",
+                                   "new:service install", "new:service start"]),
                  ("bogus", None, None), ("arg:service", None, new_service)]
         for mode, previous, expected in cases:
             with self.subTest(mode=mode, previous=previous):
@@ -190,6 +192,78 @@ shutil.copyfile(Path(os.environ['FIXTURES']) / args[4].rsplit('/',1)[1], args[ar
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(calls, expected)
                     self.assertEqual(destination.read_bytes(), fake)
+                    self.assertEqual([path.name for path in destination.parent.iterdir()], ["tha"])
+
+    def update_fixture(self, asset, command, new, old):
+        fixtures = self.directory / "fixtures"
+        fixtures.mkdir()
+        fixture_archive(fixtures / asset, {command: new, "LICENSE": b"MIT\n"} if command != "tha"
+                        else {command: new, "LICENSE": b"MIT\n", "README.md": b"fixture\n"})
+        (fixtures / "SHA256SUMS").write_text(f"{hashlib.sha256((fixtures / asset).read_bytes()).hexdigest()}  {asset}\n")
+        self.program("uname", "import sys\nprint('Linux' if sys.argv[1]=='-s' else 'x86_64')")
+        self.program("curl", """import os,sys,shutil
+from pathlib import Path
+args=sys.argv[1:]
+shutil.copyfile(Path(os.environ['FIXTURES']) / args[4].rsplit('/',1)[1], args[args.index('-o')+1])
+""")
+        home = Path(self.env["HOME"])
+        destination = home / "bin" / command
+        destination.parent.mkdir(parents=True)
+        destination.write_text(old)
+        destination.chmod(0o755)
+        return fixtures, home, destination
+
+    OLD = ('#!/bin/sh\necho "old:$*" >> "$HOME/calls"\n'
+           '[ "$*" = "service status" ] && echo "Tha service: running"\nexit 0\n')
+
+    def test_a_new_binary_that_cannot_run_changes_nothing(self):
+        new = b'#!/bin/sh\necho "new:$*" >> "$HOME/calls"\nexit 1\n'
+        fixtures, home, destination = self.update_fixture(ASSETS[0], "tha", new, self.OLD)
+        result = self.run_shell(self.installer, FIXTURES=str(fixtures), THA_BIN_DIR=str(destination.parent))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("doesn't run on this system", result.stderr)
+        self.assertEqual((home / "calls").read_text().splitlines(), ["new:--version"])
+        self.assertEqual(destination.read_text(), self.OLD)
+        self.assertEqual([path.name for path in destination.parent.iterdir()], ["tha"])
+
+    def test_a_failed_restart_puts_the_old_collector_back_and_running(self):
+        new = b'#!/bin/sh\necho "new:$*" >> "$HOME/calls"\n[ "$*" = "service start" ] && exit 1\nexit 0\n'
+        fixtures, home, destination = self.update_fixture(ASSETS[0], "tha", new, self.OLD)
+        result = self.run_shell(self.installer, FIXTURES=str(fixtures), THA_BIN_DIR=str(destination.parent))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("put the previous version back", result.stderr)
+        self.assertEqual((home / "calls").read_text().splitlines(),
+                         ["new:--version", "old:service status", "old:service stop", "new:service start", "old:service start"])
+        self.assertEqual(destination.read_text(), self.OLD)
+        self.assertEqual([path.name for path in destination.parent.iterdir()], ["tha"])
+
+    def test_a_failed_agent_setup_puts_the_old_agent_back_and_running(self):
+        asset = "tha-agent-linux-amd64.tar.gz"
+        old = '#!/bin/sh\necho "old:$*" >> "$HOME/calls"\nexit 0\n'
+        new = b'#!/bin/sh\necho "new:$*" >> "$HOME/calls"\n[ "$1" = setup ] && exit 1\nexit 0\n'
+        fixtures, home, destination = self.update_fixture(asset, "tha-agent", new, old)
+        self.program("id", "print(0)")
+        self.program("systemctl", """import os,sys
+with open(os.environ['HOME']+'/calls','a') as log: log.write('systemctl:'+' '.join(sys.argv[1:])+'\\n')
+""")
+        result = self.run_shell(self.installer, "agent", "--user", "root", FIXTURES=str(fixtures),
+                                THA_BIN_DIR=str(destination.parent), THA_INSTALL_LOG_DIR=str(self.directory / "logs"))
+        self.assertNotEqual(result.returncode, 0)
+        calls = (home / "calls").read_text().splitlines()
+        self.assertEqual(calls, ["new:--version", "systemctl:is-active --quiet tha-agent.service",
+                                 "systemctl:stop tha-agent.service", "new:setup --user root",
+                                 "systemctl:start tha-agent.service"])
+        self.assertEqual(destination.read_text(), old)
+
+    def test_the_path_hint_gives_a_command_for_the_users_shell(self):
+        fixtures, home, destination = self.update_fixture(ASSETS[0], "tha", b'#!/bin/sh\nexit 0\n', self.OLD)
+        for shell, expected in [("/bin/bash", ">> ~/.bashrc"), ("/usr/bin/zsh", ">> ~/.zshrc"),
+                                ("/usr/bin/fish", "fish_add_path"), ("/bin/dash", "export PATH=")]:
+            with self.subTest(shell=shell):
+                result = self.run_shell(self.installer, FIXTURES=str(fixtures), SHELL=shell,
+                                        THA_BIN_DIR=str(destination.parent))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(expected, result.stdout)
 
     def test_version_step_matches_tag_and_classifies_prereleases(self):
         script = self.step("validate", "Require the tag to match Cargo.toml")
@@ -222,8 +296,10 @@ for line in Path('SHA256SUMS').read_text().splitlines():
         dist = self.directory / "dist"
         dist.mkdir()
         for asset in ASSETS: fixture_archive(dist / asset)
+        (dist / "install.sh").write_text("#!/bin/sh\n")
         result = self.run_shell(script)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("install.sh", (dist / "SHA256SUMS").read_text())
         for line in (dist / "SHA256SUMS").read_text().splitlines():
             digest, name = line.split()
             self.assertEqual(digest, hashlib.sha256((dist / name).read_bytes()).hexdigest())
@@ -239,6 +315,7 @@ for line in Path('SHA256SUMS').read_text().splitlines():
         dist = self.directory / "dist"
         dist.mkdir()
         for asset in ASSETS: fixture_archive(dist / asset)
+        (dist / "install.sh").write_text("#!/bin/sh\n")
         (dist / "SHA256SUMS").write_text("fixture")
         self.program("gh", """import json,os,sys
 from pathlib import Path
@@ -249,7 +326,7 @@ if args[0]=='api': print('moved' if mode=='moved' else 'fixture-commit')
 elif args[:2]==['release','view']: raise SystemExit(0 if mode=='exists' else 1)
 elif args[:2]==['release','create']:
     assert '--draft' in args and '--verify-tag' in args
-    assert sorted(arg for arg in args if arg.startswith('dist/')) == sorted('dist/'+name for name in ['tha-agent-linux-amd64.tar.gz','tha-agent-linux-arm64.tar.gz','tha-linux-amd64.tar.gz','tha-linux-arm64.tar.gz','tha-macos-arm64.tar.gz','SHA256SUMS'])
+    assert sorted(arg for arg in args if arg.startswith('dist/')) == sorted('dist/'+name for name in ['tha-agent-linux-amd64.tar.gz','tha-agent-linux-arm64.tar.gz','tha-linux-amd64.tar.gz','tha-linux-arm64.tar.gz','tha-macos-arm64.tar.gz','install.sh','SHA256SUMS'])
     if mode=='upload-failure': raise SystemExit(1)
 elif args[:2]==['release','edit']:
     assert args[-1]=='--draft=false'

@@ -1,10 +1,13 @@
-//! `tha update` and the opt-in new-version notice. Updating runs the same published installer as
-//! the README, which verifies release checksums. Nothing here contacts GitHub on its own: the
-//! notice is off unless `check_updates = true`.
+//! `tha update` and the opt-in new-version notice. Updating runs the installer published with the
+//! release being installed, not the newest commit, so a mistake on `main` cannot break every
+//! update at once. Nothing here contacts GitHub on its own: the notice is off unless
+//! `check_updates = true`.
 use anyhow::{Context, Result, ensure};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
-const INSTALLER: &str = "https://raw.githubusercontent.com/achainarong/tha/main/scripts/install.sh";
+const RELEASES: &str = "https://github.com/achainarong/tha/releases/download";
+const INSTALLER: &str = "install.sh";
 const LATEST: &str = "https://github.com/achainarong/tha/releases/latest";
 const MAX_INSTALLER_BYTES: usize = 1024 * 1024;
 
@@ -54,6 +57,27 @@ pub async fn latest() -> Result<String> {
         .to_owned())
 }
 
+/// The checksum list comes from the same release, so this catches a damaged or swapped download,
+/// and exactly one entry must name the installer.
+fn verify_installer(script: &[u8], checksums: &str) -> Result<()> {
+    let mut entries = checksums.lines().filter_map(|line| {
+        let (digest, name) = line.split_once("  ")?;
+        (name == INSTALLER).then_some(digest)
+    });
+    let digest = entries
+        .next()
+        .context("The release has no checksum for its installer")?;
+    ensure!(
+        entries.next().is_none(),
+        "The release lists its installer twice"
+    );
+    ensure!(
+        digest == format!("{:x}", Sha256::digest(script)),
+        "The installer does not match the release's checksum; nothing was run"
+    );
+    Ok(())
+}
+
 /// Replaces this binary in place through the installer, keeping its folder.
 pub async fn run(check_only: bool) -> Result<bool> {
     let latest = latest().await?;
@@ -68,17 +92,23 @@ pub async fn run(check_only: bool) -> Result<bool> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
-    let script = client
-        .get(INSTALLER)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
-    ensure!(
-        script.len() <= MAX_INSTALLER_BYTES,
-        "The installer is unexpectedly large"
-    );
+    let fetch = async |name: &str| -> Result<Vec<u8>> {
+        let bytes = client
+            .get(format!("{RELEASES}/{latest}/{name}"))
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("Cannot download {name} for {latest}"))?
+            .bytes()
+            .await?;
+        ensure!(
+            bytes.len() <= MAX_INSTALLER_BYTES,
+            "{name} is unexpectedly large"
+        );
+        Ok(bytes.to_vec())
+    };
+    let script = fetch(INSTALLER).await?;
+    verify_installer(&script, &String::from_utf8(fetch("SHA256SUMS").await?)?)?;
     let folder = tempfile::tempdir()?;
     let path = folder.path().join("install.sh");
     std::fs::write(&path, &script)?;
@@ -89,6 +119,7 @@ pub async fn run(check_only: bool) -> Result<bool> {
     let status = tokio::process::Command::new("sh")
         .arg(&path)
         .env("THA_BIN_DIR", bin_dir)
+        .env("THA_VERSION", &latest)
         .status()
         .await
         .context("Cannot run the installer")?;
@@ -100,6 +131,19 @@ pub async fn run(check_only: bool) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_installer_must_match_exactly_one_checksum() {
+        let script = b"#!/bin/sh\n";
+        let digest = format!("{:x}", Sha256::digest(script));
+        let good = format!("{}  tha.tar.gz\n{digest}  install.sh\n", "0".repeat(64));
+        verify_installer(script, &good).unwrap();
+        assert!(verify_installer(b"tampered", &good).is_err());
+        assert!(verify_installer(script, "").is_err());
+        assert!(verify_installer(script, &format!("{digest}  tha.tar.gz\n")).is_err());
+        let twice = format!("{digest}  install.sh\n{digest}  install.sh\n");
+        assert!(verify_installer(script, &twice).is_err());
+    }
 
     #[test]
     fn versions_compare_as_numbers_and_bad_answers_are_never_newer() {

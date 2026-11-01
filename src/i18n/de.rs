@@ -3640,6 +3640,10 @@ pub const ENTRIES: &[(&str, &str)] = &[
     ),
     ("No such file or folder", "Datei oder Ordner nicht gefunden"),
     (
+        "Part of Tha stopped unexpectedly; restart Tha if something looks wrong. Details: {path}",
+        "Ein Teil von Tha wurde unerwartet beendet. Starte Tha neu, falls etwas nicht stimmt. Details: {path}",
+    ),
+    (
         "A file with this name already exists",
         "Eine Datei mit diesem Namen existiert bereits",
     ),

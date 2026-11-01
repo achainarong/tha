@@ -593,9 +593,18 @@ fn poll_exec_sessions(app: &mut App) -> bool {
 }
 
 async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
-    // Ratatui installs a panic hook that restores raw mode and the alternate screen.
-    let mut terminal = ratatui::try_init().context("Cannot initialize terminal")?;
+    // Not `ratatui::try_init`: its panic hook would restore the terminal for a panic on any
+    // thread, leaving this loop drawing on a terminal it no longer has. See `tha::crash`.
     let _restore = TerminalRestore;
+    crossterm::terminal::enable_raw_mode().context("Cannot initialize terminal")?;
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
+        .context("Cannot initialize terminal")?;
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+            .context("Cannot initialize terminal")?;
+    let crash_log = tha::crash::log_path();
+    tha::crash::install(crash_log.clone());
+    let mut background_panics = 0;
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
     let mut mouse_captured = app.mouse_enabled;
     if mouse_captured {
@@ -606,6 +615,9 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let (edit_tx, mut edit_rx) = mpsc::channel::<EditEvent>(4);
     let mut edit_tasks: Vec<AbortTask> = Vec::new();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // The terminal closed or the SSH session dropped. Without this nothing would clean up, and
+    // a download in progress would be left behind.
+    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let (snapshot_tx, mut snapshot_rx) = mpsc::channel::<SnapshotEvent>(32);
     let (refresh_tx, refresh_rx) = watch::channel(0u64);
     let (log_tx, mut log_rx) = mpsc::channel::<LogEvent>(512);
@@ -724,9 +736,21 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let mut exec_typed = std::time::Instant::now() - EXEC_ECHO_WINDOW;
     loop {
         let mut redraw_now = false;
+        if tha::crash::background_panics() != background_panics {
+            background_panics = tha::crash::background_panics();
+            app.notice = tha::tf!(
+                "Part of Tha stopped unexpectedly; restart Tha if something looks wrong. Details: {path}",
+                path = crash_log
+                    .as_deref()
+                    .unwrap_or(std::path::Path::new("crash.log"))
+                    .display()
+            );
+            redraw_now = true;
+        }
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = terminate.recv() => break,
+            _ = hangup.recv() => break,
             _ = security_refresh.tick() => { redraw_now = app.security.refresh_saved(); },
             event = async { events.as_mut()?.next().await } => match event {
                 Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {

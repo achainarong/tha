@@ -12,6 +12,9 @@ No extra network port, Docker CLI, or Security module is required for collection
   Each engine has its own database and a 256 MiB database/WAL budget.
 - **Retention:** 24 hours with incremental pruning. A full disk budget pauses new
   persistence rather than removing recent history, and the chart reports a warning.
+- **Failures:** a damaged database is moved aside as `*.damaged-<time>`, keeping only the newest
+  copy, and a new one starts. If collection stops for any other reason the agent starts it again,
+  waiting up to 5 minutes between tries, and keeps serving the engine meanwhile.
 - **Queries:** read-only aggregates for one immutable container ID and a bounded
   time range, over the existing authenticated SSH relay. Unflushed samples are
   merged without double counting, so live charts do not wait for a SQLite flush.

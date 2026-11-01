@@ -76,7 +76,7 @@ jobs:
           persist-credentials: false
       - name: Verify native runner architecture
         run: test "$(uname -m)" = "$EXPECTED_MACHINE"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2.9.3
@@ -140,13 +140,22 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
+      attestations: write
       contents: write
+      id-token: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          path: source
       - uses: actions/download-artifact@v8
         with:
           pattern: tha-release-*
           merge-multiple: true
           path: dist
+      # `tha update` runs the installer from the release it installs, not from main.
+      - name: Add the installer
+        run: cp source/scripts/install.sh dist/install.sh
       - name: Validate complete asset set and write SHA256SUMS
         run: |
           python3 - <<'PY'
@@ -160,6 +169,7 @@ jobs:
               "tha-macos-arm64.tar.gz",
               "tha-agent-linux-amd64.tar.gz",
               "tha-agent-linux-arm64.tar.gz",
+              "install.sh",
           }
           actual = {path.name for path in directory.iterdir()}
           if actual != expected:
@@ -171,6 +181,10 @@ jobs:
                   manifest.write(f"{digest}  {name}\n")
           PY
           (cd dist && sha256sum --check SHA256SUMS)
+      # A failure here stops before anything is published, so the run can be retried.
+      - uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
       - name: Publish completed draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -186,7 +200,7 @@ jobs:
             echo "Release $TAG already exists; inspect it before retrying." >&2
             exit 1
           fi
-          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+          gh release create "$TAG" dist/*.tar.gz dist/install.sh dist/SHA256SUMS \
             --verify-tag --draft --prerelease="$PRERELEASE" \
             --title "Tha $TAG" --generate-notes
           gh release edit "$TAG" --draft=false

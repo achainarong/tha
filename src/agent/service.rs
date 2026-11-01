@@ -170,6 +170,14 @@ async fn accept_clients<A, F>(
     }
 }
 
+struct AlertTask {
+    task: tokio::task::JoinHandle<()>,
+    url: String,
+    name: String,
+    history: Arc<super::history::Engine>,
+    security: Option<Arc<crate::security::agent::Engine>>,
+}
+
 pub async fn run() -> Result<()> {
     // The listener owner is also checked by the forced-command relay.
     ensure!(
@@ -250,12 +258,24 @@ pub async fn run() -> Result<()> {
             }
         };
         if let (Some(url), Some(history)) = (&webhook, &history) {
-            alert_tasks.push(super::alerts::spawn(
+            let (url, name, history, security) = (
                 url.clone(),
                 engine.name.clone(),
                 history.clone(),
                 security.clone(),
-            )?);
+            );
+            alert_tasks.push(AlertTask {
+                task: super::alerts::spawn(
+                    url.clone(),
+                    name.clone(),
+                    history.clone(),
+                    security.clone(),
+                )?,
+                url,
+                name,
+                history,
+                security,
+            });
         }
         let agent = Arc::new(Agent {
             allow_delete: config.allow_delete,
@@ -278,14 +298,30 @@ pub async fn run() -> Result<()> {
         });
     }
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        _ = terminate.recv() => {},
-        _ = tokio::signal::ctrl_c() => {},
-        result = listeners.join_next() => { anyhow::bail!("Agent listener stopped: {result:?}"); }
+    let mut alert_check = tokio::time::interval(std::time::Duration::from_secs(60));
+    alert_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = terminate.recv() => break,
+            _ = tokio::signal::ctrl_c() => break,
+            result = listeners.join_next() => { anyhow::bail!("Agent listener stopped: {result:?}"); }
+            // Nobody is watching a server overnight, so silent alerts would look like good news.
+            _ = alert_check.tick() => {
+                for alert in &mut alert_tasks {
+                    if alert.task.is_finished() {
+                        eprintln!("tha-agent: alerts for {} stopped; starting them again", alert.name);
+                        match super::alerts::spawn(alert.url.clone(), alert.name.clone(), alert.history.clone(), alert.security.clone()) {
+                            Ok(task) => alert.task = task,
+                            Err(error) => eprintln!("tha-agent: alerts for {} cannot restart: {error:#}", alert.name),
+                        }
+                    }
+                }
+            }
+        }
     }
     listeners.abort_all();
-    for task in alert_tasks {
-        task.abort();
+    for alert in alert_tasks {
+        alert.task.abort();
     }
     for worker in history_workers {
         if let Err(error) = worker.shutdown().await {

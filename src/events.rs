@@ -36,6 +36,8 @@ pub const MAX_IN_MEMORY: usize = 5000;
 const MAX_STORED: i64 = 50_000;
 const MAX_DATABASE_BYTES: u64 = 16 * 1024 * 1024;
 const APPLICATION_ID: i64 = 1_414_021_429;
+static PROBLEM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+const REOPEN_EVERY: Duration = Duration::from_secs(60);
 const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 const PRUNE_EVERY: Duration = Duration::from_secs(600);
@@ -465,23 +467,85 @@ fn read_where(
 }
 
 /// Single writer for the service. Failures are reported and never stop metric collection.
-pub fn spawn_writer(path: PathBuf) -> mpsc::Sender<(String, Vec<Event>)> {
+/// Why events are not being saved, or were lost, for the collector's status line.
+pub fn problem() -> Option<String> {
+    PROBLEM.lock().ok().and_then(|problem| problem.clone())
+}
+
+fn set_problem(problem: Option<String>) {
+    if let Ok(mut current) = PROBLEM.lock() {
+        *current = problem;
+    }
+}
+
+/// Moves a damaged database aside and starts a new one. The caller has closed the old one.
+fn restart_damaged(path: &Path) -> Result<Store> {
+    let target = crate::recovery::set_aside(path)?;
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    let message = format!("Events were damaged and started again; old file kept as {name}");
+    eprintln!("tha daemon: {message}");
+    let store = Store::open(path)?;
+    set_problem(Some(message));
+    Ok(store)
+}
+
+/// `recover` is for a path Tha chose itself: a configured path could be someone's other file.
+fn open_writer(path: &Path, recover: bool) -> Option<Store> {
+    let result = match Store::open(path) {
+        Err(error) if recover && crate::recovery::damaged(&error) => restart_damaged(path),
+        result => result,
+    };
+    match result {
+        Ok(store) => Some(store),
+        Err(error) => {
+            eprintln!("tha daemon: events are not being saved: {error:#}");
+            set_problem(Some(
+                "Events are not being saved; see the service log".into(),
+            ));
+            None
+        }
+    }
+}
+
+pub fn spawn_writer(path: PathBuf, recover: bool) -> mpsc::Sender<(String, Vec<Event>)> {
     let (tx, mut rx) = mpsc::channel::<(String, Vec<Event>)>(256);
     tokio::task::spawn_blocking(move || {
-        let mut store = match Store::open(&path) {
-            Ok(store) => store,
-            Err(error) => {
-                eprintln!("tha daemon: events are not being saved: {error:#}");
-                while rx.blocking_recv().is_some() {}
-                return;
-            }
-        };
-        let _ = store.prune(crate::history::now_ms());
+        let mut store = open_writer(&path, recover);
+        let mut opened_at = std::time::Instant::now();
+        if let Some(store) = &store {
+            let _ = store.prune(crate::history::now_ms());
+        }
         let mut pruned = std::time::Instant::now();
         let mut warned = false;
         while let Some((runtime, events)) = rx.blocking_recv() {
-            match store.insert(&runtime, &events) {
+            // Whatever stopped it may have been fixed, without restarting the service.
+            if store.is_none() && opened_at.elapsed() >= REOPEN_EVERY {
+                opened_at = std::time::Instant::now();
+                store = open_writer(&path, recover);
+                if store.is_some() {
+                    set_problem(None);
+                }
+            }
+            let Some(open) = &mut store else {
+                continue;
+            };
+            match open.insert(&runtime, &events) {
                 Ok(()) => warned = false,
+                Err(error) if recover && crate::recovery::damaged(&error) => {
+                    eprintln!("tha daemon: events database is damaged: {error:#}");
+                    // Closes the damaged file before its journal is removed.
+                    drop(store.take());
+                    opened_at = std::time::Instant::now();
+                    store = restart_damaged(&path)
+                        .inspect_err(|error| {
+                            eprintln!("tha daemon: events are not being saved: {error:#}");
+                            set_problem(Some(
+                                "Events are not being saved; see the service log".into(),
+                            ));
+                        })
+                        .ok();
+                    continue;
+                }
                 Err(error) if !warned => {
                     warned = true;
                     eprintln!("tha daemon: could not save events: {error:#}");
@@ -489,7 +553,7 @@ pub fn spawn_writer(path: PathBuf) -> mpsc::Sender<(String, Vec<Event>)> {
                 Err(_) => {}
             }
             if pruned.elapsed() >= PRUNE_EVERY {
-                let _ = store.prune(crate::history::now_ms());
+                let _ = open.prune(crate::history::now_ms());
                 pruned = std::time::Instant::now();
             }
         }
@@ -501,6 +565,28 @@ pub fn spawn_writer(path: PathBuf) -> mpsc::Sender<(String, Vec<Event>)> {
 mod tests {
     use super::*;
     use bollard::models::EventActor;
+
+    #[test]
+    fn a_damaged_database_restarts_only_where_tha_chose_the_path() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("events.sqlite3");
+        fs::write(&path, vec![0xA5; 8192]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(open_writer(&path, false).is_none());
+        assert_eq!(fs::read(&path).unwrap(), vec![0xA5; 8192]);
+
+        let mut store = open_writer(&path, true).unwrap();
+        store.insert("runtime", &[event(1000, "start")]).unwrap();
+        let kept = fs::read_dir(folder.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".damaged-"))
+            .count();
+        assert_eq!(kept, 1);
+        assert!(problem().is_some_and(|problem| problem.contains("damaged")));
+        set_problem(None);
+    }
 
     fn message(action: &str, attributes: &[(&str, &str)]) -> EventMessage {
         EventMessage {

@@ -969,6 +969,38 @@ pub async fn run(argument: Option<&str>) -> Result<()> {
 }
 
 #[cfg(test)]
+mod hostile_requests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 2048,
+            // The same inputs each run, so a release cannot fail on an unrelated random find.
+            rng_seed: proptest::test_runner::RngSeed::Fixed(1),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        // The check that decides what reaches the engine must never fall over, and whatever it
+        // allows must have one plain spelling.
+        #[test]
+        fn any_request_line_is_decided_without_panicking(
+            target in "(/|/v1\\.[0-9]{1,3}/|%2f|\\.\\./|\\?|&|=|[a-z0-9_.:-]{0,12}|containers|images|json|tha|security|exec|\\PC){0,12}",
+            delete in any::<bool>(),
+        ) {
+            for method in [Method::GET, Method::POST, Method::DELETE, Method::PUT, Method::HEAD] {
+                if check(delete, &method, &target).is_ok() {
+                    let path = target.split_once('?').map_or(target.as_str(), |(path, _)| path);
+                    prop_assert!(!path.split('/').any(|part| part == ".."), "{}", target);
+                    prop_assert!(!path.contains('%'), "{}", target);
+                    prop_assert!(!path.contains("//"), "{}", target);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

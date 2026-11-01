@@ -489,8 +489,10 @@ impl Drop for Session {
     }
 }
 
+/// At least 2 by 2: vt100 panics on a screen with one row or column, and whatever a shell prints
+/// reaches it, on the thread that draws the UI. A panel that small shows too little to matter.
 fn dimensions(rows: u16, cols: u16) -> (u16, u16) {
-    (rows.clamp(1, 256), cols.clamp(1, 512))
+    (rows.clamp(2, 256), cols.clamp(2, 512))
 }
 
 pub fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
@@ -566,6 +568,56 @@ pub fn encode_key(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
         bytes.insert(0, 0x1b);
     }
     bytes
+}
+
+#[cfg(test)]
+mod hostile_output {
+    use super::*;
+    use proptest::prelude::*;
+
+    struct Ignore;
+    impl vt100::Callbacks for Ignore {}
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 512,
+            // The same inputs each run, so a release cannot fail on an unrelated random find.
+            rng_seed: proptest::test_runner::RngSeed::Fixed(1),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        // Whatever a shell prints arrives here, split at any point.
+        #[test]
+        fn any_output_is_processed_without_panicking(
+            pieces in proptest::collection::vec(
+                proptest::collection::vec(
+                    prop_oneof![Just(0x1bu8), Just(b'['), Just(b']'), Just(b';'), Just(0x07), Just(0x18), any::<u8>()],
+                    0..300,
+                ),
+                0..8,
+            ),
+            rows in 2u16..60,
+            columns in 2u16..200,
+        ) {
+            let mut guard = OutputGuard::default();
+            let mut parser = vt100::Parser::new_with_callbacks(rows, columns, 100, Ignore);
+            for piece in &pieces {
+                guard.process(&mut parser, piece);
+            }
+            prop_assert!(guard.csi.len() <= MAX_CSI_BYTES);
+        }
+    }
+
+    #[test]
+    fn the_smallest_panel_can_print_anything() {
+        let (rows, columns) = dimensions(0, 0);
+        let mut guard = OutputGuard::default();
+        let mut parser = vt100::Parser::new_with_callbacks(rows, columns, 100, Ignore);
+        guard.process(
+            &mut parser,
+            "[[[[[[[[[[ 日本語 line\r\nnext\n\n".repeat(4).as_bytes(),
+        );
+    }
 }
 
 #[cfg(test)]

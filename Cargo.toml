@@ -36,6 +36,9 @@ unicode-width = "0.2"
 tui-term = "0.3.4"
 vt100 = "0.16.2"
 
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
 [profile.release]
 lto = "thin"
 strip = true

@@ -43,6 +43,9 @@ impl Pending {
                 Err(error) => {
                     eprintln!("tha daemon: history write failed: {error:#}");
                     missed = missed.saturating_add(self.count as u64);
+                    if store.recoverable() && crate::recovery::damaged(&error) {
+                        store.recover()?;
+                    }
                 }
             }
             if missed == 0 {
@@ -72,7 +75,7 @@ impl Pending {
         Ok(())
     }
     fn source(&self, status: &str) -> String {
-        if let Some(warning) = &self.warning {
+        let source = if let Some(warning) = &self.warning {
             format!(
                 "Warning: {warning} · {} dropped this session · live 1s · SQLite flush 15s",
                 self.dropped_total
@@ -82,6 +85,10 @@ impl Pending {
                 "{status} · live 1s · SQLite flush 15s · {} dropped this session",
                 self.dropped_total
             )
+        };
+        match crate::events::problem() {
+            Some(problem) => format!("Warning: {problem} · {source}"),
+            None => source,
         }
     }
     fn push(
@@ -125,6 +132,21 @@ impl Pending {
     }
 }
 
+/// A failed cleanup costs nothing yet, so it must not end collection. Damage does need action:
+/// it would fail again after a restart too, since opening a file does not read every page.
+fn survive<T>(store: &mut history::Store, what: &str, result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            eprintln!("tha daemon: {what} failed: {error:#}");
+            if store.recoverable() && crate::recovery::damaged(&error) {
+                store.recover()?;
+            }
+            Ok(None)
+        }
+    }
+}
+
 pub(crate) fn spawn_writer(
     writer_path: PathBuf,
     store: history::Store,
@@ -135,8 +157,15 @@ pub(crate) fn spawn_writer(
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut store = store;
         // Startup expiry is incremental, even after extended downtime.
-        while store.prune_batch(history::now_ms())? > 0 {}
-        store.maintenance()?;
+        loop {
+            let pruned = store.prune_batch(history::now_ms());
+            match survive(&mut store, "history expiry", pruned)? {
+                Some(0) | None => break,
+                Some(_) => {}
+            }
+        }
+        let cleaned = store.maintenance();
+        survive(&mut store, "history maintenance", cleaned)?;
         let mut maintenance = std::time::Instant::now();
         let mut pruning = false;
         let mut pending = Pending::default();
@@ -161,14 +190,20 @@ pub(crate) fn spawn_writer(
             }
             if maintenance.elapsed() >= Duration::from_secs(60) {
                 pruning = true;
-                store.maintenance()?;
+                let cleaned = store.maintenance();
+                survive(&mut store, "history maintenance", cleaned)?;
                 maintenance = std::time::Instant::now();
             }
             if pruning {
                 // Continue between ingestions until caught up; a fixed once-per-minute
                 // limit would fall behind on large fleets.
                 for _ in 0..8 {
-                    if store.prune_batch(history::now_ms())? == 0 {
+                    let pruned = store.prune_batch(history::now_ms());
+                    // A failure waits for the next maintenance rather than repeating every batch.
+                    if matches!(
+                        survive(&mut store, "history expiry", pruned)?,
+                        Some(0) | None
+                    ) {
                         pruning = false;
                         break;
                     }
@@ -176,7 +211,8 @@ pub(crate) fn spawn_writer(
             }
         }
         pending.flush(&mut store, &writer_dropped)?;
-        store.maintenance()?;
+        let cleaned = store.maintenance();
+        survive(&mut store, "history maintenance", cleaned)?;
         Ok(())
     })
 }
@@ -187,17 +223,25 @@ pub async fn run(
     remotes_path: Option<PathBuf>,
 ) -> Result<()> {
     let path = history::path(&config)?;
-    let store = history::Store::open(&path, config.history_disk_mb * 1024 * 1024)?;
+    let budget = config.history_disk_mb * 1024 * 1024;
+    // Only the default location is Tha's own to move aside; a configured path stays untouched.
+    let recover = config.history_database.is_none();
+    let store = if recover {
+        history::Store::open_recovering(&path, budget)?
+    } else {
+        history::Store::open(&path, budget)?
+    };
     let live: crate::live::Shared = Arc::new(Mutex::new(Default::default()));
     let server = crate::live::Server::bind(&path, live.clone())?;
     store.mark_collector()?;
     let (security_stop, security_shutdown) = tokio::sync::watch::channel(false);
-    let security_worker = tokio::spawn(crate::security::serve(security_shutdown));
+    let mut security_worker = tokio::spawn(crate::security::serve(security_shutdown));
     let (sender, receiver) = mpsc::channel::<collector::WriteBatch>(8);
     let dropped = Arc::new(AtomicU64::new(0));
     let writer = spawn_writer(path.clone(), store, live.clone(), dropped.clone(), receiver);
     let events = crate::events::spawn_writer(
         crate::events::database_path(&path).context("History path has no directory")?,
+        recover,
     );
     let claims: collector::Claims = Arc::new(Mutex::new(HashMap::new()));
     let budget = Arc::new(Semaphore::new(2));
@@ -226,11 +270,18 @@ pub async fn run(
                     }
                 }
                 remotes.retain(|remote| crate::security::enabled() && remote.connect.unwrap_or(config.remote_connect) == crate::remote::ConnectMode::Startup);
+                // A finished task here has failed, since these run until stopped. Dropping it
+                // lets the code below start it again, on the next tick at the latest.
                 security_remotes.retain(|name, (old, task)| {
                     let keep = remotes.iter().any(|remote| &remote.name == name && remote.same_transport(old));
                     if !keep { task.abort(); }
+                    else if task.is_finished() { eprintln!("tha daemon: security connection to {name} stopped; starting it again"); return false; }
                     keep
                 });
+                if security_worker.is_finished() {
+                    eprintln!("tha daemon: security service stopped; starting it again");
+                    security_worker = tokio::spawn(crate::security::serve(security_stop.subscribe()));
+                }
                 for remote in remotes {
                     security_remotes.entry(remote.name.clone()).or_insert_with(|| (remote.clone(), tokio::spawn(crate::remote::collect_security(remote))));
                 }
@@ -240,7 +291,11 @@ pub async fn run(
                 connections.extend(discovered.machines.into_iter().filter_map(|machine| machine.endpoint.ok().map(|endpoint| Connection { name: machine.name, kind: crate::config::BackendKind::Docker, endpoint })));
                 let connections = crate::discovery::deduplicate(connections);
                 let keys: std::collections::HashSet<_> = connections.iter().map(Connection::key).collect();
-                tasks.retain(|key,task| { if !keys.contains(key) { task.abort(); false } else { true } });
+                tasks.retain(|key,task| {
+                    if !keys.contains(key) { task.abort(); return false; }
+                    if task.is_finished() { eprintln!("tha daemon: collector for {key} stopped; starting it again"); return false; }
+                    true
+                });
                 for connection in connections {
                     tasks.entry(connection.key()).or_insert_with(|| tokio::spawn(collector::run(connection, config.refresh_seconds, sender.clone(), dropped.clone(), claims.clone(), budget.clone(),live.clone(),Some(events.clone()))));
                 }
