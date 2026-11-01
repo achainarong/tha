@@ -501,6 +501,107 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn remote_history_keeps_session_samples_when_the_local_daemon_is_enabled() {
+        use crate::{
+            app::App,
+            config::{BackendKind, Connection},
+            metrics::{Event, Reading, Usage},
+            model::{Container, Snapshot},
+        };
+
+        let fixture = Fixture::new();
+        let path = fixture.database();
+        let _store = Store::open(&path, 16 * 1024 * 1024).unwrap();
+        let cache: Shared = Arc::new(Mutex::new(Cache::default()));
+        let _server = Server::bind(&path, cache).unwrap();
+        for daemon_enabled in [false, true] {
+            let mut app = App::new(
+                vec![
+                    Connection {
+                        name: "local".into(),
+                        kind: BackendKind::Docker,
+                        endpoint: "unix:///unused-fixture.sock".into(),
+                    },
+                    crate::remote::connection("test-server", "docker"),
+                ],
+                100,
+                false,
+                false,
+            );
+            app.metrics_database = daemon_enabled.then(|| path.clone());
+            let container = Container {
+                id: "proxy".into(),
+                name: "proxy".into(),
+                state: "running".into(),
+                ..Default::default()
+            };
+            let key = container.key();
+            for index in 0..2 {
+                app.update_engine(
+                    index,
+                    Ok(Snapshot {
+                        engine_id: Some(format!("engine-{index}")),
+                        containers: vec![container.clone()],
+                        ..Default::default()
+                    }),
+                );
+                app.apply_metrics(Event {
+                    engine: index,
+                    revision: app.engines[index].metrics_revision,
+                    batch: [(
+                        key.clone(),
+                        Ok(Reading {
+                            usage: Usage {
+                                cpu_percent: Some(1.2),
+                                memory_bytes: Some(110 * 1024 * 1024),
+                                ..Default::default()
+                            },
+                            counters: None,
+                            sampled_at: std::time::Instant::now(),
+                        }),
+                    )]
+                    .into(),
+                });
+            }
+            let end = history::now_ms() + 1000;
+            let start = end - 60_000;
+            assert_eq!(
+                app.engines[0].metrics.local_samples(&key, start, end).len(),
+                usize::from(!daemon_enabled),
+                "Daemon-supplied local samples must not be replayed in the session overlay"
+            );
+            let remote = &app.engines[1];
+            assert_eq!(remote.metrics.samples[&key].usage.cpu_percent, Some(1.2));
+            let runtime = history::runtime_key(&remote.connection, &Some("engine-1".into()));
+            let data = history_query_with_session(
+                path.clone(),
+                runtime.clone(),
+                key.clone(),
+                (start, end),
+                60,
+                remote.metrics.local_samples(&key, start, end),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                data.points.iter().map(|point| point.count).sum::<u64>(),
+                1,
+                "The remote chart lost its session sample with daemon_enabled={daemon_enabled}"
+            );
+            let point = data.points.iter().find(|point| point.valid[0] > 0).unwrap();
+            assert_eq!(point.values[0], Some(1.2));
+            assert_eq!(point.values[1], Some((110 * 1024 * 1024) as f64));
+            assert!(
+                history::query(&path, &runtime, &key, start, end, 60)
+                    .unwrap()
+                    .points
+                    .is_empty(),
+                "Remote session samples must not be persisted as local daemon observations"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn socket_is_private_bounded_and_refuses_to_replace_user_files() {
         let fixture = Fixture::new();
         let path = fixture.database();

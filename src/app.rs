@@ -2105,7 +2105,9 @@ impl App {
             return;
         }
         if let Some(snapshot) = &engine.snapshot {
-            if self.metrics_database.is_some() {
+            // Only local engines use the daemon worker. Server readings are collected
+            // by this UI and must remain available to the chart's session overlay.
+            if self.metrics_database.is_some() && !crate::remote::is_remote(&engine.connection) {
                 engine
                     .metrics
                     .apply_remote(&snapshot.containers, event.batch);
