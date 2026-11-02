@@ -100,6 +100,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "update-security-db",
         "Refresh scanner/database and rescan checked or selected images",
     ),
+    ("scan-schedule", "Automatic scan schedule for this server"),
     (
         "actions",
         "Show contextual actions and disabled reasons (a)",
