@@ -215,6 +215,7 @@ fn on_runtime(reports: Vec<(Target, u64)>, runtime: &str) -> Vec<(Target, u64)> 
 
 pub enum Route<'a> {
     Images,
+    Jobs,
     GetSchedule,
     SetSchedule {
         cron: &'a str,
@@ -232,6 +233,9 @@ pub enum Route<'a> {
 pub fn route<'a>(method: &Method, path: &'a str) -> Option<Route<'a>> {
     if method == Method::GET && path == "/tha/security/images" {
         return Some(Route::Images);
+    }
+    if method == Method::GET && path == "/tha/security/jobs" {
+        return Some(Route::Jobs);
     }
     let rest = path.strip_prefix("/tha/security/")?;
     if method == Method::GET && rest == "schedule" {
@@ -293,12 +297,100 @@ pub struct Snapshot {
     pub error: Option<String>,
     pub report: Option<Report>,
 }
+/// One entry of `GET /tha/security/jobs`: what the agent is doing, for whoever connects next.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobStatus {
+    pub image: String,
+    pub state: String,
+    /// When it entered this state, in seconds since the epoch.
+    pub at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+fn active_state(state: &str) -> bool {
+    matches!(state, "queued" | "waiting" | "running")
+}
+
+/// Written to disk on every change, so a restart neither forgets a job nor its failure.
+#[derive(Serialize, Deserialize)]
 struct Job {
     target: Target,
     at: u64,
     state: String,
     error: Option<String>,
+    #[serde(default)]
+    update_db: bool,
 }
+
+/// A finished job is already in the reports, so only unfinished and failed ones are kept.
+fn save_jobs(path: Option<&PathBuf>, jobs: &HashMap<String, Job>) {
+    let Some(path) = path else {
+        return;
+    };
+    let kept: Vec<_> = jobs
+        .values()
+        .filter(|job| job.state != "complete")
+        .collect();
+    let result = (|| -> Result<()> {
+        let parent = path.parent().context("Scan jobs have no directory")?;
+        std::fs::create_dir_all(parent)?;
+        let file = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer(file.as_file(), &kept)?;
+        file.persist(path).context("Cannot save scan jobs")?;
+        Ok(())
+    })();
+    // A scan is worth more than its status line, so this never stops one.
+    if let Err(error) = result {
+        eprintln!("tha-agent security: cannot save scan jobs: {error:#}");
+    }
+}
+
+/// An unreadable file only costs the record of those jobs: the schedule finds its images again.
+fn load_jobs(path: Option<&PathBuf>) -> Vec<Job> {
+    let Some(bytes) = path.and_then(|path| std::fs::read(path).ok()) else {
+        return Vec::new();
+    };
+    match serde_json::from_slice::<Vec<Job>>(&bytes) {
+        Ok(jobs) => jobs
+            .into_iter()
+            .filter(|job| {
+                crate::platform::immutable_image_id(&job.target.image)
+                    && (active_state(&job.state) || job.state == "failed")
+            })
+            .collect(),
+        Err(error) => {
+            eprintln!("tha-agent security: ignoring saved scan jobs: {error}");
+            Vec::new()
+        }
+    }
+}
+
+/// Unfinished jobs go back in the queue. A scan that was running starts over, because a
+/// half-finished scan cannot be continued.
+fn recover_jobs(saved: Vec<Job>, sender: &mpsc::Sender<Work>, now: u64) -> HashMap<String, Job> {
+    let mut jobs = HashMap::new();
+    for mut job in saved {
+        if active_state(&job.state) {
+            job.at = now;
+            let work = Work {
+                target: job.target.clone(),
+                update_db: job.update_db,
+            };
+            if sender.try_send(work).is_ok() {
+                job.state = "queued".into();
+            } else {
+                job.state = "failed".into();
+                job.error = Some(
+                    "The agent restarted and its scan queue was full; start this scan again".into(),
+                );
+            }
+        }
+        jobs.insert(job.target.image.clone(), job);
+    }
+    jobs
+}
+
 struct Work {
     target: Target,
     update_db: bool,
@@ -308,6 +400,7 @@ pub struct Engine {
     connection: Connection,
     policy: Policy,
     jobs: Mutex<HashMap<String, Job>>,
+    jobs_path: Option<PathBuf>,
     schedule: Mutex<ActiveSchedule>,
     sender: mpsc::Sender<Work>,
 }
@@ -329,13 +422,18 @@ impl Engine {
         };
         let (sender, mut receiver) = mpsc::channel(256);
         let key = format!("{:x}", Sha256::digest(connection.endpoint.as_bytes()));
-        let path = super::root()
-            .ok()
+        let root = super::root().ok();
+        let path = root
+            .as_ref()
             .map(|root| root.join(format!("schedule-{key}.json")));
+        let jobs_path = root.map(|root| root.join(format!("jobs-{key}.json")));
+        let jobs = recover_jobs(load_jobs(jobs_path.as_ref()), &sender, updates::now());
+        save_jobs(jobs_path.as_ref(), &jobs);
         let state = Arc::new(Self {
             connection,
             policy: policy.clone(),
-            jobs: Mutex::new(HashMap::new()),
+            jobs: Mutex::new(jobs),
+            jobs_path,
             schedule: Mutex::new(ActiveSchedule::load(path)),
             sender,
         });
@@ -382,6 +480,12 @@ impl Engine {
 
     fn set_state(&self, target: &Target, state: &str, error: Option<String>) {
         if let Ok(mut jobs) = self.jobs.lock() {
+            let existing = jobs.get(&target.image);
+            // Headroom is checked every 30 seconds, which changes nothing worth writing down.
+            if state == "waiting" && existing.is_some_and(|job| job.state == state) {
+                return;
+            }
+            let update_db = existing.is_some_and(|job| job.update_db);
             jobs.insert(
                 target.image.clone(),
                 Job {
@@ -389,8 +493,10 @@ impl Engine {
                     at: updates::now(),
                     state: state.into(),
                     error,
+                    update_db,
                 },
             );
+            save_jobs(self.jobs_path.as_ref(), &jobs);
         }
     }
 
@@ -439,8 +545,10 @@ impl Engine {
                 at: updates::now(),
                 state: "queued".into(),
                 error: None,
+                update_db,
             },
         );
+        save_jobs(self.jobs_path.as_ref(), &jobs);
         Ok(())
     }
 
@@ -643,6 +751,26 @@ impl Engine {
                     .collect::<Vec<_>>();
                 Ok(serde_json::to_value(entries)?)
             }
+            Route::Jobs => {
+                let (runtime, _) = self.identity().await?;
+                let jobs = self
+                    .jobs
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Agent job state unavailable"))?;
+                let mut listed: Vec<_> = jobs
+                    .values()
+                    .filter(|job| job.target.runtime == runtime && job.state != "complete")
+                    .map(|job| JobStatus {
+                        image: job.target.image.clone(),
+                        state: job.state.clone(),
+                        at: job.at,
+                        error: job.error.clone(),
+                    })
+                    .collect();
+                drop(jobs);
+                listed.sort_by(|a, b| (a.at, &a.image).cmp(&(b.at, &b.image)));
+                Ok(serde_json::to_value(listed)?)
+            }
             Route::Report(image) | Route::Scan { image, .. } => {
                 let (runtime, host) = self.identity().await?;
                 let target = Target {
@@ -735,6 +863,99 @@ fn headroom(policy: &Policy, load: Option<f64>, memory_kib: Option<u64>, cpus: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn saved_job(letter: &str, state: &str) -> Job {
+        let image = format!("sha256:{}", letter.repeat(64));
+        Job {
+            target: Target {
+                connection: Connection {
+                    name: "docker".into(),
+                    kind: BackendKind::Docker,
+                    endpoint: "unix:///fixture.sock".into(),
+                },
+                runtime: "engine".into(),
+                image: image.clone(),
+                label: image,
+            },
+            at: 5,
+            state: state.into(),
+            error: (state == "failed").then(|| "broken".into()),
+            update_db: letter == "a",
+        }
+    }
+
+    #[test]
+    fn saved_jobs_survive_a_restart_and_unfinished_ones_are_queued_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.json");
+        let jobs: HashMap<_, _> = [
+            ("a", "running"),
+            ("b", "waiting"),
+            ("c", "failed"),
+            ("d", "complete"),
+        ]
+        .into_iter()
+        .map(|(letter, state)| {
+            let job = saved_job(letter, state);
+            (job.target.image.clone(), job)
+        })
+        .collect();
+        save_jobs(Some(&path), &jobs);
+        let (sender, mut receiver) = mpsc::channel(8);
+        let recovered = recover_jobs(load_jobs(Some(&path)), &sender, 100);
+        assert_eq!(recovered.len(), 3, "a finished job is in the reports");
+        let state = |letter: &str| {
+            let job = &recovered[&format!("sha256:{}", letter.repeat(64))];
+            (job.state.as_str(), job.at, job.error.as_deref())
+        };
+        assert_eq!(state("a"), ("queued", 100, None));
+        assert_eq!(state("b"), ("queued", 100, None));
+        // The failure and its time stay, so the hourly retry does not start over.
+        assert_eq!(state("c"), ("failed", 5, Some("broken")));
+        let mut work = [receiver.try_recv().unwrap(), receiver.try_recv().unwrap()];
+        assert!(
+            receiver.try_recv().is_err(),
+            "a failed job is not retried here"
+        );
+        work.sort_by(|a, b| a.target.image.cmp(&b.target.image));
+        assert!(work[0].update_db, "a database refresh is still a refresh");
+        assert!(!work[1].update_db);
+    }
+
+    #[test]
+    fn a_full_queue_after_a_restart_is_reported_and_a_damaged_file_is_ignored() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let recovered = recover_jobs(
+            vec![saved_job("a", "queued"), saved_job("b", "queued")],
+            &sender,
+            100,
+        );
+        let mut states: Vec<_> = recovered.values().map(|job| job.state.as_str()).collect();
+        states.sort_unstable();
+        assert_eq!(states, ["failed", "queued"]);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.json");
+        std::fs::write(&path, "not json").unwrap();
+        assert!(load_jobs(Some(&path)).is_empty());
+        assert!(load_jobs(Some(&directory.path().join("missing"))).is_empty());
+        // Saved text must not smuggle in something other than an immutable image.
+        let mut job = saved_job("a", "queued");
+        job.target.image = "latest".into();
+        std::fs::write(&path, serde_json::to_vec(&[job]).unwrap()).unwrap();
+        assert!(load_jobs(Some(&path)).is_empty());
+    }
+
+    #[test]
+    fn the_job_list_is_a_plain_read_with_no_arguments() {
+        assert!(matches!(
+            route(&Method::GET, "/tha/security/jobs"),
+            Some(Route::Jobs)
+        ));
+        assert!(route(&Method::POST, "/tha/security/jobs").is_none());
+        assert!(route(&Method::GET, "/tha/security/jobs?x=1").is_none());
+    }
+
     #[test]
     fn security_routes_cannot_create_arbitrary_containers_or_follow_tags() {
         for path in [

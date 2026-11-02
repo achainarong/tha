@@ -177,6 +177,7 @@ async fn report_sync_child() {
                 || path.ends_with("/version")
                 || path.ends_with("/containers/json"))
     );
+    let connection_for_jobs = connection.clone();
     let mut view = tha::security::View::default();
     view.select(Some(tha::security::Target {
         connection,
@@ -291,11 +292,44 @@ async fn report_sync_child() {
             "Status polling must not transfer old findings repeatedly"
         );
     }
+    // The job can be read back by anyone connecting later, without naming the image.
+    let listed = tha::security::remote::jobs(&connection_for_jobs)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].image, image);
+    assert!(matches!(listed[0].state.as_str(), "queued" | "waiting"));
+    // A restarted agent still knows about it, and has queued it again.
+    worker.abort();
+    let _ = worker.await;
+    let (restarted, restarted_worker) = Engine::start(
+        &AgentEngine {
+            name: "docker".into(),
+            socket: directory.join("engine.sock"),
+        },
+        &Policy {
+            enabled: true,
+            ..Default::default()
+        },
+        Arc::new(tokio::sync::Semaphore::new(0)),
+    )
+    .await
+    .unwrap();
+    let recovered: Vec<tha::security::agent::JobStatus> = serde_json::from_value(
+        restarted
+            .handle(tha::security::agent::Route::Jobs)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(recovered.len(), 1, "{recovered:?}");
+    assert_eq!(recovered[0].image, image);
+    assert!(matches!(recovered[0].state.as_str(), "queued" | "waiting"));
+    restarted_worker.abort();
     // Dropping the transport does not delete the agent's report.
     proxy.abort();
     driver.abort();
     agent_task.abort();
-    worker.abort();
     engine_task.abort();
     assert_eq!(
         db.query_row("SELECT count(*) FROM reports", [], |row| row

@@ -876,6 +876,8 @@ pub struct Capabilities {
     pub allow_upload: bool,
     pub allow_server_edit: bool,
     pub security: bool,
+    /// Answers `GET /tha/security/jobs`. Older agents refuse and log it, so nothing asks them.
+    pub scan_jobs: bool,
     pub history: bool,
     pub agent_version: String,
 }
@@ -899,6 +901,7 @@ pub fn listing(config: &AgentConfig) -> Listing {
             allow_upload: config.allow_upload,
             allow_server_edit: config.allow_server_edit,
             security: config.security.enabled,
+            scan_jobs: config.security.enabled,
             history: true,
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
         }),

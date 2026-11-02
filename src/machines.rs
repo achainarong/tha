@@ -787,6 +787,68 @@ impl App {
         }
     }
 
+    /// The connected engines whose agents can say what they are scanning.
+    pub fn server_job_connections(&self) -> Vec<Connection> {
+        self.machines
+            .iter()
+            .filter(|machine| {
+                machine.connected()
+                    && machine
+                        .capabilities
+                        .as_ref()
+                        .is_some_and(|capabilities| capabilities.scan_jobs)
+            })
+            .flat_map(|machine| {
+                machine
+                    .engines
+                    .iter()
+                    .map(|engine| remote::connection(&machine.remote.name, engine))
+            })
+            .collect()
+    }
+
+    /// Names are resolved now, because a disconnected server's image list is gone but its jobs
+    /// are still shown. Returns whether a scan ended.
+    pub fn apply_server_jobs(
+        &mut self,
+        connection: &Connection,
+        jobs: Vec<crate::security::agent::JobStatus>,
+    ) -> bool {
+        let endpoint = &connection.endpoint;
+        let jobs = jobs
+            .into_iter()
+            .map(|status| {
+                let label = crate::ui::inventory::image_label(self, endpoint, &status.image)
+                    .or_else(|| {
+                        self.security
+                            .server_jobs
+                            .get(endpoint)?
+                            .jobs
+                            .iter()
+                            .find(|job| job.status.image == status.image)
+                            .map(|job| job.label.clone())
+                    })
+                    .unwrap_or_else(|| {
+                        let id = status
+                            .image
+                            .strip_prefix("sha256:")
+                            .unwrap_or(&status.image);
+                        id.chars().take(12).collect()
+                    });
+                crate::security::ServerJob { status, label }
+            })
+            .collect();
+        self.security.set_server_jobs(endpoint, jobs)
+    }
+
+    pub fn server_scan_summary(&self, connection: &Connection) -> Option<String> {
+        let connected = remote::server_of(connection)
+            .and_then(|name| self.machine(name))
+            .is_some_and(Machine::connected);
+        self.security
+            .server_summary(&connection.endpoint, connected)
+    }
+
     pub fn selected_machine(&self) -> Option<String> {
         if let Some(Scope::Machine(name)) = self.current().map(|row| &row.scope) {
             return Some(name.clone());

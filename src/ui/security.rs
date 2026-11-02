@@ -146,6 +146,10 @@ pub fn draw_report(frame: &mut Frame, app: &mut App, inner: Rect) {
         if !compact {
             lines.push(Line::styled(safe_text(&target.image), muted()));
         }
+        if let Some((note, failed)) = app.security.server_job_note(target) {
+            let color = if failed { Color::Yellow } else { Color::Cyan };
+            lines.push(Line::styled(note, accent(app, color)));
+        }
     }
     if !compact {
         lines.push(Line::styled(
@@ -272,18 +276,38 @@ pub fn draw_report(frame: &mut Frame, app: &mut App, inner: Rect) {
     frame.render_widget(paragraph.scroll((app.detail_scroll as u16, 0)), inner);
 }
 
+/// What the agent of the engine in view is doing, also once that engine has gone offline and
+/// its images with it.
+fn server_status(app: &App) -> Option<String> {
+    let connection = app
+        .security
+        .target
+        .as_ref()
+        .map(|target| &target.connection)
+        .or_else(|| {
+            app.engines
+                .get(app.inventory_engine)
+                .map(|engine| &engine.connection)
+        })?;
+    app.server_scan_summary(connection)
+}
+
 fn content_above_status(frame: &mut Frame, app: &App, area: Rect) -> Rect {
-    if !app.security.busy && app.security.batch.is_empty() {
+    let server = server_status(app);
+    let queue = app.security.busy || !app.security.batch.is_empty();
+    if !queue && server.is_none() {
         return area;
     }
-    let status_height = if area.height >= 10 && app.security.busy {
+    let status_height = if !queue {
+        0
+    } else if area.height >= 10 && app.security.busy {
         3
     } else {
         1
-    };
+    } + u16::from(server.is_some());
     let parts =
         Layout::vertical([Constraint::Min(0), Constraint::Length(status_height)]).split(area);
-    draw_status(frame, app, parts[1]);
+    draw_status(frame, app, parts[1], queue, server);
     parts[0]
 }
 
@@ -331,7 +355,7 @@ fn scan_status_line(app: &App, now: std::time::Instant, width: u16) -> Line<'sta
     ellipsize_line(line, width as usize)
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_status(frame: &mut Frame, app: &App, area: Rect, queue: bool, server: Option<String>) {
     let inner = if area.height >= 3 {
         let block = Block::default().borders(Borders::TOP).border_style(muted());
         let inner = block.inner(area);
@@ -340,11 +364,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         area
     };
-    let mut lines = vec![scan_status_line(
-        app,
-        std::time::Instant::now(),
-        inner.width,
-    )];
+    let mut lines = Vec::new();
+    if queue {
+        lines.push(scan_status_line(
+            app,
+            std::time::Instant::now(),
+            inner.width,
+        ));
+    }
     if app.security.busy && inner.height > 1 {
         lines.push(Line::styled(
             app.security
@@ -360,6 +387,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                     crate::i18n::t("Service-owned queue · safe to close the UI").into()
                 }),
             muted(),
+        ));
+    }
+    if let Some(server) = server {
+        lines.push(ellipsize_line(
+            Line::styled(server, accent(app, Color::Cyan)),
+            inner.width as usize,
         ));
     }
     frame.render_widget(Paragraph::new(lines), inner);
@@ -733,7 +766,7 @@ mod tests {
             app.security.progress = stage.into();
             let mut terminal = Terminal::new(TestBackend::new(100, 3)).unwrap();
             terminal
-                .draw(|frame| draw_status(frame, &app, frame.area()))
+                .draw(|frame| draw_status(frame, &app, frame.area(), true, None))
                 .unwrap();
             let text: String = terminal
                 .backend()

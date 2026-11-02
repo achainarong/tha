@@ -659,6 +659,13 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
     let (security_tx, mut security_rx) = mpsc::channel::<tha::security::Event>(16);
     let (security_notice_tx, mut security_notice_rx) = mpsc::channel::<String>(4);
     let (schedule_tx, mut schedule_rx) = mpsc::channel::<tha::security::ScheduleEvent>(4);
+    let (server_jobs_tx, mut server_jobs_rx) = mpsc::channel::<(
+        tha::config::Connection,
+        Vec<tha::security::agent::JobStatus>,
+    )>(16);
+    let mut server_jobs_tick = tokio::time::interval(Duration::from_secs(10));
+    server_jobs_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut server_jobs_task: Option<AbortTask> = None;
     let mut security_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut security_cancel: Option<watch::Sender<bool>> = None;
     let (export_tx, mut export_rx) = mpsc::channel::<String>(4);
@@ -754,6 +761,33 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
             _ = terminate.recv() => break,
             _ = hangup.recv() => break,
             _ = security_refresh.tick() => { redraw_now = app.security.refresh_saved(); },
+            _ = server_jobs_tick.tick() => {
+                let connections = app.server_job_connections();
+                if app.security.enabled
+                    && !connections.is_empty()
+                    && server_jobs_task.as_ref().is_none_or(|task| task.0.is_finished())
+                {
+                    let sender = server_jobs_tx.clone();
+                    server_jobs_task = Some(AbortTask(tokio::spawn(async move {
+                        for connection in connections {
+                            // A failed read keeps what was last known, which is still the best answer.
+                            if let Ok(jobs) = tha::security::remote::jobs(&connection).await
+                                && sender.send((connection, jobs)).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                    })));
+                }
+            },
+            Some((connection, jobs)) = server_jobs_rx.recv() => {
+                if app.apply_server_jobs(&connection, jobs) {
+                    tokio::spawn(async move {
+                        let _ = tha::security::remote::sync(&connection).await;
+                    });
+                }
+                redraw_now = true;
+            },
             event = async { events.as_mut()?.next().await } => match event {
                 Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
                     exec_typed = std::time::Instant::now();

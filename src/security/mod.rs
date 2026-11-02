@@ -92,6 +92,31 @@ pub struct View {
     pub schedule_connection: Option<Connection>,
     pub schedule_ignore: bool,
     pub schedule_next: Option<String>,
+    /// Scans that lost their connection and continue on the server.
+    pub detached: usize,
+    /// What each server's agent last said it was doing, by endpoint. It outlives the connection,
+    /// which is when it is most useful.
+    pub server_jobs: std::collections::HashMap<String, ServerJobs>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerJob {
+    pub status: agent::JobStatus,
+    pub label: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerJobs {
+    pub jobs: Vec<ServerJob>,
+    pub checked: std::time::Instant,
+}
+
+fn duration_text(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds} s"),
+        60..3600 => format!("{} min", seconds / 60),
+        _ => format!("{} h", seconds / 3600),
+    }
 }
 
 /// A finished schedule request to the agent. Errors are already readable text.
@@ -101,6 +126,123 @@ pub enum ScheduleEvent {
 }
 
 impl View {
+    /// Returns whether a scan ended since the last answer, so its report is worth fetching now.
+    pub fn set_server_jobs(&mut self, endpoint: &str, jobs: Vec<ServerJob>) -> bool {
+        let active =
+            |job: &ServerJob| matches!(job.status.state.as_str(), "queued" | "waiting" | "running");
+        let ended = self.server_jobs.get(endpoint).is_some_and(|previous| {
+            previous.jobs.iter().filter(|job| active(job)).any(|job| {
+                !jobs
+                    .iter()
+                    .any(|next| next.status.image == job.status.image && active(next))
+            })
+        });
+        self.server_jobs.insert(
+            endpoint.to_owned(),
+            ServerJobs {
+                jobs,
+                checked: std::time::Instant::now(),
+            },
+        );
+        ended
+    }
+
+    pub fn server_summary(&self, endpoint: &str, connected: bool) -> Option<String> {
+        self.server_summary_at(
+            endpoint,
+            connected,
+            std::time::Instant::now(),
+            updates::now(),
+        )
+    }
+
+    fn server_summary_at(
+        &self,
+        endpoint: &str,
+        connected: bool,
+        now: std::time::Instant,
+        clock: u64,
+    ) -> Option<String> {
+        let known = self.server_jobs.get(endpoint)?;
+        let count = |state: &str| {
+            known
+                .jobs
+                .iter()
+                .filter(|job| job.status.state == state)
+                .count()
+        };
+        let mut parts = Vec::new();
+        let mut running = known
+            .jobs
+            .iter()
+            .filter(|job| job.status.state == "running");
+        if let Some(job) = running.next() {
+            let mut part = crate::tf!(
+                "scanning {name} ({time})",
+                name = crate::model::safe_text(&job.label),
+                time = duration_text(clock.saturating_sub(job.status.at))
+            );
+            let more = running.count();
+            if more > 0 {
+                part.push_str(&format!(" +{more}"));
+            }
+            parts.push(part);
+        }
+        for (count, text) in [
+            (
+                count("waiting"),
+                crate::i18n::t("{count} waiting for headroom"),
+            ),
+            (count("queued"), crate::i18n::t("{count} queued")),
+            (count("failed"), crate::i18n::t("{count} failed")),
+        ] {
+            if count > 0 {
+                parts.push(text.replace("{count}", &count.to_string()));
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        let summary = parts.join(" · ");
+        Some(if connected {
+            crate::tf!("Scans on the server: {summary}", summary = summary)
+        } else {
+            crate::tf!(
+                "Last known {age} ago, server not connected: {summary}",
+                age = duration_text(now.saturating_duration_since(known.checked).as_secs()),
+                summary = summary
+            )
+        })
+    }
+
+    /// What the server last said about the image being looked at.
+    pub fn server_job_note(&self, target: &Target) -> Option<(String, bool)> {
+        let job = self
+            .server_jobs
+            .get(&target.connection.endpoint)?
+            .jobs
+            .iter()
+            .find(|job| job.status.image == target.image)?;
+        Some(match job.status.state.as_str() {
+            "running" => (
+                crate::i18n::t("This image is being scanned on the server.").into(),
+                false,
+            ),
+            "failed" => (
+                crate::tf!(
+                    "Last scan on the server failed: {error}",
+                    error =
+                        crate::model::safe_text(job.status.error.as_deref().unwrap_or_default())
+                ),
+                true,
+            ),
+            _ => (
+                crate::i18n::t("This image is waiting for its scan on the server.").into(),
+                false,
+            ),
+        })
+    }
+
     /// Pick up reports synchronized by another connection without changing the selected image.
     pub fn refresh_saved(&mut self) -> bool {
         let Some(target) = self.target.as_ref() else {
@@ -128,6 +270,7 @@ impl View {
         );
         self.completed = 0;
         self.failed = 0;
+        self.detached = 0;
         self.busy = true;
         self.generation = self.generation.wrapping_add(1);
         self.progress = crate::i18n::t("Starting security queue…").into();
@@ -168,6 +311,15 @@ impl View {
         }
         if matches!(&event.result, Outcome::QueueDone) {
             self.busy = false;
+            if self.detached > 0 {
+                self.batch = crate::tf!(
+                    "Connection lost · {completed} completed · {failed} failed · {detached} continue on the server",
+                    completed = self.completed,
+                    failed = self.failed,
+                    detached = self.detached
+                );
+                return;
+            }
             let status = if self.queue_cancelled {
                 crate::i18n::t("Queue cancelled")
             } else {
@@ -205,6 +357,11 @@ impl View {
                     self.state = State::Failed(error);
                 }
             }
+            Outcome::Detached => {
+                self.detached += 1;
+                self.progress =
+                    crate::i18n::t("Connection lost; the scan continues on the server").into();
+            }
             Outcome::Cancelled => self.queue_cancelled = true,
             Outcome::QueueDone => (),
         }
@@ -233,6 +390,8 @@ pub struct Event {
 pub enum Outcome {
     Progress(String),
     Finished(Result<Report, String>),
+    /// The connection went away. The agent still has the job and keeps it.
+    Detached,
     Cancelled,
     QueueDone,
 }
@@ -491,6 +650,97 @@ async fn scan_batch(
 
 #[cfg(test)]
 mod tests {
+    fn server_job(letter: &str, state: &str, at: u64) -> super::ServerJob {
+        super::ServerJob {
+            status: super::agent::JobStatus {
+                image: format!("sha256:{}", letter.repeat(64)),
+                state: state.into(),
+                at,
+                error: (state == "failed").then(|| "broken".into()),
+            },
+            label: format!("image-{letter}"),
+        }
+    }
+
+    #[test]
+    fn server_jobs_are_summarized_and_stay_known_after_a_disconnect() {
+        let mut view = super::View::default();
+        assert_eq!(view.server_summary("prod", true), None);
+        view.set_server_jobs(
+            "prod",
+            vec![
+                server_job("a", "running", 1000),
+                server_job("b", "waiting", 1000),
+                server_job("c", "queued", 1000),
+                server_job("d", "queued", 1000),
+                server_job("e", "failed", 1000),
+            ],
+        );
+        let now = std::time::Instant::now();
+        let connected = view.server_summary_at("prod", true, now, 1300).unwrap();
+        assert_eq!(
+            connected,
+            "Scans on the server: scanning image-a (5 min) · 1 waiting for headroom · 2 queued · 1 failed"
+        );
+        let later = now + std::time::Duration::from_secs(120);
+        let offline = view.server_summary_at("prod", false, later, 1300).unwrap();
+        assert!(offline.starts_with("Last known 2 min ago"), "{offline}");
+        assert!(offline.contains("scanning image-a"), "{offline}");
+        assert_eq!(view.server_summary("other", true), None);
+    }
+
+    #[test]
+    fn a_scan_that_left_the_list_asks_for_its_report_and_a_new_one_does_not() {
+        let mut view = super::View::default();
+        assert!(!view.set_server_jobs("prod", vec![server_job("a", "running", 1)]));
+        assert!(!view.set_server_jobs(
+            "prod",
+            vec![server_job("a", "running", 1), server_job("b", "queued", 1)]
+        ));
+        assert!(view.set_server_jobs("prod", vec![server_job("b", "running", 2)]));
+        // A failure has no new report, but it did end, and this is cheap.
+        assert!(view.set_server_jobs("prod", vec![server_job("b", "failed", 3)]));
+        assert!(!view.set_server_jobs("prod", vec![]));
+        assert_eq!(view.server_summary("prod", true), None);
+    }
+
+    #[test]
+    fn a_lost_connection_is_counted_apart_from_failures() {
+        let target = super::Target {
+            connection: crate::config::Connection {
+                name: "prod".into(),
+                kind: crate::config::BackendKind::Docker,
+                endpoint: "agent+ssh://prod/docker".into(),
+            },
+            runtime: "engine".into(),
+            image: format!("sha256:{}", "a".repeat(64)),
+            label: "image-a".into(),
+        };
+        let mut view = super::View::default();
+        view.start(1);
+        let generation = view.generation;
+        let event = |result| super::Event {
+            generation,
+            target: target.clone(),
+            result,
+        };
+        view.complete(event(super::Outcome::Detached));
+        view.complete(event(super::Outcome::QueueDone));
+        assert!(!view.busy);
+        assert_eq!((view.failed, view.detached), (0, 1));
+        assert!(
+            view.batch.contains("1 continue on the server"),
+            "{}",
+            view.batch
+        );
+        view.set_server_jobs(
+            &target.connection.endpoint,
+            vec![server_job("a", "running", 1)],
+        );
+        let (note, failed) = view.server_job_note(&target).unwrap();
+        assert!(note.contains("being scanned") && !failed);
+    }
+
     use super::*;
     #[tokio::test]
     async fn batch_continues_after_individual_image_errors() {

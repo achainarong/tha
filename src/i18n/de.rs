@@ -4123,6 +4123,41 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "Passphrase eingeben. Beim Tippen wird nichts angezeigt.",
     ),
     (" Esc Cancel ", " Esc Abbrechen "),
+    ("scanning {name} ({time})", "scannt {name} ({time})"),
+    (
+        "{count} waiting for headroom",
+        "{count} warten auf freie Ressourcen",
+    ),
+    ("{count} queued", "{count} in der Warteschlange"),
+    ("{count} failed", "{count} fehlgeschlagen"),
+    (
+        "Scans on the server: {summary}",
+        "Scans auf dem Server: {summary}",
+    ),
+    (
+        "Last known {age} ago, server not connected: {summary}",
+        "Stand vor {age}, Server nicht verbunden: {summary}",
+    ),
+    (
+        "This image is being scanned on the server.",
+        "Dieses Image wird gerade auf dem Server gescannt.",
+    ),
+    (
+        "This image is waiting for its scan on the server.",
+        "Dieses Image wartet auf dem Server auf seinen Scan.",
+    ),
+    (
+        "Last scan on the server failed: {error}",
+        "Letzter Scan auf dem Server fehlgeschlagen: {error}",
+    ),
+    (
+        "Connection lost · {completed} completed · {failed} failed · {detached} continue on the server",
+        "Verbindung verloren · {completed} abgeschlossen · {failed} fehlgeschlagen · {detached} laufen auf dem Server weiter",
+    ),
+    (
+        "Connection lost; the scan continues on the server",
+        "Verbindung verloren; der Scan läuft auf dem Server weiter",
+    ),
     (
         "{status}. The SSH key stays locked.",
         "{status}. Der SSH-Schlüssel bleibt gesperrt.",

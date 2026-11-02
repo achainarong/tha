@@ -836,6 +836,18 @@ pub fn security_targets(app: &App, checked: bool) -> Vec<crate::security::Target
         .collect()
 }
 
+/// The name an image goes by on this engine, while its inventory is known.
+pub fn image_label(app: &App, endpoint: &str, image: &str) -> Option<String> {
+    let engine = app
+        .engines
+        .iter()
+        .find(|engine| engine.connection.endpoint == endpoint)?;
+    let row = entries(engine.snapshot.as_ref()?, OverviewMode::Images, false)
+        .into_iter()
+        .find(|row| row.key == image)?;
+    Some(format!("{}:{}", row.name, row.tags))
+}
+
 pub fn draw_overview(frame: &mut Frame, app: &mut App, area: Rect) {
     draw_overview_inner(frame, app, area, false);
 }

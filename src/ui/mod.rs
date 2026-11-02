@@ -2231,6 +2231,17 @@ fn machine_lines(app: &App, name: &str) -> Vec<Line<'static>> {
             "SSH key      {key}",
             key = safe_text(&machine.remote.identity_file)
         )));
+        for engine in &machine.engines {
+            let connection = crate::remote::connection(&machine.remote.name, engine);
+            if let Some(summary) = app.server_scan_summary(&connection) {
+                let summary = safe_text(&summary);
+                lines.push(Line::from(if machine.engines.len() > 1 {
+                    format!("{}: {summary}", safe_text(engine))
+                } else {
+                    summary
+                }));
+            }
+        }
     } else {
         lines.push(Line::styled(crate::i18n::t("Local"), bold));
     }

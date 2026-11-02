@@ -389,6 +389,7 @@ mod tests {
                 allow_upload: false,
                 allow_server_edit: false,
                 security: false,
+                scan_jobs: false,
                 history: true,
                 agent_version: "1".into(),
             }),

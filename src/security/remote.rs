@@ -1,7 +1,7 @@
 //! Fetch reports over the existing authenticated agent transport; never export remote layers.
 use super::{
     Event, Outcome, Report, Target,
-    agent::{Entry, Schedule, Snapshot},
+    agent::{Entry, JobStatus, Schedule, Snapshot},
     store, updates,
 };
 use crate::config::Connection;
@@ -161,6 +161,33 @@ pub async fn sync(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// What the agent is working on, including scans nobody here started. The server's answer is
+/// only ever displayed, so it is checked and cleaned like any other text from it.
+pub async fn jobs(connection: &Connection) -> Result<Vec<JobStatus>> {
+    let bytes = request(connection, Method::GET, "/tha/security/jobs").await?;
+    parse_jobs(&bytes)
+}
+
+fn parse_jobs(bytes: &[u8]) -> Result<Vec<JobStatus>> {
+    let mut jobs: Vec<JobStatus> = serde_json::from_slice(bytes)?;
+    ensure!(jobs.len() <= 10000, "Too many remote scan jobs");
+    for job in &mut jobs {
+        ensure!(
+            crate::platform::immutable_image_id(&job.image),
+            "Remote scan job has an invalid image ID"
+        );
+        ensure!(
+            matches!(
+                job.state.as_str(),
+                "queued" | "waiting" | "running" | "failed"
+            ),
+            "Unexpected remote scan status"
+        );
+        job.error = job.error.as_deref().map(crate::layers::text);
+    }
+    Ok(jobs)
+}
+
 pub async fn schedule(connection: &Connection) -> Result<Schedule> {
     let bytes = request(connection, Method::GET, "/tha/security/schedule").await?;
     Ok(serde_json::from_slice(&bytes)?)
@@ -232,7 +259,7 @@ async fn follow(
     target: &Target,
     mut snapshot: Snapshot,
     progress: &(impl Fn(&str) + Sync),
-) -> Result<Report> {
+) -> Result<Option<Report>> {
     let baseline = snapshot.entry.scanned;
     loop {
         let actual = self::target(&target.connection, &snapshot.entry)?;
@@ -246,7 +273,7 @@ async fn follow(
         if matches!(snapshot.state.as_str(), "complete" | "idle") {
             let report = finished_report(snapshot, baseline)?;
             store::save(target, &report)?;
-            return Ok(report);
+            return Ok(Some(report));
         }
         ensure!(
             matches!(snapshot.state.as_str(), "queued" | "waiting" | "running"),
@@ -258,17 +285,21 @@ async fn follow(
             _ => "Scanning on remote agent; only reports are transferred…",
         });
         tokio::time::sleep(Duration::from_secs(3)).await;
-        snapshot = serde_json::from_slice(
-            &request(
-                &target.connection,
-                Method::GET,
-                &format!("/tha/security/report/{}", target.image),
-            )
-            .await?,
-        )?;
+        // The agent has this job. Not hearing about it says nothing about how it is going.
+        let Ok(bytes) = request(
+            &target.connection,
+            Method::GET,
+            &format!("/tha/security/report/{}", target.image),
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+        snapshot = serde_json::from_slice(&bytes)?;
     }
 }
 
+/// `None` means the connection went away while the agent still has the job.
 /// Remote jobs belong to the agent. Cancelling here stops following, not the server's schedule.
 pub(super) async fn submit(
     targets: Vec<Target>,
@@ -312,7 +343,11 @@ pub(super) async fn submit(
             });
         };
         let result = tokio::select! {
-            result = follow(&target, snapshot, &progress) => Outcome::Finished(result.map_err(|error| crate::layers::text(&format!("{error:#}")))),
+            result = follow(&target, snapshot, &progress) => match result {
+                Ok(Some(report)) => Outcome::Finished(Ok(report)),
+                Ok(None) => Outcome::Detached,
+                Err(error) => Outcome::Finished(Err(crate::layers::text(&format!("{error:#}")))),
+            },
             _ = cancel.changed() => Outcome::Cancelled,
         };
         let cancelled = matches!(result, Outcome::Cancelled);
@@ -340,6 +375,58 @@ pub(super) async fn submit(
 mod tests {
     use super::*;
     use crate::security::agent::Route;
+
+    #[tokio::test]
+    async fn losing_the_connection_is_not_a_failed_scan() {
+        let image = format!("sha256:{}", "a".repeat(64));
+        let directory = tempfile::tempdir().unwrap();
+        let target = Target {
+            connection: Connection {
+                name: "fixture".into(),
+                kind: crate::config::BackendKind::Docker,
+                // No session is listening here, as after a disconnect.
+                endpoint: format!(
+                    "agent+ssh://never-connected-{}/docker",
+                    directory.path().file_name().unwrap().to_string_lossy()
+                ),
+            },
+            runtime: "engine".into(),
+            image: image.clone(),
+            label: image.clone(),
+        };
+        let snapshot = Snapshot {
+            entry: Entry {
+                runtime: "engine".into(),
+                host: "server".into(),
+                image,
+                scanned: 0,
+            },
+            state: "running".into(),
+            error: None,
+            report: None,
+        };
+        assert!(follow(&target, snapshot, &|_| {}).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn job_lists_from_a_server_are_checked_and_cleaned() {
+        let image = format!("sha256:{}", "a".repeat(64));
+        let parsed = parse_jobs(
+            serde_json::json!([{
+                "image": image, "state": "failed", "at": 1, "error": "bad\u{1b}[31m"
+            }])
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        assert!(!parsed[0].error.as_ref().unwrap().contains('\u{1b}'));
+        for job in [
+            serde_json::json!([{"image": "latest", "state": "running", "at": 1}]),
+            serde_json::json!([{"image": image, "state": "pwned", "at": 1}]),
+        ] {
+            assert!(parse_jobs(job.to_string().as_bytes()).is_err());
+        }
+    }
 
     #[test]
     fn schedule_requests_are_accepted_by_the_agent_route() {

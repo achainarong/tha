@@ -125,10 +125,17 @@ Browsing reports never runs a scan. Refreshing the vulnerability database does n
 retroactively reevaluate an existing report; the scheduled rescan does that.
 
 Jobs survive SSH/UI disconnects. Cancelling remote following stops the UI queue,
-not the agent's scan schedule. A service restart stops active work; pending manual
-jobs are not crash-durable, while referenced images are rediscovered. Tha reports
-a scan lost this way as failed and keeps the previous report. Scans time
-out after 30 minutes once admitted; waiting for headroom has no deadline.
+not the agent's scan schedule. The agent writes its unfinished and failed jobs to
+`jobs-*.json` next to its reports. After a service restart, unfinished jobs are queued
+again, and a scan that was running starts over. Scans time out after 30 minutes once
+admitted; waiting for headroom has no deadline.
+
+While connected, Tha asks the agent every 10 seconds what it is doing, including
+scheduled scans that Tha did not start, and shows it on the server's Overview and in
+Security. After a disconnect it keeps showing the last answer, marked as last known,
+and a lost connection counts as "continues on the server", not as a failed scan. On
+reconnecting, the list is fresh and finished reports are fetched. This needs an updated
+agent; older agents are not asked.
 
 Reports cover image contents, not writable-container changes or mounted volumes.
 An authenticated compromised server can still lie about its contents or findings.
