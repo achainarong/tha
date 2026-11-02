@@ -250,7 +250,7 @@ def locked_key_checks(scratch, public_line, environment):
         f'identity_file = "{key}"\nconnect = "startup"\n'
     )
     tui = Tui(scratch, bare, config)
-    tui.wait_for("passphrase", "a startup server with a locked key did not ask")
+    tui.wait_for(f"{key}:", "a startup server with a locked key did not ask")
     if masters():
         sys.exit("FAILED: a locked key opened SSH before it was unlocked")
     tui.send(passphrase + "\r")
@@ -276,7 +276,7 @@ def locked_key_checks(scratch, public_line, environment):
     tui.send("a")
     tui.send("\t".join(["form", "127.0.0.1", "tha", PORT, str(key)]))
     tui.send("\t\t\t\t\r")
-    tui.wait_for("passphrase", "Test connection did not ask for the passphrase")
+    tui.wait_for(f"{key}:", "Test connection did not ask for the passphrase")
     tui.send(passphrase + "\r")
     tui.wait_for("Connection works", "the test did not pass with the passphrase")
     if masters():
@@ -295,7 +295,7 @@ def locked_key_checks(scratch, public_line, environment):
         mine = dict(bare, SSH_AUTH_SOCK=own)
         config = scratch / "config-locked.toml"
         tui = Tui(scratch, mine, config)
-        tui.wait_for("passphrase", "a locked key did not ask with an agent running")
+        tui.wait_for(f"{key}:", "a locked key did not ask with an agent running")
         tui.send(passphrase + "\r")
         tui.wait_for_master("the key did not connect through the user's agent")
         if agents_for(runtime / f"tha-remote-{tui.pid}" / "agent.sock"):

@@ -214,6 +214,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("copy-name", "Copy the selected container's name"),
     ("copy-image", "Copy the selected container's image name"),
     ("copy-log-line", "Copy the newest visible log line"),
+    ("unlock-server", "Unlock the selected server's SSH key"),
     (
         "file-explorer",
         "Browse, edit, create, delete and download the selected container or server's files",
@@ -544,6 +545,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.action_review_visible = false;
         app.log_export_review_visible = false;
     }
+    remotes::draw_unlock(frame, app, area);
 }
 
 fn draw_log_editor(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1557,7 +1559,9 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     let body = sections[2];
     app.exec_dimensions = (body.height, body.width);
-    if let Some(session) = app.sessions.active_mut()
+    // The dialog sizes its own prompt, and a session resized twice a frame never settles.
+    if app.unlock_dialog.is_none()
+        && let Some(session) = app.sessions.active_mut()
         && let Err(error) = session.resize(body.height, body.width)
     {
         app.notice = crate::tf!("Exec resize failed: {error}", error = format!("{error:#}"));
@@ -1779,13 +1783,7 @@ fn draw_exec(frame: &mut Frame, app: &App, area: Rect) {
         area,
     );
     if app.monochrome {
-        for y in area.y..area.bottom() {
-            for x in area.x..area.right() {
-                frame.buffer_mut()[(x, y)]
-                    .set_fg(Color::Reset)
-                    .set_bg(Color::Reset);
-            }
-        }
+        strip_colors(frame, area);
     }
     if app.exec_input
         && app.detail_focus
@@ -1796,6 +1794,16 @@ fn draw_exec(frame: &mut Frame, app: &App, area: Rect) {
         let (row, col) = screen.cursor_position();
         if row < area.height && col < area.width {
             frame.set_cursor_position((area.x + col, area.y + row));
+        }
+    }
+}
+
+fn strip_colors(frame: &mut Frame, area: Rect) {
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            frame.buffer_mut()[(x, y)]
+                .set_fg(Color::Reset)
+                .set_bg(Color::Reset);
         }
     }
 }

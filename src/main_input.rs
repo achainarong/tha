@@ -8,6 +8,10 @@ pub(super) fn handle_key(
     refresh: &watch::Sender<u64>,
 ) -> bool {
     app.cancel_startup();
+    if app.unlock_dialog.is_some() {
+        app.unlock_dialog_key(key);
+        return false;
+    }
     if app.exec_input && app.detail_focus && app.tab == Tab::Exec {
         if app.keyboard.leaves_exec(key) {
             app.exec_input = false;
@@ -1034,6 +1038,7 @@ pub(super) fn dispatch_navigation(
         A::Settings => app.settings = Some(Default::default()),
         A::Servers => app.open_servers(),
         A::ToggleConnection => app.toggle_selected_connection(),
+        A::UnlockServer => app.unlock_selected_server(),
         A::Commands => {
             app.input_mode = InputMode::Command;
             app.input.clear();
@@ -1674,7 +1679,8 @@ pub(super) fn handle_mouse(
         _ => return false,
     }
     app.cancel_startup();
-    if app.action_confirmation.is_some()
+    if app.unlock_dialog.is_some()
+        || app.action_confirmation.is_some()
         || app.compose_confirmation.is_some()
         || app.input_mode != InputMode::Normal
         || app
@@ -2294,6 +2300,7 @@ pub(super) fn execute(app: &mut App, command: &str, refresh: &watch::Sender<u64>
         "settings" => app.settings = Some(Default::default()),
         "servers" => app.open_servers(),
         "toggle-connection" => app.toggle_selected_connection(),
+        "unlock-server" => app.unlock_selected_server(),
         "help" => {
             app.help = true;
             app.help_scroll = 0;

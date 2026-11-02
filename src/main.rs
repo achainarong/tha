@@ -586,7 +586,9 @@ fn poll_exec_sessions(app: &mut App) -> bool {
             a1 = notice.status
         );
     }
-    if app.tab == Tab::Exec && app.sessions.take_active_output_changed() {
+    if (app.tab == Tab::Exec || app.unlock_dialog.is_some())
+        && app.sessions.take_active_output_changed()
+    {
         redraw = true;
     }
     redraw
@@ -768,7 +770,9 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                     exec_typed = std::time::Instant::now();
                     redraw_now = true;
                     app.cancel_startup();
-                    if app.servers_modal_visible() {
+                    if app.unlock_dialog.is_some() {
+                        app.unlock_dialog_paste(&text);
+                    } else if app.servers_modal_visible() {
                         app.servers_paste(&text);
                     } else if let Some(confirmation) = &mut app.action_confirmation {
                         if confirmation.request.action == tha::actions::Action::Delete {
@@ -793,7 +797,7 @@ async fn run(mut app: App, refresh_seconds: u64) -> Result<()> {
                 _ => {}
             },
             _ = exec_output.notified() => {
-                if app.tab == Tab::Exec && exec_poll_at.is_none() {
+                if (app.tab == Tab::Exec || app.unlock_dialog.is_some()) && exec_poll_at.is_none() {
                     let gap = if exec_typed.elapsed() < EXEC_ECHO_WINDOW { EXEC_ECHO_GAP } else { EXEC_BATCH_GAP };
                     exec_poll_at = Some(exec_polled + gap);
                 }

@@ -3622,3 +3622,68 @@ fn log_filter_editor_validates_without_destroying_retained_logs_and_export_pins_
     assert_eq!(app.log_export_request.as_ref().unwrap().entries.len(), 1);
     assert!(app.log_export_busy);
 }
+#[tokio::test]
+async fn the_unlock_dialog_takes_the_keyboard_whatever_view_is_showing() {
+    let mut app = app();
+    let (tx, _) = watch::channel(0);
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args(["-c", "read answer; test \"$answer\" = ok"]);
+    app.open_unlock_dialog("prod", Ok(command));
+    // What restoring the saved view does at startup, which used to strand the prompt.
+    app.tab = Tab::Overview;
+    app.detail_focus = false;
+    app.exec_input = false;
+    let selected = app.selected;
+    for key in [
+        KeyCode::Char('o'),
+        KeyCode::Char('k'),
+        KeyCode::Down,
+        KeyCode::Enter,
+    ] {
+        handle_key(&mut app, KeyEvent::from(key), 20, &tx);
+    }
+    assert_eq!(app.selected, selected, "no key reached the Explorer");
+    assert_eq!(app.input_mode, InputMode::Normal);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app
+        .unlock_session()
+        .is_some_and(|session| session.running())
+    {
+        assert!(std::time::Instant::now() < deadline, "the prompt must end");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        app.sessions.poll();
+    }
+    assert_ne!(
+        app.unlock_session().map(|session| session.status()),
+        None,
+        "still open to read"
+    );
+}
+#[test]
+fn escape_cancels_the_unlock_dialog_and_gives_back_the_keyboard() {
+    let mut app = app();
+    let (tx, _) = watch::channel(0);
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args(["-c", "read answer"]);
+    app.open_unlock_dialog("prod", Ok(command));
+    app.pending_unlocks.push("stage".into());
+    handle_key(&mut app, KeyEvent::from(KeyCode::Esc), 20, &tx);
+    assert_eq!(app.unlock_dialog, None);
+    assert_eq!(app.unlocking, None);
+    assert!(app.pending_unlocks.is_empty());
+    assert!(app.sessions.is_empty());
+    assert!(app.notice.contains("locked"), "{}", app.notice);
+}
+#[test]
+fn unlock_server_needs_a_server_and_never_contacts_one_in_demo_mode() {
+    let mut app = app();
+    let (tx, _) = watch::channel(0);
+    app.demo = false;
+    execute(&mut app, "unlock-server", &tx);
+    assert_eq!(app.notice, "Select a server first");
+    assert_eq!(app.unlock_dialog, None);
+    app.demo = true;
+    execute(&mut app, "unlock-server", &tx);
+    assert!(app.notice.contains("Demo mode"), "{}", app.notice);
+    assert_eq!(app.unlock_dialog, None);
+}

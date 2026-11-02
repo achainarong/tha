@@ -13,6 +13,54 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// The passphrase prompt. `ssh-add` draws it and reads the keys, so `tha` never holds a passphrase.
+pub fn draw_unlock(frame: &mut Frame, app: &mut App, area: Rect) {
+    let area = centered(area, 72, 10);
+    let monochrome = app.monochrome;
+    let Some(session) = app.unlock_session() else {
+        return;
+    };
+    let running = session.running();
+    let block = Block::bordered()
+        .title(format!(" {} ", safe_text(&session.request.container.name)))
+        .title_bottom(if running {
+            t(" Esc Cancel ")
+        } else {
+            t(" Esc Close ")
+        });
+    let inner = padded(block.inner(area));
+    let hint = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
+    let body = Rect::new(
+        inner.x,
+        inner.y + hint.height,
+        inner.width,
+        inner.height.saturating_sub(hint.height),
+    );
+    let resized = session.resize(body.height, body.width);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(t("Type the passphrase. Nothing appears while you type.")).style(muted()),
+        hint,
+    );
+    let screen = session.screen();
+    frame.render_widget(
+        tui_term::widget::PseudoTerminal::new(screen)
+            .cursor(tui_term::widget::Cursor::default().visibility(false)),
+        body,
+    );
+    if monochrome {
+        strip_colors(frame, body);
+    }
+    let (row, col) = screen.cursor_position();
+    if running && !screen.hide_cursor() && row < body.height && col < body.width {
+        frame.set_cursor_position((body.x + col, body.y + row));
+    }
+    if let Err(error) = resized {
+        app.notice = crate::tf!("Exec resize failed: {error}", error = format!("{error:#}"));
+    }
+}
+
 fn state_label(machine: &Machine) -> (&'static str, &'static str) {
     match &machine.state {
         MachineState::NotConnected => ("○", t("Not connected")),

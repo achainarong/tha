@@ -180,6 +180,7 @@ mod tests {
             "timeline",
             "fleet",
             "file-explorer",
+            "unlock-server",
             "download",
             "capabilities",
             "save-view",

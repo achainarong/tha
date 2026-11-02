@@ -4099,12 +4099,33 @@ pub const ENTRIES: &[(&str, &str)] = &[
         "SSH-Schlüssel ist gesperrt: Er hat eine Passphrase und ist nicht im ssh-agent geladen.",
     ),
     (
-        "SSH key is locked. Press Enter on this server to unlock it.",
-        "SSH-Schlüssel ist gesperrt. Zum Entsperren Enter auf diesem Server drücken.",
+        "SSH key is locked. Press Enter on this server or run :unlock-server.",
+        "SSH-Schlüssel ist gesperrt. Enter auf diesem Server drücken oder :unlock-server ausführen.",
     ),
     (
         "Server {name}: SSH key is locked. Press Enter on it to unlock.",
         "Server {name}: SSH-Schlüssel ist gesperrt. Zum Entsperren Enter auf dem Server drücken.",
+    ),
+    (
+        "Unlock the selected server's SSH key",
+        "SSH-Schlüssel des ausgewählten Servers entsperren",
+    ),
+    (
+        "The SSH key for {name} is already unlocked.",
+        "Der SSH-Schlüssel für {name} ist bereits entsperrt.",
+    ),
+    (
+        "Unlock cancelled. The SSH key stays locked.",
+        "Entsperren abgebrochen. Der SSH-Schlüssel bleibt gesperrt.",
+    ),
+    (
+        "Type the passphrase. Nothing appears while you type.",
+        "Passphrase eingeben. Beim Tippen wird nichts angezeigt.",
+    ),
+    (" Esc Cancel ", " Esc Abbrechen "),
+    (
+        "{status}. The SSH key stays locked.",
+        "{status}. Der SSH-Schlüssel bleibt gesperrt.",
     ),
     (
         "Unlock SSH key for {name}",

@@ -491,6 +491,7 @@ pub struct App {
     /// The server whose passphrase prompt is open, and those waiting behind it.
     pub unlocking: Option<String>,
     pub pending_unlocks: Vec<String>,
+    pub unlock_dialog: Option<crate::machines::UnlockDialog>,
     pub remote_availability: Vec<(usize, bool)>,
     pub clipboard_request: Option<String>,
     pending_machine: Option<String>,
@@ -645,6 +646,7 @@ impl App {
             remote_commands: Vec::new(),
             unlocking: None,
             pending_unlocks: Vec::new(),
+            unlock_dialog: None,
             remote_availability: Vec::new(),
             clipboard_request: None,
             pending_machine: None,

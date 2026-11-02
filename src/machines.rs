@@ -7,13 +7,15 @@ use crate::{
     config::{BackendKind, Connection},
     remote::{self, ConnectMode, Remote},
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 /// The machine name of everything reached without a server.
 pub const LOCAL_MACHINE: &str = "";
 
 const LOCAL_TOOL_PREFIX: &str = "local-tool:";
 const UNLOCK_TOOL: &str = "unlock";
+/// The prompt's terminal until the dialog is first drawn at its real size.
+const UNLOCK_TERMINAL: (u16, u16) = (6, 68);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachineState {
@@ -55,6 +57,17 @@ impl Machine {
                 | MachineState::Offline { retrying: true, .. }
         )
     }
+}
+
+/// The passphrase prompt on top of everything else. It owns the keyboard, so no navigation or
+/// restored view can leave `ssh-add` running where nothing can type into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnlockDialog {
+    pub session: u64,
+    /// The shell that was showing before, which the prompt must not replace.
+    previous: Option<u64>,
+    /// Test connection asked for this, and continues once the key is unlocked.
+    test_after: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -518,7 +531,8 @@ impl App {
     }
 
     fn key_locked(&mut self, name: &str) {
-        let reason = crate::i18n::t("SSH key is locked. Press Enter on this server to unlock it.");
+        let reason =
+            crate::i18n::t("SSH key is locked. Press Enter on this server or run :unlock-server.");
         self.release_engines(name, reason);
         let Some(machine) = self.machine_mut(name) else {
             return;
@@ -531,18 +545,11 @@ impl App {
             return;
         }
         // One prompt at a time. Servers sharing the key need none once it is unlocked.
-        if self.unlock_running() {
+        if self.unlock_dialog.is_some() {
             self.pending_unlocks.push(name.to_owned());
         } else {
             self.open_unlock(name);
         }
-    }
-
-    fn unlock_running(&self) -> bool {
-        self.sessions.iter().any(|(_, session)| {
-            local_tool_kind(&session.request) == Some(UNLOCK_TOOL)
-                && matches!(session.state, crate::terminal::State::Running)
-        })
     }
 
     fn open_unlock(&mut self, name: &str) {
@@ -557,23 +564,142 @@ impl App {
         let Some(remote) = self.machine(name).map(|machine| machine.remote.clone()) else {
             return;
         };
+        self.open_unlock_dialog(name, remote::unlock_command(&remote));
+    }
+
+    pub fn open_unlock_dialog(
+        &mut self,
+        name: &str,
+        command: anyhow::Result<std::process::Command>,
+    ) {
         let title = crate::tf!(
             "Unlock SSH key for {name}",
             name = crate::model::safe_text(name)
         );
-        if self.open_local_tool(&title, UNLOCK_TOOL, remote::unlock_command(&remote)) {
-            self.unlocking = Some(name.to_owned());
+        let previous = self.sessions.active_id();
+        let opened = command.and_then(|command| {
+            self.sessions
+                .open_local_tool(&title, UNLOCK_TOOL, command, UNLOCK_TERMINAL)
+        });
+        match opened {
+            Ok(session) => {
+                self.unlock_dialog = Some(UnlockDialog {
+                    session,
+                    previous,
+                    test_after: false,
+                });
+                self.unlocking = Some(name.to_owned());
+                self.notice.clear();
+            }
+            Err(error) => self.local_tool_failed(&error),
+        }
+    }
+
+    /// The unlock action. Unlike a connection that finds the key locked, the user asked for this
+    /// now, so it opens whatever else is going on.
+    pub fn unlock_selected_server(&mut self) {
+        if self.demo {
+            self.notice = crate::i18n::t("Demo mode: servers are not contacted").into();
+            return;
+        }
+        let selected = self.selected_machine().unwrap_or_default();
+        let Some(machine) = self.machine(&selected) else {
+            self.notice = crate::i18n::t("Select a server first").into();
+            return;
+        };
+        let (remote, active) = (machine.remote.clone(), machine.session_active());
+        match remote::key_needs_unlock(&remote) {
+            Ok(true) => self.open_unlock_dialog(&selected, remote::unlock_command(&remote)),
+            Ok(false) => {
+                // Unlocked somewhere else, such as `ssh-add` in another terminal.
+                if !active {
+                    self.connect_machine(&selected);
+                }
+                self.notice = crate::tf!(
+                    "The SSH key for {name} is already unlocked.",
+                    name = crate::model::safe_text(&selected)
+                );
+            }
+            Err(error) => self.notice = crate::model::safe_text(&format!("{error:#}")),
+        }
+    }
+
+    /// The running prompt, or the output of the one that failed.
+    pub fn unlock_session(&mut self) -> Option<&mut crate::terminal::Session> {
+        let dialog = self.unlock_dialog?;
+        self.sessions.select(dialog.session).then_some(())?;
+        self.sessions.active_mut()
+    }
+
+    pub fn unlock_dialog_key(&mut self, key: KeyEvent) {
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        let Some(session) = self.unlock_session() else {
+            self.close_unlock_dialog();
+            return;
+        };
+        let running = session.running();
+        if key.code == KeyCode::Esc || (!running && key.code == KeyCode::Enter) {
+            self.close_unlock_dialog();
+        } else if running && let Err(error) = session.key(key) {
+            self.notice = crate::tf!("{error}", error = format!("{error:#}"));
+        }
+    }
+
+    pub fn unlock_dialog_paste(&mut self, text: &str) {
+        if let Some(session) = self.unlock_session()
+            && session.running()
+            && let Err(error) = session.paste(text)
+        {
+            self.notice = crate::tf!("{error}", error = format!("{error:#}"));
+        }
+    }
+
+    /// Esc ends a prompt that is still asking, which answers for the servers behind it as well.
+    fn close_unlock_dialog(&mut self) {
+        let cancelled = self
+            .unlock_session()
+            .is_some_and(|session| session.running());
+        self.unlocking = None;
+        self.pending_unlocks.clear();
+        if cancelled {
+            self.unlock_stopped(
+                crate::i18n::t("Unlock cancelled. The SSH key stays locked.").into(),
+            );
+        }
+        self.remove_unlock_session();
+    }
+
+    /// Said on the form when one is open, because a notice would be behind it.
+    fn unlock_stopped(&mut self, message: String) {
+        if let Some(form) = self.form_mut() {
+            form.error = Some(message);
+        } else {
+            self.notice = message;
+        }
+    }
+
+    fn remove_unlock_session(&mut self) {
+        let Some(dialog) = self.unlock_dialog.take() else {
+            return;
+        };
+        if self.sessions.select(dialog.session) {
+            self.sessions.close_active();
+        }
+        if let Some(previous) = dialog.previous {
+            self.sessions.select(previous);
         }
     }
 
     /// The server asked for the prompt connects, and so does anyone waiting behind it: a shared
     /// key now passes, and a different key opens its own prompt.
     fn finish_unlock(&mut self) {
-        if let Some(modal) = &mut self.remotes_modal {
-            modal.hidden = false;
-        }
+        // Asking to unlock a server that is not connected is also asking to use it.
         if let Some(name) = self.unlocking.take()
-            && self.machine(&name).is_some_and(Machine::waiting_for_user)
+            && self
+                .machine(&name)
+                .is_some_and(|machine| !machine.session_active())
         {
             self.connect_machine(&name);
             // Never ask again in a loop if the key still does not pass after this.
@@ -1067,11 +1193,24 @@ impl App {
         self.open_local_tool(&title, "create-key", command);
     }
 
+    /// The test decides what happens next, and a passing one connects a saved server by itself.
+    pub(crate) fn test_after_unlock(&mut self) {
+        if let Some(dialog) = &mut self.unlock_dialog {
+            dialog.test_after = true;
+            self.unlocking = None;
+        }
+    }
+
     fn test_connection(&mut self) {
         let Some(form) = self.form_mut() else {
             return;
         };
         let (title, command) = match form.remote() {
+            Ok(remote) if matches!(remote::key_needs_unlock(&remote), Ok(true)) => {
+                self.open_unlock_dialog(&remote.name, remote::unlock_command(&remote));
+                self.test_after_unlock();
+                return;
+            }
             Ok(remote) => (
                 crate::tf!("Test connection to {name}", name = remote.name),
                 remote::test_command(&remote),
@@ -1108,17 +1247,21 @@ impl App {
                 true
             }
             Err(error) => {
-                let message = crate::model::safe_text(&format!("{error:#}"));
-                if let Some(form) = self.form_mut() {
-                    form.error = Some(message);
-                } else {
-                    if let Some(modal) = &mut self.remotes_modal {
-                        modal.message = Some(message.clone());
-                    }
-                    self.notice = message;
-                }
+                self.local_tool_failed(&error);
                 false
             }
+        }
+    }
+
+    fn local_tool_failed(&mut self, error: &anyhow::Error) {
+        let message = crate::model::safe_text(&format!("{error:#}"));
+        if let Some(form) = self.form_mut() {
+            form.error = Some(message);
+        } else {
+            if let Some(modal) = &mut self.remotes_modal {
+                modal.message = Some(message.clone());
+            }
+            self.notice = message;
         }
     }
 
@@ -1137,17 +1280,33 @@ impl App {
         let succeeded = matches!(session.state, crate::terminal::State::Exited(0));
         let status = session.status();
         let screen = session.screen().contents();
-        self.exec_input = false;
-        if !succeeded && kind == UNLOCK_TOOL {
-            // A declined prompt is an answer, so the servers behind it do not ask as well.
-            self.unlocking = None;
-            self.pending_unlocks.clear();
-            self.notice = crate::tf!(
-                "{status}. Read the output above, then press Enter on the server to try again.",
-                status = status
-            );
+        if kind == UNLOCK_TOOL {
+            let test_after = self.unlock_dialog.is_some_and(|dialog| dialog.test_after);
+            if succeeded {
+                self.remove_unlock_session();
+                self.finish_unlock();
+                if test_after {
+                    self.test_connection();
+                }
+            } else {
+                // A declined prompt is an answer, so the servers behind it do not ask as well.
+                self.unlocking = None;
+                self.pending_unlocks.clear();
+                if test_after {
+                    self.unlock_stopped(crate::tf!(
+                        "{status}. The SSH key stays locked.",
+                        status = status
+                    ));
+                } else {
+                    self.notice = crate::tf!(
+                        "{status}. Read the output above, then press Enter on the server to try again.",
+                        status = status
+                    );
+                }
+            }
             return true;
         }
+        self.exec_input = false;
         if !succeeded {
             self.notice = crate::tf!(
                 "{status}. Read the output above, then :servers returns to the form.",
@@ -1161,10 +1320,6 @@ impl App {
         }
         self.detail_focus = false;
         self.tab = Tab::Overview;
-        if kind == UNLOCK_TOOL {
-            self.finish_unlock();
-            return true;
-        }
         let note = if kind == "test" {
             // The screen wraps long lines, so the answer is read without its line breaks.
             let answer: String = screen.lines().map(str::trim).collect();
@@ -1720,8 +1875,8 @@ mod tests {
     fn fake_unlock(app: &mut App, name: &str, script: &str) {
         let mut command = std::process::Command::new("/bin/sh");
         command.args(["-c", script]);
-        assert!(app.open_local_tool("Unlock", UNLOCK_TOOL, Ok(command)));
-        app.unlocking = Some(name.into());
+        app.open_unlock_dialog(name, Ok(command));
+        assert_eq!(app.unlocking.as_deref(), Some(name));
     }
 
     async fn finish_tool(app: &mut App) {
@@ -1835,6 +1990,37 @@ mod tests {
         assert_eq!(app.sessions.len(), 1, "the output stays readable");
         assert!(app.machine("prod").unwrap().waiting_for_user());
         assert!(app.machine("stage").unwrap().waiting_for_user());
+    }
+
+    #[tokio::test]
+    async fn test_connection_continues_after_the_passphrase_dialog() {
+        let mut app = with_servers(&["prod"]);
+        app.open_servers();
+        press(&mut app, KeyCode::Char('e'));
+        fake_unlock(&mut app, "prod", "exit 0");
+        app.test_after_unlock();
+        assert_eq!(
+            app.unlocking, None,
+            "a passing test connects it, not the unlock"
+        );
+        finish_tool(&mut app).await;
+        assert_eq!(app.unlock_dialog, None);
+        // The server's own key is missing here, so the test reports that on the form.
+        let error = app.form_mut().unwrap().error.clone().unwrap_or_default();
+        assert!(error.contains("/keys/k"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_declined_passphrase_stops_the_test_and_says_so_on_the_form() {
+        let mut app = with_servers(&["prod"]);
+        app.open_servers();
+        press(&mut app, KeyCode::Char('e'));
+        fake_unlock(&mut app, "prod", "exit 1");
+        app.test_after_unlock();
+        finish_tool(&mut app).await;
+        assert!(app.unlock_dialog.is_some(), "the output stays readable");
+        let error = app.form_mut().unwrap().error.clone().unwrap_or_default();
+        assert!(error.contains("locked"), "{error}");
     }
 
     #[tokio::test]

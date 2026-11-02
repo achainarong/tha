@@ -490,7 +490,9 @@ it from that user's `authorized_keys`.
 **Machines in the Explorer:** once a server exists, engines group under their machine.
 `Enter` on a machine shows only that machine, and connects it if needed. `Backspace`
 returns, and `:all` shows everything. `Shift+C` connects or disconnects the selected
-server. Without servers, the Explorer does not change.
+server, and `Shift+U` or `:unlock-server` asks for its SSH key's passphrase, then connects.
+The passphrase goes straight to `ssh-add`, and `Esc` cancels. Without servers, the Explorer
+does not change.
 
 **Traffic:** "Connect to servers" in Settings is **Manual** by default, so nothing is
 sent until you connect; a server's `connect` setting overrides it. With Security enabled,

@@ -7,6 +7,7 @@ for network and filesystem isolation where it works. Needs a built binary: make 
 import argparse
 import collections
 import fcntl
+import faulthandler
 import os
 import pty
 import random
@@ -33,6 +34,7 @@ PASTES = ["日本語のコンテナ名", "ท่าข้อความ", "🦀
 SIZES = [(1, 1), (1, 80), (2, 5), (3, 10), (4, 30), (5, 20), (8, 300), (10, 40), (12, 60), (24, 80), (40, 200),
          (200, 8), (60, 20), (2, 400)]
 HANG_SECONDS = 15
+STOP_SECONDS = 5
 # `q` and Ctrl-C are left out, so a run stays in the UI. Far more restarts than this means the
 # program is not starting at all, and a run with no panics would prove nothing.
 MAX_STARTS_PER_RUN = 20
@@ -67,6 +69,26 @@ def resize(descriptor, rows, columns):
     fcntl.ioctl(descriptor, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
 
 
+def stop(pid, descriptor):
+    """Kill and reap one run, and report whether it went away. Output is drained meanwhile, because
+    macOS can hold an exiting process until its terminal output has been read."""
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    deadline = time.time() + STOP_SECONDS
+    reaped = False
+    while not reaped and time.time() < deadline:
+        reaped = os.waitpid(pid, os.WNOHANG)[0] != 0
+        if not reaped and select.select([descriptor], [], [], 0.05)[0]:
+            try:
+                os.read(descriptor, 65536)
+            except OSError:
+                time.sleep(0.05)
+    os.close(descriptor)
+    return reaped
+
+
 def run(job):
     seed, rows, columns, seconds, binary, words = job
     rng = random.Random(seed)
@@ -87,12 +109,25 @@ def run(job):
                 if environment is None:
                     os.execv(program[0], program)
                 os.execve(program[0], program, environment)
+            # Never block on the terminal: a blocked write stops the reads the program needs to make
+            # progress, and it would also keep the hang check below from ever running.
+            os.set_blocking(descriptor, False)
             resize(descriptor, rows, columns)
-            last_output, alive = time.time(), True
+            last_output, alive, pending = time.time(), True, b""
             while alive and time.time() - start < seconds:
-                if select.select([descriptor], [], [], 0.003)[0]:
+                readable, writable, _ = select.select([descriptor], [descriptor] if pending else [], [], 0.003)
+                if writable:
+                    try:
+                        pending = pending[os.write(descriptor, pending):]
+                    except BlockingIOError:
+                        pass
+                    except OSError:
+                        alive = False
+                if readable:
                     try:
                         alive = bool(os.read(descriptor, 65536))
+                    except BlockingIOError:
+                        pass
                     except OSError:
                         alive = False
                     last_output = time.time()
@@ -100,6 +135,8 @@ def run(job):
                 if time.time() - last_output > HANG_SECONDS:
                     result["hang"] = True
                     break
+                if writable or pending:
+                    continue
                 roll = rng.random()
                 if roll < 0.03:
                     resize(descriptor, *rng.choice(SIZES))
@@ -114,16 +151,9 @@ def run(job):
                 else:
                     text = rng.choice(KEYS)
                 result["inputs"] += 1
-                try:
-                    os.write(descriptor, text.encode())
-                except OSError:
-                    alive = False
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-            os.waitpid(pid, 0)
-            os.close(descriptor)
+                pending = text.encode()
+            if not stop(pid, descriptor):
+                result["hang"] = True
         stderr = Path(f"{work}/stderr")
         text = stderr.read_text(errors="replace") if stderr.exists() else ""
         crash_log = Path(f"{work}/home/state/tha/crash.log")
@@ -141,6 +171,10 @@ def main():
     options = parser.parse_args()
     words = commands()
     jobs = [(seed, *SIZES[seed % len(SIZES)], options.seconds, options.binary, words) for seed in range(options.runs)]
+    # Anything still blocked past the longest possible run fails here with a stack for every thread,
+    # rather than silently using up the CI job's time limit.
+    limit = options.runs * (options.seconds + HANG_SECONDS + STOP_SECONDS) + 60
+    faulthandler.dump_traceback_later(limit, exit=True)
     with ThreadPoolExecutor(options.jobs) as pool:
         results = list(pool.map(run, jobs))
     inputs, starts = sum(r["inputs"] for r in results), sum(r["starts"] for r in results)

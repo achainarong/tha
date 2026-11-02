@@ -393,12 +393,7 @@ pub fn files_command(
 pub fn test_command(remote: &Remote) -> Result<std::process::Command> {
     remote.validate()?;
     let key = checked_key(remote)?;
-    let mut args = common_args(remote, &key, false);
-    // The passphrase typed here also unlocks the key for the real connection, which cannot ask.
-    // Only for a locked key, so a test never copies a key without a passphrase into the agent.
-    if key_locked(&key) && ensure_agent().is_ok() {
-        args.extend(["-o".into(), "AddKeysToAgent=yes".into()]);
-    }
+    let args = common_args(remote, &key, false);
     let mut command = std::process::Command::new("ssh");
     command.args(with_host(args, remote, Some(LIST_COMMAND)));
     if let Some(socket) = private_agent_socket() {
@@ -419,6 +414,12 @@ pub fn unlock_command(remote: &Remote) -> Result<std::process::Command> {
         command.env(AGENT_SOCKET_VARIABLE, socket);
     }
     Ok(command)
+}
+
+/// Whether an unlock would do anything, and why not when the key itself is the problem.
+pub fn key_needs_unlock(remote: &Remote) -> Result<bool> {
+    remote.validate()?;
+    Ok(key_locked(&checked_key(remote)?))
 }
 
 const AGENT_SOCKET_VARIABLE: &str = "SSH_AUTH_SOCK";
@@ -1653,22 +1654,6 @@ mod tests {
         std::fs::write(&broken, "not a key").unwrap();
         assert!(!key_locked(&broken));
         assert!(!key_locked(&directory.path().join("missing")));
-    }
-
-    #[test]
-    fn the_test_keeps_the_unlock_only_for_a_locked_key() {
-        let directory = tempfile::tempdir().unwrap();
-        let Some(open) = generated_key(directory.path(), "open", "") else {
-            return;
-        };
-        let mut candidate = remote();
-        candidate.identity_file = open.display().to_string();
-        let command = test_command(&candidate).unwrap();
-        assert!(
-            !command
-                .get_args()
-                .any(|arg| arg.to_string_lossy().contains("AddKeysToAgent"))
-        );
     }
 
     #[test]

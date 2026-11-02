@@ -90,6 +90,7 @@ These modal keys do not trigger global navigation or workload actions while typi
 | `settings` | Open the settings pane |
 | `servers` | Open the Servers modal to add, edit or remove servers |
 | `toggle-connection` | Connect or disconnect the selected server |
+| `unlock-server` | Ask for the passphrase of the selected server's SSH key, then connect |
 | `zoom` | Expand/restore the focused Explorer, detail tab, Performance, or inventory view |
 | `toggle-branch` | Toggle an Explorer branch |
 | `next-match`, `previous-match` | Navigate tree/log search matches |

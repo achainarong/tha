@@ -392,6 +392,7 @@ catalog! {
     Settings, "Settings: theme, language, keyboard layout, mouse", ["settings"], Global, 25, false, [","], [];
     Servers, "Servers: add, edit or remove remote servers", ["servers"], Global, 26, false, ["."], [];
     ToggleConnection, "Connect or disconnect the selected server", ["toggle-connection"], Containers, 41, false, ["shift-c"], [];
+    UnlockServer, "Unlock the selected server's SSH key", ["unlock-server"], Containers, 41, false, ["shift-u"], [];
     Quit, "Quit Tha", ["quit", "q"], Global, 40, false, ["ctrl-c"], [];
 }
 
@@ -552,6 +553,7 @@ impl ActionId {
             Self::Settings => "settings",
             Self::Servers => "servers",
             Self::ToggleConnection => "toggle-connection",
+            Self::UnlockServer => "unlock-server",
             Self::Quit => "quit",
         }
     }
